@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <img src="docs/assets/ferrox-logo.png" alt="Ferrox — pure-Rust GGUF / MoE inference" width="520">
 </p>
@@ -23,7 +25,7 @@ Install the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guide
 
 ```bash
 mkdir -p models
-hf download TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
+huggingface-cli download TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
   tinyllama-1.1b-chat-v1.0.Q8_0.gguf --local-dir models
 ```
 
