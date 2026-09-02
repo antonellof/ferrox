@@ -524,12 +524,19 @@ fn read_gguf_string(cursor: &mut io::Cursor<&[u8]>) -> Result<String, GgufError>
 
 fn read_gguf_value(cursor: &mut io::Cursor<&[u8]>) -> Result<GgufValue, GgufError> {
     let type_tag = cursor.read_u32::<LittleEndian>()?;
-    read_gguf_value_typed(cursor, type_tag)
+    read_gguf_value_typed(cursor, type_tag, 0)
 }
+
+/// Maximum nesting depth for GGUF metadata arrays. Real files nest one level
+/// (an array of strings); this bounds the native recursion in
+/// `read_gguf_value_typed` so a crafted file of nested arrays cannot overflow
+/// the stack.
+const MAX_VALUE_DEPTH: u32 = 8;
 
 fn read_gguf_value_typed(
     cursor: &mut io::Cursor<&[u8]>,
     type_tag: u32,
+    depth: u32,
 ) -> Result<GgufValue, GgufError> {
     Ok(match type_tag {
         0 => GgufValue::U8(cursor.read_u8()?),
@@ -542,11 +549,29 @@ fn read_gguf_value_typed(
         7 => GgufValue::Bool(cursor.read_u8()? != 0),
         8 => GgufValue::String(read_gguf_string(cursor)?),
         9 => {
+            if depth >= MAX_VALUE_DEPTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GGUF array nesting too deep",
+                )
+                .into());
+            }
             let elem_tag = cursor.read_u32::<LittleEndian>()?;
             let len = cursor.read_u64::<LittleEndian>()? as usize;
-            let mut items = Vec::with_capacity(len);
+            // Every array element occupies at least one byte on the wire, so a
+            // length larger than the bytes remaining is impossible; reject it
+            // before it can size an allocation (the same invariant as
+            // read_gguf_string).
+            let remaining = cursor
+                .get_ref()
+                .len()
+                .saturating_sub(cursor.position() as usize);
+            if len > remaining {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+            }
+            let mut items = Vec::with_capacity(len.min(PREALLOC_CAP));
             for _ in 0..len {
-                items.push(read_gguf_value_typed(cursor, elem_tag)?);
+                items.push(read_gguf_value_typed(cursor, elem_tag, depth + 1)?);
             }
             GgufValue::Array(items)
         }
@@ -811,6 +836,59 @@ mod tests {
             Err(GgufError::BadMagic(_)) => {}
             Err(other) => panic!("expected BadMagic error, got a different error: {other}"),
             Ok(_) => panic!("expected BadMagic error, got Ok"),
+        }
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// A metadata array whose declared length exceeds the bytes that could
+    /// possibly follow must be rejected before it sizes an allocation, rather
+    /// than aborting the process with a multi-exabyte allocation request.
+    fn header_with_single_kv(key: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_u32::<LittleEndian>(GGUF_MAGIC).unwrap();
+        buf.write_u32::<LittleEndian>(3).unwrap(); // version
+        buf.write_u64::<LittleEndian>(0).unwrap(); // tensor_count
+        buf.write_u64::<LittleEndian>(1).unwrap(); // kv_count
+        write_string(&mut buf, key);
+        buf
+    }
+
+    #[test]
+    fn rejects_array_length_larger_than_the_file() {
+        let mut buf = header_with_single_kv("a");
+        buf.write_u32::<LittleEndian>(9).unwrap(); // value type = array
+        buf.write_u32::<LittleEndian>(4).unwrap(); // element type = u32
+        buf.write_u64::<LittleEndian>(u64::MAX / 64).unwrap(); // impossible length
+
+        let tmp = std::env::temp_dir().join(format!("ferrox_test_arr_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, &buf).unwrap();
+        match GgufFile::open(&tmp) {
+            Err(_) => {}
+            Ok(_) => panic!("expected an error for an oversized array length"),
+        }
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn rejects_deeply_nested_arrays() {
+        // Each level is an array whose only element is another array. Without a
+        // depth limit this recurses one stack frame per level and overflows.
+        let mut buf = header_with_single_kv("a");
+        buf.write_u32::<LittleEndian>(9).unwrap(); // outer value type = array
+        for _ in 0..100_000 {
+            buf.write_u32::<LittleEndian>(9).unwrap(); // element type = array
+            buf.write_u64::<LittleEndian>(1).unwrap(); // length 1
+        }
+        buf.write_u32::<LittleEndian>(0).unwrap(); // innermost element type = u8
+        buf.write_u64::<LittleEndian>(1).unwrap();
+        buf.push(0);
+
+        let tmp =
+            std::env::temp_dir().join(format!("ferrox_test_nested_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, &buf).unwrap();
+        match GgufFile::open(&tmp) {
+            Err(_) => {}
+            Ok(_) => panic!("expected an error for deeply nested arrays"),
         }
         std::fs::remove_file(&tmp).ok();
     }
