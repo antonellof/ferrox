@@ -20,11 +20,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// OpenAI's `usage.completion_tokens_details`.
+///
+/// Only the one field is carried: the others in OpenAI's object
+/// (`audio_tokens`, `accepted_prediction_tokens`) describe features
+/// this server does not implement, and inventing zeroes for them would
+/// be the same lie this type exists to stop telling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// OpenAI's nested completion breakdown. Absent unless the
+    /// reasoning split actually ran, because a zero here is a claim
+    /// about the model and not about this server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
     /// Prefill throughput (prompt tokens / prefill seconds), when timed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_per_second: Option<f64>,
@@ -82,6 +98,7 @@ impl Usage {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            completion_tokens_details: None,
             prompt_per_second: None,
             predicted_per_second: None,
             prompt_eval_duration_ms: None,
@@ -116,6 +133,27 @@ impl Usage {
         if self.completion_tokens > 0 {
             self.time_to_first_token_ms = Some(secs * 1000.0);
         }
+        self
+    }
+
+    /// How many of the completion's tokens were spent reasoning.
+    ///
+    /// OpenAI's own field, and the only part of a reasoning model's
+    /// accounting that IS in their spec -- `reasoning_content` is a
+    /// DeepSeek convention this server also speaks, but the token
+    /// count is standard, and it is how a caller prices or budgets a
+    /// thinking model.
+    ///
+    /// `None`, not zero, when this build cannot know: a checkpoint
+    /// whose family emits no reasoning at all, and any path that did
+    /// not run the split. `/v1/responses` used to report a hardcoded
+    /// `0` here, which reads as "this model did not think" rather than
+    /// "nobody counted" -- the exact confusion this module's header
+    /// rules out for timings.
+    pub fn with_reasoning_tokens(mut self, reasoning: usize) -> Self {
+        self.completion_tokens_details = Some(CompletionTokensDetails {
+            reasoning_tokens: reasoning,
+        });
         self
     }
 

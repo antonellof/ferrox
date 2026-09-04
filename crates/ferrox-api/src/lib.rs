@@ -40,4 +40,4 @@ pub use health::{Capability, HealthResponse, HealthState};
 pub use lifecycle::{ServerReady, READY_EVENT};
 pub use progress::{RateEstimator, RateReport};
 pub use request_id::next_request_id;
-pub use usage::Usage;
+pub use usage::{CompletionTokensDetails, Usage};
