@@ -56,6 +56,7 @@ mod openai_extra;
 mod output;
 mod policy;
 mod rerank;
+mod reasoning_tokens;
 mod response_cache;
 pub(crate) mod responses;
 mod resume;
