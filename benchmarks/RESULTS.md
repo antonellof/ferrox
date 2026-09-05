@@ -61,6 +61,35 @@ Correctness was checked before speed: `ferrox verify --backend cuda
 --prompt-tokens 512` is token-identical to the CPU reference for Q4_K,
 Q5_K and Q6_K.
 
+**The CUDA gap gets WORSE on newer hardware.** Re-measured on an
+RTX 3060 (Ampere, compute 8.6), ferrox and llama.cpp both built with
+CUDA on the same box, quiet host:
+
+| model | test | ferrox | llama.cpp | gap |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | pp512 | 185.33 | 10277.19 | **55.5×** |
+| Llama-3.2-1B Q4_K_M | tg128 | 24.50 | 282.17 | 11.5× |
+| Llama-3.2-3B Q4_K_M | pp512 | 75.58 | 4276.84 | **56.6×** |
+| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | 127.03 | 12.2× |
+
+Against the Pascal rows above, prefill goes from ~11× to ~56×.
+**llama.cpp is 2.4× faster on Ampere than on Pascal (4318 to 10277
+tok/s on the 1B); ferrox does not scale at all.** Decode is roughly
+unchanged. So the remaining prefill gap is not a constant factor: it
+widens with GPU generation, which means the kernel leaves newer
+hardware unused.
+
+Thread count is not the explanation (`-t 4` against ferrox's chosen
+`-t 1` gives 232.73 against 186.83, still 44× off), and the GPU is
+about half idle during prefill (sampled 0%, 57%, 50%), a different
+signature from decode's ~90%.
+
+These four rows are **prose, not receipts.** They come from
+`ferrox bench -m --compare` rather than `--suite`, so nothing was
+written to `receipts/engine/` and they are absent from the generated
+table below. Stated here rather than omitted, and marked rather than
+mixed in.
+
 **What remains is one number, not a list.** Every CUDA row is now
 between 10.8× and 17.4× on prefill and 9.2× and 17.1× on decode,
 across every kind. A uniform band is a systemic per-token cost rather
