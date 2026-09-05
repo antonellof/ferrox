@@ -165,6 +165,20 @@ now ruled out**:
   lever even if the diagnosis is right, and here the diagnosis was also
   wrong.
 
+**And prefill is a second, larger problem that widens with hardware.**
+Re-measured on an RTX 3060 (Ampere): prefill is **55x to 57x** off
+llama.cpp, against ~11x on the GTX 1080. llama.cpp is 2.4x faster on
+Ampere than on Pascal; ferrox is not faster at all. Decode is roughly
+unchanged at 11.5x to 12.2x. The GPU sits about half idle during
+prefill (0%, 57%, 50%) where decode runs it at ~90%, so the two have
+different signatures and are probably different bugs. Thread count is
+not it: `-t 4` against ferrox's chosen `-t 1` is worth 25% and leaves
+44x.
+
+Treat the 50% as a lead needing repeated sampling, not a conclusion.
+One instantaneous utilization sample already cost this plan a day and a
+PR.
+
 **What llama.cpp's CUDA backend does**, read out of
 `.scratch/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu`. Kept because it
 is true and useful, with the caveat that it is NOT the explanation for
