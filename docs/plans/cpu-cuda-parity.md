@@ -154,27 +154,71 @@ now ruled out**:
   allocation. That is where to look next, and it is consistent with a
   gap that is uniform across every quant kind.
 
-**The cause is identified, and the fix is already written.**
-`ferrox-cuda/src/gpu.rs` defines `DeviceAct` / `upload_act` /
-`matvec_into` / `download_act`, whose doc says they exist "so a
+**The cause is identified. Part of the fix has landed, and it does not
+reach parity on its own.**
+
+`ferrox-cuda/src/gpu.rs` defined `DeviceAct` / `upload_act` /
+`matvec_into` / `download_act`, whose doc said they existed "so a
 matvec's output can be fed straight into the next matvec without a
-DtoH/HtoD round-trip (the exact per-call upload/download overhead that
-made CUDA decode bandwidth-starved)". **All four have zero uses outside
-that file.** The decode path takes `launch_matvec`, which returns
-`Vec<f32>` and therefore ends in `dtoh_sync_copy`: every matmul
-uploads, allocates, launches, synchronises and downloads, on the order
-of a hundred times per token.
+DtoH/HtoD round-trip". All four had zero uses outside that file. They
+are now replaced by `ferrox_cuda::act_chain::ActChain`, which every
+multi-kernel entry point (`launch_matvec`, `launch_matvec_multi`,
+`launch_dense_ffn_swiglu`, `launch_fused_add_rmsnorm`) goes through, so
+there is one residency implementation rather than three hand-rolled
+ones plus a dead API.
 
-**Exit:** wire the chaining, then before/after `tg128` on the same GPU
-plus `nvidia-smi` utilization, which should rise from 36%.
+**What that could and could not buy, counted rather than guessed.** One
+dense CUDA decode layer performs FIVE device-to-host synchronisations:
+three in `apply_gpu_multi` (Q, K, V -- `cudarc` 0.11.9's
+`dtoh_sync_copy` ends in `synchronize()`, so N outputs cost N syncs),
+one for `o_proj` via `launch_matvec`, one for `launch_dense_ffn_swiglu`.
+Plus one for `lm_head` per token. `ActChain::download_all` collapses
+the first three into one. It cannot collapse the other two, and that is
+a property of the DECODER, not of the backend: between QKV and `o_proj`
+sit the QKV biases, the QK norms, RoPE and the attention reduction, all
+on the host; between `o_proj` and the FFN sit `post_attn_norm`, the
+residual add and the FFN norm, also on the host. **There is no pair of
+consecutive matmuls left in the decode path with nothing between them
+except the one `launch_dense_ffn_swiglu` already fuses.** So chaining
+matvecs takes 5 syncs per layer to 3, and no further.
 
-**The hazard to design around first.** Metal's equivalent
+Reaching llama.cpp's shape needs what llama.cpp actually does, which is
+not "chain a pair of matmuls": `ggml_backend_cuda_graph_compute`'s node
+loop contains ZERO `cudaStreamSynchronize` because EVERY tensor,
+intermediates included, is allocated in a device buffer up front
+(`ggml_backend_cuda_buffer_type`) and the host never sees one. Every
+sync lives at the graph boundary, in the buffer API. Residency there is
+the default state of a tensor, not an optimisation applied to a pair of
+calls. The ferrox equivalent is to make the residual stream itself a
+`DeviceAct` for the whole token, which is a `decoder.rs` change.
+
+**And even that has a ceiling.** At 36% utilization, removing 100% of
+the host round-trips caps the win at about 2.8x. The measured decode gap
+is 9x to 17x. So a second, independent cause is in the kernels: the
+matvecs are one 256-thread block per row doing a shared-memory tree
+reduction, where ggml-cuda uses warp-level `dp4a` over several rows per
+block. Both have to be fixed; neither alone closes the gap.
+
+**Exit:** unchanged -- before/after `tg128` on the same GPU plus
+`nvidia-smi` utilization. What landed so far is UNVERIFIED on hardware:
+`cargo test -p ferrox-cuda --features cuda -- --ignored`.
+
+**The hazard, and how it was closed.** Metal's equivalent
 (`take_resident_activation_if_matches`) matches on LENGTH alone, which
 is safe there only because exactly one site sets it and it is cleared
 aggressively. Copied to CUDA without that discipline, two same-length
 activations alias and the model silently answers wrong, which is worse
-than being slow. Whatever carries residency needs an identity the
-caller cannot get wrong, not a length comparison.
+than being slow -- and in a decoder every layer produces activations of
+the same length, so a length comparison cannot tell layer 3's residual
+from layer 11's. `ferrox-cuda` had already grown a thread-local
+`ResidentActivation` of exactly that shape (pointer + length), unwired
+and unusable; it is deleted. What replaced it is
+`ferrox_cuda::chain_id`: a process-unique `ChainId` stamped onto every
+activation at the moment it is created, and a chain refuses anything it
+did not stamp. The check is not a convention every call site must
+remember -- `DeviceAct`'s device pointer is reachable only through
+`slice_for(ChainId)`, from behind a module boundary, so a chain that
+skips the check does not compile.
 
 ### 3. Decide the CPU pool by work size, not by environment variable
 

@@ -63,6 +63,18 @@
 //! Not yet verified: a full FFN (multiple fused matvecs) rather than one
 //! projection at a time, and behavior on GPUs other than the RTX 3060s
 //! this was tested against.
+//!
+//! Also not yet verified: the [`crate::act_chain::ActChain`] rewrite of
+//! `launch_matvec`, `launch_matvec_multi`, `launch_dense_ffn_swiglu`
+//! and `launch_fused_add_rmsnorm` (#133). The arithmetic is unchanged --
+//! the same kernels in the same order -- but `launch_matvec_multi` now
+//! downloads its N outputs with one host synchronisation instead of N,
+//! through a raw `cudarc::driver::result::memcpy_dtoh_async` rather
+//! than the safe wrapper, and NO GPU HAS RUN IT. Its hardware tests are
+//! `batched_download_matches_single_download_and_keeps_order` and
+//! `a_chain_refuses_another_chains_activation`.
+
+use crate::act_chain::ActChain;
 
 /// What `probe()` found on the host, if anything.
 pub struct CudaInfo {
@@ -90,6 +102,13 @@ pub enum CudaError {
     /// that can compute it, never compute something else.
     #[error("unsupported on the CUDA path: {0}")]
     Unsupported(String),
+    /// A device-resident activation was handed to a chain that did not
+    /// produce it. Its own variant rather than a `Launch` string
+    /// because it is not a device failure at all: nothing was launched,
+    /// and the condition is a caller bug that must never be papered
+    /// over by retrying. See [`crate::chain_id`].
+    #[error(transparent)]
+    ForeignActivation(#[from] crate::chain_id::ForeignActivation),
 }
 
 /// Probes for CUDA devices. Returns `None` on any failure to load the
@@ -637,7 +656,15 @@ pub(crate) fn ensure_module_loaded_lazy(
 /// process-wide and persistent (see `shared_device`/`ensure_module_loaded`) --
 /// quantized weight buffers are also cached by host pointer+length
 /// (`resident_cuda_weights`) so decode does not re-upload multi-GB
-/// matrices every token. Activations still upload per call.
+/// matrices every token.
+///
+/// This is a chain of exactly ONE matvec: the caller wants a
+/// `Vec<f32>`, so the activation has to come back and the sync is
+/// unavoidable here. Expressed on [`ActChain`] anyway so there is one
+/// upload/launch/download implementation rather than four; the entry
+/// points that have more than one kernel to run
+/// ([`launch_matvec_multi`], [`launch_dense_ffn_swiglu`]) are where the
+/// chaining actually saves a sync.
 #[allow(clippy::too_many_arguments)] // shared internal launch plumbing; each parameter is a distinct, clearly-named buffer/shape value, not something worth bundling into a struct for one private callee.
 fn launch_matvec(
     kernel_src: &'static str,
@@ -649,14 +676,6 @@ fn launch_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
-    let dev = shared_device()?;
-    // If the previous decode left a matching host activation marked
-    // resident, skip a redundant HtoD (the bytes are still the same;
-    // a future DeviceAct-TLS path will skip the copy entirely).
-    let _reuse = take_resident_activation_if_matches(x);
-    let d_x = dev
-        .htod_copy(x.to_vec())
-        .map_err(|e| CudaError::Launch(format!("{e:?}")))?;
     let launch = MatvecLaunch {
         kernel_src,
         module_name,
@@ -666,14 +685,10 @@ fn launch_matvec(
         row_bytes,
         n_blocks_per_row,
     };
-    // `_weights` holds the resident-weight Arc alive until the DtoH sync.
-    let (d_out, _weights) = enqueue_matvec(&dev, &launch, &d_x)?;
-    let out = dev
-        .dtoh_sync_copy(&d_out)
-        .map_err(|e| CudaError::Launch(format!("{e:?}")))?;
-    // Mark result resident for a possible follow-up matvec on the same
-    // host buffer (caller must keep `out` alive and pass the same ptr).
-    Ok(out)
+    let chain = ActChain::open()?;
+    let d_x = chain.upload(x)?;
+    let d_out = chain.matvec(&launch, &d_x)?;
+    chain.download(&d_out)
 }
 
 /// Enqueues one matvec kernel on the shared device's default stream:
@@ -685,10 +700,10 @@ fn launch_matvec(
 /// per-call HtoD of the activation happens here. Returns the device
 /// output slice plus the resident-weight `Arc`, which the caller must
 /// keep alive until it syncs (the kernel reads that buffer
-/// asynchronously). This is the single per-launch primitive shared by
-/// [`launch_matvec`], [`launch_matvec_multi`], [`matvec_into`], and
-/// [`launch_dense_ffn_swiglu`].
-fn enqueue_matvec(
+/// asynchronously). This is the single per-launch primitive every
+/// matvec goes through; [`ActChain::matvec`] is its only caller, and
+/// every public entry point reaches it from there.
+pub(crate) fn enqueue_matvec(
     dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
     launch: &MatvecLaunch<'_>,
     d_x: &cudarc::driver::CudaSlice<f32>,
@@ -908,10 +923,16 @@ pub struct MatvecLaunch<'a> {
 }
 
 /// Uploads `x` once, enqueues N matvec kernels (resident weights), then
-/// downloads N outputs. Mirrors ggml-cuda's "enqueue on stream, sync at
-/// the edge" discipline as far as cudarc 0.11.9 allows without a full
-/// device-resident graph: one HtoD for `x`, N kernel launches, then N
-/// DtoH. Used by `WeightMatrix::apply_gpu_multi` for Q/K/V and gate+up.
+/// downloads N outputs with **one** host synchronisation for all of
+/// them. Used by `WeightMatrix::apply_gpu_multi` for Q/K/V and gate+up.
+///
+/// The single sync is the whole point, and it is what changed for #133.
+/// This used to call `dtoh_sync_copy` per output, and `cudarc` 0.11.9's
+/// `dtoh_sync_copy` ends in `synchronize()` -- so Q/K/V cost three host
+/// syncs per layer, on every layer of every token, where ggml-cuda's
+/// node loop performs zero and synchronises once at the graph boundary.
+/// [`ActChain::download_all`] enqueues the three copies back to back and
+/// waits once.
 pub fn launch_matvec_multi(
     x: &[f32],
     launches: &[MatvecLaunch<'_>],
@@ -920,33 +941,13 @@ pub fn launch_matvec_multi(
         return Ok(Vec::new());
     }
 
-    let dev = shared_device()?;
-
-    let d_x = dev
-        .htod_copy(x.to_vec())
-        .map_err(|e| CudaError::Launch(format!("x upload: {e:?}")))?;
-
-    // Hold weight Arcs + device outs until after all launches so kernels
-    // can overlap before any host sync (llama: sync only at graph edge).
-    let mut weight_arcs = Vec::with_capacity(launches.len());
-    let mut d_outs = Vec::with_capacity(launches.len());
-
-    for launch in launches {
-        let (d_out, d_weights) = enqueue_matvec(&dev, launch, &d_x)?;
-        weight_arcs.push(d_weights);
-        d_outs.push(d_out);
-    }
-    drop(weight_arcs);
-
-    let mut results = Vec::with_capacity(d_outs.len());
-    for (i, d_out) in d_outs.into_iter().enumerate() {
-        let out = dev.dtoh_sync_copy(&d_out).map_err(|e| {
-            CudaError::Launch(format!("output download {}: {e:?}", launches[i].fn_name))
-        })?;
-        results.push(out);
-    }
-
-    Ok(results)
+    let chain = ActChain::open()?;
+    let d_x = chain.upload(x)?;
+    let d_outs = launches
+        .iter()
+        .map(|launch| chain.matvec(launch, &d_x))
+        .collect::<Result<Vec<_>, _>>()?;
+    chain.download_all(&d_outs)
 }
 
 /// CUDA C source for an elementwise SwiGLU pair fuse:
@@ -976,7 +977,7 @@ extern "C" __global__ void silu_mul_f32(
 /// slice. `gate`/`up` are device slices of length `n` produced by the
 /// two FFN input matvecs; the result feeds straight into the down
 /// matvec without ever touching host memory.
-fn silu_mul_device(
+pub(crate) fn silu_mul_device(
     dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
     gate: &cudarc::driver::CudaSlice<f32>,
     up: &cudarc::driver::CudaSlice<f32>,
@@ -1045,28 +1046,24 @@ extern "C" __global__ void fused_add_rmsnorm_f32(
 }
 "#;
 
-/// Computes `rms_norm(x + residual, weight, eps)` on the device: one
-/// HtoD upload each for `x`, `residual`, and `weight`, one DtoH for the
-/// result. Fuses the elementwise add with the RMSNorm reduction so the
-/// sum never materializes on the host.
-pub fn launch_fused_add_rmsnorm(
-    x: &[f32],
-    residual: &[f32],
-    weight: &[f32],
+/// Enqueues `rms_norm(x + residual, weight, eps)` on the shared
+/// device's default stream (no host sync), returning the device output
+/// slice. All three inputs are already-on-device activations of length
+/// `n`; the result feeds straight into whatever the chain runs next.
+/// Fuses the elementwise add with the RMSNorm reduction so the sum
+/// never materializes on the host.
+pub(crate) fn fused_add_rmsnorm_device(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    x: &cudarc::driver::CudaSlice<f32>,
+    residual: &cudarc::driver::CudaSlice<f32>,
+    weight: &cudarc::driver::CudaSlice<f32>,
+    n: usize,
     eps: f32,
-) -> Result<Vec<f32>, CudaError> {
+) -> Result<cudarc::driver::CudaSlice<f32>, CudaError> {
     use cudarc::driver::LaunchAsync;
 
-    assert_eq!(x.len(), residual.len());
-    assert_eq!(x.len(), weight.len());
-    let n = x.len();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-
-    let dev = shared_device()?;
     ensure_module_loaded(
-        &dev,
+        dev,
         FUSED_ADD_RMSNORM_KERNEL_SRC,
         "ferrox_fused_add_rmsnorm",
         "fused_add_rmsnorm_f32",
@@ -1079,15 +1076,6 @@ pub fn launch_fused_add_rmsnorm(
             )
         })?;
 
-    let d_x = dev
-        .htod_copy(x.to_vec())
-        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm x upload: {e:?}")))?;
-    let d_residual = dev
-        .htod_copy(residual.to_vec())
-        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm residual upload: {e:?}")))?;
-    let d_weight = dev
-        .htod_copy(weight.to_vec())
-        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm weight upload: {e:?}")))?;
     let mut d_out = dev
         .alloc_zeros::<f32>(n)
         .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm out alloc: {e:?}")))?;
@@ -1099,86 +1087,38 @@ pub fn launch_fused_add_rmsnorm(
         shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
     };
     unsafe {
-        func.launch(
-            cfg,
-            (&d_x, &d_residual, &d_weight, &mut d_out, n as i32, eps),
-        )
-        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm launch: {e:?}")))?;
+        func.launch(cfg, (x, residual, weight, &mut d_out, n as i32, eps))
+            .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm launch: {e:?}")))?;
+    }
+    Ok(d_out)
+}
+
+/// Computes `rms_norm(x + residual, weight, eps)` on the device: one
+/// HtoD upload each for `x`, `residual`, and `weight`, one DtoH for the
+/// result.
+///
+/// The host-edge wrapper around [`fused_add_rmsnorm_device`]. A caller
+/// that already holds these three on the device should run the chain
+/// operation ([`ActChain::add_rms_norm`]) instead and keep the result
+/// there.
+pub fn launch_fused_add_rmsnorm(
+    x: &[f32],
+    residual: &[f32],
+    weight: &[f32],
+    eps: f32,
+) -> Result<Vec<f32>, CudaError> {
+    assert_eq!(x.len(), residual.len());
+    assert_eq!(x.len(), weight.len());
+    if x.is_empty() {
+        return Ok(Vec::new());
     }
 
-    dev.dtoh_sync_copy(&d_out)
-        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm download: {e:?}")))
-}
-
-/// A device-resident activation vector: a `CudaSlice<f32>` plus its
-/// logical length, so a matvec's output can be fed straight into the
-/// next matvec without a DtoH/HtoD round-trip (the exact per-call
-/// upload/download overhead that made CUDA decode bandwidth-starved).
-/// Mirrors Metal's on-device activation residency; created by
-/// [`upload_act`], consumed by [`matvec_into`], read back by
-/// [`download_act`].
-pub struct DeviceAct {
-    slice: cudarc::driver::CudaSlice<f32>,
-    len: usize,
-}
-
-// SAFETY: the slice lives on the process-wide shared CudaDevice and is
-// only touched by kernels launched on that device; same sharing model
-// as ResidentCudaWeights above.
-unsafe impl Send for DeviceAct {}
-unsafe impl Sync for DeviceAct {}
-
-impl DeviceAct {
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-/// Uploads a host activation vector to the device once, returning a
-/// [`DeviceAct`] that later matvecs can consume in place (no repeated
-/// HtoD). One HtoD copy; the shared persistent device/context is reused.
-pub fn upload_act(x: &[f32]) -> Result<DeviceAct, CudaError> {
-    let dev = shared_device()?;
-    let slice = dev
-        .htod_copy(x.to_vec())
-        .map_err(|e| CudaError::Launch(format!("act upload: {e:?}")))?;
-    Ok(DeviceAct {
-        slice,
-        len: x.len(),
-    })
-}
-
-/// Downloads a [`DeviceAct`] back to a host `Vec<f32>` (one DtoH, which
-/// also synchronizes the stream). Used at the edge of a chained matvec
-/// sequence, exactly once, instead of once per matvec.
-pub fn download_act(act: &DeviceAct) -> Result<Vec<f32>, CudaError> {
-    let dev = shared_device()?;
-    dev.dtoh_sync_copy(&act.slice)
-        .map_err(|e| CudaError::Launch(format!("act download: {e:?}")))
-}
-
-/// Runs one matvec whose activation input is already on the device,
-/// producing another device-resident activation — no HtoD of `x`, no
-/// DtoH of the result. This is the device-resident counterpart of the
-/// `launch_*_matvec` host wrappers: chain several of these (plus
-/// [`silu_mul_device`], via [`launch_dense_ffn_swiglu`]) between a
-/// single [`upload_act`] and [`download_act`] to keep a whole FFN /
-/// projection stack on-GPU.
-pub fn matvec_into(launch: &MatvecLaunch<'_>, x: &DeviceAct) -> Result<DeviceAct, CudaError> {
-    let dev = shared_device()?;
-    let (d_out, _weights) = enqueue_matvec(&dev, launch, &x.slice)?;
-    // DtoH-free: the resident-weight Arc is dropped here, but the kernel
-    // has already been enqueued reading it on the same (default) stream,
-    // and the *cached* Arc in CUDA_WEIGHT_CACHE keeps the buffer alive
-    // regardless — resident_cuda_weights never evicts.
-    Ok(DeviceAct {
-        slice: d_out,
-        len: launch.rows,
-    })
+    let chain = ActChain::open()?;
+    let d_x = chain.upload(x)?;
+    let d_residual = chain.upload(residual)?;
+    let d_weight = chain.upload(weight)?;
+    let d_out = chain.add_rms_norm(&d_x, &d_residual, &d_weight, eps)?;
+    chain.download(&d_out)
 }
 
 /// Fused dense SwiGLU FFN entirely on-device: uploads `x` once, runs
@@ -1191,6 +1131,12 @@ pub fn matvec_into(launch: &MatvecLaunch<'_>, x: &DeviceAct) -> Result<DeviceAct
 /// process-resident (see `resident_cuda_weights`); only the single
 /// activation upload and single result download cross the bus.
 ///
+/// This is the chain the whole [`ActChain`] seam was written for, and
+/// it used to be spelled out longhand here with its own `htod_copy`,
+/// its own `enqueue_matvec` calls and its own `_wg`/`_wu`/`_wd` Arc
+/// bindings -- a second, hand-kept copy of residency discipline. It is
+/// now the same four calls any other caller would make.
+///
 /// `gate`/`up` must have the same output row count (the FFN hidden dim)
 /// and the same input `cols` as `x`; `down`'s input `cols` must equal
 /// that FFN hidden dim (its `n_blocks_per_row` covers the SwiGLU output
@@ -1202,79 +1148,13 @@ pub fn launch_dense_ffn_swiglu(
     down: &MatvecLaunch<'_>,
     x: &[f32],
 ) -> Result<Vec<f32>, CudaError> {
-    let dev = shared_device()?;
-
-    let d_x = dev
-        .htod_copy(x.to_vec())
-        .map_err(|e| CudaError::Launch(format!("ffn x upload: {e:?}")))?;
-
-    // Bind the resident-weight Arcs (`_wg`/`_wu`/`_wd`) for the whole
-    // function so every kernel's weight buffer outlives the final sync.
-    let (d_gate, _wg) = enqueue_matvec(&dev, gate, &d_x)?;
-    let (d_up, _wu) = enqueue_matvec(&dev, up, &d_x)?;
-    let d_act = silu_mul_device(&dev, &d_gate, &d_up, gate.rows)?;
-    let (d_out, _wd) = enqueue_matvec(&dev, down, &d_act)?;
-
-    dev.dtoh_sync_copy(&d_out)
-        .map_err(|e| CudaError::Launch(format!("ffn out download: {e:?}")))
-}
-
-/// Thread-local resident activation buffer (output of a matvec that
-/// might be reused as input to the next call, skipping host↔device
-/// upload/download). Mirrors Metal's `RESIDENT_ACT` TLS in
-/// `ferrox-metal/src/gpu.rs` -- same pattern: decoder hands back the
-/// output buffer if it knows the next matvec will consume it, and
-/// `launch_matvec` (or a future fused-stack path) can skip `htod_copy`
-/// when the pointer+length match.
-///
-/// Not yet wired into `launch_matvec` itself (future work: check TLS
-/// before `htod_copy`, skip upload if matches, download result and
-/// update TLS if decoder will hand it back) -- the public
-/// `set_resident_activation` / `clear_resident_activation` functions
-/// are the API surface for that integration.
-#[allow(dead_code)] // Infrastructure for future launch_matvec integration.
-#[derive(Clone, Copy)]
-struct ResidentActivation {
-    /// Raw host pointer (borrowed, not owned -- caller must keep alive).
-    ptr: *const f32,
-    len: usize,
-}
-
-thread_local! {
-    static RESIDENT_ACT: std::cell::Cell<Option<ResidentActivation>> = const { std::cell::Cell::new(None) };
-}
-
-/// Stores a resident activation buffer pointer for the current thread.
-/// Used by dense-decode paths when the output of one matvec (e.g.
-/// final_norm) is known to be the input of the next (e.g. lm_head).
-/// Call this *after* downloading the result to host, passing the host
-/// slice pointer+length. The next `launch_matvec` call can skip
-/// `htod_copy` if it sees the same pointer.
-pub fn set_resident_activation(x: &[f32]) {
-    RESIDENT_ACT.set(Some(ResidentActivation {
-        ptr: x.as_ptr(),
-        len: x.len(),
-    }));
-}
-
-/// Clears the resident activation TLS (use after a decode that doesn't
-/// consume it, or at the start of a fresh generation, to avoid stale
-/// pointer reuse).
-pub fn clear_resident_activation() {
-    RESIDENT_ACT.set(None);
-}
-
-/// Checks if a resident activation matches `x` (same pointer+length),
-/// and if so, returns `true` and clears the TLS. `launch_matvec` can
-/// then skip `htod_copy(x)` because the data is already on device from
-/// the prior call.
-///
-/// Not yet called by `launch_matvec` -- future work to wire this check
-/// in before the `htod_copy` inside that function.
-fn take_resident_activation_if_matches(x: &[f32]) -> bool {
-    RESIDENT_ACT
-        .take()
-        .is_some_and(|res| res.len == x.len() && res.ptr == x.as_ptr())
+    let chain = ActChain::open()?;
+    let d_x = chain.upload(x)?;
+    let d_gate = chain.matvec(gate, &d_x)?;
+    let d_up = chain.matvec(up, &d_x)?;
+    let d_act = chain.silu_mul(&d_gate, &d_up)?;
+    let d_out = chain.matvec(down, &d_act)?;
+    chain.download(&d_out)
 }
 
 #[cfg(test)]
@@ -1747,12 +1627,27 @@ mod tests {
         }
     }
 
-    /// `upload_act` → `matvec_into` → `download_act` (device-resident
+    /// A Q8_0 `MatvecLaunch` over the fixture matrix, for the chain
+    /// hardware tests below. Written once because three tests need the
+    /// same one and a fourth copy is how these drift.
+    fn q8_0_fixture_launch(weights: &[u8], rows: usize, cols: usize) -> MatvecLaunch<'_> {
+        MatvecLaunch {
+            kernel_src: Q8_0_MATVEC_KERNEL_SRC,
+            module_name: "ferrox_q8_0",
+            fn_name: "q8_0_matvec",
+            weights,
+            rows,
+            row_bytes: (cols / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES,
+            n_blocks_per_row: cols / ferrox_quant::Q8_0_BLOCK_ELEMS,
+        }
+    }
+
+    /// `ActChain::upload` → `matvec` → `download` (device-resident
     /// activation, no per-matvec host round-trip) must agree with the
     /// host-wrapper `launch_q8_0_matvec` for the same weights/input.
     #[test]
-    #[ignore = "requires real CUDA hardware -- run with --ignored to verify DeviceAct residency vs the host-wrapper matvec"]
-    fn matvec_into_matches_host_wrapper() {
+    #[ignore = "requires real CUDA hardware -- run with --ignored to verify ActChain residency vs the host-wrapper matvec"]
+    fn chained_matvec_matches_host_wrapper() {
         let rows = 4;
         let cols = 64;
         let row_bytes = (cols / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES;
@@ -1761,23 +1656,101 @@ mod tests {
         let host = launch_q8_0_matvec(&weights, &x, rows, row_bytes, cols / 32)
             .expect("host-wrapper matvec must launch");
 
-        let d_x = upload_act(&x).expect("upload");
-        let launch = MatvecLaunch {
-            kernel_src: Q8_0_MATVEC_KERNEL_SRC,
-            module_name: "ferrox_q8_0",
-            fn_name: "q8_0_matvec",
-            weights: weights.as_slice(),
-            rows,
-            row_bytes,
-            n_blocks_per_row: cols / 32,
-        };
-        let d_out = matvec_into(&launch, &d_x).expect("device matvec");
-        let device = download_act(&d_out).expect("download");
+        let chain = ActChain::open().expect("chain must open on CUDA hardware");
+        let d_x = chain.upload(&x).expect("upload");
+        let launch = q8_0_fixture_launch(&weights, rows, cols);
+        let d_out = chain.matvec(&launch, &d_x).expect("device matvec");
+        let device = chain.download(&d_out).expect("download");
 
         assert_eq!(host.len(), device.len());
         for (i, (h, d)) in host.iter().zip(device.iter()).enumerate() {
             assert_close_relative(*d, *h, i);
         }
+    }
+
+    /// `download_all` is the only thing in this crate that reaches
+    /// `cudarc::driver::result` directly (N async DtoH, then ONE
+    /// `synchronize`), so it needs a twin: `download`, which goes
+    /// through `cudarc`'s safe `dtoh_sync_copy`. They must agree
+    /// element for element, and the batched one must preserve ORDER --
+    /// `apply_gpu_multi` pops Q/K/V off the result by position, so a
+    /// permuted return is a silently wrong model.
+    #[test]
+    #[ignore = "requires real CUDA hardware -- run with --ignored to verify the one-sync batched download against the per-output safe one"]
+    fn batched_download_matches_single_download_and_keeps_order() {
+        let cols = 64;
+        // Three DIFFERENT row counts, so a swapped pair cannot pass by
+        // being the same shape -- the exact failure a length-keyed
+        // residency scheme would let through.
+        let shapes = [3usize, 5, 7];
+        let fixtures: Vec<(Vec<u8>, Vec<f32>, Vec<f32>)> = shapes
+            .iter()
+            .map(|rows| real_q8_0_test_matrix(*rows, cols))
+            .collect();
+        let x = fixtures[0].1.clone();
+
+        let chain = ActChain::open().expect("chain must open on CUDA hardware");
+        let d_x = chain.upload(&x).expect("upload");
+        let launches: Vec<MatvecLaunch<'_>> = fixtures
+            .iter()
+            .zip(shapes.iter())
+            .map(|((w, _, _), rows)| q8_0_fixture_launch(w, *rows, cols))
+            .collect();
+        let d_outs: Vec<_> = launches
+            .iter()
+            .map(|l| chain.matvec(l, &d_x).expect("device matvec"))
+            .collect();
+
+        let one_by_one: Vec<Vec<f32>> = d_outs
+            .iter()
+            .map(|a| chain.download(a).expect("single download"))
+            .collect();
+        let batched = chain.download_all(&d_outs).expect("batched download");
+
+        assert_eq!(batched.len(), one_by_one.len());
+        for (n, (b, s)) in batched.iter().zip(one_by_one.iter()).enumerate() {
+            assert_eq!(b.len(), shapes[n], "output {n} came back the wrong length");
+            assert_eq!(b.len(), s.len());
+            for (i, (got, want)) in b.iter().zip(s.iter()).enumerate() {
+                assert_close_relative(*got, *want, i);
+            }
+        }
+    }
+
+    /// The identity rule, end to end on a device: an activation
+    /// produced by one chain must be REFUSED by another, not silently
+    /// computed against. `chain_id`'s host tests cover the rule itself;
+    /// this covers that `DeviceAct`'s device pointer really is
+    /// unreachable without passing it.
+    #[test]
+    #[ignore = "requires real CUDA hardware -- run with --ignored to verify a foreign activation is refused rather than reused"]
+    fn a_chain_refuses_another_chains_activation() {
+        let rows = 4;
+        let cols = 64;
+        let (weights, x, _expected) = real_q8_0_test_matrix(rows, cols);
+
+        let producer = ActChain::open().expect("chain must open on CUDA hardware");
+        let stale = producer.upload(&x).expect("upload");
+
+        let consumer = ActChain::open().expect("second chain must open");
+        assert_ne!(producer.id(), consumer.id());
+
+        let launch = q8_0_fixture_launch(&weights, rows, cols);
+        let err = consumer
+            .matvec(&launch, &stale)
+            .expect_err("a foreign activation must be refused, never computed against");
+        assert!(
+            matches!(err, CudaError::ForeignActivation(_)),
+            "expected a ForeignActivation refusal, got {err}"
+        );
+        assert!(
+            consumer.download(&stale).is_err(),
+            "download must refuse a foreign activation too"
+        );
+        assert!(
+            consumer.download_all(&[stale]).is_err(),
+            "batched download must refuse a foreign activation too"
+        );
     }
 
     /// Fused `rms_norm(x + residual, weight, eps)` on device must agree
