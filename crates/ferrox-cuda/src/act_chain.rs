@@ -345,10 +345,10 @@ mod tests {
     use super::*;
 
     /// Runs without a GPU: `same_len` is the shape guard the elementwise
-    /// chain operations refuse on, and it must REFUSE rather than
-    /// silently run the kernel over the shorter of the two, which is
-    /// what an `assert_eq!` in release with `-C debug-assertions=off`
-    /// would... not do, but which a `min(a, b)` would.
+    /// chain operations refuse on, and the thing it must not do is
+    /// quietly pick a length and run the kernel anyway. Taking
+    /// `min(a, b)` would read a correct-looking prefix of a mismatched
+    /// pair and answer WRONG; the refusal names both lengths instead.
     #[test]
     fn same_len_accepts_a_match_and_names_a_mismatch() {
         assert_eq!(
