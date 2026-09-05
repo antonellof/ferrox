@@ -14,6 +14,7 @@
 //! and has not been verified.
 
 pub mod capability;
+pub mod coalesced_twin;
 
 /// The `mul_mm` kernel source and its per-quant-kind dispatch table.
 /// Always compiled: it is CUDA C *text* plus a scalar twin, neither of

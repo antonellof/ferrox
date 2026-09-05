@@ -388,6 +388,116 @@ extern "C" __global__ void q5_0_matvec(
 ///
 /// Verified: compiled by NVRTC and executed on a real GPU, matching
 /// the CPU reference exactly -- see the module doc comment.
+/// Q4_K matvec with a COALESCED access pattern.
+///
+/// The kernel this replaces walks whole 144-byte super-blocks per
+/// thread (`blk += blockDim.x`), so adjacent lanes read addresses 144
+/// bytes apart and every lane in a warp touches a different cache
+/// line. Measured consequence on an RTX 3060: 19.0 GB/s of weight
+/// traffic, **5.3%** of the card's 360 GB/s, where llama.cpp reaches
+/// 60.4%. A decode matvec is a streaming read of the weights, so that
+/// percentage IS the gap, and the inner arithmetic is irrelevant while
+/// it holds (a `dp4a` port measured under 1%, #142).
+///
+/// Here one warp takes one super-block at a time and lane `l` reads
+/// `qs[4l .. 4l+4)`. Thirty-two lanes then cover the 128 quantized
+/// bytes as one contiguous run instead of 32 scattered ones.
+///
+/// The activation stays f32 on purpose. Quantizing it to int8 is what
+/// llama.cpp does, and on a real checkpoint it diverges from the CPU
+/// reference at token 4, which `ferrox verify` refuses. This change is
+/// meant to be token-identical.
+///
+/// Lane to data mapping, which is the part to get right:
+///   off = 4*l           byte offset into the 128 qs bytes
+///   oi  = l/8           which 32-byte group, so which sub-block PAIR
+///   low nibbles  -> activations at blk*256 + oi*64 + (off%32)
+///   high nibbles -> the same, plus 32
+/// The 32 bytes of a group carry the first 32 activations in their low
+/// nibbles and the next 32 in their high nibbles, so a lane that pairs
+/// byte `i` with activation `i` for both halves reads the wrong place.
+pub const Q4_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float ferrox_f16_to_f32_co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+__device__ __forceinline__ void ferrox_q4_k_scale_min_co(
+    int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
+) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *m = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        *m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+
+extern "C" __global__ void q4_k_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    const int off = 4 * lane;
+    const int oi = lane / 8;
+    const int within = off % 32;
+
+    float acc = 0.0f;
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 144;
+        const float d = ferrox_f16_to_f32_co(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+        const float dmin = ferrox_f16_to_f32_co(
+            (unsigned short)block[2] | ((unsigned short)block[3] << 8));
+        const unsigned char* scales = block + 4;
+        const unsigned char* qs = block + 16;
+
+        unsigned char sc1, m1, sc2, m2;
+        ferrox_q4_k_scale_min_co(2 * oi, scales, &sc1, &m1);
+        ferrox_q4_k_scale_min_co(2 * oi + 1, scales, &sc2, &m2);
+        const float d1 = d * (float)sc1, min1 = dmin * (float)m1;
+        const float d2 = d * (float)sc2, min2 = dmin * (float)m2;
+
+        // The whole warp's 32 loads cover qs[0..128) contiguously.
+        const uchar4 w = *(const uchar4*)(qs + off);
+        const int xb = blk * 256 + oi * 64 + within;
+        const unsigned char wb[4] = { w.x, w.y, w.z, w.w };
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            acc += (d1 * (float)(wb[i] & 0x0F) - min1) * x[xb + i];
+            acc += (d2 * (float)(wb[i] >> 4) - min2) * x[xb + 32 + i];
+        }
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
 pub const Q4_K_MATVEC_KERNEL_SRC: &str = r#"
 extern "C" __device__ float ferrox_f16_to_f32(unsigned short bits) {
     unsigned int sign = (bits >> 15) & 0x1u;
@@ -761,6 +871,13 @@ fn launch_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
+    // Q4_K takes the coalesced kernel: same arithmetic, a warp reading
+    // one contiguous run per super-block instead of 32 strided ones.
+    // The old pattern reached 5.3% of an RTX 3060's memory bandwidth
+    // where llama.cpp reaches 60.4% (#133).
+    if fn_name == "q4_k_matvec" {
+        return launch_matvec_coalesced_q4_k(weights, x, rows, row_bytes, n_blocks_per_row);
+    }
     let dev = shared_device()?;
     let d_x = dev
         .htod_copy(x.to_vec())
@@ -792,6 +909,66 @@ fn launch_matvec(
 /// asynchronously). This is the single per-launch primitive shared by
 /// [`launch_matvec`], [`launch_matvec_multi`] and
 /// [`launch_dense_ffn_swiglu`].
+/// Q4_K matvec through the coalesced kernel.
+///
+/// Same arithmetic and same f32 activations as the kernel it replaces,
+/// so it is meant to be token-identical; what changes is that a warp
+/// reads 128 contiguous bytes per super-block instead of 32 scattered
+/// 144-byte-strided ones.
+fn launch_matvec_coalesced_q4_k(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    use cudarc::driver::LaunchAsync;
+
+    let dev = shared_device()?;
+    ensure_module_loaded(
+        &dev,
+        Q4_K_MATVEC_COALESCED_KERNEL_SRC,
+        "ferrox_q4_k_coalesced",
+        "q4_k_matvec_coalesced",
+    )?;
+    let func = dev
+        .get_func("ferrox_q4_k_coalesced", "q4_k_matvec_coalesced")
+        .ok_or_else(|| CudaError::KernelCompile("q4_k_matvec_coalesced not found".into()))?;
+
+    let d_x = dev
+        .htod_copy(x.to_vec())
+        .map_err(|e| CudaError::Launch(format!("x upload: {e:?}")))?;
+    let d_weights = resident_cuda_weights(&dev, weights)?;
+    let mut d_out = dev
+        .alloc_zeros::<f32>(rows)
+        .map_err(|e| CudaError::Launch(format!("output alloc: {e:?}")))?;
+
+    // Eight warps per block: enough rows in flight per SM to keep loads
+    // outstanding, which is the thing this kernel exists to fix.
+    const WARPS: usize = 8;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (rows.div_ceil(WARPS) as u32, 1, 1),
+        block_dim: ((WARPS * 32) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                &d_weights.slice,
+                &d_x,
+                &mut d_out,
+                rows as i32,
+                row_bytes as i32,
+                n_blocks_per_row as i32,
+            ),
+        )
+        .map_err(|e| CudaError::Launch(format!("q4_k_matvec_coalesced launch: {e:?}")))?;
+    }
+    dev.dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("output download: {e:?}")))
+}
+
 fn enqueue_matvec(
     dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
     launch: &MatvecLaunch<'_>,
@@ -1612,6 +1789,34 @@ mod tests {
             .map(|r| scalar_dot(&weights[r * row_bytes..(r + 1) * row_bytes], &x))
             .collect();
         (weights, x, expected)
+    }
+
+    /// The coalesced kernel against its scalar twin, on a real device.
+    ///
+    /// The twin proves the lane mapping without a GPU. This proves the
+    /// CUDA C, the `uchar4` load and the warp-shuffle reduction, none
+    /// of which the twin covers.
+    ///
+    ///   cargo test -p ferrox-cuda --features cuda -- --ignored
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verifies the coalesced Q4_K matvec against its scalar twin"]
+    fn launch_q4_k_matvec_coalesced_matches_the_twin() {
+        let rows = 37usize; // not a multiple of the warps per block
+        let n_blocks_per_row = 3usize;
+        let cols = n_blocks_per_row * 256;
+        let row_bytes = n_blocks_per_row * 144;
+        let weights: Vec<u8> = pseudo_bytes(7, rows * row_bytes);
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.021).sin()).collect();
+
+        let got =
+            super::launch_matvec_coalesced_q4_k(&weights, &x, rows, row_bytes, n_blocks_per_row)
+                .expect("coalesced matvec");
+        assert_eq!(got.len(), rows);
+        for r in 0..rows {
+            let row = &weights[r * row_bytes..(r + 1) * row_bytes];
+            let want = crate::coalesced_twin::q4_k_matvec_coalesced_row(row, &x, n_blocks_per_row);
+            assert_close_relative(got[r], want, r);
+        }
     }
 
     #[test]
