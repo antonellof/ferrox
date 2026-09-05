@@ -20,6 +20,7 @@ pub mod capability;
 /// which needs `cudarc`, so the default `cargo test -p ferrox-cuda` run
 /// on a GPU-less host still exercises the arithmetic the kernel encodes.
 /// Only the launch path ([`mul_mm_launch`]) is feature-gated.
+pub mod dp4a_twin;
 pub mod mul_mm;
 pub mod mul_mm_ref;
 

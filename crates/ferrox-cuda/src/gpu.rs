@@ -388,6 +388,185 @@ extern "C" __global__ void q5_0_matvec(
 ///
 /// Verified: compiled by NVRTC and executed on a real GPU, matching
 /// the CPU reference exactly -- see the module doc comment.
+/// Quantizes an f32 activation to int8 blocks of 32 with one f32 scale
+/// each, the shape llama.cpp calls `q8_1`.
+///
+/// This is half of why llama.cpp's decode is faster. The activation is
+/// quantized ONCE per matvec and then read by every output row, at one
+/// byte per element instead of four, and the inner loop becomes an
+/// integer dot product that `dp4a` does four lanes at a time.
+///
+/// One block of 32 elements per CUDA block: `amax` over the 32,
+/// `d = amax/127`, then the quantized bytes. A zero block yields
+/// `d = 0` and zero bytes, which multiplies out correctly rather than
+/// dividing by zero.
+pub const QUANTIZE_Q8_1_KERNEL_SRC: &str = r#"
+extern "C" __global__ void quantize_q8_1(
+    const float* x,       // [n]
+    signed char* qs,      // [n]
+    float* ds,            // [n / 32]
+    int n_blocks
+) {
+    int blk = blockIdx.x * blockDim.x + threadIdx.x;
+    if (blk >= n_blocks) return;
+    const float* xb = x + (size_t)blk * 32;
+
+    float amax = 0.0f;
+    for (int i = 0; i < 32; i++) {
+        float a = fabsf(xb[i]);
+        if (a > amax) amax = a;
+    }
+    float d = amax / 127.0f;
+    ds[blk] = d;
+    float inv = d > 0.0f ? 1.0f / d : 0.0f;
+    signed char* qb = qs + (size_t)blk * 32;
+    for (int i = 0; i < 32; i++) {
+        // rintf, not truncation: llama.cpp rounds to nearest here and a
+        // truncating cast biases every value toward zero.
+        qb[i] = (signed char)rintf(xb[i] * inv);
+    }
+}
+"#;
+
+/// Q4_K matvec against a q8_1-quantized activation, using `dp4a`.
+///
+/// The arithmetic is llama.cpp's `vec_dot_q4_K_q8_1_impl_vmmq`,
+/// reorganised to match this repo's existing per-sub-block loop rather
+/// than llama's `iqs` slicing, which is equivalent and far easier to
+/// hold against a scalar twin:
+///
+/// ```text
+/// sum (d*sc*q4 - dmin*m) * x  =  d*sc*dx*sum(q4*xq) - dmin*m*dx*sum(xq)
+/// ```
+///
+/// Both sums are integer dot products. The second is `dp4a` against
+/// `0x01010101`, which is llama's `dot2` trick for the min term.
+///
+/// One warp per row and a shuffle reduction, replacing a 256-thread
+/// block with an 8-deep `__syncthreads()` tree.
+pub const Q4_K_MATVEC_DP4A_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float ferrox_f16_to_f32_dp(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+__device__ __forceinline__ int ferrox_dp4a(int a, int b, int c) {
+#if __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    // Pre-Pascal has no dp4a. Same arithmetic, four lanes by hand, so
+    // the kernel stays correct on old hardware instead of failing to
+    // build.
+    const signed char* pa = (const signed char*)&a;
+    const signed char* pb = (const signed char*)&b;
+    return c + pa[0]*pb[0] + pa[1]*pb[1] + pa[2]*pb[2] + pa[3]*pb[3];
+#endif
+}
+
+extern "C" __device__ void ferrox_q4_k_scale_min_dp(
+    int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
+) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *m = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        *m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+
+extern "C" __global__ void q4_k_matvec_dp4a(
+    const unsigned char* weights, // [rows * row_bytes]
+    const signed char* xq,        // [cols] int8
+    const float* xd,              // [cols / 32] block scales
+    float* out,                   // [rows]
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    // One warp per row; several rows per block.
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int row = blockIdx.x * (blockDim.x / 32) + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    float acc = 0.0f;
+
+    for (int blk = lane; blk < n_blocks_per_row; blk += 32) {
+        const unsigned char* block = row_ptr + (size_t)blk * 144;
+        unsigned short d_bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
+        unsigned short dmin_bits = (unsigned short)block[2] | ((unsigned short)block[3] << 8);
+        float d = ferrox_f16_to_f32_dp(d_bits);
+        float dmin = ferrox_f16_to_f32_dp(dmin_bits);
+        const unsigned char* scales = block + 4;
+        const unsigned char* qs = block + 16;
+
+        // 256 activation elements per super-block = 8 q8_1 blocks.
+        int xblk = blk * 8;
+
+        int is = 0, q_off = 0, sub = 0;
+        #pragma unroll
+        for (int oi = 0; oi < 4; oi++) {
+            unsigned char sc1, m1, sc2, m2;
+            ferrox_q4_k_scale_min_dp(is, scales, &sc1, &m1);
+            ferrox_q4_k_scale_min_dp(is + 1, scales, &sc2, &m2);
+
+            // The 32 weight bytes carry BOTH sub-blocks: low nibbles are
+            // the first 32 activations, high nibbles the next 32.
+            const unsigned char* wp = qs + q_off;
+            const signed char* xlo = xq + (size_t)(xblk + sub) * 32;
+            const signed char* xhi = xlo + 32;
+
+            int dot_lo = 0, sum_lo = 0, dot_hi = 0, sum_hi = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                int w = (int)wp[4*k] | ((int)wp[4*k+1] << 8)
+                      | ((int)wp[4*k+2] << 16) | ((int)wp[4*k+3] << 24);
+                int a_lo = (int)xlo[4*k] | ((int)xlo[4*k+1] << 8)
+                         | ((int)xlo[4*k+2] << 16) | ((int)xlo[4*k+3] << 24);
+                int a_hi = (int)xhi[4*k] | ((int)xhi[4*k+1] << 8)
+                         | ((int)xhi[4*k+2] << 16) | ((int)xhi[4*k+3] << 24);
+                int w_lo = w & 0x0F0F0F0F;
+                int w_hi = (w >> 4) & 0x0F0F0F0F;
+                dot_lo = ferrox_dp4a(w_lo, a_lo, dot_lo);
+                sum_lo = ferrox_dp4a(0x01010101, a_lo, sum_lo);
+                dot_hi = ferrox_dp4a(w_hi, a_hi, dot_hi);
+                sum_hi = ferrox_dp4a(0x01010101, a_hi, sum_hi);
+            }
+
+            float dxlo = xd[xblk + sub];
+            float dxhi = xd[xblk + sub + 1];
+            acc += d * (float)sc1 * dxlo * (float)dot_lo
+                 - dmin * (float)m1 * dxlo * (float)sum_lo;
+            acc += d * (float)sc2 * dxhi * (float)dot_hi
+                 - dmin * (float)m2 * dxhi * (float)sum_hi;
+
+            q_off += 32;
+            sub += 2;
+            is += 2;
+        }
+    }
+
+    // Warp shuffle: no shared memory, no __syncthreads.
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
 pub const Q4_K_MATVEC_KERNEL_SRC: &str = r#"
 extern "C" __device__ float ferrox_f16_to_f32(unsigned short bits) {
     unsigned int sign = (bits >> 15) & 0x1u;
@@ -761,6 +940,12 @@ fn launch_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
+    // Q4_K goes through the dp4a path: int8 activations and four MACs
+    // per instruction, which is llama.cpp's mmvq design and the whole
+    // measured decode gap (#142).
+    if fn_name == "q4_k_matvec" && x.len().is_multiple_of(32) {
+        return launch_matvec_dp4a_q4_k(weights, x, rows, row_bytes, n_blocks_per_row);
+    }
     let dev = shared_device()?;
     let d_x = dev
         .htod_copy(x.to_vec())
@@ -792,6 +977,107 @@ fn launch_matvec(
 /// asynchronously). This is the single per-launch primitive shared by
 /// [`launch_matvec`], [`launch_matvec_multi`] and
 /// [`launch_dense_ffn_swiglu`].
+/// Q4_K matvec through the `dp4a` path: quantize the activation once,
+/// then one warp per row.
+///
+/// Replaces four bytes of activation per element with one, and one
+/// float MAC per element with a quarter of a `dp4a`. Those two together
+/// are the CUDA decode gap measured in #133 (9x to 19x), and this is
+/// llama.cpp's `mmvq` design ported rather than invented.
+///
+/// The activation buffer is allocated and quantized per call. That is
+/// still one upload of `n` bytes instead of `rows * n * 4` bytes of
+/// re-reads, which is the point; a persistent buffer is a later
+/// refinement and not what makes the difference.
+fn launch_matvec_dp4a_q4_k(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    use cudarc::driver::LaunchAsync;
+
+    let dev = shared_device()?;
+    let n = x.len();
+    if !n.is_multiple_of(32) {
+        return Err(CudaError::Launch(format!(
+            "q8_1 blocks are 32 wide; activation of {n} is not a multiple of 32"
+        )));
+    }
+    let n_x_blocks = n / 32;
+
+    // 1. quantize the activation, once.
+    ensure_module_loaded(
+        &dev,
+        QUANTIZE_Q8_1_KERNEL_SRC,
+        "ferrox_quantize_q8_1",
+        "quantize_q8_1",
+    )?;
+    let qfunc = dev
+        .get_func("ferrox_quantize_q8_1", "quantize_q8_1")
+        .ok_or_else(|| CudaError::KernelCompile("quantize_q8_1 not found".into()))?;
+    let d_x = dev
+        .htod_copy(x.to_vec())
+        .map_err(|e| CudaError::Launch(format!("x upload: {e:?}")))?;
+    let mut d_qs = dev
+        .alloc_zeros::<i8>(n)
+        .map_err(|e| CudaError::Launch(format!("qs alloc: {e:?}")))?;
+    let mut d_ds = dev
+        .alloc_zeros::<f32>(n_x_blocks)
+        .map_err(|e| CudaError::Launch(format!("ds alloc: {e:?}")))?;
+    let qcfg = cudarc::driver::LaunchConfig {
+        grid_dim: (n_x_blocks.div_ceil(128) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        qfunc
+            .launch(qcfg, (&d_x, &mut d_qs, &mut d_ds, n_x_blocks as i32))
+            .map_err(|e| CudaError::Launch(format!("quantize_q8_1 launch: {e:?}")))?;
+    }
+
+    // 2. one warp per row, several rows per block.
+    ensure_module_loaded(
+        &dev,
+        Q4_K_MATVEC_DP4A_KERNEL_SRC,
+        "ferrox_q4_k_dp4a",
+        "q4_k_matvec_dp4a",
+    )?;
+    let func = dev
+        .get_func("ferrox_q4_k_dp4a", "q4_k_matvec_dp4a")
+        .ok_or_else(|| CudaError::KernelCompile("q4_k_matvec_dp4a not found".into()))?;
+    let d_weights = resident_cuda_weights(&dev, weights)?;
+    let mut d_out = dev
+        .alloc_zeros::<f32>(rows)
+        .map_err(|e| CudaError::Launch(format!("output alloc: {e:?}")))?;
+
+    const WARPS_PER_BLOCK: usize = 4;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (rows.div_ceil(WARPS_PER_BLOCK) as u32, 1, 1),
+        block_dim: ((WARPS_PER_BLOCK * 32) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                &d_weights.slice,
+                &d_qs,
+                &d_ds,
+                &mut d_out,
+                rows as i32,
+                row_bytes as i32,
+                n_blocks_per_row as i32,
+            ),
+        )
+        .map_err(|e| CudaError::Launch(format!("q4_k_matvec_dp4a launch: {e:?}")))?;
+    }
+
+    dev.dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("output download: {e:?}")))
+}
+
 fn enqueue_matvec(
     dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
     launch: &MatvecLaunch<'_>,
@@ -1612,6 +1898,67 @@ mod tests {
             .map(|r| scalar_dot(&weights[r * row_bytes..(r + 1) * row_bytes], &x))
             .collect();
         (weights, x, expected)
+    }
+
+    /// The dp4a path against the CPU reference, on a real device.
+    ///
+    /// The scalar twin in `dp4a_twin` proves the ALGEBRA without a GPU.
+    /// This proves the CUDA C, which is that algebra transcribed a
+    /// second time, plus the quantize kernel, the warp-shuffle
+    /// reduction and the launch geometry. None of those four are
+    /// covered by the twin.
+    ///
+    /// Run on a machine with a real device:
+    ///   cargo test -p ferrox-cuda --features cuda -- --ignored
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verifies the dp4a Q4_K matvec against the CPU reference"]
+    fn launch_q4_k_matvec_dp4a_matches_cpu_reference() {
+        let rows = 37usize; // deliberately not a multiple of the warps per block
+        let n_blocks_per_row = 3usize;
+        let cols = n_blocks_per_row * 256;
+        let row_bytes = n_blocks_per_row * 144;
+
+        let mut seed = 0x5eed_1234u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        let mut weights = vec![0u8; rows * row_bytes];
+        for w in weights.iter_mut() {
+            *w = next();
+        }
+        // Finite scales, so this is about the unpack and not about NaN.
+        for r in 0..rows {
+            for b in 0..n_blocks_per_row {
+                let at = r * row_bytes + b * 144;
+                weights[at] = 0x00;
+                weights[at + 1] = 0x2C;
+                weights[at + 2] = 0x00;
+                weights[at + 3] = 0x28;
+            }
+        }
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i * 37 % 101) as f32 / 25.0) + 0.5)
+            .collect();
+
+        let got = super::launch_matvec_dp4a_q4_k(&weights, &x, rows, row_bytes, n_blocks_per_row)
+            .expect("dp4a matvec");
+        assert_eq!(got.len(), rows);
+
+        // Reference: the same sum the integer path is computing, from
+        // the quantized activation, so the comparison is about the
+        // kernel rather than about q8_1 rounding.
+        let acts = crate::dp4a_twin::quantize_q8_1(&x);
+        for r in 0..rows {
+            let row = &weights[r * row_bytes..(r + 1) * row_bytes];
+            let want = crate::dp4a_twin::q4_k_matvec_dp4a_row(row, &acts, n_blocks_per_row);
+            let scale = want.abs().max(1.0);
+            assert!(
+                (got[r] - want).abs() / scale < 1e-4,
+                "row {r}: gpu {} vs twin {want}",
+                got[r]
+            );
+        }
     }
 
     #[test]
