@@ -445,39 +445,51 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
             ));
         }
     }
-    table.push_str(
-        "No HTTP, no chat template, no tokenizer, no sampler. This is the engine\n\
-         alone. `pp512` is batched prefill, `tg128` is decode. **Neither engine's\n\
-         thread count is forced**: each picks its own default, because llama.cpp\n\
-         defaults to performance cores and loses 2–4× when pushed above them, so\n\
-         pinning both to the same count does not make the comparison fairer.\n\n\
-         **Gap** = `llama / ferrox` (<1 ferrox faster). Rows are grouped by\n\
-         backend (Metal → CUDA → CPU), then test (`pp` then `tg`), then **worst\n\
-         gap first**. Regenerate with `ferrox bench --suite` / `--render`.\n\n",
-    );
-
-    // Compact "at a glance" for the largest prefill losses.
-    let mut worst_pp: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.test.starts_with("pp") && r.gap.is_some_and(|g| g > 1.05))
-        .collect();
-    worst_pp.sort_by(|a, b| {
-        b.gap
-            .partial_cmp(&a.gap)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    if !worst_pp.is_empty() {
-        table.push_str("**Largest engine prefill gaps (pp\\*, gap > 1.05×):**\n\n");
-        for r in worst_pp.iter().take(8) {
-            table.push_str(&format!(
-                "- `{}` / {} / {}: {}\n",
-                r.model,
-                r.backend,
-                r.test,
-                r.gap.map(gap_cell).unwrap_or_else(|| "—".into()),
-            ));
+    // A summary table, not prose. Generated from the same receipts as
+    // the detail rows below, so it cannot drift away from them the way
+    // a hand-written headline does. One line per host and backend: the
+    // range is what a reader wants before any individual model.
+    {
+        use std::collections::BTreeMap;
+        let mut by: BTreeMap<(String, String, bool), Vec<f64>> = BTreeMap::new();
+        for r in &rows {
+            if let Some(g) = r.gap {
+                by.entry((r.host.clone(), r.backend.clone(), r.test.starts_with("pp")))
+                    .or_default()
+                    .push(g);
+            }
         }
-        table.push('\n');
+        if !by.is_empty() {
+            table.push_str("### Summary\n\n");
+            table.push_str("| Host | Backend | Prefill gap | Decode gap |\n");
+            table.push_str("|---|---|---|---|\n");
+            let mut seen: Vec<(String, String)> =
+                by.keys().map(|(h, b, _)| (h.clone(), b.clone())).collect();
+            seen.dedup();
+            for (host, backend) in seen {
+                let fmt = |pp: bool| -> String {
+                    match by.get(&(host.clone(), backend.clone(), pp)) {
+                        Some(v) if !v.is_empty() => {
+                            let lo = v.iter().cloned().fold(f64::INFINITY, f64::min);
+                            let hi = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                            if (hi - lo).abs() < 0.005 {
+                                gap_cell(lo)
+                            } else {
+                                format!("{} to {}", gap_cell(lo), gap_cell(hi))
+                            }
+                        }
+                        _ => "—".to_string(),
+                    }
+                };
+                table.push_str(&format!(
+                    "| {host} | {} | {} | {} |\n",
+                    backend.to_uppercase(),
+                    fmt(true),
+                    fmt(false)
+                ));
+            }
+            table.push('\n');
+        }
     }
 
     fn push_section_at(table: &mut String, depth: &str, title: &str, rows: &[&Row]) {
@@ -666,6 +678,49 @@ mod tests {
             "two hosts sharing a receipt name is how a ledger loses a machine"
         );
         assert_eq!(host_slug("  --  "), "");
+    }
+
+    /// The summary is GENERATED, not written by hand.
+    ///
+    /// It replaced a hand-written headline table, which is a thing that
+    /// drifts: the numbers above the fold stop matching the receipts
+    /// below it and nobody notices, because nothing compares them. One
+    /// row per host and backend, with the range taken from the same
+    /// rows the detail tables use.
+    #[test]
+    fn the_summary_is_derived_from_the_same_rows_as_the_detail_tables() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox_summary_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let engine = dir.join("receipts").join("engine");
+        std::fs::create_dir_all(&engine).expect("mkdir");
+        std::fs::write(
+            dir.join("RESULTS.md"),
+            format!("head\n{BEGIN}\nold\n{END}\ntail\n"),
+        )
+        .expect("seed");
+        // Two gaps on one host+backend, so the summary must show a range.
+        receipt(&engine, "a", "Box One", "cuda", 10.0, 20.0);
+        receipt(&engine, "b", "Box One", "cuda", 10.0, 100.0);
+
+        render(&dir).expect("render");
+        let out = std::fs::read_to_string(dir.join("RESULTS.md")).expect("read");
+
+        assert!(out.contains("### Summary"), "no summary table:\n{out}");
+        let summary = &out[out.find("### Summary").expect("summary")..];
+        let first_detail = summary.find("\n### ").unwrap_or(summary.len());
+        let summary = &summary[..first_detail];
+        assert!(
+            summary.contains("2.00×") && summary.contains("10.00×"),
+            "the summary must span the rows it describes:\n{summary}"
+        );
+        assert!(
+            summary.contains("Box One"),
+            "the summary must name the host:\n{summary}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

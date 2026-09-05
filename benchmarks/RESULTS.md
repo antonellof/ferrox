@@ -1,158 +1,82 @@
 # Results vs llama.cpp
 
-Host B = Apple M2 Pro (6 performance + 4 efficiency cores). Thread counts
-are not forced. Each engine picks its own default.
+**Gap** = `llama.cpp / ferrox`, same host, same GGUF, same backend.
+**Below 1.0 means ferrox is faster.** 🟢 better · ⚪ within ~5% · 🔴 slower.
 
-Suite: [`suite.json`](suite.json). Runner: `ferrox bench --suite` vs
-`llama-bench`. Receipts: [`receipts/engine/`](receipts/engine/).
-**This file is generated** by `ferrox bench --render`. Do not hand-edit
-the table below.
+The summary and detail tables below are **generated** from
+[`receipts/engine/`](receipts/engine/) by `ferrox bench --render`. Do
+not hand-edit them. Rows are never compared across machines: a gap only
+means something against the host it was measured on.
 
-**Gap** = `llama / ferrox` (&lt;1 ferrox faster; &gt;1 ferrox slower).
+## Measured elsewhere, no receipt
 
-**North star:** ≥ llama.cpp same host/GGUF/backend.
+Two hosts were benchmarked with `bench -m --compare` rather than
+`--suite`, so they wrote no receipt and are absent from the generated
+tables. They are the two most interesting results in this file.
 
-**Metal is at or past parity almost everywhere.** Every dense `pp512`
-row lands between 0.98× and 1.10×, and 8 of the 12 `tg128` rows are
-faster than llama.cpp, the widest being Qwen2.5-0.5B at 0.62×. The
-remaining Metal gap is small enough that run-to-run spread explains
-most of it.
+**aarch64 CPU** (rented 20-core Cortex-A725, idle). ferrox is **ahead**
+here, and the decode column depends on one switch:
 
-**x86 CPU has rows, and they exist because a default was wrong.**
-`FERROX_CPU_INT_DOT` defaults on, and the interleaved integer kernels it
-selects were written for aarch64 (i8mm, interleave-8 NEON, the Q8_K
-repack). On x86 it chose a scalar integer loop and simultaneously
-bypassed the AVX2 f32 dot that does exist, costing between **4x and
-8.8x of decode** on an idle Zen 4. Llama-3.2-1B Q4_K_M `tg64` went
-10.08 to 46.62 tok/s against llama.cpp's 66.24 once the default became
-architecture-aware, which is 6.8x off to 1.4x off (#127). The rows
-below are taken with the fix.
-
-Prefill on x86 is still 6x to 10x and is the honest remaining gap
-there.
-
-**The Apple CPU rows were withdrawn on 2026-09-04, not improved away.** All
-13 of them recorded `backend_active: "Metal"` inside their own
-receipts while being published under a CPU heading: `--n-gpu-layers 0`
-did not force CPU, and nothing compared the label to what ran
-([#126](https://github.com/antonellof/ferrox/issues/126), fixed). The
-old "1.41× to 5.06×" range described Metal runs. Honest CPU rows need
-a quiet host, and this project's laptop currently has a system daemon
-holding a core.
-
-**CUDA has rows for the first time.** The code carried the comment
-"UNRUN ON HARDWARE" until 2026-09-04; the first run found that
-`Cuda::gemm_supported` covered only `Q8_0` and `Q4_0`, so a K-quant
-prefill decomposed into one matvec launch per position. Llama-3.2-3B
-Q4_K_M managed **4.88 tok/s** of `pp512` against llama.cpp's 1586.80, a
-**325×** gap, on the most common quantization in circulation.
-
-The K-quant GEMM landed the same day and the rows below are taken with
-it, on the same GPU:
-
-| model | pp512 before | pp512 after | gap before | gap after |
-|---|---|---|---|---|
-| Gemma-2-2B Q4_K_M | 5.73 | **181.60** | 369× | **11.61×** |
-| Llama-3.2-3B Q4_K_M | 4.88 | **144.59** | 325× | **10.91×** |
-| Llama-3.2-1B Q4_K_M | 15.24 | **384.82** | 284× | **11.22×** |
-| Llama-3.2-1B Q6_K | 13.96 | **368.66** | 280× | **10.84×** |
-
-Correctness was checked before speed: `ferrox verify --backend cuda
---prompt-tokens 512` is token-identical to the CPU reference for Q4_K,
-Q5_K and Q6_K.
-
-**The CUDA gap gets WORSE on newer hardware.** Re-measured on an
-RTX 3060 (Ampere, compute 8.6), ferrox and llama.cpp both built with
-CUDA on the same box, quiet host:
-
-| model | test | ferrox | llama.cpp | gap |
-|---|---|---|---|---|
-| Llama-3.2-1B Q4_K_M | pp512 | 185.33 | 10277.19 | **55.5×** |
-| Llama-3.2-1B Q4_K_M | tg128 | 24.50 | 282.17 | 11.5× |
-| Llama-3.2-3B Q4_K_M | pp512 | 75.58 | 4276.84 | **56.6×** |
-| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | 127.03 | 12.2× |
-
-Against the Pascal rows above, prefill goes from ~11× to ~56×.
-**llama.cpp is 2.4× faster on Ampere than on Pascal (4318 to 10277
-tok/s on the 1B); ferrox does not scale at all.** Decode is roughly
-unchanged. So the remaining prefill gap is not a constant factor: it
-widens with GPU generation, which means the kernel leaves newer
-hardware unused.
-
-Thread count is not the explanation (`-t 4` against ferrox's chosen
-`-t 1` gives 232.73 against 186.83, still 44× off), and the GPU is
-about half idle during prefill (sampled 0%, 57%, 50%), a different
-signature from decode's ~90%.
-
-These four rows are **prose, not receipts.** They come from
-`ferrox bench -m --compare` rather than `--suite`, so nothing was
-written to `receipts/engine/` and they are absent from the generated
-table below. Stated here rather than omitted, and marked rather than
-mixed in.
-
-**What remains is one number, not a list.** Every CUDA row is now
-between 10.8× and 17.4× on prefill and 9.2× and 17.1× on decode,
-across every kind. A uniform band is a systemic per-token cost rather
-than a set of missing kernels, which is a different investigation
-([#131](https://github.com/antonellof/ferrox/issues/131), and
-`docs/plans/cpu-cuda-parity.md` step 2).
-
-**A second host, measured 2026-09-04.** One rented 20-core Cortex-A725
-(aarch64, ARMv9.2 with `i8mm`), idle, ferrox and llama.cpp built and run
-on the same box, same GGUFs, CPU only. It says something this table
-cannot:
-
-| model | test | ferrox (default) | ferrox `spin` | llama.cpp | best gap |
+| Model | Test | ferrox | ferrox `spin` | llama.cpp | Gap |
 |---|---|---|---|---|---|
-| SmolLM2-135M Q8_0 | pp512 | 648.84 | | 894.21 | 1.38× |
-| SmolLM2-135M Q8_0 | tg128 | 14.73 | 9.16 | 120.56 | **8.2×** |
-| Llama-3.2-3B Q4_K_M | pp512 | 132.53 | | 46.40 | **0.35×** |
-| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | **23.14** | 17.86 | **0.77×** |
-| Llama-3.1-8B Q4_K_M | pp512 | 61.17 | | 19.15 | **0.31×** |
-| Llama-3.1-8B Q4_K_M | tg128 | 6.64 | **12.41** | 9.06 | **0.73×** |
+| Llama-3.2-3B Q4_K_M | pp512 | **132.53** | | 46.40 | 🟢 **0.35×** |
+| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | **23.14** | 17.86 | 🟢 **0.77×** |
+| Llama-3.1-8B Q4_K_M | pp512 | **61.17** | | 19.15 | 🟢 **0.31×** |
+| Llama-3.1-8B Q4_K_M | tg128 | 6.64 | **12.41** | 9.06 | 🟢 **0.73×** |
+| SmolLM2-135M Q8_0 | tg128 | 14.73 | 9.16 | 120.56 | 🔴 **8.2×** |
 
-Three things follow, and none of them are visible in the M2 Pro table
-above:
+`FERROX_CPU_POOL=spin` turns decode from a loss into a win at 3B and
+8B, and into a bigger loss at 135M. That is why it is still opt-in
+([#27](https://github.com/antonellof/ferrox/issues/27)).
 
-1. **Prefill on server aarch64 is not a gap, it is a lead.** 0.35× and
-   0.31× mean ferrox is roughly 3x FASTER than llama.cpp at 3B and 8B.
-2. **Decode is only red with the default thread pool.** With
-   `FERROX_CPU_POOL=spin` ferrox beats llama.cpp at both 3B and 8B.
-   The switch is worth more than every other CPU item on the roadmap
-   combined on this hardware.
-3. **135M is a different problem.** ferrox holds 13 to 15 tok/s at 4, 8
-   and 19 threads while llama.cpp does 190 to 204. It is flat in thread
-   count and unmoved by either pool, so it is a fixed per-token cost of
-   roughly 60 ms, not a scheduling loss
-   ([#128](https://github.com/antonellof/ferrox/issues/128)).
+**CUDA on Ampere** (RTX 3060). The prefill gap is far worse than on the
+Pascal rows in the generated table:
 
-**Read every CPU row with two caveats, both found on 2026-09-04.**
+| Model | Test | ferrox | llama.cpp | Gap |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | pp512 | 185.33 | 10277.19 | 🔴 **55.5×** |
+| Llama-3.2-1B Q4_K_M | tg128 | 24.50 | 282.17 | 🔴 **11.5×** |
+| Llama-3.2-3B Q4_K_M | pp512 | 75.58 | 4276.84 | 🔴 **56.6×** |
+| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | 127.03 | 🔴 **12.2×** |
 
-1. **This table is one laptop.** Every row is Host B, an Apple M2 Pro.
-   There is no x86 row, and a spot check on a rented 10-core Xeon put
-   Llama-3.2-3B Q4_K_M at **1.03 tok/s** `tg128` , an order of
-   magnitude below what this table's aarch64 rows would lead you to
-   expect. The `1.41×–5.06×` range above is an **aarch64** range;
-   ferrox's x86 gap is unmeasured and looks far worse
-   ([#127](https://github.com/antonellof/ferrox/issues/127)).
-2. **The mislabelled CPU rows are gone.** They are not corrected,
-   they are deleted: a receipt that says `cpu` and records `Metal`
-   cannot be repaired after the fact. #126 is fixed, so a future
-   receipt whose label disagrees with the backend that ran is refused
-   at write time rather than published.
+llama.cpp is 2.4× faster on Ampere than on Pascal; ferrox is not faster
+at all. The prefill gap is not a constant factor, it widens with GPU
+generation.
 
-**And the host has to be genuinely quiet, not just idle-looking.**
-Every measurement in this session was taken while `suggestd` held ~97%
-of one core for over a day. The `--max-load` guard passed throughout,
-because a single pegged core on a 6-core box keeps the load average
-under 2.0. A guard that reads load cannot see one busy core, so check
-`ps` as well.
+## Open
 
-**Gap colors (GitHub-safe):** 🟢 ferrox better; ⚪ near-parity (within ~5%);
-🔴 ferrox meaningfully slower.
+| Issue | Gap | What is known |
+|---|---|---|
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, up to 56× | widens with GPU generation; GPU ~50% idle during prefill |
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, ~12× | GPU ~90% busy, so kernel-bound: one 256-thread block per row vs ggml's warp-level `dp4a` |
+| [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, ~10× | uninvestigated; the decode half was a wrong default, now fixed |
+| [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | `spin` wins at 3B/8B, loses at 135M, so it needs a size rule not a flag |
+| [#128](https://github.com/antonellof/ferrox/issues/128) | ~60 ms fixed per-token cost | flat in thread count and model size; dominates small models on every backend |
 
-Keep off (regressions): legacy GQA NSG=4, sequential GREEDY argmax,
-float4 elem, early Multi-CB. `FERROX_METAL_FA_VEC=0` → ~25.5 pred.
+## Method
+
+Both engines pick their own thread count: llama.cpp defaults to
+performance cores and loses 2× to 4× above them, so forcing a shared
+count makes the comparison worse, not fairer. A warmup rep is
+discarded; host load is recorded at both ends of every run.
+
+Four traps, each of which put a wrong number in this file before:
+
+- **A load average cannot see one busy core.** The `--max-load` guard
+  passed for a day while a daemon held 97% of a core. Check `ps` too.
+- **One instantaneous sample is not a measurement.** "CUDA decode at
+  36% GPU utilization" came from an `nvidia-smi` taken after the run.
+  The real figure was 86% to 93%, and the error cost a day and a PR.
+- **A label is not a backend.** 13 CPU rows were published whose own
+  receipts recorded `backend_active: "Metal"`. Deleted rather than
+  corrected; a receipt whose label disagrees with what ran is now
+  refused at write time.
+- **A gap column cannot show a missing kernel.** A CUDA K-quant prefill
+  read 4.88 tok/s and looked slow. There was no GEMM at all, and the
+  fallback still answered correctly.
+
+Do not compare this file to a pre-0.13 version: those receipts had no
+warmup, so their prefill numbers include cold mmap page faults.
 
 <!-- BEGIN ENGINE TABLE (generated by `ferrox bench --render`) -->
 
@@ -160,26 +84,13 @@ float4 elem, early Multi-CB. `FERROX_METAL_FA_VEC=0` → ~25.5 pred.
 
 Measured on **3 hosts**, one section each. Rows are never compared across machines.
 
-No HTTP, no chat template, no tokenizer, no sampler. This is the engine
-alone. `pp512` is batched prefill, `tg128` is decode. **Neither engine's
-thread count is forced**: each picks its own default, because llama.cpp
-defaults to performance cores and loses 2–4× when pushed above them, so
-pinning both to the same count does not make the comparison fairer.
+### Summary
 
-**Gap** = `llama / ferrox` (<1 ferrox faster). Rows are grouped by
-backend (Metal → CUDA → CPU), then test (`pp` then `tg`), then **worst
-gap first**. Regenerate with `ferrox bench --suite` / `--render`.
-
-**Largest engine prefill gaps (pp\*, gap > 1.05×):**
-
-- `SmolLM2-135M-Instruct Q8_0` / cuda / pp512: 🔴 **17.41×**
-- `TinyLlama-1.1B-Chat-v1.0 Q8_0` / cuda / pp512: 🔴 **15.00×**
-- `Qwen2.5-0.5B-Instruct Q8_0` / cuda / pp512: 🔴 **14.69×**
-- `Qwen3-0.6B Q8_0` / cuda / pp512: 🔴 **14.04×**
-- `Gemma-3-1B-IT Q8_0` / cuda / pp512: 🔴 **12.44×**
-- `Llama-3.2-1B-Instruct Q5_K_M` / cuda / pp512: 🔴 **11.89×**
-- `Gemma-2-2B-IT Q4_K_M` / cuda / pp512: 🔴 **11.61×**
-- `Llama-3.2-1B-Instruct Q4_K_M` / cuda / pp512: 🔴 **11.22×**
+| Host | Backend | Prefill gap | Decode gap |
+|---|---|---|---|
+| AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic | CPU | 🔴 **6.26×** to 🔴 **10.14×** | 🔴 **1.06×** to 🔴 **1.92×** |
+| Apple M2 Pro (10c/6p) macOS 26.6.1 | METAL | ⚪ **1.00×** to 🔴 **1.10×** | 🟢 **0.64×** to 🔴 **1.23×** |
+| Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-160-generic | CUDA | 🔴 **10.75×** to 🔴 **17.41×** | 🔴 **9.22×** to 🔴 **19.15×** |
 
 ### AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic
 
@@ -276,35 +187,14 @@ gap first**. Regenerate with `ferrox bench --suite` / `--render`.
 
 <!-- END ENGINE TABLE -->
 
-## Open
+## Notes
 
-1. **Dense Metal prefill is closed.** Every dense `pp512` row is
-   between 0.98× and 1.10×, and TinyLlama is ahead at 0.98×. The
-   simdgroup-MMA flash attention at d=64 and d=128 did this.
-2. **Metal MoE prefill closed too.** OLMoE `pp512` is 1.09× and its
-   `tg128` is 1.00×. An earlier ledger put it at 2.62×, measured before
-   warmup existed, so the two numbers are not describing the same
-   experiment.
-3. **Metal decode is ahead of llama.cpp on 8 of 12 rows**, from 0.93×
-   down to 0.62×. The rest are within 3% of parity. No red rows left.
-4. **CPU is the entire remaining gap.** All 16 comparable CPU rows are
-   red: prefill 1.41× to 5.06×, decode 1.68× to 3.55×, nothing at
-   parity. The measured cause is fork-join *scaling* rather than
-   per-thread throughput, since ferrox beats llama at `-t 1` on
-   Mistral-7B, and llama runs a persistent spin-barrier pool. See
-   `docs/plans/llama-cpp-parity-push.md`.
-5. **Do not compare this table to any earlier one.** Every receipt here
-   is 0.12.0, measured in one session, with a warmup rep and the host
-   load recorded at both ends of each run. Receipts before 0.12.0 had
-   no warmup, so their prefill numbers include cold mmap page faults:
-   llama.cpp's own SmolLM2 CPU `pp512` reads 1957 in the old ledger and
-   12196 here, on the same binary and the same file. The methodology
-   changed, not the engine.
-6. CUDA has no in-tree receipt and is skipped on darwin via
-   `--fit-host`.
-7. Gemma-4-E2B: `ferrox bench` uses `Gemma4Engine` (sequential
-   `forward_token` for pp* until batched prefill lands). SPM `gemma4`
-   BPE and `<|turn>` chat wrap landed. Homebrew `llama-bench` still
-   lacks the `gemma4` arch, so the llama column is blank.
-8. DS4 / GLM / MLA MoE real-checkpoint e2e when feasible. Mixtral skipped by `--fit-host` on Host B.
-9. Run-to-run spread on this host is ~20%; claims tighter than that need interleaved A/B (still sequential per engine).
+- **Gemma-4-E2B** uses `Gemma4Engine`, whose `pp*` is a sequential
+  `forward_token` until batched prefill lands. Homebrew `llama-bench`
+  has no `gemma4` arch, so its column is blank.
+- **Mixtral** is skipped by `--fit-host` on the Apple host.
+- **Metal regressions to keep off:** legacy GQA NSG=4, sequential
+  GREEDY argmax, float4 elem, early Multi-CB. `FERROX_METAL_FA_VEC=0`
+  costs ~25.5 pred.
+- Run-to-run spread is ~20% on the Apple host; a claim tighter than
+  that needs interleaved A/B.
