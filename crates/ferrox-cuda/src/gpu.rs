@@ -745,7 +745,11 @@ pub(crate) fn ensure_module_loaded_lazy(
 /// process-wide and persistent (see `shared_device`/`ensure_module_loaded`) --
 /// quantized weight buffers are also cached by host pointer+length
 /// (`resident_cuda_weights`) so decode does not re-upload multi-GB
-/// matrices every token. Activations still upload per call.
+/// matrices every token. Activations still upload per call, and that is
+/// deliberate: keeping them device-resident between matmuls was tried
+/// (PR #136) and measured 22% SLOWER on a GTX 1080, because decode is
+/// kernel-bound at ~90% utilization rather than host-bound. See
+/// `docs/plans/cpu-cuda-parity.md` step 2.
 #[allow(clippy::too_many_arguments)] // shared internal launch plumbing; each parameter is a distinct, clearly-named buffer/shape value, not something worth bundling into a struct for one private callee.
 fn launch_matvec(
     kernel_src: &'static str,
@@ -758,10 +762,6 @@ fn launch_matvec(
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
     let dev = shared_device()?;
-    // If the previous decode left a matching host activation marked
-    // resident, skip a redundant HtoD (the bytes are still the same;
-    // a future DeviceAct-TLS path will skip the copy entirely).
-    let _reuse = take_resident_activation_if_matches(x);
     let d_x = dev
         .htod_copy(x.to_vec())
         .map_err(|e| CudaError::Launch(format!("{e:?}")))?;
@@ -776,12 +776,8 @@ fn launch_matvec(
     };
     // `_weights` holds the resident-weight Arc alive until the DtoH sync.
     let (d_out, _weights) = enqueue_matvec(&dev, &launch, &d_x)?;
-    let out = dev
-        .dtoh_sync_copy(&d_out)
-        .map_err(|e| CudaError::Launch(format!("{e:?}")))?;
-    // Mark result resident for a possible follow-up matvec on the same
-    // host buffer (caller must keep `out` alive and pass the same ptr).
-    Ok(out)
+    dev.dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("{e:?}")))
 }
 
 /// Enqueues one matvec kernel on the shared device's default stream:
@@ -794,7 +790,7 @@ fn launch_matvec(
 /// output slice plus the resident-weight `Arc`, which the caller must
 /// keep alive until it syncs (the kernel reads that buffer
 /// asynchronously). This is the single per-launch primitive shared by
-/// [`launch_matvec`], [`launch_matvec_multi`], [`matvec_into`], and
+/// [`launch_matvec`], [`launch_matvec_multi`] and
 /// [`launch_dense_ffn_swiglu`].
 fn enqueue_matvec(
     dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
@@ -1237,77 +1233,6 @@ pub fn launch_fused_add_rmsnorm(
         .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm download: {e:?}")))
 }
 
-/// A device-resident activation vector: a `CudaSlice<f32>` plus its
-/// logical length, so a matvec's output can be fed straight into the
-/// next matvec without a DtoH/HtoD round-trip (the exact per-call
-/// upload/download overhead that made CUDA decode bandwidth-starved).
-/// Mirrors Metal's on-device activation residency; created by
-/// [`upload_act`], consumed by [`matvec_into`], read back by
-/// [`download_act`].
-pub struct DeviceAct {
-    slice: cudarc::driver::CudaSlice<f32>,
-    len: usize,
-}
-
-// SAFETY: the slice lives on the process-wide shared CudaDevice and is
-// only touched by kernels launched on that device; same sharing model
-// as ResidentCudaWeights above.
-unsafe impl Send for DeviceAct {}
-unsafe impl Sync for DeviceAct {}
-
-impl DeviceAct {
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-/// Uploads a host activation vector to the device once, returning a
-/// [`DeviceAct`] that later matvecs can consume in place (no repeated
-/// HtoD). One HtoD copy; the shared persistent device/context is reused.
-pub fn upload_act(x: &[f32]) -> Result<DeviceAct, CudaError> {
-    let dev = shared_device()?;
-    let slice = dev
-        .htod_copy(x.to_vec())
-        .map_err(|e| CudaError::Launch(format!("act upload: {e:?}")))?;
-    Ok(DeviceAct {
-        slice,
-        len: x.len(),
-    })
-}
-
-/// Downloads a [`DeviceAct`] back to a host `Vec<f32>` (one DtoH, which
-/// also synchronizes the stream). Used at the edge of a chained matvec
-/// sequence, exactly once, instead of once per matvec.
-pub fn download_act(act: &DeviceAct) -> Result<Vec<f32>, CudaError> {
-    let dev = shared_device()?;
-    dev.dtoh_sync_copy(&act.slice)
-        .map_err(|e| CudaError::Launch(format!("act download: {e:?}")))
-}
-
-/// Runs one matvec whose activation input is already on the device,
-/// producing another device-resident activation — no HtoD of `x`, no
-/// DtoH of the result. This is the device-resident counterpart of the
-/// `launch_*_matvec` host wrappers: chain several of these (plus
-/// [`silu_mul_device`], via [`launch_dense_ffn_swiglu`]) between a
-/// single [`upload_act`] and [`download_act`] to keep a whole FFN /
-/// projection stack on-GPU.
-pub fn matvec_into(launch: &MatvecLaunch<'_>, x: &DeviceAct) -> Result<DeviceAct, CudaError> {
-    let dev = shared_device()?;
-    let (d_out, _weights) = enqueue_matvec(&dev, launch, &x.slice)?;
-    // DtoH-free: the resident-weight Arc is dropped here, but the kernel
-    // has already been enqueued reading it on the same (default) stream,
-    // and the *cached* Arc in CUDA_WEIGHT_CACHE keeps the buffer alive
-    // regardless — resident_cuda_weights never evicts.
-    Ok(DeviceAct {
-        slice: d_out,
-        len: launch.rows,
-    })
-}
-
 /// Fused dense SwiGLU FFN entirely on-device: uploads `x` once, runs
 /// the gate and up matvecs (device-resident weights), fuses
 /// `silu(gate)*up` in a kernel, runs the down matvec, and downloads the
@@ -1344,64 +1269,6 @@ pub fn launch_dense_ffn_swiglu(
 
     dev.dtoh_sync_copy(&d_out)
         .map_err(|e| CudaError::Launch(format!("ffn out download: {e:?}")))
-}
-
-/// Thread-local resident activation buffer (output of a matvec that
-/// might be reused as input to the next call, skipping host↔device
-/// upload/download). Mirrors Metal's `RESIDENT_ACT` TLS in
-/// `ferrox-metal/src/gpu.rs` -- same pattern: decoder hands back the
-/// output buffer if it knows the next matvec will consume it, and
-/// `launch_matvec` (or a future fused-stack path) can skip `htod_copy`
-/// when the pointer+length match.
-///
-/// Not yet wired into `launch_matvec` itself (future work: check TLS
-/// before `htod_copy`, skip upload if matches, download result and
-/// update TLS if decoder will hand it back) -- the public
-/// `set_resident_activation` / `clear_resident_activation` functions
-/// are the API surface for that integration.
-#[allow(dead_code)] // Infrastructure for future launch_matvec integration.
-#[derive(Clone, Copy)]
-struct ResidentActivation {
-    /// Raw host pointer (borrowed, not owned -- caller must keep alive).
-    ptr: *const f32,
-    len: usize,
-}
-
-thread_local! {
-    static RESIDENT_ACT: std::cell::Cell<Option<ResidentActivation>> = const { std::cell::Cell::new(None) };
-}
-
-/// Stores a resident activation buffer pointer for the current thread.
-/// Used by dense-decode paths when the output of one matvec (e.g.
-/// final_norm) is known to be the input of the next (e.g. lm_head).
-/// Call this *after* downloading the result to host, passing the host
-/// slice pointer+length. The next `launch_matvec` call can skip
-/// `htod_copy` if it sees the same pointer.
-pub fn set_resident_activation(x: &[f32]) {
-    RESIDENT_ACT.set(Some(ResidentActivation {
-        ptr: x.as_ptr(),
-        len: x.len(),
-    }));
-}
-
-/// Clears the resident activation TLS (use after a decode that doesn't
-/// consume it, or at the start of a fresh generation, to avoid stale
-/// pointer reuse).
-pub fn clear_resident_activation() {
-    RESIDENT_ACT.set(None);
-}
-
-/// Checks if a resident activation matches `x` (same pointer+length),
-/// and if so, returns `true` and clears the TLS. `launch_matvec` can
-/// then skip `htod_copy(x)` because the data is already on device from
-/// the prior call.
-///
-/// Not yet called by `launch_matvec` -- future work to wire this check
-/// in before the `htod_copy` inside that function.
-fn take_resident_activation_if_matches(x: &[f32]) -> bool {
-    RESIDENT_ACT
-        .take()
-        .is_some_and(|res| res.len == x.len() && res.ptr == x.as_ptr())
 }
 
 #[cfg(test)]
@@ -1981,39 +1848,6 @@ mod tests {
         assert_eq!(gpu.len(), expected.len());
         for (i, (got, want)) in gpu.iter().zip(expected.iter()).enumerate() {
             assert_close_relative(*got, *want, i);
-        }
-    }
-
-    /// `upload_act` → `matvec_into` → `download_act` (device-resident
-    /// activation, no per-matvec host round-trip) must agree with the
-    /// host-wrapper `launch_q8_0_matvec` for the same weights/input.
-    #[test]
-    #[ignore = "requires real CUDA hardware -- run with --ignored to verify DeviceAct residency vs the host-wrapper matvec"]
-    fn matvec_into_matches_host_wrapper() {
-        let rows = 4;
-        let cols = 64;
-        let row_bytes = (cols / ferrox_quant::Q8_0_BLOCK_ELEMS) * ferrox_quant::Q8_0_BLOCK_BYTES;
-        let (weights, x, _expected) = real_q8_0_test_matrix(rows, cols);
-
-        let host = launch_q8_0_matvec(&weights, &x, rows, row_bytes, cols / 32)
-            .expect("host-wrapper matvec must launch");
-
-        let d_x = upload_act(&x).expect("upload");
-        let launch = MatvecLaunch {
-            kernel_src: Q8_0_MATVEC_KERNEL_SRC,
-            module_name: "ferrox_q8_0",
-            fn_name: "q8_0_matvec",
-            weights: weights.as_slice(),
-            rows,
-            row_bytes,
-            n_blocks_per_row: cols / 32,
-        };
-        let d_out = matvec_into(&launch, &d_x).expect("device matvec");
-        let device = download_act(&d_out).expect("download");
-
-        assert_eq!(host.len(), device.len());
-        for (i, (h, d)) in host.iter().zip(device.iter()).enumerate() {
-            assert_close_relative(*d, *h, i);
         }
     }
 
