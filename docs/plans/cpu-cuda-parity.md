@@ -165,6 +165,28 @@ now ruled out**:
   lever even if the diagnosis is right, and here the diagnosis was also
   wrong.
 
+**What llama.cpp's CUDA backend does**, read out of
+`.scratch/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu`. Kept because it
+is true and useful, with the caveat that it is NOT the explanation for
+this gap:
+
+- `ggml_backend_cuda_graph_compute` runs a whole token's graph, and its
+  node loop contains **zero** `cudaStreamSynchronize` or
+  `cudaDeviceSynchronize` calls. Every sync in the file is at the graph
+  boundary, in `tensor_set` / `tensor_get` / `cpy_tensor`.
+- Every tensor, including every intermediate activation, is allocated
+  in a device buffer up front. Residency is a tensor's default state,
+  not an optimisation applied to a pair of calls, so the host never
+  sees an intermediate.
+
+That is a real architectural difference and it settles the identity
+question a residency scheme would face: a tensor's device buffer IS its
+identity, for its lifetime, which is stronger than any length or epoch
+comparison. But ferrox's decode already runs the GPU at ~90%, so it is
+not waiting on the host, and closing this difference would not close
+the gap. Recorded so the next reader does not re-derive it and reach
+the conclusion this plan already retracted.
+
 **The cause is the kernels.** ferrox's CUDA matvec uses one 256-thread
 block per row with a shared-memory tree reduction; ggml-cuda uses
 warp-level `dp4a` with no shared-memory round trip. At ~90%
