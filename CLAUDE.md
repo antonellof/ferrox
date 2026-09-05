@@ -139,6 +139,16 @@ kernel's threadgroup geometry (a correct kernel returned zeros for half
 its rows); a wire struct and a sampler that silently disagreed about
 which fields exist (SIX parameters accepted and ignored).
 
+2026-09-04/05 added three more, all found by measuring rather than
+reading: a benchmark receipt carrying `backend: "cpu"` beside
+`backend_active: "Metal"`, in the same file, with nothing comparing the
+two, for **13 of 13** published CPU rows; `KINDS` and the host-check
+tool's fixed shape list, where adding the K-quants made the tool panic
+on the first one and check NOTHING for a day while still exiting green;
+and `FERROX_CPU_INT_DOT`, a default that was correct on the
+architecture its kernels were written for and cost the other one 4x to
+8.8x of decode.
+
 The durable fixes are never the individual patches. They are the places
 where disagreement now fails to COMPILE or turns a test red: an
 exhaustive destructure with no `..`, one predicate the four call sites
@@ -181,6 +191,76 @@ Rust specifics this repo holds to:
   is coverage, not a defect.
 - Tests live in `#[cfg(test)]` beside the code. A test that cannot fail
   is not a test: sabotage it once and confirm it goes red.
+- **Confirm the sabotage LANDED.** A mutation that did not apply is
+  indistinguishable from a test that holds. One sabotage here passed
+  and proved nothing because `cargo fmt` had wrapped the target line
+  across three lines, so the patch never matched. Grep the file for the
+  mutated text before believing a green run, and if a test survives the
+  first sabotage attempt, suspect the sabotage before believing the
+  test.
+
+## Measuring, and not fooling yourself
+
+Every performance claim in this repo has to survive these. They are
+here because each one was broken in a single week, and each break cost
+either a wrong number in `benchmarks/RESULTS.md` or a merged-nothing
+PR.
+
+- **Rent a box; do not measure on this laptop.** `suggestd` holds ~97%
+  of a core on it indefinitely and respawns hot when killed. CPU and
+  CUDA rows come from vast.ai; the M2 Pro is for Metal, where it is the
+  only hardware that can run the backend. Pick offers where
+  `cpu_cores_effective == cpu_cores`, so no co-tenant shares the CPU.
+  Four instances cost $0.49. Destroy them the moment the receipts are
+  copied back, and confirm with `vastai show instances`.
+- **A load average cannot see one busy core.** `ferrox bench`'s
+  `--max-load 2.0` guard passed for an entire day while one of six
+  cores was pegged, because one core does not move a six-core average
+  enough to trip it. The guard is necessary and not sufficient: check
+  `ps -eo pcpu,comm | sort -rn | head` too, and treat any process above
+  ~90% as disqualifying.
+- **One instantaneous sample is not a measurement.** "CUDA decode runs
+  at 36% GPU utilization" came from a single `nvidia-smi` taken AFTER a
+  bench had finished, so it caught an idle moment. Sampled five times
+  DURING the run, the real figure was 86-93%. That one number sent a
+  day of work at a host-side cost that did not exist and produced a PR
+  measured 22% SLOWER. Sample repeatedly, and sample while the thing
+  runs.
+- **Verify the flag did what it says, from the artifact.** `ferrox
+  bench --n-gpu-layers 0` is documented as forcing CPU and did not:
+  the backend is decided once per process and cached, so the flag
+  arrived too late. Read `backend_active` in the receipt, not the flag
+  you passed. A receipt whose label disagrees with the backend that ran
+  is now refused at write time and asserted over the committed set,
+  because this was found only after publishing 13 wrong rows.
+- **Check that the lever can reach the target before pulling it.** At
+  the (wrong) 36% figure, removing EVERY host round-trip was worth at
+  most 1/0.36 = 2.8x against a 9x-17x gap. That arithmetic was written
+  down before the code was, and reading past it cost the PR. If the
+  best case does not close the gap, the diagnosis is incomplete
+  whatever else is true.
+- **Interleave A/B when comparing two builds**, and report the raw
+  sequence. `main, branch, main, branch` catches drift that two
+  sequential runs hide.
+- **A gap column cannot show a missing kernel.** A CUDA K-quant prefill
+  read 4.88 tok/s against llama.cpp's 1586.80 and looked like a
+  performance problem; there was no GEMM at all, and the fallback still
+  answered correctly. Check coverage before profiling.
+
+## Working with agents
+
+- **One worktree per agent.** Two agents in the same checkout collided
+  here: one detected another's half-finished refactor, backed its own
+  work out, and redid it in isolation. Use `isolation: "worktree"`.
+- **Do not redo an agent's task while it runs.** A narrower, better
+  version of a deletion was in flight while the same deletion was
+  attempted by hand; the hand version removed a live hardware test with
+  it.
+- **Agents do not tag, publish, force-push, rent hardware, or
+  benchmark.** They implement and open a PR; verification on real
+  hardware is the parent session's, and a kernel merges only after
+  `cargo test -p ferrox-cuda --features cuda -- --ignored` has run on a
+  GPU.
 
 ## Architecture
 
