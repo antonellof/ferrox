@@ -246,6 +246,17 @@ PR.
   read 4.88 tok/s against llama.cpp's 1586.80 and looked like a
   performance problem; there was no GEMM at all, and the fallback still
   answered correctly. Check coverage before profiling.
+- **Check what the kernel is actually limited BY, before optimising
+  anything in it.** Convert the measurement into the resource: for a
+  decode matvec, `weights_bytes * tok/s` is achieved memory bandwidth,
+  and that number is one line of arithmetic. ferrox reaches **5.3%** of
+  an RTX 3060's 360 GB/s where llama.cpp reaches **60.4%**, so decode
+  is limited by memory-request concurrency. A port of llama.cpp's
+  `dp4a` inner loop was written, verified correct on hardware, and
+  measured **under 1% faster**, because four MACs per instruction buys
+  nothing in a kernel that is waiting on loads. The source diff between
+  two kernels tells you what is different; it does not tell you which
+  difference is the limit.
 
 ## Working with agents
 
