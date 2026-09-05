@@ -156,3 +156,99 @@ mod coalesced_tests {
         );
     }
 }
+
+/// Scalar twin of `Q6_K_MATVEC_COALESCED_KERNEL_SRC`, lane by lane.
+pub fn q6_k_matvec_coalesced_row(row: &[u8], x: &[f32], n_blocks: usize) -> f32 {
+    let mut lanes = [0f64; 32];
+    for blk in 0..n_blocks {
+        let block = &row[blk * 210..(blk + 1) * 210];
+        let d = f16_to_f32(u16::from(block[208]) | (u16::from(block[209]) << 8));
+        let x_base = blk * 256;
+        for (lane, slot) in lanes.iter_mut().enumerate() {
+            let is = lane / 16;
+            let mut acc = 0f32;
+            for half in 0..2 {
+                let ql = &block[half * 64..];
+                let qh = &block[128 + half * 32..];
+                let sc = &block[192 + half * 8..192 + half * 8 + 8];
+                let xh = x_base + half * 128;
+                let q1 = i32::from((ql[lane] & 0x0F) | ((qh[lane] & 0x03) << 4)) - 32;
+                let q2 = i32::from((ql[lane + 32] & 0x0F) | (((qh[lane] >> 2) & 0x03) << 4)) - 32;
+                let q3 = i32::from((ql[lane] >> 4) | (((qh[lane] >> 4) & 0x03) << 4)) - 32;
+                let q4 = i32::from((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 0x03) << 4)) - 32;
+                acc += d * f32::from(sc[is] as i8) * q1 as f32 * x[xh + lane];
+                acc += d * f32::from(sc[is + 2] as i8) * q2 as f32 * x[xh + lane + 32];
+                acc += d * f32::from(sc[is + 4] as i8) * q3 as f32 * x[xh + lane + 64];
+                acc += d * f32::from(sc[is + 6] as i8) * q4 as f32 * x[xh + lane + 96];
+            }
+            *slot += f64::from(acc);
+        }
+    }
+    lanes.iter().sum::<f64>() as f32
+}
+
+#[cfg(test)]
+mod q6_k_coalesced_tests {
+    use super::*;
+
+    fn q6_k_row(n_blocks: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut row: Vec<u8> = (0..n_blocks * 210)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect();
+        for blk in 0..n_blocks {
+            let b = blk * 210;
+            row[b + 208] = 0x00;
+            row[b + 209] = 0x2C; // finite d
+        }
+        row
+    }
+
+    #[test]
+    fn the_coalesced_q6_k_row_matches_dequantize_then_dot() {
+        for (n_blocks, seed) in [(1usize, 5u32), (3, 23), (5, 47)] {
+            let row = q6_k_row(n_blocks, seed);
+            let n = n_blocks * 256;
+            let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.017).cos()).collect();
+            let weights = ferrox_quant::dequant_q6_k(&row).expect("dequant");
+            let want: f64 = weights
+                .iter()
+                .zip(x.iter())
+                .map(|(w, v)| f64::from(*w) * f64::from(*v))
+                .sum();
+            let got = f64::from(q6_k_matvec_coalesced_row(&row, &x, n_blocks));
+            let scale = weights
+                .iter()
+                .zip(x.iter())
+                .map(|(w, v)| (f64::from(*w) * f64::from(*v)).abs())
+                .sum::<f64>()
+                .max(1.0);
+            assert!(
+                (got - want).abs() / scale < 1e-6,
+                "n_blocks {n_blocks} seed {seed}: coalesced {got} vs dequant-dot {want}"
+            );
+        }
+    }
+
+    /// The four sub-scales are 2 apart, not adjacent. Getting that
+    /// wrong scales three of the four outputs by the wrong factor.
+    #[test]
+    fn the_four_scale_indices_are_two_apart() {
+        let row = q6_k_row(1, 9);
+        let x: Vec<f32> = (0..256).map(|i| ((i % 11) as f32) - 5.0).collect();
+        let weights = ferrox_quant::dequant_q6_k(&row).expect("dequant");
+        let want: f64 = weights
+            .iter()
+            .zip(x.iter())
+            .map(|(w, v)| f64::from(*w) * f64::from(*v))
+            .sum();
+        let got = f64::from(q6_k_matvec_coalesced_row(&row, &x, 1));
+        assert!(
+            (got - want).abs() / want.abs().max(1.0) < 1e-5,
+            "{got} vs {want}"
+        );
+    }
+}

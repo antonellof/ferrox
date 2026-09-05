@@ -416,6 +416,87 @@ extern "C" __global__ void q5_0_matvec(
 /// The 32 bytes of a group carry the first 32 activations in their low
 /// nibbles and the next 32 in their high nibbles, so a lane that pairs
 /// byte `i` with activation `i` for both halves reads the wrong place.
+/// Q6_K matvec with a coalesced access pattern.
+///
+/// The kernel this replaces gives each thread a whole 210-byte
+/// super-block, so a warp's 32 loads land 210 bytes apart. Here the
+/// warp takes one super-block and lane `l` takes the index the old
+/// inner loop iterated, which makes `ql[l]`, `ql[l+32]` and `qh[l]`
+/// each contiguous across the warp.
+///
+/// Q6_K is worth doing right after Q4_K because a `Q4_K_M` checkpoint
+/// is not all Q4_K: its output tensor is usually Q6_K, so this kernel
+/// runs every token too.
+///
+/// Same arithmetic and same f32 activations as before, so it stays
+/// token-identical.
+pub const Q6_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float ferrox_f16_to_f32_q6co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+extern "C" __global__ void q6_k_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    const int is = lane / 16;
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 210;
+        const float d = ferrox_f16_to_f32_q6co(
+            (unsigned short)block[208] | ((unsigned short)block[209] << 8));
+        const int x_base = blk * 256;
+
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const unsigned char* ql = block + half * 64;
+            const unsigned char* qh = block + 128 + half * 32;
+            const signed char* sc = (const signed char*)(block + 192 + half * 8);
+            const int xh = x_base + half * 128;
+
+            const int q1 = (int)((ql[lane] & 0x0F) | ((qh[lane] & 0x03) << 4)) - 32;
+            const int q2 = (int)((ql[lane + 32] & 0x0F) | (((qh[lane] >> 2) & 0x03) << 4)) - 32;
+            const int q3 = (int)((ql[lane] >> 4) | (((qh[lane] >> 4) & 0x03) << 4)) - 32;
+            const int q4 = (int)((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 0x03) << 4)) - 32;
+
+            acc += d * (float)sc[is] * (float)q1 * x[xh + lane];
+            acc += d * (float)sc[is + 2] * (float)q2 * x[xh + lane + 32];
+            acc += d * (float)sc[is + 4] * (float)q3 * x[xh + lane + 64];
+            acc += d * (float)sc[is + 6] * (float)q4 * x[xh + lane + 96];
+        }
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
 pub const Q4_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
 __device__ __forceinline__ float ferrox_f16_to_f32_co(unsigned short bits) {
     unsigned int sign = (bits >> 15) & 0x1u;
@@ -878,6 +959,9 @@ fn launch_matvec(
     if fn_name == "q4_k_matvec" {
         return launch_matvec_coalesced_q4_k(weights, x, rows, row_bytes, n_blocks_per_row);
     }
+    if fn_name == "q6_k_matvec" {
+        return launch_matvec_coalesced_q6_k(weights, x, rows, row_bytes, n_blocks_per_row);
+    }
     let dev = shared_device()?;
     let d_x = dev
         .htod_copy(x.to_vec())
@@ -915,6 +999,58 @@ fn launch_matvec(
 /// so it is meant to be token-identical; what changes is that a warp
 /// reads 128 contiguous bytes per super-block instead of 32 scattered
 /// 144-byte-strided ones.
+/// Q6_K matvec through the coalesced kernel. See
+/// [`launch_matvec_coalesced_q4_k`]; same shape, different unpack.
+fn launch_matvec_coalesced_q6_k(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    use cudarc::driver::LaunchAsync;
+
+    let dev = shared_device()?;
+    ensure_module_loaded(
+        &dev,
+        Q6_K_MATVEC_COALESCED_KERNEL_SRC,
+        "ferrox_q6_k_coalesced",
+        "q6_k_matvec_coalesced",
+    )?;
+    let func = dev
+        .get_func("ferrox_q6_k_coalesced", "q6_k_matvec_coalesced")
+        .ok_or_else(|| CudaError::KernelCompile("q6_k_matvec_coalesced not found".into()))?;
+    let d_x = dev
+        .htod_copy(x.to_vec())
+        .map_err(|e| CudaError::Launch(format!("x upload: {e:?}")))?;
+    let d_weights = resident_cuda_weights(&dev, weights)?;
+    let mut d_out = dev
+        .alloc_zeros::<f32>(rows)
+        .map_err(|e| CudaError::Launch(format!("output alloc: {e:?}")))?;
+    const WARPS: usize = 8;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (rows.div_ceil(WARPS) as u32, 1, 1),
+        block_dim: ((WARPS * 32) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                &d_weights.slice,
+                &d_x,
+                &mut d_out,
+                rows as i32,
+                row_bytes as i32,
+                n_blocks_per_row as i32,
+            ),
+        )
+        .map_err(|e| CudaError::Launch(format!("q6_k_matvec_coalesced launch: {e:?}")))?;
+    }
+    dev.dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("output download: {e:?}")))
+}
+
 fn launch_matvec_coalesced_q4_k(
     weights: &[u8],
     x: &[f32],
@@ -1789,6 +1925,32 @@ mod tests {
             .map(|r| scalar_dot(&weights[r * row_bytes..(r + 1) * row_bytes], &x))
             .collect();
         (weights, x, expected)
+    }
+
+    /// The coalesced Q6_K kernel against its scalar twin, on a real
+    /// device. A `Q4_K_M` checkpoint runs this one too, for its output
+    /// tensor.
+    ///
+    ///   cargo test -p ferrox-cuda --features cuda -- --ignored
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verifies the coalesced Q6_K matvec against its scalar twin"]
+    fn launch_q6_k_matvec_coalesced_matches_the_twin() {
+        let rows = 37usize;
+        let n_blocks_per_row = 3usize;
+        let cols = n_blocks_per_row * 256;
+        let row_bytes = n_blocks_per_row * 210;
+        let weights: Vec<u8> = pseudo_bytes(11, rows * row_bytes);
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.017).cos()).collect();
+
+        let got =
+            super::launch_matvec_coalesced_q6_k(&weights, &x, rows, row_bytes, n_blocks_per_row)
+                .expect("coalesced q6_k matvec");
+        assert_eq!(got.len(), rows);
+        for r in 0..rows {
+            let row = &weights[r * row_bytes..(r + 1) * row_bytes];
+            let want = crate::coalesced_twin::q6_k_matvec_coalesced_row(row, &x, n_blocks_per_row);
+            assert_close_relative(got[r], want, r);
+        }
     }
 
     /// The coalesced kernel against its scalar twin, on a real device.
