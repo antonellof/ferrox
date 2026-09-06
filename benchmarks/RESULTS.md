@@ -29,48 +29,58 @@ here, and the decode column depends on one switch:
 8B, and into a bigger loss at 135M. That is why it is still opt-in
 ([#27](https://github.com/antonellof/ferrox/issues/27)).
 
-**CUDA on Ampere** (RTX 3060). The prefill gap is far worse than on the
-Pascal rows in the generated table:
+**CUDA on Ampere** (RTX 3070, after
+[#146](https://github.com/antonellof/ferrox/pull/146)). Decode was 12×
+behind on the previous Ampere measurement and is now ~3×; prefill is
+unchanged.
 
 | Model | Test | ferrox | llama.cpp | Gap |
 |---|---|---|---|---|
-| Llama-3.2-1B Q4_K_M | pp512 | 185.33 | 10277.19 | 🔴 **55.5×** |
-| Llama-3.2-1B Q4_K_M | tg128 | 24.50 | 282.17 | 🔴 **11.5×** |
-| Llama-3.2-3B Q4_K_M | pp512 | 75.58 | 4276.84 | 🔴 **56.6×** |
-| Llama-3.2-3B Q4_K_M | tg128 | 10.38 | 127.03 | 🔴 **12.2×** |
+| Llama-3.2-3B Q4_K_M | tg128 | 49.10 | 156.14 | 🔴 **3.18×** |
+| Llama-3.2-1B Q5_K_M | tg128 | 100.50 | 332.78 | 🔴 **3.31×** |
+| Llama-3.2-1B Q8_0 | tg128 | 59.63 | 258.87 | 🔴 **4.34×** |
+| Llama-3.2-3B Q4_K_M | pp512 | 193.63 | 5639.64 | 🔴 **29.13×** |
+| Llama-3.2-1B Q5_K_M | pp512 | 480.93 | 13297.59 | 🔴 **27.65×** |
+| Llama-3.2-1B Q8_0 | pp512 | 325.81 | 14947.77 | 🔴 **45.88×** |
 
-llama.cpp is 2.4× faster on Ampere than on Pascal; ferrox is not faster
-at all. The prefill gap is not a constant factor, it widens with GPU
-generation.
+Prefill and decode are two different problems. Prefill is a missing
+tensor-core `mul_mm` and its gap widens with GPU generation. Decode was
+a memory access pattern, and what fixed it is below.
 
-**CUDA decode, before and after coalescing the matvec kernels**
-(RTX 3080, `tg128`, `--n-gpu-layers 99`, runs interleaved
+**What coalescing the matvecs bought** (same RTX 3070, runs interleaved
 `main, branch, main, branch`; PRs
-[#144](https://github.com/antonellof/ferrox/pull/144) and
-[#145](https://github.com/antonellof/ferrox/pull/145)). The old kernels
+[#144](https://github.com/antonellof/ferrox/pull/144),
+[#145](https://github.com/antonellof/ferrox/pull/145),
+[#146](https://github.com/antonellof/ferrox/pull/146)). The old kernels
 gave one thread a whole super-block, so 32 lanes read addresses one
-block apart and each load instruction spread across as many cache lines
-as it had lanes. A warp now takes the super-block and each lane one
-contiguous slice.
+block apart and every load instruction spread across as many cache
+lines as it had lanes. A warp now takes the super-block and each lane
+one contiguous slice.
 
-| Model | Before | After | Change | GB/s after | % of 760 GB/s |
+| Model | Before | After | Change | GB/s after | % of 448 GB/s |
 |---|---:|---:|---:|---:|---:|
-| Llama-3.2-1B Q5_K_M | 34.74 | **43.17** | 🟢 **+24.3%** | 39.3 | 5.2% |
-| Llama-3.2-3B Q4_K_M | 20.74 | **23.24** | 🟢 **+12.1%** | 46.9 | 6.2% |
-| Llama-3.2-1B Q8_0 | 51.73 | **56.98** | 🟢 **+10.1%** | 75.3 | 9.9% |
+| Llama-3.2-1B Q5_K_M | 32.85 | **100.90** | 🟢 **+207%** | 92.0 | 20.5% |
+| Llama-3.2-3B Q4_K_M | 18.38 | **48.50** | 🟢 **+164%** | 97.9 | 21.9% |
+| Llama-3.2-1B Q8_0 | 45.75 | **59.81** | 🟢 **+31%** | 79.0 | 17.6% |
 
-Output is byte-identical to the CPU reference on all three. The last
-column is the point: llama.cpp reaches about 60% of card bandwidth, so
-the access pattern was a real cost and was not the main one. The next
-lever is occupancy, and the fused FFN and attention kernels have not
-been touched at all.
+Output stays byte-identical to the CPU reference on all three. Most of
+this is #146, and the reason is worth keeping: #144 and #145 routed
+only `launch_matvec`, while the fused FFN — gate, up and down, about
+83% of the weight bytes a 3B decode step reads — enqueues directly and
+kept the old kernels. The benchmarks said "coalesced" and the FFN was
+not. Q8_0 gains least because its old kernel already read 32 contiguous
+bytes per thread.
+
+Achieved bandwidth is the number to watch, not tok/s: 17% to 22% of the
+card, against llama.cpp's ~60%. The access pattern was a real cost and
+was not the last one.
 
 ## Open
 
 | Issue | Gap | What is known |
 |---|---|---|
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, up to 56× | widens with GPU generation; GPU ~50% idle during prefill |
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, ~10× | memory-bound, not host- or arithmetic-bound: 5–10% of card bandwidth against llama.cpp's ~60%. Coalescing the matvecs bought 10–24%; the FFN and attention kernels are still uncoalesced |
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 28× to 46× | no tensor-core `mul_mm`; widens with GPU generation |
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, ~3× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing the matvecs closed 12× to 3×; the next lever is occupancy, not the access pattern |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, ~10× | uninvestigated; the decode half was a wrong default, now fixed |
 | [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | `spin` wins at 3B/8B, loses at 135M, so it needs a size rule not a flag |
 | [#128](https://github.com/antonellof/ferrox/issues/128) | ~60 ms fixed per-token cost | flat in thread count and model size; dominates small models on every backend |
