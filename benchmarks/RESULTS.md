@@ -43,12 +43,34 @@ llama.cpp is 2.4× faster on Ampere than on Pascal; ferrox is not faster
 at all. The prefill gap is not a constant factor, it widens with GPU
 generation.
 
+**CUDA decode, before and after coalescing the matvec kernels**
+(RTX 3080, `tg128`, `--n-gpu-layers 99`, runs interleaved
+`main, branch, main, branch`; PRs
+[#144](https://github.com/antonellof/ferrox/pull/144) and
+[#145](https://github.com/antonellof/ferrox/pull/145)). The old kernels
+gave one thread a whole super-block, so 32 lanes read addresses one
+block apart and each load instruction spread across as many cache lines
+as it had lanes. A warp now takes the super-block and each lane one
+contiguous slice.
+
+| Model | Before | After | Change | GB/s after | % of 760 GB/s |
+|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q5_K_M | 34.74 | **43.17** | 🟢 **+24.3%** | 39.3 | 5.2% |
+| Llama-3.2-3B Q4_K_M | 20.74 | **23.24** | 🟢 **+12.1%** | 46.9 | 6.2% |
+| Llama-3.2-1B Q8_0 | 51.73 | **56.98** | 🟢 **+10.1%** | 75.3 | 9.9% |
+
+Output is byte-identical to the CPU reference on all three. The last
+column is the point: llama.cpp reaches about 60% of card bandwidth, so
+the access pattern was a real cost and was not the main one. The next
+lever is occupancy, and the fused FFN and attention kernels have not
+been touched at all.
+
 ## Open
 
 | Issue | Gap | What is known |
 |---|---|---|
 | [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, up to 56× | widens with GPU generation; GPU ~50% idle during prefill |
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, ~12× | GPU ~90% busy, so kernel-bound: one 256-thread block per row vs ggml's warp-level `dp4a` |
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, ~10× | memory-bound, not host- or arithmetic-bound: 5–10% of card bandwidth against llama.cpp's ~60%. Coalescing the matvecs bought 10–24%; the FFN and attention kernels are still uncoalesced |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, ~10× | uninvestigated; the decode half was a wrong default, now fixed |
 | [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | `spin` wins at 3B/8B, loses at 135M, so it needs a size rule not a flag |
 | [#128](https://github.com/antonellof/ferrox/issues/128) | ~60 ms fixed per-token cost | flat in thread count and model size; dominates small models on every backend |
