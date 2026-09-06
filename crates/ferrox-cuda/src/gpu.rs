@@ -1099,13 +1099,8 @@ fn launch_matvec(
     row_bytes: usize,
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
-    // Kinds with a coalesced kernel take it: same arithmetic, a warp
-    // reading one contiguous run per super-block instead of 32 strided
-    // ones. The old pattern reached 5.3% of an RTX 3060's memory
-    // bandwidth where llama.cpp reaches 60.4% (#133).
-    if let Some(kernel) = coalesced_matvec_kernel(fn_name) {
-        return launch_matvec_coalesced(kernel, weights, x, rows, row_bytes, n_blocks_per_row);
-    }
+    // Which kernel actually runs is `enqueue_matvec`'s decision, so
+    // every caller gets the same one -- see `matvec_launch_plan`.
     let dev = shared_device()?;
     let d_x = dev
         .htod_copy(x.to_vec())
@@ -1172,65 +1167,61 @@ fn coalesced_matvec_kernel(fn_name: &str) -> Option<(&'static str, &'static str,
     }
 }
 
-/// Runs one matvec through a coalesced kernel: same arithmetic and the
-/// same f32 activations as the kernel it replaces, so it is meant to be
-/// token-identical. What changes is the access pattern -- a warp reads
-/// one contiguous run per super-block instead of 32 runs strided by the
-/// block size -- and therefore the achieved memory bandwidth, which is
-/// what decode is actually limited by (#133).
+/// How many warps a coalesced matvec block carries. Eight keeps enough
+/// rows in flight per SM to hold loads outstanding, which is the thing
+/// those kernels exist to fix.
+const COALESCED_WARPS_PER_BLOCK: usize = 8;
+
+/// Which kernel a matvec actually runs, and the geometry that kernel
+/// needs.
 ///
-/// Every coalesced kernel takes the same six arguments and the same
-/// launch geometry, so they share this one launcher; the kind-specific
-/// part is entirely inside the CUDA C.
-fn launch_matvec_coalesced(
-    kernel: (&'static str, &'static str, &'static str),
-    weights: &[u8],
-    x: &[f32],
+/// The two must agree: a coalesced kernel launched with the
+/// block-per-row geometry computes one row per BLOCK while indexing as
+/// if it had one row per WARP, and returns wrong numbers rather than
+/// failing. That is the repo's dominant bug shape, so the choice is
+/// made once, here, by the only function that decides it, and
+/// `the_plan_pairs_each_kernel_with_its_own_geometry` checks the
+/// pairing on the host.
+///
+/// This lives in `enqueue_matvec` rather than in `launch_matvec`
+/// because the fused dense FFN and `launch_matvec_multi` enqueue
+/// directly. Routing at the `launch_matvec` level left the FFN --
+/// gate, up and down, about 83% of the weight bytes a Llama-3.2-3B
+/// decode step reads -- on the uncoalesced kernels while the
+/// benchmarks said "coalesced".
+fn matvec_launch_plan(
+    fn_name: &'static str,
+    kernel_src: &'static str,
+    module_name: &'static str,
     rows: usize,
-    row_bytes: usize,
-    n_blocks_per_row: usize,
-) -> Result<Vec<f32>, CudaError> {
-    use cudarc::driver::LaunchAsync;
-
-    let (src, module, entry) = kernel;
-    let dev = shared_device()?;
-    ensure_module_loaded(&dev, src, module, entry)?;
-    let func = dev
-        .get_func(module, entry)
-        .ok_or_else(|| CudaError::KernelCompile(format!("{entry} not found")))?;
-
-    let d_x = dev
-        .htod_copy(x.to_vec())
-        .map_err(|e| CudaError::Launch(format!("x upload: {e:?}")))?;
-    let d_weights = resident_cuda_weights(&dev, weights)?;
-    let mut d_out = dev
-        .alloc_zeros::<f32>(rows)
-        .map_err(|e| CudaError::Launch(format!("output alloc: {e:?}")))?;
-
-    // Eight warps per block: enough rows in flight per SM to keep loads
-    // outstanding, which is the thing these kernels exist to fix.
-    const WARPS: usize = 8;
-    let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (rows.div_ceil(WARPS) as u32, 1, 1),
-        block_dim: ((WARPS * 32) as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        func.launch(
-            cfg,
-            (
-                &d_weights.slice,
-                &d_x,
-                &mut d_out,
-                rows as i32,
-                row_bytes as i32,
-                n_blocks_per_row as i32,
-            ),
-        )
-        .map_err(|e| CudaError::Launch(format!("{entry} launch: {e:?}")))?;
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    cudarc::driver::LaunchConfig,
+) {
+    match coalesced_matvec_kernel(fn_name) {
+        Some((src, module, entry)) => (
+            src,
+            module,
+            entry,
+            cudarc::driver::LaunchConfig {
+                grid_dim: (rows.div_ceil(COALESCED_WARPS_PER_BLOCK) as u32, 1, 1),
+                block_dim: ((COALESCED_WARPS_PER_BLOCK * 32) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        ),
+        None => (
+            kernel_src,
+            module_name,
+            fn_name,
+            cudarc::driver::LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+            },
+        ),
     }
-    dev.dtoh_sync_copy(&d_out)
-        .map_err(|e| CudaError::Launch(format!("output download: {e:?}")))
 }
 
 fn enqueue_matvec(
@@ -1246,26 +1237,22 @@ fn enqueue_matvec(
 > {
     use cudarc::driver::LaunchAsync;
 
-    ensure_module_loaded(dev, launch.kernel_src, launch.module_name, launch.fn_name)?;
-    let func = dev
-        .get_func(launch.module_name, launch.fn_name)
-        .ok_or_else(|| {
-            CudaError::KernelCompile(format!(
-                "function '{}' not found after load_ptx",
-                launch.fn_name
-            ))
-        })?;
+    let (src, module, entry, cfg) = matvec_launch_plan(
+        launch.fn_name,
+        launch.kernel_src,
+        launch.module_name,
+        launch.rows,
+    );
+
+    ensure_module_loaded(dev, src, module, entry)?;
+    let func = dev.get_func(module, entry).ok_or_else(|| {
+        CudaError::KernelCompile(format!("function '{entry}' not found after load_ptx"))
+    })?;
 
     let d_weights = resident_cuda_weights(dev, launch.weights)?;
     let mut d_out = dev
         .alloc_zeros::<f32>(launch.rows)
         .map_err(|e| CudaError::Launch(format!("output alloc: {e:?}")))?;
-
-    let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (launch.rows as u32, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
-    };
 
     unsafe {
         func.launch(
@@ -1279,7 +1266,7 @@ fn enqueue_matvec(
                 launch.n_blocks_per_row as i32,
             ),
         )
-        .map_err(|e| CudaError::Launch(format!("kernel {}: {e:?}", launch.fn_name)))?;
+        .map_err(|e| CudaError::Launch(format!("kernel {entry}: {e:?}")))?;
     }
 
     Ok((d_out, d_weights))
@@ -2070,28 +2057,28 @@ mod tests {
         type Twin = fn(&[u8], &[f32], usize) -> f32;
         let cases: &[(&str, usize, usize, u32, Twin)] = &[
             (
-                "q4_k_matvec",
+                "Q4_K",
                 144,
                 256,
                 7,
                 crate::coalesced_twin::q4_k_matvec_coalesced_row,
             ),
             (
-                "q5_k_matvec",
+                "Q5_K",
                 176,
                 256,
                 17,
                 crate::coalesced_twin::q5_k_matvec_coalesced_row,
             ),
             (
-                "q6_k_matvec",
+                "Q6_K",
                 210,
                 256,
                 11,
                 crate::coalesced_twin::q6_k_matvec_coalesced_row,
             ),
             (
-                "q8_0_matvec",
+                "Q8_0",
                 34,
                 32,
                 23,
@@ -2100,34 +2087,93 @@ mod tests {
         ];
         let rows = 37usize; // not a multiple of the warps per block
         let n_blocks_per_row = 3usize;
-        for (fn_name, block_bytes, per_block, seed, twin) in cases {
+        for (kind, block_bytes, per_block, seed, twin) in cases {
             let row_bytes = n_blocks_per_row * block_bytes;
             let cols = n_blocks_per_row * per_block;
             let weights = pseudo_bytes(*seed, rows * row_bytes);
             let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.021).sin()).collect();
-            let kernel = super::coalesced_matvec_kernel(fn_name)
-                .unwrap_or_else(|| panic!("{fn_name} has no coalesced kernel"));
-            let got = super::launch_matvec_coalesced(
-                kernel,
+            // Enter through the ordinary kernel identity, not the
+            // coalesced one, so this exercises the ROUTING too: if
+            // `matvec_launch_plan` stopped substituting the coalesced
+            // kernel, the result would match a dequantize-then-dot
+            // reference but not the coalesced twin's lane order.
+            let (src, module, fn_name) = super::matvec_launch_meta(kind)
+                .unwrap_or_else(|| panic!("{kind} has no matvec kernel"));
+            let got = super::launch_matvec(
+                src,
+                module,
+                fn_name,
                 &weights,
                 &x,
                 rows,
                 row_bytes,
                 n_blocks_per_row,
             )
-            .unwrap_or_else(|e| panic!("{fn_name}: {e:?}"));
-            assert_eq!(got.len(), rows, "{fn_name}");
+            .unwrap_or_else(|e| panic!("{kind}: {e:?}"));
+            assert_eq!(got.len(), rows, "{kind}");
             for r in 0..rows {
                 let row = &weights[r * row_bytes..(r + 1) * row_bytes];
                 let want = twin(row, &x, n_blocks_per_row);
                 assert!(
                     !(want.is_nan() ^ got[r].is_nan()),
-                    "{fn_name} row {r}: GPU={} twin={want}",
+                    "{kind} row {r}: GPU={} twin={want}",
                     got[r]
                 );
                 assert_close_relative(got[r], want, r);
             }
         }
+    }
+
+    /// A coalesced kernel launched with the block-per-row geometry
+    /// indexes as if it had one row per warp while getting one row per
+    /// block, and returns wrong numbers rather than failing. So the
+    /// kernel and its geometry are chosen together, and this checks
+    /// they stay that way -- on the host, with no GPU.
+    #[test]
+    fn the_plan_pairs_each_kernel_with_its_own_geometry() {
+        let rows = 37usize; // not a multiple of the warps per block
+
+        for kind in ["Q4_K", "Q5_K", "Q6_K", "Q8_0"] {
+            let (src, module, fn_name) = super::matvec_launch_meta(kind).expect("kernel");
+            let (plan_src, plan_module, entry, cfg) =
+                super::matvec_launch_plan(fn_name, src, module, rows);
+            assert!(
+                entry.ends_with("_coalesced"),
+                "{kind}: plan chose {entry}, not the coalesced kernel"
+            );
+            assert!(
+                plan_src.contains(entry) && plan_module.ends_with("_coalesced"),
+                "{kind}: plan's source and module do not match {entry}"
+            );
+            let warps = super::COALESCED_WARPS_PER_BLOCK as u32;
+            assert_eq!(cfg.block_dim, (warps * 32, 1, 1), "{kind}: block_dim");
+            assert_eq!(cfg.shared_mem_bytes, 0, "{kind}: needs no shared memory");
+            // Every row must land in some warp, including the tail.
+            assert!(
+                cfg.grid_dim.0 * warps >= rows as u32,
+                "{kind}: {} blocks x {warps} warps does not cover {rows} rows",
+                cfg.grid_dim.0
+            );
+            assert!(
+                (cfg.grid_dim.0 - 1) * warps < rows as u32,
+                "{kind}: {} blocks is more than the tail needs",
+                cfg.grid_dim.0
+            );
+        }
+
+        // A kind with no coalesced kernel keeps the old geometry, and
+        // keeps its own kernel rather than silently getting another's.
+        let (src, module, fn_name) = super::matvec_launch_meta("Q4_0").expect("kernel");
+        let (plan_src, plan_module, entry, cfg) =
+            super::matvec_launch_plan(fn_name, src, module, rows);
+        assert_eq!(entry, fn_name);
+        assert!(std::ptr::eq(plan_src, src) && std::ptr::eq(plan_module, module));
+        assert_eq!(cfg.grid_dim, (rows as u32, 1, 1), "one block per row");
+        assert_eq!(cfg.block_dim, (256, 1, 1));
+        assert!(
+            cfg.shared_mem_bytes > 0,
+            "the block-per-row kernels reduce through shared memory"
+        );
     }
 
     /// A coalesced kernel the table does not name is dead code that
