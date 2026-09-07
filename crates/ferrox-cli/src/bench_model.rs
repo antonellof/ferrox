@@ -1080,7 +1080,7 @@ mod tests {
 fn accelerator_name(backend: &str) -> Option<String> {
     match backend {
         #[cfg(feature = "cuda")]
-        "CUDA" => ferrox_cuda::probe().and_then(|i| i.first_device_name),
+        "CUDA" => ferrox_cuda::gpu::probe().and_then(|i| i.first_device_name),
         #[cfg(feature = "metal")]
         "Metal" => ferrox_metal::gpu::probe(),
         _ => None,
