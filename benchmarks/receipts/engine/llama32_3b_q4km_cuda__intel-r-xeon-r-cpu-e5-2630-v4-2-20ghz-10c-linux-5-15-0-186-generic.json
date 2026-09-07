@@ -1,20 +1,19 @@
 {
-  "approx_params": 1599078400,
+  "accelerator": "NVIDIA GeForce RTX 3060",
+  "approx_params": 3958898688,
   "arch": "llama",
   "backend": "cuda",
   "backend_active": "CUDA",
-  "engine_env": {
-    "FERROX_CPU_INT_DOT": "1"
-  },
+  "engine_env": {},
   "ferrox_version": "0.17.1",
-  "host_load_1min_end": 0.86,
-  "host_load_1min_start": 0.65,
+  "host_load_1min_end": 1.46,
+  "host_load_1min_start": 1.07,
   "host_spec": {
     "arch": "x86_64",
     "cores": 10,
     "cpu": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz",
-    "label": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-160-generic",
-    "os": "Linux 5.15.0-160-generic",
+    "label": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic",
+    "os": "Linux 5.15.0-186-generic",
     "perf_cores": null,
     "ram_gb": 15.5
   },
@@ -32,39 +31,39 @@
     "pressure": null,
     "source": null
   },
-  "id": "llama32_1b_q4km",
+  "id": "llama32_3b_q4km",
   "kind": "engine",
-  "load_s": 0.071304758,
-  "model_path": "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+  "load_s": 0.081295873,
+  "model_path": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 807694464,
+  "size_bytes": 2019377696,
   "tests": [
     {
       "ferrox_samples": [
-        385.2358841002072,
-        384.3331191937287,
-        384.8220868618716
+        160.02727629918553,
+        161.97056317817444,
+        161.53436480515154
       ],
-      "ferrox_stddev": 0.36897786915153574,
-      "ferrox_tps": 384.8220868618716,
-      "gap": 11.221419319286621,
-      "llama_tps": 4318.25,
+      "ferrox_stddev": 0.8325295243008344,
+      "ferrox_tps": 161.53436480515154,
+      "gap": 25.140099476037246,
+      "llama_tps": 4060.99,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        11.818418972637222,
-        11.79499565017055,
-        11.799105183387992
+        42.71828630468295,
+        42.92401718244383,
+        42.72018611711245
       ],
-      "ferrox_stddev": 0.01021199052207525,
-      "ferrox_tps": 11.799105183387992,
-      "gap": 15.143521243590937,
-      "llama_tps": 178.68,
+      "ferrox_stddev": 0.09653779141735072,
+      "ferrox_tps": 42.72018611711245,
+      "gap": 2.81178550277625,
+      "llama_tps": 120.12,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }
