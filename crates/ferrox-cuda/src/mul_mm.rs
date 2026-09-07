@@ -81,7 +81,7 @@
 /// Rows of the weight matrix per threadblock tile.
 pub const BM: usize = 64;
 /// Tokens (batch entries) per threadblock tile.
-pub const BN: usize = 32;
+pub const BN: usize = 64;
 /// K-elements consumed per tile step. Must be a multiple of [`SUB`], and
 /// every real quantized row length is a multiple of 32, so a K-loop that
 /// steps 32 never straddles a partial block.
@@ -89,7 +89,7 @@ pub const BK: usize = 32;
 /// Rows of the output micro-tile each thread owns.
 pub const TM: usize = 4;
 /// Columns of the output micro-tile each thread owns.
-pub const TN: usize = 2;
+pub const TN: usize = 4;
 /// Threads per block. `BM/TM * BN/TN` -- one thread per micro-tile.
 pub const THREADS: usize = (BM / TM) * (BN / TN);
 /// Elements produced by one call to the per-kind unpack function. This
@@ -112,6 +112,19 @@ const _: () = assert!(
     "the A-tile loader uses a prefix of the block"
 );
 const _: () = assert!(THREADS <= 1024, "CUDA caps a block at 1024 threads");
+// The inner loop reads its micro-tile operands as `float4`, which is
+// what keeps a warp's 32 lanes off eight shared-memory banks. That
+// needs each thread's slice to start 16-byte aligned: the micro-tile
+// widths must be multiples of four, and so must the shared rows they
+// index into, or the fourth lane of a row starts mid-vector.
+const _: () = assert!(
+    TM.is_multiple_of(4) && TN.is_multiple_of(4),
+    "the inner loop loads float4 from shared memory"
+);
+const _: () = assert!(
+    BM.is_multiple_of(4) && BN.is_multiple_of(4),
+    "a shared row must keep the next row 16-byte aligned"
+);
 
 /// One quantized weight format the GEMM can consume.
 ///
@@ -769,13 +782,27 @@ extern "C" __global__ void FX_FN_NAME(
         for (int kk = 0; kk < FX_BK; kk++) {
             float a[FX_TM];
             float b[FX_TN];
+            // One 16-byte load per four operands, not four 4-byte ones.
+            // A warp's 32 lanes take 16 distinct `tx`, so the scalar
+            // form had them striding four floats apart across eight
+            // banks -- a four-way conflict on the hottest load in the
+            // kernel. As `float4` the same 16 lanes read 256 contiguous
+            // bytes, which the hardware serves without conflict.
 #pragma unroll
-            for (int m = 0; m < FX_TM; m++) {
-                a[m] = sa[kk][tx * FX_TM + m];
+            for (int m = 0; m < FX_TM; m += 4) {
+                const float4 v = *(const float4*)&sa[kk][tx * FX_TM + m];
+                a[m + 0] = v.x;
+                a[m + 1] = v.y;
+                a[m + 2] = v.z;
+                a[m + 3] = v.w;
             }
 #pragma unroll
-            for (int n = 0; n < FX_TN; n++) {
-                b[n] = sb[kk][ty * FX_TN + n];
+            for (int n = 0; n < FX_TN; n += 4) {
+                const float4 v = *(const float4*)&sb[kk][ty * FX_TN + n];
+                b[n + 0] = v.x;
+                b[n + 1] = v.y;
+                b[n + 2] = v.z;
+                b[n + 3] = v.w;
             }
 #pragma unroll
             for (int n = 0; n < FX_TN; n++) {
@@ -955,8 +982,8 @@ pub fn validate_shape(
 /// Whether a batched dispatch of this shape is worth a GEMM at all.
 ///
 /// One token is a matvec, and `gpu.rs`'s matvec kernels are the arm that
-/// has actually run on hardware; sending a single row through a 64x32
-/// tile would waste 31 of every 32 output columns. The caller should
+/// has actually run on hardware; sending a single row through the tile
+/// would waste every output column but one. The caller should
 /// keep using `apply_gpu` below this threshold.
 pub fn worth_a_gemm(batch: usize) -> bool {
     // `.max(2)` so this stays "never a single token" even if the tile
