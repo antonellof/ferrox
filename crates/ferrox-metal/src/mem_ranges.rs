@@ -60,11 +60,6 @@ pub(crate) struct MemRanges {
     bufs: Vec<*const ProtocolObject<dyn MTLBuffer>>,
     srcs: Vec<usize>,
     dsts: Vec<usize>,
-    /// Encoder was created `MTLDispatchTypeSerial`, so Metal already orders
-    /// dispatches and no barrier is needed. llama does the same: with a
-    /// null `mem_ranges`, `ggml_metal_op_concurrency_reset` returns before
-    /// `ggml_metal_encoder_memory_barrier`.
-    serial: bool,
 }
 
 #[inline]
@@ -75,17 +70,6 @@ fn buf_key(b: &ProtocolObject<dyn MTLBuffer>) -> usize {
 impl MemRanges {
     pub(crate) fn new() -> Self {
         Self::default()
-    }
-
-    /// Tracker for a `MTLDispatchTypeSerial` encoder: every `begin_op` is a
-    /// no-op, because Metal already orders one dispatch after the next and
-    /// `memoryBarrierWithScope:` is only meaningful under concurrent
-    /// dispatch. Keeps call sites identical between the two encoder kinds.
-    pub(crate) fn serial() -> Self {
-        Self {
-            serial: true,
-            ..Self::default()
-        }
     }
 
     pub(crate) fn reset(&mut self) {
@@ -149,9 +133,6 @@ impl MemRanges {
         srcs: &[&ProtocolObject<dyn MTLBuffer>],
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) {
-        if self.serial {
-            return;
-        }
         BEGIN_OP_COUNT.fetch_add(1, Ordering::Relaxed);
         if !self.check(srcs, dsts) {
             // SAFETY: pointers were taken from live encoder-bound scratch /
@@ -176,9 +157,67 @@ impl MemRanges {
         srcs: &[&ProtocolObject<dyn MTLBuffer>],
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) {
-        if self.serial {
-            return;
-        }
         self.add(srcs, dsts);
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    /// Every dispatch encoded into the decode stack must declare what it
+    /// reads and writes, or the concurrent encoder is free to run it
+    /// against data still in flight.
+    ///
+    /// This is the failure that used to be papered over: Gemma's post-norm
+    /// layers diverged under concurrent dispatch, and the fix disabled
+    /// concurrency for that whole class of model rather than finding the
+    /// undeclared op. Concurrency is only safe by CONSTRUCTION -- every op
+    /// declared -- and nothing was checking that construction held.
+    ///
+    /// An op declares itself one of two ways: the call site wraps it in
+    /// `begin_op`/`end_op`, or the helper takes `&mut mrs` and tracks its
+    /// own hazards (`encode_gqa_with_kv` does, because with a quantized KV
+    /// cache it writes an f16 dequant scratch no caller can name).
+    #[test]
+    fn every_encode_in_the_decode_stack_declares_its_hazards() {
+        let src = include_str!("attn.rs");
+        let start = src
+            .find("pub fn launch_decode_dense_stack(")
+            .expect("decode stack function");
+        // Stop at the next top-level item.
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let mut open = false;
+        let mut undeclared = Vec::new();
+        for (i, line) in body.lines().enumerate() {
+            let t = line.trim();
+            if t.starts_with("mrs.begin_op(") {
+                open = true;
+            }
+            if t.starts_with("mrs.end_op(") {
+                open = false;
+            }
+            let is_encode = t.starts_with("encode_") && t.contains('(');
+            if is_encode && !open {
+                // A self-tracking helper takes the tracker itself. The call
+                // spans several lines, so look at the next few.
+                let window: String = body.lines().skip(i).take(6).collect::<Vec<_>>().join(" ");
+                // The tracker is handed over either as `&mut mrs` or, where
+                // the caller already holds `&mut MemRanges`, as bare `mrs`.
+                let handed_over = window.contains("&mut mrs") || window.contains(" mrs,");
+                if !handed_over {
+                    undeclared.push(t.to_string());
+                }
+            }
+        }
+        assert!(
+            undeclared.is_empty(),
+            "these dispatches declare no reads/writes and are not self-tracking, \
+             so the concurrent encoder may run them against in-flight data: {undeclared:#?}"
+        );
     }
 }

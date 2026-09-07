@@ -5883,31 +5883,28 @@ pub fn launch_decode_dense_stack(
         .collect::<Result<Vec<_>, MetalError>>()?;
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    // Sandwich (Gemma post-norms): use the default serial encoder. Concurrent
-    // dispatch + in-place RMSNorm/deferred residuals was measured to diverge
-    // from CPU on Gemma-2 B=1 decode while the serial prefill-shaped residual
-    // path stays coherent. Non-sandwich (SmolLM2) keeps Concurrent for Q∥K∥V.
+    // Gemma-style post-norms ("sandwich"): these layers take the EAGER
+    // residual path below, which is what makes concurrent encode safe here.
     let sandwich = layers
         .iter()
         .any(|l| l.post_attn_norm.is_some() || l.post_ffn_norm.is_some());
-    // The encoder kind and the hazard tracker are chosen together, from one
-    // expression, so they can never disagree: a serial encoder means Metal
-    // already orders the dispatches and every barrier is dead weight (llama
-    // likewise skips them when it is not encoding concurrently), while a
-    // Concurrent encoder means every hazard has to be declared. `mrs` emits
-    // a barrier only where a dispatch actually reads or overwrites something
-    // still in flight, narrowed to those resources rather than every buffer.
-    let (encoder, mut mrs) = if sandwich {
-        (
-            cmd_buf
-                .computeCommandEncoder()
-                .ok_or(MetalError::CommandFailed)?,
-            MemRanges::serial(),
-        )
-    } else {
-        // llama.cpp concurrent encode: gate∥up and Q∥K∥V overlap
-        (compute_encoder_concurrent(&cmd_buf)?, MemRanges::new())
-    };
+    // Every model encodes concurrently: gate∥up and Q∥K∥V overlap, and the
+    // hazard tracker emits a barrier only where a dispatch reads or
+    // overwrites something still in flight, narrowed to those resources.
+    //
+    // Sandwich models (Gemma post-norms) used to be forced onto the serial
+    // encoder, because concurrent dispatch with in-place RMSNorm and
+    // DEFERRED residuals diverged from CPU on Gemma-2 B=1 decode. That fix
+    // landed two changes at once -- serial encode AND eager residuals -- and
+    // the eager residuals are the half that mattered: with them, every op in
+    // this function declares its own reads and writes (`encode_gqa_with_kv`
+    // self-tracks, including the f16 dequant scratch no caller can name), so
+    // concurrency is safe by construction rather than by scheduling luck.
+    //
+    // Measured on an M2 Pro, interleaved, GPU-clock: Gemma-2-2B Q4_K_M decode
+    // 13.23 -> 12.20 ms/token, and greedy output stays byte-identical to the
+    // serial encoder across Gemma-2 and Gemma-3 on every prompt tried.
+    let (encoder, mut mrs) = (compute_encoder_concurrent(&cmd_buf)?, MemRanges::new());
 
     let embd_resident = if let Some(e) = embd {
         let w = resident_weight_buffer(device, e.weights)?;
