@@ -6086,37 +6086,26 @@ pub fn launch_decode_dense_stack(
             )?;
             mrs.end_op(&[o_buf], &[o_buf]);
         }
-        if sandwich {
-            // Eager residual + separate ffn_norm (prefill / CPU parity).
-            mrs.begin_op(&encoder, &[h_buf, o_buf], &[h_buf]);
-            encode_vec_add(&encoder, device, h_buf, o_buf, hidden_dim as u32)?;
-            mrs.end_op(&[h_buf, o_buf], &[h_buf]);
-            mrs.begin_op(&encoder, &[h_buf], &[x2_buf]);
-            encode_rms_norm(
-                &encoder,
-                device,
-                h_buf,
-                &ffn_nw.buffer,
-                x2_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[h_buf], &[x2_buf]);
-        } else {
-            // Fuse attn residual + ffn_norm into one dispatch.
-            mrs.begin_op(&encoder, &[h_buf, o_buf], &[h_buf, x2_buf]);
-            encode_add_rms_norm(
-                &encoder,
-                device,
-                h_buf,
-                o_buf,
-                &ffn_nw.buffer,
-                x2_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[h_buf, o_buf], &[h_buf, x2_buf]);
-        }
+        // Attn residual + ffn_norm in one dispatch, for every model.
+        //
+        // Sandwich layers used to split this into `vec_add` then `rms_norm`,
+        // which is the same arithmetic in two dispatches: `post_attn_norm`
+        // has already been applied to `o_buf` in place above, so both paths
+        // compute `h += o` then `x2 = rms_norm(h)`. The split was a leftover
+        // from the serial-encoder era -- `encode_add_rms_norm` writes `h`
+        // itself, so the residual is just as eager as the two-dispatch form.
+        mrs.begin_op(&encoder, &[h_buf, o_buf], &[h_buf, x2_buf]);
+        encode_add_rms_norm(
+            &encoder,
+            device,
+            h_buf,
+            o_buf,
+            &ffn_nw.buffer,
+            x2_buf,
+            hidden_dim as u32,
+            rms_eps,
+        )?;
+        mrs.end_op(&[h_buf, o_buf], &[h_buf, x2_buf]);
         // gate ∥ up (llama concurrent)
         mrs.begin_op(&encoder, &[x2_buf], &[gate_buf, up_buf]);
         encode_matvec(&encoder, device, &layer.gate, &gate_w, x2_buf, gate_buf)?;
