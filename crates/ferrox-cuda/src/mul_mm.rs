@@ -81,7 +81,7 @@
 /// Rows of the weight matrix per threadblock tile.
 pub const BM: usize = 64;
 /// Tokens (batch entries) per threadblock tile.
-pub const BN: usize = 64;
+pub const BN: usize = 128;
 /// K-elements consumed per tile step. Must be a multiple of [`SUB`], and
 /// every real quantized row length is a multiple of 32, so a K-loop that
 /// steps 32 never straddles a partial block.
@@ -89,7 +89,7 @@ pub const BK: usize = 32;
 /// Rows of the output micro-tile each thread owns.
 pub const TM: usize = 4;
 /// Columns of the output micro-tile each thread owns.
-pub const TN: usize = 4;
+pub const TN: usize = 8;
 /// Threads per block. `BM/TM * BN/TN` -- one thread per micro-tile.
 pub const THREADS: usize = (BM / TM) * (BN / TN);
 /// Elements produced by one call to the per-kind unpack function. This
