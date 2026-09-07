@@ -3,17 +3,21 @@
 **Gap** = `llama.cpp / ferrox`, same host, same GGUF, same backend.
 **Below 1.0 means ferrox is faster.** 🟢 better · ⚪ within ~5% · 🔴 slower.
 
-**The CUDA rows below predate
-[#148](https://github.com/antonellof/ferrox/pull/148)** and understate
-prefill by roughly 20% to 26%: they were measured before the GEMM tile
-retune. They are left as measured rather than adjusted, because a
-hand-edited receipt is not a measurement. Re-running the suite replaces
-them.
+**Two generated sections are behind the code.** Both are left as
+measured rather than adjusted, because a hand-edited receipt is not a
+measurement; re-running the suite replaces them.
+
+| Section | Predates | Understated by |
+|---|---|---|
+| CUDA | [#148](https://github.com/antonellof/ferrox/pull/148) | prefill, ~20–26% |
+| Metal | [#150](https://github.com/antonellof/ferrox/pull/150) | decode on Gemma-class models, ~8–13% |
 
 The summary and detail tables below are **generated** from
 [`receipts/engine/`](receipts/engine/) by `ferrox bench --render`. Do
 not hand-edit them. Rows are never compared across machines: a gap only
-means something against the host it was measured on.
+means something against the host it was measured on. A GPU row also names
+the card it ran on; the 16 Metal rows predate that field and are
+attributable only by their host label, which does name the M2 Pro.
 
 ## Measured elsewhere, no receipt
 
@@ -69,12 +73,43 @@ Achieved bandwidth is the number to watch, not tok/s: 17% to 22% of the
 card, against llama.cpp's ~60%. The access pattern was a real cost and
 was not the last one.
 
+**Metal, what concurrent encode bought** (M2 Pro, interleaved
+`main, branch, main, branch`, `MTLCommandBuffer` GPU-clock, which is
+immune to host load; [#150](https://github.com/antonellof/ferrox/pull/150)).
+Gemma-class models were forced onto a serial encoder by a correctness
+fix that outlived its cause, so they ran with no dispatch overlap.
+
+| Model | Before | After | Change |
+|---|---:|---:|---:|
+| Gemma-3-1B Q8_0 | 8.24 | **7.15** ms/tok | 🟢 **−13.2%** |
+| Gemma-2-2B Q4_K_M | 13.09 | **12.00** ms/tok | 🟢 **−8.3%** |
+
+Output is byte-identical to `main`. That takes Gemma-2-2B decode from
+the table's 1.23× to about **1.12×**, and it is the worst Metal row.
+
+**Metal, where the rest of the gap is** (quiet host, GPU-clock and wall
+from one process; [#149](https://github.com/antonellof/ferrox/issues/149)).
+
+| Model | wall ms/tok | GPU ms/tok | host | gap | gap if host were 0 |
+|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 6.53 | **4.82** | 26% | 0.97× | **0.72×** |
+| Gemma-2-2B Q4_K_M | 16.46 | **11.79** | 28% | 1.12× | **0.88×** |
+
+ferrox's Metal kernels already finish faster than llama.cpp's whole
+token. The remaining gap is host-side, and injecting dispatches to
+measure the slope directly says it is **not** op count: a dispatch costs
+**0.61 µs** of host time and **5.16 µs** of GPU time, so all ~515 of
+Gemma-2's dispatches are 7% of its host cost. The host lever is
+pipelining encode against execution; fusion is a GPU-side lever worth
+~22% of GPU time.
+
 ## Open
 
 | Issue | Gap | What is known |
 |---|---|---|
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 22× to 34× | no tensor-core `mul_mm`; widens with GPU generation, and now the larger of the two gaps by far |
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing the matvecs closed 9–19× to 2–5×; the next lever is occupancy, not the access pattern |
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 22× to 34× | ~4× is tensor cores (`mul_mm` has none), ~5× is undiagnosed kernel efficiency. #148 bought 20–26% and ruled out dequant redundancy and occupancy |
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing closed 9–19× to 2–5×. What limits the rest is not diagnosed — the access pattern was a real cost and was not the last one |
+| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, ~1.12× worst row | kernels already beat llama.cpp's whole token; ~28% of wall is fixed per-token host round-trip, not op count |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, ~10× | uninvestigated; the decode half was a wrong default, now fixed |
 | [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | `spin` wins at 3B/8B, loses at 135M, so it needs a size rule not a flag |
 | [#128](https://github.com/antonellof/ferrox/issues/128) | ~60 ms fixed per-token cost | flat in thread count and model size; dominates small models on every backend |
@@ -100,6 +135,13 @@ Four traps, each of which put a wrong number in this file before:
 - **A gap column cannot show a missing kernel.** A CUDA K-quant prefill
   read 4.88 tok/s and looked slow. There was no GEMM at all, and the
   fallback still answered correctly.
+- **A ratio across two models is not a marginal cost.** Dividing Metal
+  host time by dispatch count across two models gave ~12 µs per
+  dispatch. Injecting dispatches and measuring the slope gave **0.61
+  µs** — wrong by 20×, and it pointed a whole plan at the wrong lever.
+- **Check the effect clears the noise before believing a null.** A
+  fusion removing 5% of dispatches was worth ~1.4% of wall against a
+  ~1.1% noise floor. "No difference" measured nothing either way.
 
 Do not compare this file to a pre-0.13 version: those receipts had no
 warmup, so their prefill numbers include cold mmap page faults.
