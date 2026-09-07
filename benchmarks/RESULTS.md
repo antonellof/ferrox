@@ -3,6 +3,13 @@
 **Gap** = `llama.cpp / ferrox`, same host, same GGUF, same backend.
 **Below 1.0 means ferrox is faster.** 🟢 better · ⚪ within ~5% · 🔴 slower.
 
+**The CUDA rows below predate
+[#148](https://github.com/antonellof/ferrox/pull/148)** and understate
+prefill by roughly 20% to 26%: they were measured before the GEMM tile
+retune. They are left as measured rather than adjusted, because a
+hand-edited receipt is not a measurement. Re-running the suite replaces
+them.
+
 The summary and detail tables below are **generated** from
 [`receipts/engine/`](receipts/engine/) by `ferrox bench --render`. Do
 not hand-edit them. Rows are never compared across machines: a gap only
