@@ -56,6 +56,26 @@ fn host_slug(label: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// The machine a receipt describes, as one string: the host spec plus
+/// the card, when it ran on one.
+///
+/// Both the section list and the rows themselves are keyed on this,
+/// through this ONE function. They used to be two separate reads of
+/// `host_spec.label`, which is a CPU string -- so a GTX 1080 row and an
+/// RTX 3080 row taken on the same Xeon sorted into one section, which
+/// is precisely the merge the grouping exists to prevent.
+fn host_identity(receipt: &serde_json::Value) -> String {
+    let label = receipt
+        .get("host_spec")
+        .and_then(|h| h.get("label"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unrecorded (receipt written before 0.13.0)");
+    match receipt.get("accelerator").and_then(|v| v.as_str()) {
+        Some(card) => format!("{label} + {card}"),
+        None => label.to_string(),
+    }
+}
+
 fn suite_path(bench_dir: &Path) -> PathBuf {
     bench_dir.join("suite.json")
 }
@@ -345,13 +365,7 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
     // waved through individually.
     let mut hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for r in &receipts {
-        hosts.insert(
-            r.get("host_spec")
-                .and_then(|h| h.get("label"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unrecorded (receipt written before 0.13.0)")
-                .to_string(),
-        );
+        hosts.insert(host_identity(r));
     }
     // More than one host used to be a hard refusal, on the grounds
     // that "one table cannot describe them". That reasoning is right
@@ -365,12 +379,7 @@ pub fn render(bench_dir: &Path) -> anyhow::Result<()> {
 
     let mut rows: Vec<Row> = Vec::new();
     for r in &receipts {
-        let host_label = r
-            .get("host_spec")
-            .and_then(|h| h.get("label"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unrecorded (receipt written before 0.13.0)")
-            .to_string();
+        let host_label = host_identity(r);
         let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let backend = r
             .get("backend")
@@ -836,5 +845,59 @@ mod committed_receipt_tests {
             "receipts that misdescribe the backend they ran on:\n  {}",
             wrong.join("\n  ")
         );
+    }
+}
+
+#[cfg(test)]
+mod host_identity_tests {
+    use super::host_identity;
+
+    fn receipt(label: &str, accelerator: Option<&str>) -> serde_json::Value {
+        let mut r = serde_json::json!({"host_spec": {"label": label}});
+        if let Some(card) = accelerator {
+            r["accelerator"] = serde_json::Value::String(card.to_string());
+        }
+        r
+    }
+
+    /// The failure this exists to stop: two GPUs in one box. Both rows
+    /// carry the same CPU label, and grouping on that label alone put a
+    /// Pascal gap and an Ampere gap under one heading -- two computers
+    /// in one table, which is the thing the grouping was added to
+    /// prevent.
+    #[test]
+    fn two_cards_in_one_host_are_two_hosts() {
+        let xeon = "Intel(R) Xeon(R) CPU E5-2630 v4 (10c) Linux";
+        let pascal = host_identity(&receipt(xeon, Some("NVIDIA GeForce GTX 1080")));
+        let ampere = host_identity(&receipt(xeon, Some("NVIDIA GeForce RTX 3080")));
+        assert_ne!(
+            pascal, ampere,
+            "same CPU, different card: these are different machines"
+        );
+        assert!(pascal.contains("GTX 1080") && ampere.contains("RTX 3080"));
+    }
+
+    /// A `cpu` row names no card, and must not grow a phantom one.
+    #[test]
+    fn a_cpu_row_is_identified_by_its_host_alone() {
+        let label = "AMD Ryzen 9 7945HX (16c) Linux";
+        assert_eq!(host_identity(&receipt(label, None)), label);
+    }
+
+    /// Same machine, same card: one section, not two.
+    #[test]
+    fn the_same_host_and_card_is_one_host() {
+        let a = host_identity(&receipt("Xeon (10c)", Some("RTX 3070")));
+        let b = host_identity(&receipt("Xeon (10c)", Some("RTX 3070")));
+        assert_eq!(a, b);
+    }
+
+    /// Pre-0.13.0 receipts carry no spec; they group as one unknown
+    /// host rather than each being waved through on its own.
+    #[test]
+    fn a_receipt_with_no_spec_is_one_named_unknown_host() {
+        let id = host_identity(&serde_json::json!({}));
+        assert!(id.contains("unrecorded"), "{id}");
+        assert_eq!(id, host_identity(&serde_json::json!({})));
     }
 }

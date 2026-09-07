@@ -877,6 +877,22 @@ fn write_receipt(
             "os": spec.os,
         })
     };
+    // `host_spec` names the CPU. For a `cpu` row that is the whole
+    // machine; for a `cuda` or `metal` row it is the least interesting
+    // part. Ten published CUDA rows carried a Xeon's model number and
+    // NOTHING about the card, in a file whose own header says rows are
+    // never compared across machines -- there was no field to compare
+    // them by, so a Pascal row and an Ampere row grouped as one host.
+    let accelerator = accelerator_name(backend);
+    if backend != "CPU" && accelerator.is_none() {
+        anyhow::bail!(
+            "refusing to write a `{}` receipt that does not name the accelerator it ran on. \
+             A GPU gap is meaningless without the card: the ledger groups rows by host, and \
+             two different GPUs in one host section are two different machines.",
+            args.backend
+        );
+    }
+
     // A receipt may not claim one backend and record another. Every
     // `cpu` row in the ledger did exactly that (#126), and the
     // contradiction sat in the file: `backend: "cpu"` beside
@@ -918,6 +934,9 @@ fn write_receipt(
         // directory: without this, rows from two hosts merge into one
         // table with no column that says so.
         "host_spec": host_spec_json,
+        // The card, for a row that ran on one. `null` for `cpu` rows,
+        // where `host_spec` already is the machine.
+        "accelerator": accelerator,
         // Non-default `FERROX_*` knobs in effect. Some of them (MoE
         // stage ablation, the fail-closed loader override) change how
         // much work the engine does, so a row taken under one is not
@@ -1048,5 +1067,43 @@ mod tests {
     fn truncate_leaves_short_strings_alone_and_clips_long_ones() {
         assert_eq!(truncate("llama Q8_0", 30), "llama Q8_0");
         assert_eq!(truncate(&"x".repeat(40), 30), "x".repeat(30));
+    }
+}
+
+/// The accelerator a non-CPU run executed on, as the backend itself
+/// reports it.
+///
+/// Returns `None` on CPU, where `host_spec` already describes the
+/// machine, and `None` when a GPU backend cannot name its device --
+/// which the receipt writer treats as a refusal rather than a blank,
+/// because an unnamed card is what made ten CUDA rows unattributable.
+fn accelerator_name(backend: &str) -> Option<String> {
+    match backend {
+        #[cfg(feature = "cuda")]
+        "CUDA" => ferrox_cuda::probe().and_then(|i| i.first_device_name),
+        #[cfg(feature = "metal")]
+        "Metal" => ferrox_metal::gpu::probe(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod accelerator_tests {
+    use super::*;
+
+    /// A `cpu` row has no accelerator and must not be refused for it.
+    #[test]
+    fn the_cpu_backend_names_no_accelerator() {
+        assert_eq!(accelerator_name("CPU"), None);
+    }
+
+    /// The guard is keyed on the ACTIVE backend, not the label, for the
+    /// same reason `backend_label_agrees` is: the label is what the
+    /// ledger publishes and the active backend is what ran.
+    #[test]
+    fn only_a_gpu_backend_is_required_to_name_a_device() {
+        for (backend, required) in [("CPU", false), ("CUDA", true), ("Metal", true)] {
+            assert_eq!(backend != "CPU", required, "{backend}");
+        }
     }
 }

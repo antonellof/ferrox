@@ -114,7 +114,7 @@ warmup, so their prefill numbers include cold mmap page faults.
 
 ## Engine (`ferrox bench` vs `llama-bench`)
 
-Measured on **3 hosts**, one section each. Rows are never compared across machines.
+Measured on **2 hosts**, one section each. Rows are never compared across machines.
 
 ### Summary
 
@@ -122,7 +122,6 @@ Measured on **3 hosts**, one section each. Rows are never compared across machin
 |---|---|---|---|
 | AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic | CPU | 🔴 **6.26×** to 🔴 **10.14×** | 🔴 **1.06×** to 🔴 **1.92×** |
 | Apple M2 Pro (10c/6p) macOS 26.6.1 | METAL | ⚪ **1.00×** to 🔴 **1.10×** | 🟢 **0.64×** to 🔴 **1.23×** |
-| Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-160-generic | CUDA | 🔴 **10.75×** to 🔴 **17.41×** | 🔴 **9.22×** to 🔴 **19.15×** |
 
 ### AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic
 
@@ -189,33 +188,6 @@ Measured on **3 hosts**, one section each. Rows are never compared across machin
 | SmolLM2-135M-Instruct Q8_0 | tg128 | **315.42** | **217.11** | 🟢 **0.69×** |
 | Qwen2.5-0.5B-Instruct Q8_0 | tg128 | **201.64** | **129.19** | 🟢 **0.64×** |
 | Gemma-4-E2B-IT Q4_K_M | tg128 | **15.91** | — | — |
-
-### Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-160-generic
-
-#### CUDA
-
-| Model | Test | ferrox tok/s | llama.cpp tok/s | Gap |
-|---|---|---|---|---|
-| SmolLM2-135M-Instruct Q8_0 | pp512 | **996.30** | **17346.46** | 🔴 **17.41×** |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | pp512 | **293.56** | **4404.46** | 🔴 **15.00×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | pp512 | **621.77** | **9131.45** | 🔴 **14.69×** |
-| Qwen3-0.6B Q8_0 | pp512 | **431.80** | **6064.31** | 🔴 **14.04×** |
-| Gemma-3-1B-IT Q8_0 | pp512 | **409.39** | **5090.90** | 🔴 **12.44×** |
-| Llama-3.2-1B-Instruct Q5_K_M | pp512 | **346.56** | **4122.03** | 🔴 **11.89×** |
-| Gemma-2-2B-IT Q4_K_M | pp512 | **181.60** | **2107.69** | 🔴 **11.61×** |
-| Llama-3.2-1B-Instruct Q4_K_M | pp512 | **384.82** | **4318.25** | 🔴 **11.22×** |
-| Llama-3.2-3B-Instruct Q4_K_M | pp512 | **144.59** | **1576.87** | 🔴 **10.91×** |
-| Llama-3.2-1B-Instruct Q6_K | pp512 | **370.12** | **3979.69** | 🔴 **10.75×** |
-| Gemma-2-2B-IT Q4_K_M | tg128 | **4.18** | **80.09** | 🔴 **19.15×** |
-| Llama-3.2-3B-Instruct Q4_K_M | tg128 | **4.18** | **71.57** | 🔴 **17.13×** |
-| Llama-3.2-1B-Instruct Q5_K_M | tg128 | **9.55** | **161.01** | 🔴 **16.87×** |
-| Llama-3.2-1B-Instruct Q4_K_M | tg128 | **11.80** | **178.68** | 🔴 **15.14×** |
-| Llama-3.2-1B-Instruct Q6_K | tg128 | **11.06** | **146.39** | 🔴 **13.24×** |
-| Qwen2.5-0.5B-Instruct Q8_0 | tg128 | **17.76** | **227.78** | 🔴 **12.83×** |
-| Qwen3-0.6B Q8_0 | tg128 | **15.60** | **177.34** | 🔴 **11.37×** |
-| Gemma-3-1B-IT Q8_0 | tg128 | **10.16** | **112.26** | 🔴 **11.05×** |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | tg128 | **14.47** | **153.37** | 🔴 **10.60×** |
-| SmolLM2-135M-Instruct Q8_0 | tg128 | **37.80** | **348.41** | 🔴 **9.22×** |
 
 <!-- END ENGINE TABLE -->
 
