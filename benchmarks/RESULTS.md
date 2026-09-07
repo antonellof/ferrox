@@ -29,25 +29,12 @@ here, and the decode column depends on one switch:
 8B, and into a bigger loss at 135M. That is why it is still opt-in
 ([#27](https://github.com/antonellof/ferrox/issues/27)).
 
-**CUDA on Ampere** (RTX 3070, after
-[#146](https://github.com/antonellof/ferrox/pull/146)). Decode was 12×
-behind on the previous Ampere measurement and is now ~3×; prefill is
-unchanged.
+**CUDA now has receipts** and is in the generated table below, on an
+RTX 3060, so it is no longer described here. Decode reads 2.2× to 5.0×
+and prefill 22.6× to 33.8×. The one thing receipts cannot show is a
+before/after against the same engine, so that stays:
 
-| Model | Test | ferrox | llama.cpp | Gap |
-|---|---|---|---|---|
-| Llama-3.2-3B Q4_K_M | tg128 | 49.10 | 156.14 | 🔴 **3.18×** |
-| Llama-3.2-1B Q5_K_M | tg128 | 100.50 | 332.78 | 🔴 **3.31×** |
-| Llama-3.2-1B Q8_0 | tg128 | 59.63 | 258.87 | 🔴 **4.34×** |
-| Llama-3.2-3B Q4_K_M | pp512 | 193.63 | 5639.64 | 🔴 **29.13×** |
-| Llama-3.2-1B Q5_K_M | pp512 | 480.93 | 13297.59 | 🔴 **27.65×** |
-| Llama-3.2-1B Q8_0 | pp512 | 325.81 | 14947.77 | 🔴 **45.88×** |
-
-Prefill and decode are two different problems. Prefill is a missing
-tensor-core `mul_mm` and its gap widens with GPU generation. Decode was
-a memory access pattern, and what fixed it is below.
-
-**What coalescing the matvecs bought** (same RTX 3070, runs interleaved
+**What coalescing the matvecs bought** (RTX 3070, runs interleaved
 `main, branch, main, branch`; PRs
 [#144](https://github.com/antonellof/ferrox/pull/144),
 [#145](https://github.com/antonellof/ferrox/pull/145),
@@ -79,8 +66,8 @@ was not the last one.
 
 | Issue | Gap | What is known |
 |---|---|---|
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 28× to 46× | no tensor-core `mul_mm`; widens with GPU generation |
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, ~3× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing the matvecs closed 12× to 3×; the next lever is occupancy, not the access pattern |
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 22× to 34× | no tensor-core `mul_mm`; widens with GPU generation, and now the larger of the two gaps by far |
+| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing the matvecs closed 9–19× to 2–5×; the next lever is occupancy, not the access pattern |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, ~10× | uninvestigated; the decode half was a wrong default, now fixed |
 | [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | `spin` wins at 3B/8B, loses at 135M, so it needs a size rule not a flag |
 | [#128](https://github.com/antonellof/ferrox/issues/128) | ~60 ms fixed per-token cost | flat in thread count and model size; dominates small models on every backend |
@@ -114,7 +101,7 @@ warmup, so their prefill numbers include cold mmap page faults.
 
 ## Engine (`ferrox bench` vs `llama-bench`)
 
-Measured on **2 hosts**, one section each. Rows are never compared across machines.
+Measured on **3 hosts**, one section each. Rows are never compared across machines.
 
 ### Summary
 
@@ -122,6 +109,7 @@ Measured on **2 hosts**, one section each. Rows are never compared across machin
 |---|---|---|---|
 | AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic | CPU | 🔴 **6.26×** to 🔴 **10.14×** | 🔴 **1.06×** to 🔴 **1.92×** |
 | Apple M2 Pro (10c/6p) macOS 26.6.1 | METAL | ⚪ **1.00×** to 🔴 **1.10×** | 🟢 **0.64×** to 🔴 **1.23×** |
+| Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic + NVIDIA GeForce RTX 3060 | CUDA | 🔴 **22.55×** to 🔴 **33.79×** | 🔴 **2.18×** to 🔴 **5.04×** |
 
 ### AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic
 
@@ -188,6 +176,33 @@ Measured on **2 hosts**, one section each. Rows are never compared across machin
 | SmolLM2-135M-Instruct Q8_0 | tg128 | **315.42** | **217.11** | 🟢 **0.69×** |
 | Qwen2.5-0.5B-Instruct Q8_0 | tg128 | **201.64** | **129.19** | 🟢 **0.64×** |
 | Gemma-4-E2B-IT Q4_K_M | tg128 | **15.91** | — | — |
+
+### Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic + NVIDIA GeForce RTX 3060
+
+#### CUDA
+
+| Model | Test | ferrox tok/s | llama.cpp tok/s | Gap |
+|---|---|---|---|---|
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | pp512 | **302.19** | **10212.32** | 🔴 **33.79×** |
+| Qwen3-0.6B Q8_0 | pp512 | **438.82** | **14049.28** | 🔴 **32.02×** |
+| Qwen2.5-0.5B-Instruct Q8_0 | pp512 | **651.16** | **20442.80** | 🔴 **31.39×** |
+| SmolLM2-135M-Instruct Q8_0 | pp512 | **995.37** | **28311.27** | 🔴 **28.44×** |
+| Llama-3.2-1B-Instruct Q5_K_M | pp512 | **376.64** | **10203.41** | 🔴 **27.09×** |
+| Llama-3.2-1B-Instruct Q4_K_M | pp512 | **416.29** | **10571.65** | 🔴 **25.39×** |
+| Llama-3.2-3B-Instruct Q4_K_M | pp512 | **161.53** | **4060.99** | 🔴 **25.14×** |
+| Gemma-2-2B-IT Q4_K_M | pp512 | **205.72** | **5140.69** | 🔴 **24.99×** |
+| Gemma-3-1B-IT Q8_0 | pp512 | **451.52** | **10803.23** | 🔴 **23.93×** |
+| Llama-3.2-1B-Instruct Q6_K | pp512 | **425.71** | **9598.55** | 🔴 **22.55×** |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | tg128 | **47.87** | **241.17** | 🔴 **5.04×** |
+| Qwen3-0.6B Q8_0 | tg128 | **64.56** | **310.11** | 🔴 **4.80×** |
+| SmolLM2-135M-Instruct Q8_0 | tg128 | **141.55** | **670.59** | 🔴 **4.74×** |
+| Qwen2.5-0.5B-Instruct Q8_0 | tg128 | **89.38** | **387.65** | 🔴 **4.34×** |
+| Gemma-3-1B-IT Q8_0 | tg128 | **51.98** | **176.24** | 🔴 **3.39×** |
+| Llama-3.2-1B-Instruct Q5_K_M | tg128 | **88.43** | **257.49** | 🔴 **2.91×** |
+| Gemma-2-2B-IT Q4_K_M | tg128 | **43.19** | **124.58** | 🔴 **2.88×** |
+| Llama-3.2-3B-Instruct Q4_K_M | tg128 | **42.72** | **120.12** | 🔴 **2.81×** |
+| Llama-3.2-1B-Instruct Q4_K_M | tg128 | **100.78** | **278.65** | 🔴 **2.76×** |
+| Llama-3.2-1B-Instruct Q6_K | tg128 | **100.16** | **217.90** | 🔴 **2.18×** |
 
 <!-- END ENGINE TABLE -->
 

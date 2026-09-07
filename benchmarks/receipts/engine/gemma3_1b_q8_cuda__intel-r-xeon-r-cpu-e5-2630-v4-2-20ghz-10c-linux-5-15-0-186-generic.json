@@ -1,0 +1,73 @@
+{
+  "accelerator": "NVIDIA GeForce RTX 3060",
+  "approx_params": 1363083264,
+  "arch": "gemma3",
+  "backend": "cuda",
+  "backend_active": "CUDA",
+  "engine_env": {},
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 1.78,
+  "host_load_1min_start": 1.24,
+  "host_spec": {
+    "arch": "x86_64",
+    "cores": 10,
+    "cpu": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz",
+    "label": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic",
+    "os": "Linux 5.15.0-186-generic",
+    "perf_cores": null,
+    "ram_gb": 15.5
+  },
+  "host_thermal_end": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "host_thermal_start": {
+    "cpu_speed_limit_percent": null,
+    "degraded": null,
+    "measured": false,
+    "pressure": null,
+    "source": null
+  },
+  "id": "gemma3_1b_q8",
+  "kind": "engine",
+  "load_s": 0.054447207,
+  "model_path": "models/hf_test/gemma-3-1b-it-Q8_0.gguf",
+  "quant": "quantized",
+  "quiet_host": true,
+  "reps": 3,
+  "schema": 2,
+  "size_bytes": 1069306624,
+  "tests": [
+    {
+      "ferrox_samples": [
+        451.68667528216065,
+        449.6868480476636,
+        451.5240602911682
+      ],
+      "ferrox_stddev": 0.9068321804081882,
+      "ferrox_tps": 451.5240602911682,
+      "gap": 23.92614469544207,
+      "llama_tps": 10803.23,
+      "test": "pp512",
+      "workload_digest": "b8d417040110e751"
+    },
+    {
+      "ferrox_samples": [
+        52.04565341113847,
+        51.98341647303077,
+        51.90777349606685
+      ],
+      "ferrox_stddev": 0.056377859532444966,
+      "ferrox_tps": 51.98341647303077,
+      "gap": 3.3903119871206253,
+      "llama_tps": 176.24,
+      "test": "tg128",
+      "workload_digest": "044655d19aa3baa5"
+    }
+  ],
+  "threads": 10,
+  "warmup_reps": 1
+}
