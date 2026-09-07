@@ -558,6 +558,38 @@ mod tests {
                 "{}: sub-block count not defined from the Rust constant",
                 k.name
             );
+            // The twin's whole claim is that it walks the same tiles as
+            // the kernel, and it reads BM/BN/BK/TM/TN from Rust while
+            // the kernel reads them from these `#define`s. Two
+            // structures that have to agree about one thing: pin them.
+            // Without this, retuning a constant in Rust and leaving a
+            // literal in the emitter gives a kernel that launches, and
+            // a twin that agrees with itself about the wrong shape.
+            for (name, value) in [
+                ("FX_BM", BM),
+                ("FX_BN", BN),
+                ("FX_BK", BK),
+                ("FX_TM", TM),
+                ("FX_TN", TN),
+                ("FX_THREADS", THREADS),
+                ("FX_SUB", SUB),
+            ] {
+                assert!(
+                    src.contains(&format!("#define {name} {value}\n")),
+                    "{}: {name} is not emitted as the Rust constant {value}",
+                    k.name
+                );
+            }
+            // The `float4` loads are what keep a warp off eight banks.
+            // A rewrite that quietly went back to scalar reads would be
+            // correct and several times slower, which is the kind of
+            // regression a numeric test cannot see.
+            assert!(
+                src.contains("const float4 v = *(const float4*)&sa[kk]")
+                    && src.contains("const float4 v = *(const float4*)&sb[kk]"),
+                "{}: the inner loop no longer loads its operands as float4",
+                k.name
+            );
             assert!(
                 src.contains(&format!("#define FX_THREADS {THREADS}\n")),
                 "{}: thread count not defined from the Rust constant",
@@ -576,14 +608,36 @@ mod tests {
 
     /// A batch of one is a matvec, and the matvec kernels are the arm
     /// that has actually run on hardware. The GEMM must not claim it.
+    ///
+    /// The threshold is DERIVED from the tile width, so this asserts the
+    /// property rather than the number. It used to spell `8`, which was
+    /// `BN / 4` at the time; retuning `BN` to 64 moved the threshold and
+    /// turned a passing test red for no defect. A test that restates a
+    /// derived constant is one more structure that has to agree with
+    /// another one.
     #[test]
     fn single_token_dispatches_stay_on_the_matvec_path() {
         use crate::mul_mm::worth_a_gemm;
         assert!(!worth_a_gemm(0));
-        assert!(!worth_a_gemm(1));
-        assert!(!worth_a_gemm(4));
-        assert!(worth_a_gemm(8));
-        assert!(worth_a_gemm(512));
+        assert!(!worth_a_gemm(1), "one token is a matvec at any tile width");
+
+        // Monotone, so there is one threshold rather than a range of
+        // shapes that flip back and forth.
+        let threshold = (1..=4 * BN)
+            .find(|b| worth_a_gemm(*b))
+            .expect("some batch is worth a GEMM");
+        assert!(threshold >= 2, "never a single token");
+        assert!(
+            threshold <= BN,
+            "a full tile of tokens must be worth a GEMM, threshold {threshold} > BN {BN}"
+        );
+        for b in 1..4 * BN {
+            assert_eq!(
+                worth_a_gemm(b),
+                b >= threshold,
+                "batch {b} disagrees with threshold {threshold}"
+            );
+        }
     }
 
     /// A partial tile on both axes must still be *covered* by the grid:
