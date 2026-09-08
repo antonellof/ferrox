@@ -99,12 +99,7 @@ mod tests {
 
     fn count_pieces(pieces: &'static [&'static str]) -> Option<usize> {
         let ids: Vec<usize> = (0..pieces.len()).collect();
-        count(
-            Some(ReasoningFormat::Think),
-            false,
-            &ids,
-            decoder(pieces),
-        )
+        count(Some(ReasoningFormat::Think), false, &ids, decoder(pieces))
     }
 
     #[test]

@@ -1048,6 +1048,17 @@ pub use ferrox_api::Usage;
 
 #[derive(Clone)]
 pub struct GenerationParams {
+    /// The reasoning split this request's checkpoint implies, resolved
+    /// once by whoever holds the model name
+    /// (`ReasoningFormat::infer`). `None` when the checkpoint has no
+    /// reasoning format at all, which is what makes
+    /// `usage.completion_tokens_details` ABSENT rather than a zero the
+    /// model did not earn.
+    ///
+    /// Whether the prompt already opened the block is not carried here:
+    /// it is a property of the rendered prompt, which `generate` has,
+    /// so deriving it there keeps one source instead of two.
+    pub reasoning: Option<crate::policy::parser::ReasoningFormat>,
     pub max_tokens: usize,
     pub sampling: SamplingParams,
     pub seed: u64,
@@ -1560,6 +1571,26 @@ pub fn generate(
     if let Some(cached) = cached_tokens {
         usage = usage.with_cached_tokens(cached);
     }
+    // How much of the answer was thinking. `None` when this checkpoint
+    // has no reasoning format, which leaves `completion_tokens_details`
+    // ABSENT -- a zero there reads as "this model did not think" rather
+    // than "nobody counted", and `/v1/responses` shipped exactly that
+    // confusion (#120).
+    //
+    // Whether the prompt already opened the block is read off the
+    // rendered prompt, not guessed from the family: a template asked to
+    // think opens it itself, and then the first generated token is
+    // already reasoning with no marker to find.
+    if let Some(reasoning) = crate::reasoning_tokens::count(
+        params.reasoning,
+        params
+            .reasoning
+            .is_some_and(|f| f.prompt_opens_reasoning(prompt)),
+        &generated_ids,
+        |ids| tokenizer.decode(ids),
+    ) {
+        usage = usage.with_reasoning_tokens(reasoning);
+    }
     // A paged request's reuse is the radix tree's, not the contiguous
     // prefix cache's, so it is counted here instead. Reported through
     // the same field because it means the same thing to a caller:
@@ -1915,6 +1946,7 @@ mod tests {
 
     fn greedy_params(max_tokens: usize) -> GenerationParams {
         GenerationParams {
+            reasoning: None,
             max_tokens,
             sampling: SamplingParams::default(),
             seed: 1,
@@ -2308,6 +2340,7 @@ mod tests {
             None,
             &prompt,
             &GenerationParams {
+                reasoning: None,
                 max_tokens: 20,
                 sampling: SamplingParams::default(),
                 seed: 1,
@@ -2466,6 +2499,7 @@ mod tests {
 
     fn scripted_params(max_tokens: usize) -> GenerationParams {
         GenerationParams {
+            reasoning: None,
             max_tokens,
             sampling: SamplingParams {
                 temperature: 0.0,
@@ -2763,6 +2797,7 @@ mod tests {
             None,
             &prompt,
             &GenerationParams {
+                reasoning: None,
                 max_tokens: 20,
                 sampling: SamplingParams::default(),
                 seed: 1,

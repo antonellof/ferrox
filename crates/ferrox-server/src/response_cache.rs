@@ -113,11 +113,19 @@ impl Hash for GrammarKey {
 /// The destructure below is exhaustive ON PURPOSE, for the same reason
 /// [`sampling_key`]'s is: a field added to `GenerationParams` stops this
 /// crate compiling, HERE, until someone decides whether it belongs in
-/// the cache key. Two of the nine fields are deliberately NOT keyed and
+/// the cache key. Three of the ten fields are deliberately NOT keyed and
 /// each says why at its `_` binding -- an exclusion on the record is a
 /// decision; a field nobody looked at is the bug in #35.
 pub fn generation_key(params: &GenerationParams) -> GenerationKey {
     let GenerationParams {
+        // NOT KEYED. `reasoning` is `ReasoningFormat::infer` of the
+        // SERVED model name, so it is a pure function of the checkpoint
+        // answering -- and the checkpoint is already keyed, by
+        // `CacheKey::model`. Two entries that agree on the model cannot
+        // disagree on this. Keying it as well would add a field that can
+        // never differ when the rest matches, which is a key that looks
+        // stricter than it is rather than a cache that is safer.
+        reasoning: _,
         max_tokens,
         sampling,
         // NOT KEYED. The resolved seed is a clock reading for any
@@ -434,6 +442,7 @@ mod tests {
     /// field at its do-nothing value.
     fn params() -> GenerationParams {
         GenerationParams {
+            reasoning: None,
             max_tokens: 16,
             sampling: SamplingParams::default(),
             seed: 0,
