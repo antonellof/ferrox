@@ -531,6 +531,10 @@ pub(crate) async fn completion(
 
     let prompt = req.prompt_text()?.to_string();
     let mut params = GenerationParams {
+        // This endpoint returns the text verbatim and never splits a
+        // reasoning block out of it, so counting one would describe a
+        // split that did not happen.
+        reasoning: None,
         max_tokens: 0,
         sampling: req.sampling_knobs()?.resolve(),
         seed: req.seed(),

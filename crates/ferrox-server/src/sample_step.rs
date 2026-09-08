@@ -215,6 +215,7 @@ mod tests {
 
     fn params(json_object: bool, temperature: f32) -> GenerationParams {
         GenerationParams {
+            reasoning: None,
             max_tokens: 8,
             sampling: SamplingParams {
                 temperature,

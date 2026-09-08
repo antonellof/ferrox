@@ -55,6 +55,7 @@ mod model;
 mod openai_extra;
 mod output;
 mod policy;
+mod reasoning_tokens;
 mod rerank;
 mod response_cache;
 pub(crate) mod responses;
@@ -1850,6 +1851,11 @@ impl ChatCompletionRequest {
     /// asked for.
     fn generation_params(&self) -> Result<GenerationParams, ApiError> {
         Ok(GenerationParams {
+            // Set by `generation_params_for_template`, which is the only
+            // caller that knows the SERVED model name. Left `None` here
+            // so a path that never resolves it reports the field absent
+            // rather than claiming the model did not think.
+            reasoning: None,
             max_tokens: self.max_tokens,
             sampling: self.sampling_params()?,
             seed: self.resolved_seed(),
@@ -1886,6 +1892,11 @@ impl ChatCompletionRequest {
         served_model: &str,
     ) -> Result<GenerationParams, ApiError> {
         let mut params = self.generation_params()?;
+        // The served model, not the request's `model` field -- see this
+        // function's doc. Same name `OutputPosture::resolve` reads the
+        // answer back with, so the count and the split cannot disagree
+        // about which family this checkpoint is.
+        params.reasoning = crate::policy::parser::ReasoningFormat::infer(served_model);
         if let Some(stop) = template.end_of_turn() {
             if !params.stop.iter().any(|s| s == stop) {
                 params.stop.push(stop.to_string());
@@ -5217,6 +5228,7 @@ mod tests {
 
     fn greedy_params(max_tokens: usize) -> GenerationParams {
         GenerationParams {
+            reasoning: None,
             max_tokens,
             sampling: SamplingParams::default(),
             seed: 1,
@@ -8232,6 +8244,40 @@ mod tests {
 
     fn chat_request(value: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(value).expect("request")
+    }
+
+    /// The reasoning split is resolved from the SERVED model, and it is
+    /// what decides whether `usage.completion_tokens_details` exists at
+    /// all. Resolved from the request's `model` field instead, a client
+    /// naming an alias would silently get no count -- and `None` here is
+    /// indistinguishable on the wire from "this model did not think",
+    /// which is the confusion #120 is about.
+    #[test]
+    fn the_reasoning_split_is_resolved_from_the_served_model_not_the_request() {
+        let req = chat_request(serde_json::json!({
+            // Deliberately a name that infers NOTHING, so a pass can only
+            // come from the served name below.
+            "model": "some-alias",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let template = chat_template::PromptTemplate::plain();
+
+        let thinks = req
+            .generation_params_for_template(&template, "Qwen3-8B")
+            .expect("params");
+        assert!(
+            thinks.reasoning.is_some(),
+            "a thinking checkpoint must carry its format into generation"
+        );
+
+        let plain = req
+            .generation_params_for_template(&template, "Llama-3.2-1B-Instruct")
+            .expect("params");
+        assert!(
+            plain.reasoning.is_none(),
+            "a checkpoint with no reasoning format must carry none, so the \
+             usage field stays absent rather than becoming a zero"
+        );
     }
 
     /// The wire field reaches the sampler, compiled.

@@ -705,7 +705,7 @@ fn failure_code(error: &DecodeError) -> &'static str {
 /// semantics); `cached_tokens` is 0 when no prefix cache is configured,
 /// which is the same thing `Usage::cached_tokens: None` means.
 fn usage_json(usage: &Usage) -> Value {
-    json!({
+    let mut v = json!({
         "input_tokens": usage.prompt_tokens,
         "output_tokens": usage.completion_tokens,
         "total_tokens": usage.prompt_tokens + usage.completion_tokens,
@@ -713,8 +713,14 @@ fn usage_json(usage: &Usage) -> Value {
             "cached_tokens": usage.cached_tokens.unwrap_or(0),
             "cache_write_tokens": 0,
         },
-        "output_tokens_details": {"reasoning_tokens": 0},
-    })
+    });
+    // Present only when the split actually ran. This used to be a
+    // hardcoded `0`, which told every caller that every model on every
+    // request thought for exactly no tokens (#120).
+    if let Some(d) = usage.completion_tokens_details.as_ref() {
+        v["output_tokens_details"] = json!({"reasoning_tokens": d.reasoning_tokens});
+    }
+    v
 }
 
 fn reasoning_item(id: &str, text: Option<&str>, status: &str) -> Value {
@@ -1714,6 +1720,40 @@ mod tests {
 
     fn usage(prompt: usize, completion: usize) -> Usage {
         Usage::new(prompt, completion)
+    }
+
+    /// `/v1/responses` reported `reasoning_tokens: 0` for every answer
+    /// from every model, which is a claim that the model did not think,
+    /// not an admission that nobody counted (#120).
+    #[test]
+    fn a_model_that_did_not_think_omits_the_reasoning_field_entirely() {
+        let v = usage_json(&usage(10, 20));
+        assert_eq!(v["input_tokens"], 10);
+        assert_eq!(v["output_tokens"], 20);
+        assert!(
+            v.get("output_tokens_details").is_none(),
+            "a checkpoint with no reasoning format must report NO details \
+             object, not a zero it did not earn: {v}"
+        );
+    }
+
+    #[test]
+    fn a_counted_reasoning_split_reaches_the_wire() {
+        let v = usage_json(&usage(10, 20).with_reasoning_tokens(7));
+        assert_eq!(
+            v["output_tokens_details"]["reasoning_tokens"], 7,
+            "the counted split must be what the wire carries: {v}"
+        );
+    }
+
+    /// Zero is a real answer when the split RAN and found no reasoning,
+    /// and it has to survive as a present zero rather than being folded
+    /// back into "absent".
+    #[test]
+    fn a_split_that_ran_and_found_nothing_reports_a_present_zero() {
+        let v = usage_json(&usage(10, 20).with_reasoning_tokens(0));
+        assert_eq!(v["output_tokens_details"]["reasoning_tokens"], 0);
+        assert!(v.get("output_tokens_details").is_some());
     }
 
     /// Drive the stream machine with a script of semantic events.

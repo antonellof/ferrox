@@ -479,6 +479,10 @@ pub async fn completions(
     let prompt = req.prompt_text()?.to_string();
     let active = state.require_active()?;
     let params = GenerationParams {
+        // This endpoint returns the text verbatim and never splits a
+        // reasoning block out of it, so counting one would describe a
+        // split that did not happen.
+        reasoning: None,
         max_tokens: req.max_tokens,
         sampling: req.sampling_knobs()?.resolve(),
         seed: req.seed.unwrap_or(0),
