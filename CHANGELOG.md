@@ -13,7 +13,7 @@ Entries name what changed and, where it matters, what was wrong
 before. A fix that closed a silent-wrong-answer class says so — those
 are the ones worth reading twice.
 
-## [0.17.1] - 2026-09-04
+## [0.17.1] - 2026-09-04 
 
 ### Fixed
 
