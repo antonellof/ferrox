@@ -25,8 +25,12 @@ pub struct GgufSplitArgs {
     pub merge: bool,
 
     /// Max tensors per shard (llama.cpp's default: 128).
-    #[arg(long, default_value_t = DEFAULT_MAX_TENSORS, conflicts_with = "split_max_size")]
-    pub split_max_tensors: usize,
+    ///
+    /// `Option`, not a `default_value_t`: `--merge` refuses every split
+    /// option it was given, and a defaulted field cannot say whether
+    /// the user typed it.
+    #[arg(long, conflicts_with = "split_max_size")]
+    pub split_max_tensors: Option<usize>,
 
     /// Max tensor bytes per shard, as `N(M|G)`: decimal megabytes or
     /// gigabytes, the way llama.cpp reads them (`128M` is 128,000,000).
@@ -78,12 +82,44 @@ pub fn parse_split_size(s: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| format!("{s} does not fit in 64 bits"))
 }
 
-/// The one place the two size flags become a mode: `--split-max-size`
-/// wins when given, otherwise tensor mode with the (defaulted) count.
-pub fn split_mode(args: &GgufSplitArgs) -> SplitMode {
-    match args.split_max_size {
-        Some(bytes) => SplitMode::MaxBytes(bytes),
-        None => SplitMode::MaxTensors(args.split_max_tensors),
+impl GgufSplitArgs {
+    /// The one place the two size flags become a mode:
+    /// `--split-max-size` wins when given, otherwise tensor mode, and
+    /// tensor mode is the default with llama.cpp's 128
+    /// (`gguf-split.cpp:45`, `:161-164`).
+    pub fn mode(&self) -> SplitMode {
+        match self.split_max_size {
+            Some(bytes) => SplitMode::MaxBytes(bytes),
+            None => SplitMode::MaxTensors(self.split_max_tensors.unwrap_or(DEFAULT_MAX_TENSORS)),
+        }
+    }
+
+    /// Every option that only means something to `--split`, named,
+    /// with whether it was typed. `--merge` refuses the ones it was
+    /// given from THIS list, and the tests walk it, so a flag cannot be
+    /// added to one and forgotten by the other.
+    ///
+    /// The destructure is exhaustive with no `..` on purpose: a new
+    /// field on `GgufSplitArgs` stops compiling here until someone
+    /// decides which half of the tool it belongs to. The alternative
+    /// ships a split-only flag that `--merge` accepts and ignores,
+    /// which is this repo's dominant bug shape.
+    fn split_only_flags(&self) -> [(&'static str, bool); 3] {
+        let GgufSplitArgs {
+            split: _,
+            merge: _,
+            split_max_tensors,
+            split_max_size,
+            no_tensor_first_split,
+            dry_run: _,
+            input: _,
+            output: _,
+        } = self;
+        [
+            ("--split-max-tensors", split_max_tensors.is_some()),
+            ("--split-max-size", split_max_size.is_some()),
+            ("--no-tensor-first-split", *no_tensor_first_split),
+        ]
     }
 }
 
@@ -111,10 +147,10 @@ fn print_plan(plan: &SplitPlan) {
 }
 
 fn run_split(args: &GgufSplitArgs) -> Result<()> {
-    let source = GgufFile::open(&args.input)
-        .with_context(|| format!("opening {}", args.input.display()))?;
+    let source =
+        GgufFile::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
     let opts = SplitOptions {
-        mode: split_mode(args),
+        mode: args.mode(),
         no_tensor_first_split: args.no_tensor_first_split,
     };
     let plan = plan_split(&source, &opts)
@@ -136,8 +172,21 @@ fn run_split(args: &GgufSplitArgs) -> Result<()> {
 }
 
 fn run_merge(args: &GgufSplitArgs) -> Result<()> {
-    if args.no_tensor_first_split || args.split_max_size.is_some() {
-        bail!("--merge takes no split options");
+    // llama.cpp parses the split options in merge mode and then never
+    // reads them, so `--merge --split-max-size 1G` silently does
+    // nothing there. Refusing names what was ignored instead.
+    let given: Vec<&str> = args
+        .split_only_flags()
+        .iter()
+        .filter(|(_, typed)| *typed)
+        .map(|(name, _)| *name)
+        .collect();
+    if !given.is_empty() {
+        bail!(
+            "--merge takes no split options, but {} was given; a merge writes one file, so \
+             there is no shard size to choose",
+            given.join(", ")
+        );
     }
     eprintln!(
         "gguf_merge: {} -> {}",
@@ -192,16 +241,17 @@ mod tests {
     }
 
     /// Without either flag the mode is tensor mode at llama.cpp's 128
-    /// (`gguf-split.cpp:45`, `:162-164`); a size flag switches mode.
+    /// (`gguf-split.cpp:45`, `:161-164`); a size flag switches mode.
     #[test]
     fn the_default_mode_is_128_tensors_and_a_size_flag_switches_it() {
         let args = parse(&["in.gguf", "out"]);
-        assert_eq!(split_mode(&args), SplitMode::MaxTensors(128));
+        assert_eq!(args.mode(), SplitMode::MaxTensors(DEFAULT_MAX_TENSORS));
+        assert_eq!(DEFAULT_MAX_TENSORS, 128);
         assert!(!args.merge && !args.dry_run && !args.no_tensor_first_split);
         let args = parse(&["--split-max-size", "2G", "in.gguf", "out"]);
-        assert_eq!(split_mode(&args), SplitMode::MaxBytes(2_000_000_000));
+        assert_eq!(args.mode(), SplitMode::MaxBytes(2_000_000_000));
         let args = parse(&["--split-max-tensors", "7", "in.gguf", "out"]);
-        assert_eq!(split_mode(&args), SplitMode::MaxTensors(7));
+        assert_eq!(args.mode(), SplitMode::MaxTensors(7));
     }
 
     /// `gguf-split.cpp:119` and `:135`: the two operations and the two
@@ -209,16 +259,56 @@ mod tests {
     #[test]
     fn conflicting_flags_are_refused_at_parse_time() {
         for argv in [
-            ["--split", "--merge", "in.gguf", "out"],
-            ["--split-max-tensors", "3", "--split-max-size", "1G", "in.gguf", "out"][..4]
-                .try_into()
-                .unwrap(),
+            vec!["--split", "--merge", "in.gguf", "out"],
+            vec![
+                "--split-max-tensors",
+                "3",
+                "--split-max-size",
+                "1G",
+                "in.gguf",
+                "out",
+            ],
         ] {
             let mut full = vec!["gguf-split"];
             full.extend_from_slice(&argv);
             assert!(
                 GgufSplitArgs::try_parse_from(&full).is_err(),
                 "{argv:?} parsed"
+            );
+        }
+    }
+
+    /// Every split-only option has to be REFUSED by `--merge`, not
+    /// parsed and dropped: llama.cpp accepts `--merge --split-max-size
+    /// 1G` and ignores it. The list is walked rather than restated, so
+    /// a new flag that `split_only_flags` classifies is covered here
+    /// the moment it is added; the exhaustive destructure there is what
+    /// stops a new flag from being classified as neither.
+    #[test]
+    fn every_split_only_flag_is_refused_by_merge_and_named_in_the_refusal() {
+        let value_of = |flag: &str| match flag {
+            "--split-max-tensors" => Some("4"),
+            "--split-max-size" => Some("1G"),
+            _ => None,
+        };
+        let flags = parse(&["in.gguf", "out"]).split_only_flags();
+        assert_eq!(flags.len(), 3, "a flag was added without a case here");
+        for (flag, typed) in flags {
+            assert!(!typed, "`{flag}` reads as typed when it was not");
+            let mut argv = vec!["--merge", flag];
+            argv.extend(value_of(flag));
+            argv.extend(["in.gguf", "out"]);
+            let args = parse(&argv);
+            assert!(
+                args.split_only_flags()
+                    .iter()
+                    .any(|(name, typed)| *name == flag && *typed),
+                "`{flag}` did not register as typed"
+            );
+            let err = run_merge(&args).unwrap_err().to_string();
+            assert!(
+                err.contains(flag),
+                "merge with `{flag}` must name it; got: {err}"
             );
         }
     }

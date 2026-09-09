@@ -8,6 +8,7 @@ mod bench_model;
 mod bench_suite;
 mod chat;
 mod download;
+mod gguf_split;
 mod hf;
 mod host_state;
 mod http;
@@ -104,6 +105,11 @@ enum Commands {
     /// measurably worse text. Use `llama-quantize` for those; ferrox
     /// reads what it writes.
     Quantize(quantize::QuantizeArgs),
+    /// Split a GGUF into shards, or merge a shard set back into one
+    /// file: llama.cpp's `llama-gguf-split`, same flags and same
+    /// `<prefix>-NNNNN-of-MMMMM.gguf` names.
+    #[command(name = "gguf-split")]
+    GgufSplit(gguf_split::GgufSplitArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
@@ -540,6 +546,7 @@ const SUBCOMMANDS: &[&str] = &[
     "layer-divergence",
     "quant-sensitivity",
     "quantize",
+    "gguf-split",
     "parity",
     "perplexity",
     "speculative",
@@ -762,6 +769,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Pull(args) => pull::run_pull(args)?,
         Commands::Download(args) => download::run(args)?,
         Commands::Quantize(args) => quantize::run(args)?,
+        Commands::GgufSplit(args) => gguf_split::run(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
             if file.shard_count() > 1 {
