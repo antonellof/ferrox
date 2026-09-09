@@ -179,7 +179,7 @@ mod declaration_tests {
     /// cache it writes an f16 dequant scratch no caller can name).
     #[test]
     fn every_encode_in_the_decode_stack_declares_its_hazards() {
-        let src = include_str!("attn.rs");
+        let src = include_str!("decode_dense.rs");
         let start = src
             .find("pub fn launch_decode_dense_stack(")
             .expect("decode stack function");

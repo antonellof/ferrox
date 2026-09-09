@@ -21,6 +21,9 @@ pub mod gpu;
 pub mod attn;
 
 #[cfg(feature = "metal")]
+pub mod decode_dense;
+
+#[cfg(feature = "metal")]
 mod mem_ranges;
 
 #[cfg(feature = "metal")]
