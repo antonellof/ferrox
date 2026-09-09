@@ -2,6 +2,8 @@
 //! `make_block_q4_0x4`), with the GEMV and GEMM that read it. Nibbles
 //! are XOR-masked at pack time so no `- 8` bias subtraction is needed.
 
+#[cfg(target_arch = "x86_64")]
+use super::avx2;
 use super::common::*;
 #[cfg(target_arch = "aarch64")]
 use super::neon;
@@ -262,15 +264,7 @@ pub fn gemm_q4_0x4_group(
 /// CPU: ARM i8mm with the interleave-8 layout (`ggml_gemm_q4_0_4x8_q8_0`).
 #[inline]
 pub fn q4_0x4_gemm_uses_acts_x4(interleave: usize) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        interleave == 8 && std::arch::is_aarch64_feature_detected!("i8mm")
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = interleave;
-        false
-    }
+    interleaved_gemm_is_accelerated(interleave)
 }
 
 /// [`gemm_q4_0x4_group`] against a pre-interleaved activation quad;
@@ -325,6 +319,13 @@ pub fn gemm_q4_0x4_group_x4_on(
     if accel == AccelX4::NeonI8mm {
         unsafe {
             neon::gemm_q4_0x4_q8_0_neon_i8mm(slice, tile, n_cols, out);
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if accel == AccelX4::Avx2 {
+        unsafe {
+            avx2::gemm_q4_0x4_q8_0_avx2(slice, tile, n_cols, out);
         }
         return;
     }

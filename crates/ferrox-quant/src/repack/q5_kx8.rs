@@ -2,6 +2,8 @@
 //! GEMM that read it. The fifth bit lives in a separate `qh` plane,
 //! interleaved the same way as `qs`.
 
+#[cfg(target_arch = "x86_64")]
+use super::avx2;
 use super::common::*;
 #[cfg(target_arch = "aarch64")]
 use super::neon;
@@ -417,15 +419,7 @@ pub fn gemm_q5_kx8_group(
 /// ARM i8mm with the interleave-8 layout (`ggml_gemm_q5_K_8x8_q8_K`).
 #[inline]
 pub fn q5_kx8_gemm_uses_acts_x4(interleave: usize) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        interleave == 8 && std::arch::is_aarch64_feature_detected!("i8mm")
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = interleave;
-        false
-    }
+    interleaved_gemm_is_accelerated(interleave)
 }
 
 /// [`gemm_q5_kx8_group`] against a pre-interleaved activation quad; the
@@ -481,6 +475,13 @@ pub fn gemm_q5_kx8_group_x4_on(
     if accel == AccelX4::NeonI8mm {
         unsafe {
             neon::gemm_q5_kx8_q8_k_neon_i8mm(slice, tile, n_cols, out);
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if accel == AccelX4::Avx2 {
+        unsafe {
+            avx2::gemm_q5_kx8_q8_k_avx2(slice, tile, n_cols, out);
         }
         return;
     }

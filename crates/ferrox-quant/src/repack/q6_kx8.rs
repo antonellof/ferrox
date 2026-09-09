@@ -2,6 +2,8 @@
 //! GEMM that read it. Six bits split across a `ql` nibble plane and a
 //! `qh` 2-bit plane, with signed per-16 scales and no mins.
 
+#[cfg(target_arch = "x86_64")]
+use super::avx2;
 use super::common::*;
 #[cfg(target_arch = "aarch64")]
 use super::neon;
@@ -315,15 +317,7 @@ pub fn gemm_q6_kx8_group(
 /// batch callers should use the Kx8 layout only when this returns true.
 #[inline]
 pub fn q6_kx8_gemm_uses_acts_x4(interleave: usize) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        interleave == 8 && std::arch::is_aarch64_feature_detected!("i8mm")
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = interleave;
-        false
-    }
+    interleaved_gemm_is_accelerated(interleave)
 }
 
 /// [`gemm_q6_kx8_group`] against a pre-interleaved activation quad; the
@@ -380,6 +374,13 @@ pub fn gemm_q6_kx8_group_x4_on(
     if accel == AccelX4::NeonI8mm {
         unsafe {
             neon::gemm_q6_kx8_q8_k_neon_i8mm(slice, tile, n_cols, out);
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if accel == AccelX4::Avx2 {
+        unsafe {
+            avx2::gemm_q6_kx8_q8_k_avx2(slice, tile, n_cols, out);
         }
         return;
     }

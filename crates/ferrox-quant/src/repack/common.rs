@@ -25,14 +25,18 @@ pub(crate) fn f16_from_bytes(b: &[u8]) -> f32 {
 /// `_on` variants; [`gemm_q4_kx8_group_x4`] and its siblings stay as
 /// probe-per-call wrappers so existing callers and tests are unchanged.
 ///
-/// This is a dispatch decision only. Both arms compute the same values,
-/// bit-identically, which is what the `*_x4_portable_is_bit_exact_vs_scalar_gemv`
-/// tests assert. Forcing [`AccelX4::Portable`] on an i8mm host is therefore
-/// a valid (slow) way to run, and the tests use it that way.
+/// This is a dispatch decision only. Every arm computes the same values,
+/// to within f32 rounding order; the portable arm is bit-identical to the
+/// per-activation GEMV, which is what the
+/// `*_x4_portable_is_bit_exact_vs_scalar_gemv` tests assert. Forcing
+/// [`AccelX4::Portable`] on an accelerated host is therefore a valid
+/// (slow) way to run, and the tests use it that way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccelX4 {
-    /// ARM i8mm `SMMLA` kernels in [`neon`].
+    /// ARM i8mm `SMMLA` kernels in `super::neon`.
     NeonI8mm,
+    /// x86_64 AVX2 + FMA kernels in `super::avx2`.
+    Avx2,
     /// The portable scalar reference.
     Portable,
 }
@@ -47,8 +51,44 @@ impl AccelX4 {
                 return AccelX4::NeonI8mm;
             }
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return AccelX4::Avx2;
+            }
+        }
         AccelX4::Portable
     }
+
+    /// Whether this is a real SIMD kernel rather than the scalar
+    /// reference.
+    #[inline]
+    pub fn is_simd(self) -> bool {
+        // Exhaustive on purpose, with no `_` arm: a new kernel family
+        // must answer this question rather than inherit an answer.
+        match self {
+            AccelX4::NeonI8mm | AccelX4::Avx2 => true,
+            AccelX4::Portable => false,
+        }
+    }
+}
+
+/// Whether the `×4` batch GEMMs run a SIMD kernel on this host for
+/// `interleave`-packed weights.
+///
+/// **One predicate.** The five `q*_gemm_uses_acts_x4` entry points are
+/// the same question asked with a different name, and they used to be
+/// five separately written `cfg` blocks — the exact shape (two or more
+/// structures that must agree, with nothing enforcing it) that this repo
+/// keeps paying for. They now all delegate here, so a host either has
+/// the whole `×4` tier or none of it, and no kind can be told "yes" while
+/// its kernel is missing.
+///
+/// The `×4` GEMMs exist only for the interleave-8 layout, on either
+/// architecture, which is why the width is part of the question.
+#[inline]
+pub fn interleaved_gemm_is_accelerated(interleave: usize) -> bool {
+    interleave == 8 && AccelX4::detect().is_simd()
 }
 
 /// Decode one 12-byte packed scale/min group into 8 scales + 8 mins (u8).
@@ -105,6 +145,11 @@ pub fn prepare_q8_acts_x4(acts: &[Q8Activations], n_cols: usize) -> Q8ActsX4 {
     let mut d = vec![0f32; nb * 4];
     for (a, act) in acts.iter().enumerate() {
         debug_assert_eq!(act.d.len(), nb);
+        debug_assert!(
+            !act.q.contains(&i8::MIN),
+            "the AVX2 Q8_0 GEMM negates the activation with `_mm256_sign_epi8`, \
+             and -128 negates to itself; every ggml quantizer clamps to +-127"
+        );
         for b in 0..nb {
             let src = &act.q[b * Q8_0_BLOCK_ELEMS..(b + 1) * Q8_0_BLOCK_ELEMS];
             let dst = &mut qs[b * Q8_0_BLOCK_ELEMS * 4..(b + 1) * Q8_0_BLOCK_ELEMS * 4];

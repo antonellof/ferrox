@@ -2,6 +2,8 @@
 //! that span more than one kind family. Per-family tests live beside
 //! this file, one module per packed layout.
 
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 mod q4_0x4;
 mod q4_kx8;
 mod q5_kx8;
@@ -26,7 +28,9 @@ fn synth_q5_k_row(n_blocks: usize, seed: u8) -> Vec<u8> {
             &f16::from_f32(0.01 + (b as f32 + seed as f32) * 0.002).to_le_bytes(),
         );
         for i in 0..12u8 {
-            weights.push(20 + i.wrapping_mul(3).wrapping_add(seed));
+            // `wrapping_add`, not `+`: a randomized seed overflows u8
+            // here and the panic is the fixture's, not a kernel's.
+            weights.push(20u8.wrapping_add(i.wrapping_mul(3)).wrapping_add(seed));
         }
         for i in 0..32u8 {
             weights.push(i.wrapping_mul(11).wrapping_add(b as u8).wrapping_add(seed));
@@ -68,7 +72,9 @@ fn synth_q4_k_row(n_blocks: usize, seed: u8) -> Vec<u8> {
             &f16::from_f32(0.01 + (b as f32 + seed as f32) * 0.002).to_le_bytes(),
         );
         for i in 0..12u8 {
-            weights.push(20 + i.wrapping_mul(3).wrapping_add(seed));
+            // `wrapping_add`, not `+`: a randomized seed overflows u8
+            // here and the panic is the fixture's, not a kernel's.
+            weights.push(20u8.wrapping_add(i.wrapping_mul(3)).wrapping_add(seed));
         }
         for i in 0..128u8 {
             weights.push(i.wrapping_mul(17).wrapping_add(b as u8).wrapping_add(seed));
@@ -448,4 +454,24 @@ fn block_size_matches_ggml() {
     assert_eq!(Q6_KX8_BLOCK_BYTES, 16 + 128 + 1024 + 512);
     assert_eq!(Q8_0X4_BLOCK_BYTES, 4 * 2 + Q8_0_BLOCK_ELEMS * Q8_0X4_NROWS);
     assert_eq!(Q4_0X4_BLOCK_BYTES, 4 * 2 + Q4_0_BLOCK_ELEMS * 2);
+}
+
+/// Quantized activations never reach `-128`, which is the invariant the
+/// AVX2 Q8_0 GEMM's `_mm256_sign_epi8` negation rests on: negating
+/// `i8::MIN` wraps to itself, so one product per occurrence would come
+/// out with the wrong sign and nothing would say so.
+///
+/// `prepare_q8_acts_x4` `debug_assert`s the quad it builds; this pins the
+/// property at its source instead, so a quantizer that stopped clamping
+/// fails here rather than in an architecture-specific kernel nobody runs
+/// on the machine that changed it.
+#[test]
+fn quantized_activations_never_reach_the_value_that_negates_to_itself() {
+    // Deliberately extreme and asymmetric: the clamp only shows up when
+    // rounding would otherwise land past -127.
+    let x: Vec<f32> = (0..512)
+        .map(|i| ((i as f32) * 0.37).sin() * 1000.0 - 500.0)
+        .collect();
+    assert!(!quantize_activations_q8(&x).q.contains(&i8::MIN));
+    assert!(!quantize_activations_q8_k(&x).q.contains(&i8::MIN));
 }
