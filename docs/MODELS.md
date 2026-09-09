@@ -186,16 +186,17 @@ only, and 1B is neither 27B nor rope-scaled, so it is untouched by all
 of this. The speed recovery from returning to the fused path is
 unmeasured, because measuring it needs a quiet host.
 
-   `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other **34**
-   stop with `UnauditedArchitecture`. `FERROX_ALLOW_UNAUDITED_ARCH=1`
-   runs one anyway; compare the output against llama.cpp yourself
-   before you trust it.
+   `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
+   **31** stop with `UnauditedArchitecture`.
+   `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
+   against llama.cpp yourself before you trust it.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. One of the 34 is a fixture away from
-running and some need an attention implementation, so the refusal says
-which, with the `llama.cpp/src/models/*.cpp` line that decides it:
+"Unaudited" is not one thing. One of the 31 is one named match arm away
+and the rest need an attention implementation or a reading nobody has
+done, so the refusal says which, with the
+`llama.cpp/src/models/*.cpp` line that decides it:
 
 | Class | Means |
 |---|---|
@@ -204,17 +205,21 @@ which, with the `llama.cpp/src/models/*.cpp` line that decides it:
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 34 have now been read on both sides (`ferrox_models::capability`,
+All 31 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
 
 | Class | Count |
 |---|---|
-| fixture-away | 9 |
-| one match arm | 7 |
+| fixture-away | 0 |
+| one match arm | 1 |
 | new code | 26 |
 | unknown | 4 |
+
+**Fixture-away is empty.** Every row that only needed evidence has it
+now, so everything still refusing needs code or a reading. That is a
+better answer than the count alone: the cheap wins are spent.
 
 It was 47 until the triage itself removed one. Reading
 `src/models/minicpm3.cpp:5-6,41-46` showed `minicpm3` requires
@@ -225,19 +230,29 @@ MLA model that was never on the generic path, so it now refuses by name
 multipliers) rather than as unaudited. The count going down for the
 right reason.
 
-**Fixture-away (9).** Ferrox already computes these graphs; only
-evidence is missing. `gemma`, `internlm2`, `exaone`, `ernie4_5`,
-`bailingmoe2`, `xverse`, `baichuan` (the 7B; the 13B uses ALiBi and is
-refused by layer count), `chatglm` (its fused SwiGLU is the audited
-`phi3` path exactly) and `plamo3` (sandwich norms, fused QKV, fused
-SwiGLU, every slot already exists).
+**Fixture-away (0).** The class started at 9 and is empty.
+`internlm2`, `exaone`, `ernie4_5`, `bailingmoe2`, `xverse`, `baichuan`
+(the 7B; the 13B uses ALiBi and is refused by layer count) and `plamo3`
+were admitted with libllama-golden fixtures on 2026-09-03, `gemma`
+followed, and `chatglm` left the class the other way: an attempt to
+build its fixture found the fused `attn_qkv.bias` that every real
+ChatGLM2/3 export carries and ferrox drops, so it is ONE MATCH ARM now.
 
-**One match arm (7).** One small named piece each. `seed_oss` and the
-gpt-oss norm slot; `deepseek` and top-k renormalisation (fixed);
-`ernie4_5-moe` and interleaved MoE layers; `bailingmoe` and a
-`leading_dense_block_count` llama.cpp reads but never uses; and
-`hunyuan-moe`, `maincoder` and `hunyuan-dense`, all three of which want
-the same flag: QK norm applied *after* RoPE rather than before.
+**One match arm (1).** `chatglm`, above: the fused `attn_qkv.bias`,
+which is the same arm `qwen` and `starcoder` are refused by name for.
+The other six all closed. `seed_oss` and the gpt-oss norm slot;
+`deepseek` and top-k renormalisation; `bailingmoe` and a
+`leading_dense_block_count` llama.cpp reads but never uses;
+`hunyuan-moe`, `maincoder` and `hunyuan-dense`, which all wanted the
+same flag (QK norm applied *after* RoPE rather than before, plus, for
+`hunyuan-dense` alone, the NTK-alpha RoPE base rescale); and
+`ernie4_5-moe`, whose interleaved MoE layers landed as a REFUSAL rather
+than an implementation, because llama.cpp's own tensor loader
+(`ernie4-5.cpp:49`) has no interleave step in it while its graph
+(`ernie4-5-moe.cpp:64`) does, so an interleaved checkpoint cannot be
+loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
+checkpoint carries is 1, and that is what Ferrox runs and pins against
+libllama.
 
 **New code (26).** A different attention or residual structure. The
 recurring shapes, rather than 26 separate stories:

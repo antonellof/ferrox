@@ -12,26 +12,36 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-03. **23** architectures run with
+Honest position, re-audited 2026-09-09. **26** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 34 unaudited refusals are now TRIAGED, and the refusal says which of
-three things is missing: 1 is a fixture away (implemented, unevidenced),
-3 need one named match arm, 26 need new code, 4 are unknown with the
-question stated. Five one-match-arm rows closed on 2026-09-02 and seven
-fixture-away rows on 2026-09-03, each with a libllama-golden fixture,
-which is what moved 46 to 41 to 34. Building those fixtures found two
-defects worth more than the admissions: `plamo3` could never have loaded
-a real checkpoint, because it is the only architecture upstream whose
-post-norms use the two-argument `LLM_TN` overload and ferrox asked for
-the wrong spelling; and a gate refused every file carrying
-`attention.sliding_window_pattern` as unimplemented while the feature
-was already implemented, which made the loader's own read of that key
-unreachable. `unaudited_triage` carries the verdict and the llama.cpp
-line that decides it. llama.cpp hand-writes 140
+The 31 unaudited refusals are now TRIAGED, and the refusal says which of
+three things is missing: **0 are a fixture away**, 1 needs one named
+match arm, 26 need new code, 4 are unknown with the question stated.
+Five one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
+2026-09-03, and `gemma`, `hunyuan-dense` and `ernie4_5-moe` on
+2026-09-09, each with a libllama-golden fixture, which is what moved 46
+to 41 to 34 to 31. The fixture-away class being EMPTY is the honest
+headline: every row that only needed evidence has it, so what is left
+needs code.
+
+Building those fixtures keeps finding defects worth more than the
+admissions. `plamo3` could never have loaded a real checkpoint, because
+it is the only architecture upstream whose post-norms use the
+two-argument `LLM_TN` overload and ferrox asked for the wrong spelling;
+a gate refused every file carrying `attention.sliding_window_pattern` as
+unimplemented while the feature was already implemented, which made the
+loader's own read of that key unreachable; llama.cpp's own
+`ernie4_5-moe` tensor loader (`ernie4-5.cpp:49`) has no interleave step
+in it while its graph (`ernie4-5-moe.cpp:64`) does, so no interleaved
+ERNIE-4.5 MoE checkpoint can be loaded by llama.cpp at all and that arm
+had to land as a refusal; and `hunyuan-dense`'s verdict cited a
+converter line (`conversion/hunyuan.py:356`) that belongs to
+`hunyuan-vl`, not to it. `unaudited_triage` carries the verdict and the
+llama.cpp line that decides it. llama.cpp hand-writes 140
 per-architecture graphs; `decoder.rs` is 6752 lines and that is why the
 counts differ.
 
@@ -116,7 +126,7 @@ started creeping back up (6702 to 6752) after its one shrink. The rule
 is written down two paragraphs below and is being broken while it is
 written.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 23
+Those files are why llama.cpp has 140 architectures and ferrox has 26
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model
