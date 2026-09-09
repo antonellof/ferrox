@@ -15,6 +15,7 @@
 //! | `ernie4_5` | NORM | `head_dim != n_embd / n_head` |
 //! | `baichuan` | NORM | 32 layers, because llama.cpp picks ALiBi off the layer count |
 //! | `exaone` | NEOX | a tied lm_head, and `head_dim != n_embd / n_head` |
+//! | `gemma` | NEOX | the sqrt(n_embd) embedding scale, GeGLU, a tied lm_head |
 //! | `bailingmoe2` | NEOX | fused QKV, per-head QK norm before RoPE, sigmoid-gated MoE |
 //! | `plamo3` | NEOX | sandwich norms, a real sliding window, and a tensor name nobody else spells |
 //!
@@ -108,8 +109,8 @@
 
 mod common;
 use common::{
-    assert_all_three_paths_match, graph_caches, graph_fixture_path, load_graph_fixture, worst_vs,
-    GRAPH_PROMPT,
+    assert_all_three_paths_match, assert_all_three_paths_match_within, graph_caches,
+    graph_fixture_path, load_graph_fixture, worst_vs, GELU_TABLE_TOL, GRAPH_PROMPT, GRAPH_TOL,
 };
 use ferrox_models::capability::QkNormStyle;
 use ferrox_models::{Decoder, ModelConfig, RopeLayout};
@@ -118,27 +119,36 @@ use ferrox_moe::GatingFunction;
 /// The rows whose llama.cpp graph has no QK-norm, no post-norms, no
 /// window and no experts. Named once so the four checklist tests below
 /// cannot drift apart about who is in the set.
-const DENSE_ROWS: [&str; 5] = ["internlm2", "xverse", "ernie4_5", "baichuan", "exaone"];
-
-/// Every row this suite admits.
-const ALL_ROWS: [&str; 7] = [
+const DENSE_ROWS: [&str; 6] = [
     "internlm2",
     "xverse",
     "ernie4_5",
     "baichuan",
     "exaone",
+    "gemma",
+];
+
+/// Every row this suite admits.
+const ALL_ROWS: [&str; 8] = [
+    "internlm2",
+    "xverse",
+    "ernie4_5",
+    "baichuan",
+    "exaone",
+    "gemma",
     "bailingmoe2",
     "plamo3",
 ];
 
 /// The rows with no sliding window and no post-norms. `plamo3` has
 /// both, so it is excluded here and pinned by its own tests instead.
-const NO_WINDOW_NO_POST_NORM_ROWS: [&str; 6] = [
+const NO_WINDOW_NO_POST_NORM_ROWS: [&str; 7] = [
     "internlm2",
     "xverse",
     "ernie4_5",
     "baichuan",
     "exaone",
+    "gemma",
     "bailingmoe2",
 ];
 
@@ -548,6 +558,224 @@ fn the_exaone_fixture_ships_no_output_weight_and_ties_the_lm_head() {
     // It still produced output above, so the lm_head came from
     // `token_embd.weight`.
     assert!(file.find_tensor("token_embd.weight").is_some());
+}
+
+// --- gemma (Gemma-1) ------------------------------------------------
+//
+// The oldest row of the family, and the last one that ran without
+// evidence. `src/models/gemma.cpp` in full: `load_arch_hparams` (:3-11)
+// reads only the RMS epsilon and picks a size off the layer count that
+// nothing branches on; `load_arch_tensors` (:13-34) creates attn_norm,
+// split Q/K/V through `create_tensor_qkv`, an attn_output sized from
+// `n_embd_head_k * n_head`, ffn_norm and gate/up/down, with no biases,
+// no QK-norm and no post-norms; and the graph (:41-138) is the
+// sequential residual.
+//
+// Three pieces are Gemma's and all three are in the fixture's path: the
+// sqrt(n_embd) embedding scale (:49), GeGLU rather than SwiGLU (:112,
+// `LLM_FFN_GELU, LLM_FFN_PAR`), and an attention scale llama.cpp
+// reaches by scaling Q by `1/sqrtf(n_embd_head)` at :86 and then
+// passing `kq_scale = 1.0f` at :91 -- the same number ferrox's kernels
+// apply when `attention_scale` is None, which is why fact 3 below holds
+// for this row too.
+//
+// The lm_head is TIED with no fallback: :20 duplicates
+// `token_embd.weight` into `output` unconditionally, so the fixture
+// ships no `output.weight` and the embedding scale is not cancelled by
+// a separate head.
+
+const GEMMA_GOLDEN: [f32; 48] = [
+    0.29964927,
+    0.6283499,
+    0.22527266,
+    -0.10582298,
+    -0.4777732,
+    -0.24892166,
+    -0.28255585,
+    -0.08312392,
+    0.06489246,
+    -0.56164,
+    -0.16337517,
+    0.24526599,
+    0.119027674,
+    -0.7749605,
+    0.16473716,
+    0.20174162,
+    -0.15967777,
+    0.19335732,
+    -0.4492208,
+    0.5128704,
+    0.0019430518,
+    0.1487342,
+    0.16347827,
+    -0.24232048,
+    0.24746539,
+    0.603195,
+    0.1283208,
+    -0.4600235,
+    0.3777966,
+    -0.022114657,
+    -0.21029684,
+    0.3769806,
+    -0.21484213,
+    0.13908015,
+    -0.077077374,
+    0.046033803,
+    -0.3738503,
+    0.7610342,
+    -0.05985511,
+    -0.02556756,
+    -0.1984951,
+    0.13185397,
+    -0.19448894,
+    0.16269659,
+    -0.40522176,
+    -0.4143316,
+    0.21067318,
+    -0.5611287,
+];
+
+/// The one row here compared at [`GELU_TABLE_TOL`] rather than
+/// `GRAPH_TOL`, because llama.cpp's GELU is an f16 lookup table and
+/// ferrox's is exact. See that constant for the measurement that settled
+/// it: an independent numpy pass over this same fixture matches
+/// llama.cpp to 1.19e-7 through the table and to 3.93e-5 without it,
+/// and 3.93e-5 is what ferrox shows.
+#[test]
+fn gemma_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match_within("gemma", &GEMMA_GOLDEN, GELU_TABLE_TOL);
+}
+
+/// The loosened tolerance is loosened for a REASON, and the reason is
+/// bounded.
+///
+/// A per-row tolerance is the easiest place in this suite to hide a real
+/// error, so the gap is asserted from BOTH sides: it is genuinely larger
+/// than `GRAPH_TOL` (otherwise the exemption is unnecessary and should
+/// go) and still under half of `GELU_TABLE_TOL` (otherwise the
+/// exemption has started covering something else). If ferrox ever
+/// adopts ggml's table, the first assertion fails and says so.
+#[test]
+fn gemmas_gap_from_llama_cpp_is_the_gelu_table_and_stays_that_size() {
+    let d = load_graph_fixture("gemma");
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &GEMMA_GOLDEN,
+    );
+    assert!(
+        worst > GRAPH_TOL,
+        "gemma now agrees to {worst}, within GRAPH_TOL; drop GELU_TABLE_TOL for this row"
+    );
+    assert!(
+        worst < GELU_TABLE_TOL / 2.0,
+        "gemma's gap grew to {worst}; GELU_TABLE_TOL was sized for the f16 GELU table \
+         (measured 3.93e-5) and is now covering something else"
+    );
+}
+
+/// Gemma-1's three pieces are the ones ferrox resolved, and the fixture
+/// really is the tied case.
+///
+/// The embedding scale is asserted as a NUMBER rather than as
+/// `is_some`: `sqrt(hidden_dim)` and `sqrt(head_dim)` are both
+/// plausible readings of "scale the embeddings", they differ by a
+/// factor of 1.7 here, and only one of them is `gemma.cpp:49`.
+#[test]
+fn gemma_resolves_its_embedding_scale_its_activation_and_its_tied_head() {
+    let d = load_graph_fixture("gemma");
+    assert_eq!(
+        d.config.embedding_scale,
+        Some((d.config.hidden_dim as f32).sqrt()),
+        "gemma.cpp:49 scales the embeddings by sqrt(n_embd)"
+    );
+    assert_eq!(
+        d.config.ffn_activation,
+        ferrox_models::config::FfnActivation::Gelu,
+        "gemma.cpp:112 passes LLM_FFN_GELU, not LLM_FFN_SILU"
+    );
+    // head_dim comes from `gemma.attention.key_length`; n_embd/n_head
+    // would be 6.
+    assert_eq!(d.config.head_dim, 8);
+    assert_eq!(d.config.hidden_dim, 24);
+
+    let path = graph_fixture_path("gemma");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    assert!(
+        file.find_tensor("output.weight").is_none(),
+        "gemma.cpp:20 ties the lm_head unconditionally; a fixture with its own head would \
+         not exercise that, and llama.cpp would refuse the unread tensor"
+    );
+}
+
+/// Gemma-1 declares no softcap and no sliding window, so the Gemma-2/3
+/// machinery must resolve to INERT on this row.
+///
+/// `GemmaFamily` is exempted from both `unsupported_feature_keys` and
+/// `unsupported_scaling_keys` on the grounds that it implements those
+/// features. That exemption is only honest while a Gemma checkpoint
+/// declaring none of them ends up with none of them, and Gemma-1 is the
+/// row where the whole family's machinery has nothing to do.
+#[test]
+fn gemma_one_gets_no_softcap_no_window_and_no_attention_scale_override() {
+    let d = load_graph_fixture("gemma");
+    assert!(d.config.sliding_window.is_none(), "gemma-1 declares none");
+    assert!(d.config.attn_logit_softcap.is_none());
+    assert!(d.config.final_logit_softcap.is_none());
+    // Fact 3: the 27B branch of `attention_scale_override` is the only
+    // Gemma size that overrides the kernels' own scale, and this is not
+    // it.
+    assert!(d.config.attention_scale.is_none());
+}
+
+/// Dropping the sqrt(n_embd) embedding scale is a large divergence.
+///
+/// This is what makes the golden comparison mean something. `gemma`'s
+/// verdict claimed the scale was implemented; a fixture that could not
+/// see it would have "proved" that claim just as well with the scale
+/// removed.
+#[test]
+fn dropping_gemmas_embedding_scale_diverges_from_llama_cpp() {
+    let path = graph_fixture_path("gemma");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.embedding_scale = None;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &GEMMA_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "removing the embedding scale moved the logits by only {worst}; the fixture cannot \
+         see gemma.cpp:49"
+    );
+}
+
+/// Running Gemma's FFN as SwiGLU instead of GeGLU is a large
+/// divergence.
+///
+/// gelu and silu agree to within a few percent near zero, so this only
+/// holds because the fixture's `ffn_gate` is drawn wide enough to reach
+/// the range where they part.
+#[test]
+fn running_gemmas_ffn_as_swiglu_instead_of_geglu_diverges_from_llama_cpp() {
+    let path = graph_fixture_path("gemma");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.ffn_activation = ferrox_models::config::FfnActivation::Swiglu;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &GEMMA_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "swapping GeGLU for SwiGLU moved the logits by only {worst}; the fixture cannot see \
+         gemma.cpp:112"
+    );
 }
 
 // --- bailingmoe2 (Ling-2.0) -----------------------------------------
@@ -999,6 +1227,9 @@ fn the_rope_variant_each_architecture_uses_is_the_one_llama_cpp_uses() {
         ("baichuan", RopeLayout::Norm),
         // ... and the NEOX group.
         ("exaone", RopeLayout::Neox),
+        // llama-model.cpp:2642, the same NEOX arm gemma2 and gemma3 are
+        // in.
+        ("gemma", RopeLayout::Neox),
         ("bailingmoe2", RopeLayout::Neox),
         ("plamo3", RopeLayout::Neox),
     ] {
@@ -1024,6 +1255,7 @@ fn rotating_the_wrong_pairs_diverges_from_llama_cpp() {
         ("ernie4_5", &ERNIE4_5_GOLDEN),
         ("baichuan", &BAICHUAN_GOLDEN),
         ("exaone", &EXAONE_GOLDEN),
+        ("gemma", &GEMMA_GOLDEN),
         ("bailingmoe2", &BAILINGMOE2_GOLDEN),
         ("plamo3", &PLAMO3_GOLDEN),
     ] {

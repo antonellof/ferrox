@@ -79,6 +79,31 @@ pub const GRAPH_PROMPT: [usize; 6] = [3, 7, 11, 19, 23, 5];
 /// of magnitude more.
 pub const GRAPH_TOL: f32 = 1e-5;
 
+/// The tolerance for a row whose FFN is **GeGLU**, where the reference
+/// itself is the approximate side.
+///
+/// ggml defines `GGML_GELU_FP16` (`ggml/src/ggml-cpu/vec.h:46`), so
+/// llama.cpp's CPU GELU is a 65536-entry **f16 lookup table**: the input
+/// is rounded to f16 to index it and the stored value is f16 too
+/// (`vec.h:1414-1425`). `GGML_SILU_FP16` is NOT defined, so SiLU is
+/// exact SIMD -- which is exactly why every SwiGLU row in these suites
+/// agrees to ~1e-6 and the one GeGLU row does not.
+///
+/// This is the same shape as the K-quant `vec_dot_type` divergence in
+/// `docs/plans/llama-cpp-gap-inventory.md` §10: two defensible
+/// implementations, one of them the reference's, and the gap is not a
+/// ferrox bug. It was measured rather than assumed. An independent numpy
+/// forward pass over the same fixture
+/// (`scripts/gemma_fixture_numpy_ref.py`) reproduces llama.cpp's logits
+/// to **1.19e-7** when its GELU goes through ggml's table and to
+/// **3.93e-5** when its GELU is exact -- the second number being, to the
+/// digit, what ferrox shows.
+///
+/// 2e-4 is therefore ~5x the measured gap and still orders of magnitude
+/// under every sabotage in these suites, each of which moves the logits
+/// by more than 1e-2.
+pub const GELU_TABLE_TOL: f32 = 2e-4;
+
 pub fn graph_fixture_path(name: &str) -> String {
     format!(
         "{}/tests/fixtures/{name}_tiny.gguf",
@@ -106,13 +131,23 @@ pub fn graph_caches(decoder: &Decoder) -> Vec<KvCache> {
 /// architecture is that they have diverged before: five model features
 /// went missing from one of them while the others kept working.
 pub fn assert_all_three_paths_match(name: &str, golden: &[f32]) {
+    assert_all_three_paths_match_within(name, golden, GRAPH_TOL);
+}
+
+/// The same three paths at a stated tolerance, for the rows where the
+/// REFERENCE is the approximate side.
+///
+/// Parameterised rather than copied: two bodies would be two standards,
+/// and the weaker one would be invisible. Only [`GELU_TABLE_TOL`] is
+/// ever passed here, and only by the GeGLU rows.
+pub fn assert_all_three_paths_match_within(name: &str, golden: &[f32], tol: f32) {
     let decoder = load_graph_fixture(name);
 
     let mut kv = graph_caches(&decoder);
     assert_close(
         &decoder.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
         golden,
-        GRAPH_TOL,
+        tol,
         &format!("{name}: prefill (forward_batch_last)"),
     );
 
@@ -121,7 +156,7 @@ pub fn assert_all_three_paths_match(name: &str, golden: &[f32]) {
     for (pos, &tok) in GRAPH_PROMPT.iter().enumerate() {
         out = decoder.forward_token(tok, pos, &mut kv);
     }
-    assert_close(&out, golden, GRAPH_TOL, &format!("{name}: decode"));
+    assert_close(&out, golden, tol, &format!("{name}: decode"));
 
     let mut kv = vec![graph_caches(&decoder)];
     let mut out = Vec::new();
@@ -129,7 +164,7 @@ pub fn assert_all_three_paths_match(name: &str, golden: &[f32]) {
         let batch = decoder.forward_multi_seq(&[tok], &[pos], &mut kv);
         out = batch.into_iter().next().unwrap();
     }
-    assert_close(&out, golden, GRAPH_TOL, &format!("{name}: multi-seq"));
+    assert_close(&out, golden, tol, &format!("{name}: multi-seq"));
 }
 
 /// The worst absolute difference from the golden values, for the

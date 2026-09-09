@@ -1,12 +1,11 @@
-//! The five ONE-MATCH-ARM architectures, checked against llama.cpp
-//! itself.
+//! The ONE-MATCH-ARM architectures, checked against llama.cpp itself.
 //!
 //! `capability.rs` triaged 46 unaudited architectures into four classes.
-//! Seven were ONE MATCH ARM: one small, nameable piece missing -- an
-//! activation, a norm slot, a routing flag, an ordering. Five of those
-//! seven are closed here. Each needed a different arm, and each fixture
-//! is built so that getting THAT arm wrong is a large, obvious
-//! divergence rather than a rounding difference:
+//! ONE MATCH ARM means one small, nameable piece missing -- an
+//! activation, a norm slot, a routing flag, an ordering. Seven are
+//! closed here. Each needed a different arm, and each fixture is built
+//! so that getting THAT arm wrong is a large, obvious divergence rather
+//! than a rounding difference:
 //!
 //! | arch | the arm | what would break |
 //! |---|---|---|
@@ -15,6 +14,18 @@
 //! | `seed_oss` | pre-FFN norm lives in `post_attention_norm` | a whole RMSNorm on the wrong side of a residual |
 //! | `maincoder` | QK norm AFTER RoPE | every layer's attention scores |
 //! | `hunyuan-moe` | QK norm AFTER RoPE | every layer's attention scores |
+//! | `hunyuan-dense` | NTK-alpha RoPE base rescale (and the same QK-norm order) | every position, on every layer |
+//! | `ernie4_5-moe` | `interleave_moe_layer_step`, landed as a REFUSAL | see below |
+//!
+//! **One of the seven arms could not be implemented, and that is the
+//! finding rather than a shortfall.** `ernie4_5-moe`'s interleave step
+//! is real in llama.cpp's GRAPH (`ernie4-5-moe.cpp:64`) and absent from
+//! llama.cpp's own TENSOR LOADER (`ernie4-5.cpp:49`), so the two agree
+//! only where the step changes nothing and a genuinely interleaved
+//! checkpoint cannot be loaded by llama.cpp at all -- measured, on the
+//! two-step fixture this suite ships. The step every real checkpoint
+//! carries is audited here; anything else is refused by name and the
+//! refusal says why.
 //!
 //! **Where the numbers come from.** Each `GOLDEN` array below was
 //! produced by running **llama.cpp's own graph** for that architecture
@@ -47,6 +58,7 @@ use common::{
     assert_all_three_paths_match, graph_caches as caches, graph_fixture_path as fixture,
     load_graph_fixture as load, worst_vs, GRAPH_PROMPT as PROMPT,
 };
+use ferrox_gguf::TensorSource;
 use ferrox_models::capability::QkNormStyle;
 use ferrox_models::{Decoder, ModelConfig};
 
@@ -513,4 +525,365 @@ fn norming_before_rope_instead_of_after_diverges_from_llama_cpp() {
              the fixture cannot see this arm"
         );
     }
+}
+
+// --- hunyuan-dense: the NTK-alpha RoPE base rescale -----------------
+//
+// `hunyuan-dense` has no graph of its own: `src/models/models.h:1830-1834`
+// derives `llama_model_hunyuan_dense` from `llama_model_hunyuan_vl` and
+// reuses its hparams, its tensors and its graph, so the file to read is
+// `src/models/hunyuan-vl.cpp`. It had two blockers and both are closed
+// here.
+//
+// The arm: `:8-12` rescales the trained RoPE base by
+// `alpha^(head_dim / (head_dim - 2))` when `{arch}.rope.scaling.alpha`
+// is positive. That key is read for EVERY architecture at
+// `llama-model.cpp:1186` and applied by exactly two graphs, which is why
+// ferrox's `rope_ntk_alpha` is a named list and not a generic rule.
+//
+// The second half, per-head QK norm applied AFTER RoPE (`:56-66` rope,
+// then `:73-81` norm), was already implemented as
+// `Decoder::qk_norm_after_rope` for `maincoder` and `hunyuan-moe`; this
+// row only had to be added to the list.
+//
+// WHAT THE VERDICT GOT WRONG, and the fixture is what found it: the
+// triage cited `conversion/hunyuan.py:356` as the converter line that
+// writes `{arch}.rope.scaling.alpha` for this architecture. That line is
+// in `HunyuanVLTextModel`, whose `model_arch` is `HUNYUAN_VL` -- a
+// different GGUF architecture string and a different, still-refusing
+// row. The `HUNYUAN_DENSE` converter is `HunYuanModel` at :254-281, and
+// it does the same arithmetic in PYTHON (`scaled_base = base * (alpha **
+// (dim / (dim - 2)))`, :270) and writes the already-scaled value through
+// `add_rope_freq_base`, with no alpha key at all. So on a converted file
+// llama.cpp's :8-12 is a no-op. The fixture writes the key explicitly so
+// that the arm ferrox implements is the arm the reference runs, and
+// libllama prints `freq_base_train = 92100.8` for a file whose
+// `rope.freq_base` is 500.
+
+const HUNYUAN_DENSE_GOLDEN: [f32; 48] = [
+    0.22020058,
+    0.63418895,
+    0.20907053,
+    0.3790403,
+    -0.11444236,
+    0.057364255,
+    -0.34231323,
+    -0.072572984,
+    -0.5012044,
+    0.17969774,
+    -0.45948866,
+    0.09718554,
+    0.3629007,
+    -0.20113428,
+    0.27587852,
+    -0.35394314,
+    0.1426361,
+    -0.12607718,
+    0.058810126,
+    -0.47764817,
+    0.17408267,
+    0.19744661,
+    0.21505915,
+    0.19182259,
+    -0.09484324,
+    0.012222506,
+    0.12370877,
+    0.061753318,
+    0.2311838,
+    -0.23603764,
+    -0.29653496,
+    -0.43558064,
+    0.8097959,
+    -0.19447437,
+    0.30741596,
+    0.0015857695,
+    -0.18803233,
+    0.09101723,
+    0.59113497,
+    -0.22490542,
+    -0.2511651,
+    -0.1257552,
+    -0.12590414,
+    -0.119154006,
+    -0.033712514,
+    0.104955494,
+    0.08142837,
+    0.37710968,
+];
+
+#[test]
+fn hunyuan_dense_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("hunyuan_dense", &HUNYUAN_DENSE_GOLDEN);
+}
+
+/// The rescale really ran, and it produced llama.cpp's own number.
+///
+/// `92100.8` is what libllama prints as `freq_base_train` for this
+/// fixture, whose file says `rope.freq_base = 500` and
+/// `rope.scaling.alpha = 50`. Asserting the resolved base rather than
+/// only the logits means a regression names itself instead of arriving
+/// as forty-eight wrong floats.
+#[test]
+fn hunyuan_dense_rotates_at_the_ntk_alpha_rescaled_base() {
+    let path = fixture("hunyuan_dense");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    assert_eq!(
+        file.metadata_f32("hunyuan-dense.rope.freq_base"),
+        Some(500.0),
+        "the fixture must carry the UNSCALED base, or it pins nothing about the rescale"
+    );
+    assert_eq!(
+        file.metadata_f32("hunyuan-dense.rope.scaling.alpha"),
+        Some(50.0),
+        "and it must carry the alpha, which no converter writes for this architecture"
+    );
+    let d = load("hunyuan_dense");
+    let want = 500.0f32 * 50.0f32.powf(8.0 / 6.0);
+    assert!(
+        (d.config.rope_theta - want).abs() < 1e-1,
+        "rope_theta resolved to {}, want {want} (libllama prints freq_base_train = 92100.8)",
+        d.config.rope_theta
+    );
+    // The other half of the row, and the reason it was one arm rather
+    // than two.
+    assert!(d.qk_norm_after_rope, "hunyuan-vl.cpp:56-66 then :73-81");
+    assert_eq!(d.config.qk_norm_style, QkNormStyle::PerHead);
+    assert_eq!(d.config.rope_layout, ferrox_models::RopeLayout::Neox);
+    assert!(
+        d.config.attention_scale.is_none(),
+        "hunyuan-vl.cpp:22 passes a literal 1/sqrt(n_embd_head), which the kernels apply"
+    );
+}
+
+/// Skipping the rescale is a large divergence.
+///
+/// Without this the golden comparison would hold just as well against a
+/// decoder that ignored the key, because RoPE at 500 and RoPE at 92100
+/// differ only where the positions matter. It is why the fixture's
+/// unscaled base is small and its Q/K are drawn wide.
+#[test]
+fn rotating_hunyuan_dense_at_the_unscaled_base_diverges_from_llama_cpp() {
+    let path = fixture("hunyuan_dense");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.rope_theta = 500.0;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&PROMPT, 0, &mut kv),
+        &HUNYUAN_DENSE_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "ignoring the NTK-alpha rescale moved the logits by only {worst}; the fixture \
+         cannot see hunyuan-vl.cpp:8-12"
+    );
+}
+
+/// And the ordering half is visible on this row too, not only on the
+/// other two.
+#[test]
+fn norming_hunyuan_dense_before_rope_instead_of_after_diverges_from_llama_cpp() {
+    let mut d = load("hunyuan_dense");
+    assert!(d.qk_norm_after_rope);
+    d.qk_norm_after_rope = false;
+    let mut kv = caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&PROMPT, 0, &mut kv),
+        &HUNYUAN_DENSE_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "swapping the QK-norm order moved the logits by only {worst}"
+    );
+}
+
+// --- ernie4_5-moe: the interleave step, and why it is a refusal -----
+//
+// The arm was meant to be `{arch}.interleave_moe_layer_step`, so that
+// `ModelConfig::layer_is_dense` matched `src/models/ernie4-5-moe.cpp:64`:
+//
+//     il >= n_layer_dense_lead && (il + 1) % n_moe_layer_step == 0
+//
+// Building the fixture is what changed the answer. llama.cpp's TENSOR
+// LOADER has no step in it: `src/models/ernie4-5.cpp:49` creates
+// `ffn_gate_inp`, `ffn_down_exps` and `ffn_up_exps` as REQUIRED for
+// every layer at or past `n_layer_dense_lead`, and creates the dense
+// `ffn_gate`/`ffn_up`/`ffn_down` for none of them. The loader and the
+// graph therefore agree only where the modulo changes nothing, and a
+// checkpoint whose interleave really interleaves cannot be loaded by
+// llama.cpp at all. Measured, not reasoned: the two-step fixture beside
+// this one makes libllama print
+//
+//     check_tensor_dims: tensor 'blk.2.ffn_gate_inp.weight' not found
+//
+// Both published ERNIE-4.5 MoE checkpoints (21B-A3B, 300B-A47B) carry a
+// step of 1 -- `conversion/ernie.py:88` writes `moe_layer_interval`
+// straight from the HF config -- at which point the rule collapses to
+// the leading-dense prefix ferrox already implements. That is the file
+// the golden values below come from; anything else is refused by name
+// in `moe_interleave`.
+//
+// The rest of the row was read too: SOFTMAX routing, HARDCODED at :90 --
+// this architecture is NOT sigmoid-routed, whatever the gap inventory
+// said -- with `norm_w = true` (:88) and an optional `exp_probs_b`
+// selection bias (ernie4-5.cpp:53). The fixture carries neither
+// `expert_gating_func` nor `expert_weights_norm`, so both have to come
+// out of ferrox's architecture-name defaults.
+
+const ERNIE4_5_MOE_GOLDEN: [f32; 48] = [
+    -0.08447625,
+    -0.12077317,
+    0.34613043,
+    0.03877828,
+    0.037789084,
+    -0.18150453,
+    -0.016461063,
+    0.123786785,
+    0.018926805,
+    0.010408605,
+    -5.1606377e-4,
+    0.20932025,
+    -0.09644128,
+    -0.09167313,
+    -0.047137674,
+    0.32158756,
+    0.42049405,
+    -0.10163629,
+    0.24967228,
+    -0.17491005,
+    -0.23651567,
+    0.061103027,
+    -0.025830623,
+    0.30918807,
+    -0.18258056,
+    -0.32253858,
+    -0.04022187,
+    -0.07561384,
+    -0.22288801,
+    0.2532389,
+    0.3253422,
+    0.1982599,
+    0.1800408,
+    -0.0014230456,
+    -0.13664317,
+    -0.09072188,
+    -0.19590256,
+    -0.22582309,
+    -0.062144432,
+    -0.087381646,
+    -0.33621082,
+    0.20399752,
+    0.18209141,
+    -0.08127112,
+    0.20059398,
+    -0.23522364,
+    -1.6790349e-5,
+    0.016684819,
+];
+
+#[test]
+fn ernie4_5_moe_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("ernie4_5_moe", &ERNIE4_5_MOE_GOLDEN);
+}
+
+/// What the loader decided about the row's own facts.
+///
+/// The interleave step is in the file at 1, the leading-dense prefix is
+/// honoured (unlike `bailingmoe`, which reads the same kind of key and
+/// ignores it), and the routing resolved to llama.cpp's hardcoded pair.
+#[test]
+fn the_loader_reads_ernie_moes_step_its_dense_prefix_and_its_routing() {
+    let path = fixture("ernie4_5_moe");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    assert_eq!(
+        file.metadata_u64("ernie4_5-moe.interleave_moe_layer_step"),
+        Some(1),
+        "the fixture must carry the REQUIRED key (ernie4-5.cpp:11)"
+    );
+    // Neither routing key is in the file, so both of these come from
+    // ferrox's architecture-name defaults and this is what pins them.
+    assert!(file
+        .metadata_u64("ernie4_5-moe.expert_gating_func")
+        .is_none());
+    assert!(file
+        .metadata_bool("ernie4_5-moe.expert_weights_norm")
+        .is_none());
+
+    let d = load("ernie4_5_moe");
+    assert!(d.config.layer_is_dense(0), "leading_dense_block_count = 1");
+    assert!(!d.config.layer_is_dense(1));
+    assert!(!d.config.layer_is_dense(2));
+    assert_eq!(
+        d.config.moe.gating,
+        ferrox_moe::GatingFunction::Softmax,
+        "ernie4-5-moe.cpp:90 hardcodes LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX"
+    );
+    assert!(
+        d.config.moe.norm_topk_prob,
+        "ernie4-5-moe.cpp:88 passes norm_w = true"
+    );
+    assert_eq!(d.config.moe.n_experts, 4);
+    assert_eq!(d.config.moe.n_experts_active, 2);
+    assert_eq!(d.config.moe.n_shared_experts, 1);
+    assert_eq!(d.config.rope_layout, ferrox_models::RopeLayout::Norm);
+    // head_dim comes from `attention.key_length`; n_embd/n_head is 6.
+    assert_eq!(d.config.head_dim, 8);
+}
+
+/// Routing this row through sigmoid instead of softmax is a large
+/// divergence.
+///
+/// The gap inventory listed `ernie4_5-moe` beside `bailingmoe2` as
+/// "sigmoid-routed MoE with `ffn_exp_probs_b` router bias", and only the
+/// second half is true. Without this test the golden comparison would
+/// rest on a default nothing had checked.
+#[test]
+fn routing_ernie_moe_through_sigmoid_instead_of_softmax_diverges_from_llama_cpp() {
+    let path = fixture("ernie4_5_moe");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.moe.gating = ferrox_moe::GatingFunction::Sigmoid;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let mut kv = caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&PROMPT, 0, &mut kv),
+        &ERNIE4_5_MOE_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "sigmoid routing moved the logits by only {worst}; the fixture cannot see the \
+         gating function"
+    );
+}
+
+/// The refusal fires, on a file that exists.
+///
+/// This is the half that stops `moe_interleave` from being a gate that
+/// cannot fire. The second fixture is written exactly the way
+/// `conversion/ernie.py` would write a two-step checkpoint -- dense
+/// `blk.2.ffn_gate.weight`, no expert tensors on that layer -- and
+/// libllama refuses it with `check_tensor_dims: tensor
+/// 'blk.2.ffn_gate_inp.weight' not found`, because its loader creates
+/// the expert tensors for every layer past the dense prefix regardless
+/// of the step. ferrox refuses it earlier and says why.
+#[test]
+fn a_two_step_ernie_moe_checkpoint_is_refused_by_name() {
+    let path = fixture("ernie4_5_moe_step2");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    assert_eq!(
+        file.metadata_u64("ernie4_5-moe.interleave_moe_layer_step"),
+        Some(2),
+        "the refusal fixture must actually declare the step it is refused for"
+    );
+    // And it really is shaped like a converted two-step checkpoint: the
+    // interleaved dense layer stores dense FFN tensors.
+    assert!(file.find_tensor("blk.2.ffn_gate.weight").is_some());
+    assert!(file.find_tensor("blk.2.ffn_gate_inp.weight").is_none());
+
+    let err = ModelConfig::from_gguf(&file).expect_err("must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("interleave_moe_layer_step"), "{msg}");
+    assert!(msg.contains("ernie4-5.cpp:49"), "{msg}");
+    assert!(msg.contains("cannot be loaded by llama.cpp"), "{msg}");
 }

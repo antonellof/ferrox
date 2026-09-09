@@ -279,6 +279,30 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // QK-norm weights centred near 1.5 so the ordering is visible.
     "maincoder",
     "hunyuan-moe",
+    // `hunyuan-dense`: the same post-RoPE QK-norm order (it has no graph
+    // of its own -- models.h:1830-1834 derives it from
+    // llama_model_hunyuan_vl) PLUS the NTK-alpha RoPE base rescale at
+    // hunyuan-vl.cpp:8-12, which is now `rope_ntk_alpha`. Its fixture
+    // carries `hunyuan-dense.rope.scaling.alpha` explicitly, because the
+    // HUNYUAN_DENSE converter does that arithmetic in Python and writes
+    // the already-scaled base (conversion/hunyuan.py:254-281) -- the
+    // `add_rope_scaling_alpha` at :356 is HunyuanVLTextModel, i.e. the
+    // separate `hunyuan-vl` row. The triage verdict cited that line for
+    // this architecture and was wrong about it.
+    "hunyuan-dense",
+    // `ernie4_5-moe`: the MoE sibling of the audited `ernie4_5`. Its
+    // interleave step is a REFUSAL rather than an implementation, and
+    // that is the finding, not a shortcut: llama.cpp's tensor loader
+    // (ernie4-5.cpp:49) creates expert tensors for every layer past the
+    // leading-dense prefix with NO step in the condition, while its
+    // graph (ernie4-5-moe.cpp:64) takes the dense branch when
+    // `(il + 1) % step != 0`, so a checkpoint whose interleave really
+    // interleaves cannot be loaded by llama.cpp at all -- measured, on a
+    // two-step fixture, as `check_tensor_dims: tensor
+    // 'blk.2.ffn_gate_inp.weight' not found`. Both published ERNIE-4.5
+    // MoE checkpoints carry a step of 1, which is what the golden
+    // fixture pins; `moe_interleave` refuses anything else by name.
+    "ernie4_5-moe",
     // tests/fixture_away_graphs.rs: architectures that were triaged
     // FIXTURE-AWAY -- ferrox already built their graph, and only the
     // evidence was missing. Same standard as the rows above: a synthetic
@@ -298,10 +322,24 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     "internlm2",
     // `xverse` (xverse.cpp:3-12,14-35,59-121): the same, with no biases.
     "xverse",
+    // `gemma` (gemma.cpp:3-11,13-34,41-138): Gemma-1, the oldest row of
+    // the family and the last one that was not evidenced. Its three
+    // Gemma-specific pieces were already implemented for `GemmaFamily`
+    // and the fixture is what proves each of them: the sqrt(n_embd)
+    // embedding scale (:49), GeGLU rather than SwiGLU (:112,
+    // LLM_FFN_GELU) and a `1/sqrt(head_dim)` attention scale that
+    // llama.cpp reaches by scaling Q at :86 and passing kq_scale = 1.0f
+    // at :91, which is what leaving `attention_scale` as None already
+    // produces. Its lm_head is TIED with no fallback (:20), so the
+    // fixture ships no `output.weight` and the embedding scale is not
+    // cancelled downstream. Gemma-1 declares no softcap and no sliding
+    // window, so the Gemma-2/3 machinery must resolve to inert, and
+    // `tests/fixture_away_graphs.rs` asserts that rather than assuming
+    // it.
+    "gemma",
     // `ernie4_5` DENSE (ernie4-5.cpp:36-69,95-149): NORM RoPE, head_dim
     // decoupled from n_embd/n_head. `ernie4_5-moe` is a different row
-    // and still refuses -- its layers interleave on a step ferrox does
-    // not read.
+    // with its own fixture, above.
     "ernie4_5",
     // `baichuan` (baichuan.cpp:5-14,17-40,64-137): the 7B ONLY. The 13B
     // is a different model under the same string and is refused by name
@@ -471,20 +509,16 @@ fn deferred_scope(name: &'static str, scope: ArchScope, reason: &'static str) ->
 /// `every_unaudited_generic_architecture_is_triaged_or_listed_as_pending`
 /// between them enforce.
 const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
-    (
-        "ernie4_5-moe",
-        TriageClass::OneMatchArm,
-        "interleaved MoE layers. src/models/ernie4-5-moe.cpp:64 makes a layer MoE only when \
-         `il >= n_layer_dense_lead && (il + 1) % n_moe_layer_step == 0`, but \
-         ModelConfig::layer_is_dense (config.rs:353-355) implements only the leading-dense \
-         prefix and nothing in ferrox reads {arch}.interleave_moe_layer_step \
-         (LLM_KV_INTERLEAVE_MOE_LAYER_STEP, read at ernie4-5.cpp:11). A real checkpoint \
-         therefore looks for blk.N.ffn_gate_exps.weight on a layer that stores \
-         blk.N.ffn_gate.weight and fails on the missing tensor. Routing is SOFTMAX with \
-         norm_w=true (:88-90) plus an optional exp_probs_b (ernie4-5.cpp:53), and \
-         ferrox_moe::route_top_k_biased already applies a selection bias under softmax -- \
-         this architecture is NOT sigmoid-routed",
-    ),
+    // `ernie4_5-moe` was HERE, ONE MATCH ARM on
+    // `{arch}.interleave_moe_layer_step`. Building its fixture found the
+    // arm is not implementable against a reference: llama.cpp's tensor
+    // loader (ernie4-5.cpp:49) and its graph (ernie4-5-moe.cpp:64)
+    // disagree about which layers are MoE, and only the graph has the
+    // step, so a checkpoint whose interleave interleaves cannot be
+    // loaded by llama.cpp at all. The arm landed as a REFUSAL
+    // (`crate::moe_interleave`) and the step every real checkpoint
+    // carries is audited (`tests/one_match_arm_graphs.rs`), so the row
+    // is in AUDITED_GENERIC_GQA and carries no verdict.
     ("granite", TriageClass::NewCode, GRANITE_MULTIPLIERS),
     ("granitemoe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
     // ferrox-only alias row; no llama.cpp GGUF spells it this way, but
@@ -765,25 +799,16 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          QK-norm is before RoPE (:100-109), which is the one thing that would otherwise have \
          been a blocker",
     ),
-    (
-        "hunyuan-dense",
-        TriageClass::OneMatchArm,
-        "the NTK-alpha RoPE base rescale. hunyuan-dense has no graph of its own -- \
-         models.h:1830 derives it from llama_model_hunyuan_vl -- so the file to read is \
-         src/models/hunyuan-vl.cpp. It had TWO blockers and one is now gone: it applies \
-         attn_k_norm and attn_q_norm AFTER ggml_rope_ext (:105-123 rotate, then :132 and \
-         :137 norm), and that ordering is implemented -- `Decoder::qk_norm_after_rope`, \
-         admitted for `hunyuan-moe` and `maincoder` with libllama-golden fixtures. What is \
-         left is :8-12, which rescales rope_freq_base_train by \
-         `alpha^(head_dim / (head_dim - 2))` when {arch}.rope.scaling.alpha is positive (a \
-         REQUIRED-if-present key `conversion/hunyuan.py:356` really writes) -- an NTK-alpha \
-         base rescale ferrox neither applies nor gates, so a checkpoint carrying the key \
-         would load and rotate at the unscaled base. Second, smaller: :98-113 switches to \
-         ggml_rope_multi when {arch}.rope.dimension_sections is present, and ferrox has no \
-         M-RoPE. Everything else (:39-51, :86-167) is attn_norm, per-head QK norm, ffn_norm, \
-         dense SiLU SwiGLU and a sequential residual, so this is now a one-arm-plus-a-gate \
-         away rather than two arms",
-    ),
+    // `hunyuan-dense` was HERE, ONE MATCH ARM on the NTK-alpha RoPE
+    // base rescale. The arm landed (`crate::rope_ntk_alpha`), the
+    // post-RoPE QK-norm half was already implemented, and both are
+    // evidenced against libllama in `tests/one_match_arm_graphs.rs`, so
+    // the row is audited and carries no verdict. Its verdict cited
+    // `conversion/hunyuan.py:356` as the line that writes
+    // `{arch}.rope.scaling.alpha` for this architecture; that line is in
+    // HunyuanVLTextModel, whose model_arch is HUNYUAN_VL. The
+    // HUNYUAN_DENSE converter (:254-281) does the same arithmetic in
+    // Python and writes the already-scaled base instead.
     (
         "laguna",
         TriageClass::NewCode,
@@ -929,6 +954,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         for n in ["baichuan", "ernie4_5", "internlm2", "xverse"] {
             v.push(gqa_norm(n));
         }
+        // `ernie4_5-moe` was ONE MATCH ARM in `NORM_ROPE_TRIAGED` and is
+        // audited now: the step every real checkpoint carries has a
+        // libllama-golden fixture (`tests/one_match_arm_graphs.rs`) and
+        // any other step is refused by name (`crate::moe_interleave`).
+        v.push(gqa_norm("ernie4_5-moe"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -960,6 +990,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // norm slot.
             "hunyuan-moe",
             "seed_oss",
+            // `hunyuan-dense` was ONE MATCH ARM in `NEOX_ROPE_TRIAGED`
+            // and is audited now: the NTK-alpha RoPE base rescale
+            // (`crate::rope_ntk_alpha`) plus the post-RoPE QK-norm order
+            // it shares with `hunyuan-moe`, both against libllama's own
+            // logits.
+            "hunyuan-dense",
             // Were FIXTURE-AWAY and now have the fixture
             // (`tests/fixture_away_graphs.rs`). EXAONE 3.x only:
             // `exaone4` and `exaone-moe` are different graphs and stay
@@ -1190,31 +1226,18 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             ArchPath::GenericGqa { rope: Neox },
             PerHead,
         ));
-        v.push(
-            prof(
-                "gemma",
-                TextGeneration,
-                GemmaFamily,
-                KvGqa,
-                Neox,
-                ArchPath::GenericGqa { rope: Neox },
-                PerHead,
-            )
-            .triaged(
-                TriageClass::FixtureAway,
-                "src/models/gemma.cpp:16-33 creates exactly the tensors the generic decoder \
-                 loads -- attn_norm, split Q/K/V, attn_output, ffn_norm, gate/up/down -- with \
-                 no biases, no QK-norm and no post-norms, and its graph is \
-                 sequential-residual (:97,115). The three Gemma-specific pieces are all \
-                 implemented: the sqrt(n_embd) embedding scale (:49 vs loader.rs:467-474's \
-                 GemmaFamily embedding_scale), GeGLU (:112 vs FfnActivation::Gelu) and a \
-                 1/sqrt(head_dim) attention scale (:86 scales Q, then :91 passes \
-                 kq_scale=1.0f -- which is what loader.rs:476-480 leaving attention_scale as \
-                 None already produces). Gemma-1 declares no softcap and no sliding window, \
-                 so the Gemma-2/3 machinery is inert here. Admitting it needs a fixture or a \
-                 parity run, not new code",
-            ),
-        );
+        // `gemma` was FIXTURE-AWAY here until it got its fixture
+        // (`tests/fixture_away_graphs.rs`); it is audited now and
+        // carries no verdict at all.
+        v.push(prof(
+            "gemma",
+            TextGeneration,
+            GemmaFamily,
+            KvGqa,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            PerHead,
+        ));
         v.push(prof(
             "gemma2",
             TextGeneration,
@@ -2344,14 +2367,16 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 34,
+            seen == 31,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
              rows -- deepseek, bailingmoe, seed_oss, maincoder, hunyuan-moe -- were admitted \
-             with libllama-golden fixtures, and 41 until seven FIXTURE-AWAY rows -- \
+             with libllama-golden fixtures, 41 until seven FIXTURE-AWAY rows -- \
              internlm2, xverse, ernie4_5, baichuan, exaone, bailingmoe2, plamo3 -- got \
-             theirs (tests/fixture_away_graphs.rs)"
+             theirs (tests/fixture_away_graphs.rs), and 34 until `gemma`, `hunyuan-dense` \
+             and `ernie4_5-moe` got theirs. `gemma` was the LAST fixture-away row, so that \
+             class is empty now and everything left needs code"
         );
     }
 
@@ -2359,11 +2384,14 @@ mod audit_tests {
     /// classes must not read the same, which is the defect being fixed.
     #[test]
     fn the_refusal_detail_distinguishes_the_classes() {
-        // `gemma` (v1), not `bailingmoe2`: that one was FIXTURE-AWAY
-        // here until it got its fixture (`tests/fixture_away_graphs.rs`)
-        // and is audited now, so it renders no detail at all.
-        let fixture = unaudited_refusal_detail("gemma");
-        let arm = unaudited_refusal_detail("ernie4_5-moe");
+        // `chatglm`, not `ernie4_5-moe`: that one was ONE MATCH ARM here
+        // until its arm landed as a refusal and its step-1 fixture was
+        // measured against libllama, so it is audited now and renders no
+        // detail at all. There is deliberately no FIXTURE-AWAY sample:
+        // `gemma` was the last row in that class and
+        // `every_unaudited_row_is_triaged_and_the_distribution_is_pinned`
+        // now pins it at zero. Everything left needs code.
+        let arm = unaudited_refusal_detail("chatglm");
         let new_code = unaudited_refusal_detail("olmo2");
         // TRIAGE_PENDING is empty now that all 47 are read, so the
         // untriaged branch is exercised through a name the catalog does
@@ -2371,15 +2399,14 @@ mod audit_tests {
         // architecture added to the catalog would render until somebody
         // reads it.
         let untriaged = unaudited_refusal_detail("an-arch-nobody-has-read");
-        assert!(fixture.contains("FIXTURE-AWAY"), "{fixture}");
         assert!(arm.contains("ONE MATCH ARM"), "{arm}");
         assert!(new_code.contains("NEW CODE"), "{new_code}");
         assert!(
             untriaged.contains("not done for `an-arch-nobody-has-read` yet"),
             "{untriaged}"
         );
-        for a in [&fixture, &arm, &new_code, &untriaged] {
-            for b in [&fixture, &arm, &new_code, &untriaged] {
+        for a in [&arm, &new_code, &untriaged] {
+            for b in [&arm, &new_code, &untriaged] {
                 if !std::ptr::eq(a, b) {
                     assert_ne!(a, b, "two refusal details are identical");
                 }
@@ -2388,7 +2415,7 @@ mod audit_tests {
         // The blocker itself, not only the class label, has to be in the
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
-        assert!(arm.contains("interleave_moe_layer_step"), "{arm}");
+        assert!(arm.contains("attn_qkv.bias"), "{arm}");
         assert!(new_code.contains("olmo2.cpp:47,52"), "{new_code}");
     }
 
