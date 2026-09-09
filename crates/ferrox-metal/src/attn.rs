@@ -48,23 +48,24 @@
 //! environment variable.
 //!
 //! `FERROX_CTK` selects KV dtype ([`MetalKvDtype`]); see [`is_implemented`].
+pub use crate::decode_dense::{
+    launch_decode_dense_stack, AttnExtras, DenseLayerMetal, EmbdGatherMetal,
+};
+use crate::dispatch::dispatch_counted;
 use crate::elem::{
     encode_act_mul_f32_to_f16, encode_add_rms_norm, encode_add_rms_norm_batch,
-    encode_add_rms_norm_f32_to_f16_batch, encode_argmax, encode_f32_to_f16, encode_gelu_mul,
-    encode_rms_norm, encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_f32_to_f16_batch,
+    encode_add_rms_norm_f32_to_f16_batch, encode_argmax, encode_f32_to_f16, encode_rms_norm,
+    encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_f32_to_f16_batch,
     encode_rms_norm_per_head_batch, encode_silu_mul, encode_vec_add, encode_vec_add_at,
     warm_prefill_elem_pipelines,
 };
-use crate::embd::{encode_get_rows, EmbdKind};
+use crate::embd::encode_get_rows;
 use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax_batch, encode_mul_mm_sg_f16,
     encode_q4_0_moe_gate_up_id, encode_q4_0_moe_id, encode_q4_0_moe_topk, ensure_pipeline,
     memory_barrier_resources, resident_f32_buffer, resident_weight_buffer, shared_metal,
     warm_mul_mm_sg_pipeline, MatvecLaunch, MetalError, MoeExpertLaunch, MoePackedQ4, MulMmSgLaunch,
     ResidentF32Buffer, ResidentWeightBuffer,
-};
-pub use crate::decode_dense::{
-    launch_decode_dense_stack, AttnExtras, DenseLayerMetal, EmbdGatherMetal,
 };
 use crate::mem_ranges::MemRanges;
 use crate::moe_ids::MoeIdsLog;
@@ -2914,7 +2915,11 @@ fn borrow_prefill_scratch(
 /// `n_rot/2` entries, which is narrower than `head_dim/2` under partial
 /// rotary. Checking it against the head width instead rejects every
 /// Phi-3/Phi-4 checkpoint at the door.
-pub(crate) fn assert_freq_factors_len(freq_factors: Option<&[f32]>, rope: MetalRope, head_dim: usize) {
+pub(crate) fn assert_freq_factors_len(
+    freq_factors: Option<&[f32]>,
+    rope: MetalRope,
+    head_dim: usize,
+) {
     if let Some(ff) = freq_factors {
         assert_eq!(ff.len(), rope.rot_dim.unwrap_or(head_dim) / 2);
     }
@@ -3000,7 +3005,8 @@ pub(crate) fn encode_rope(
             8,
         );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: 1,
@@ -3104,7 +3110,8 @@ fn encode_rope_batch(
             9,
         );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: n_tokens as usize,
@@ -3143,7 +3150,8 @@ fn encode_kv_append(
     }
     let tg = 256usize.min(n_elems as usize).max(1);
     let n_tg = (n_elems as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -3188,7 +3196,8 @@ fn encode_kv_append_q8_0(
     let n_blocks = (n_elems as usize) / ferrox_quant::Q8_0_BLOCK_ELEMS;
     let tg = 256usize.min(n_blocks).max(1);
     let n_tg = n_blocks.div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -3228,7 +3237,8 @@ fn encode_dequant_q8_0_to_f16(
     let n_blocks = (n_elems as usize) / ferrox_quant::Q8_0_BLOCK_ELEMS;
     let tg = 256usize.min(n_blocks).max(1);
     let n_tg = n_blocks.div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -3273,7 +3283,8 @@ fn encode_kv_append_turbo4(
     let n_blocks = (n_elems as usize) / ferrox_quant::TURBO4_KV_GROUP;
     let tg = 256usize.min(n_blocks).max(1);
     let n_tg = n_blocks.div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -3313,7 +3324,8 @@ fn encode_dequant_turbo4_to_f16(
     let n_blocks = (n_elems as usize) / ferrox_quant::TURBO4_KV_GROUP;
     let tg = 256usize.min(n_blocks).max(1);
     let n_tg = n_blocks.div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -3629,7 +3641,8 @@ fn encode_gqa_prefill_fa_ext(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: n_q.div_ceil(QN) as usize,
@@ -3749,7 +3762,8 @@ fn encode_gqa_prefill_fa_vec(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: n_q as usize,
@@ -3826,7 +3840,8 @@ fn encode_gqa_fa_vec(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: 1,
@@ -3897,7 +3912,8 @@ fn encode_gqa(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: 1,
@@ -3979,7 +3995,8 @@ fn encode_gqa_prefill(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: n_q as usize,

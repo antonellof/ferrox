@@ -51,6 +51,7 @@
 //! single-use access -- exactly matching what `launch_matvec` already
 //! does (a fresh command buffer/encoder every call, never stored).
 
+use crate::dispatch::dispatch_counted;
 use crate::moe_ids::IdsBinding;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -98,6 +99,7 @@ pub(crate) fn compute_encoder_concurrent(
 /// reads), which bubbles the GPU on OLMoE Concurrent encode.
 #[inline]
 pub(crate) fn memory_barrier_buffers(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+    crate::dispatch::note_barrier();
     encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
 }
 
@@ -110,9 +112,11 @@ pub(crate) fn memory_barrier_resources(
     bufs: &[&ProtocolObject<dyn MTLBuffer>],
 ) {
     if bufs.is_empty() {
+        // Counted by the delegate.
         memory_barrier_buffers(encoder);
         return;
     }
+    crate::dispatch::note_barrier();
     // MTLBuffer: MTLResource — build a contiguous pointer list for the API.
     let mut resources: Vec<NonNull<ProtocolObject<dyn MTLResource>>> =
         Vec::with_capacity(bufs.len());
@@ -1572,7 +1576,8 @@ pub(crate) fn encode_q4_0_mul_mm(
         enc.setThreadgroupMemoryLength_atIndex((tg as usize) * 4, 0);
     }
 
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        enc,
         MTLSize {
             width: rows,
             height: 1,
@@ -3590,7 +3595,8 @@ pub(crate) fn encode_moe_mm_id_map0(
         enc.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 3);
         enc.setThreadgroupMemoryLength_atIndex(smem, 0);
     }
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        enc,
         MTLSize {
             width: 1,
             height: 1,
@@ -3648,7 +3654,8 @@ pub(crate) fn encode_mul_mm_id_f16(
             );
         }
         enc.setThreadgroupMemoryLength_atIndex(8192, 0);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            enc,
             MTLSize {
                 width: (n_tokens as usize).div_ceil(32),
                 height: (rows as usize).div_ceil(64),
@@ -3689,7 +3696,8 @@ pub(crate) fn encode_moe_router_mm_f32(
             );
         }
     }
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        enc,
         MTLSize {
             width: n_experts as usize,
             height: n_tokens as usize,
@@ -3738,7 +3746,8 @@ pub(crate) fn encode_moe_topk_softmax_batch(
         }
         enc.setThreadgroupMemoryLength_atIndex((n as usize) * 4, 0);
     }
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        enc,
         MTLSize {
             width: n_tokens as usize,
             height: 1,
@@ -3958,7 +3967,8 @@ pub(crate) fn encode_moe_prefill_weighted_sum(
         encoder.setBytes_length_atIndex(NonNull::new(&mut nt as *mut u32 as *mut _).unwrap(), 4, 5);
     }
     let sum_elems = (n_tokens as usize) * (hidden_rows as usize);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: sum_elems.div_ceil(SUM_TG),
             height: 1,
@@ -4016,7 +4026,8 @@ pub(crate) fn encode_mul_mm_id(
             );
         }
         enc.setThreadgroupMemoryLength_atIndex(8192, 0);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            enc,
             MTLSize {
                 width: (n_tokens as usize).div_ceil(32),
                 height: (rows as usize).div_ceil(64),
@@ -4135,7 +4146,8 @@ pub(crate) fn encode_mul_mm_sg_f16(
             );
         }
         enc.setThreadgroupMemoryLength_atIndex(smem, 0);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            enc,
             MTLSize {
                 width: batch_size.div_ceil(32),
                 height: l.rows.div_ceil(64),
@@ -4209,7 +4221,8 @@ pub(crate) fn encode_mul_mm_sg_offset_ex(
             );
         }
         enc.setThreadgroupMemoryLength_atIndex(smem, 0);
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            enc,
             MTLSize {
                 width: batch_size.div_ceil(32),
                 height: l.rows.div_ceil(64),
@@ -4417,7 +4430,7 @@ fn launch_k_quant_mul_mm_sg(
             height: 1,
             depth: 1,
         };
-        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        dispatch_counted(&enc, grid, tg);
     }
     enc.endEncoding();
     let t_gpu = std::time::Instant::now();
@@ -4466,8 +4479,29 @@ pub(crate) fn mm_timing_add(setup: u128, gpu: u128, read: u128) {
 /// `GPUStartTime`/`GPUEndTime` measure the command buffer's own occupancy
 /// and stay usable while the machine is busy, so A/B evidence in
 /// `docs/plans/llama-cpp-parity-push.md` is taken from these.
-static GPU_TIMING: std::sync::Mutex<Vec<(&'static str, u64, u64)>> =
-    std::sync::Mutex::new(Vec::new());
+static GPU_TIMING: std::sync::Mutex<Vec<TimingSlot>> = std::sync::Mutex::new(Vec::new());
+
+/// One tag's running GPU-time total, plus what the host encoded to
+/// produce it.
+///
+/// The encode counters in [`crate::dispatch`] are process-wide, so a
+/// per-submission figure has to come from the DELTA between consecutive
+/// submissions of the same tag rather than from a total divided by a
+/// count -- otherwise a prefill's dispatches land in the decode average.
+/// GitHub issue #149 is about the host cost of encoding, so this number
+/// belongs next to the GPU time it bought, not in a separate readout
+/// somebody has to line up by hand.
+struct TimingSlot {
+    tag: &'static str,
+    n: u64,
+    acc_ns: u64,
+    /// Counter snapshot at the previous submission under this tag.
+    prev: crate::dispatch::EncodeStats,
+    /// Encode work attributed to this tag, summed over `n` submissions.
+    acc_dispatches: u64,
+    acc_barriers: u64,
+    acc_begin_ops: u64,
+}
 
 /// True when `FERROX_METAL_GPU_TIMING` is set (cached; read once).
 pub(crate) fn gpu_timing_enabled() -> bool {
@@ -4486,24 +4520,44 @@ pub(crate) fn gpu_timing_note(
         return;
     }
     let dt_ns = ((cmd_buf.GPUEndTime() - cmd_buf.GPUStartTime()) * 1e9).max(0.0) as u64;
+    let now = crate::dispatch::metal_encode_stats();
     let Ok(mut slots) = GPU_TIMING.lock() else {
         return;
     };
-    let slot = match slots.iter_mut().find(|(t, _, _)| *t == tag) {
+    let slot = match slots.iter_mut().find(|s| s.tag == tag) {
         Some(s) => s,
         None => {
-            slots.push((tag, 0, 0));
+            slots.push(TimingSlot {
+                tag,
+                n: 0,
+                acc_ns: 0,
+                prev: now,
+                acc_dispatches: 0,
+                acc_barriers: 0,
+                acc_begin_ops: 0,
+            });
             slots.last_mut().expect("just pushed")
         }
     };
-    slot.1 += 1;
-    slot.2 += dt_ns;
-    let (n, acc) = (slot.1, slot.2);
+    slot.n += 1;
+    slot.acc_ns += dt_ns;
+    slot.acc_dispatches += now.dispatches.saturating_sub(slot.prev.dispatches);
+    slot.acc_barriers += now.barriers.saturating_sub(slot.prev.barriers);
+    slot.acc_begin_ops += now.begin_ops.saturating_sub(slot.prev.begin_ops);
+    slot.prev = now;
+    let n = slot.n;
     if n.is_multiple_of(every.max(1)) {
+        let per = |acc: u64| acc as f64 / n as f64;
         eprintln!(
-            "ferrox: metal gpu[{tag}] {:.3} ms avg over {n} (last {:.3} ms)",
-            (acc as f64 / n as f64) / 1e6,
+            "ferrox: metal gpu[{tag}] {:.3} ms avg over {n} (last {:.3} ms); \
+             encode/submission: {:.1} dispatches, {:.1} barriers, \
+             {:.1} hazard checks ({:.2} bar/op)",
+            (slot.acc_ns as f64 / n as f64) / 1e6,
             dt_ns as f64 / 1e6,
+            per(slot.acc_dispatches),
+            per(slot.acc_barriers),
+            per(slot.acc_begin_ops),
+            slot.acc_barriers as f64 / slot.acc_begin_ops.max(1) as f64,
         );
     }
 }
@@ -4589,7 +4643,8 @@ pub fn launch_q4_k_mul_mm(
         enc.setThreadgroupMemoryLength_atIndex((tg as usize) * 4, 0);
     }
 
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        &enc,
         MTLSize {
             width: rows,
             height: 1,
@@ -5918,7 +5973,8 @@ fn encode_moe_matvec_id(
             encoder.setThreadgroupMemoryLength_atIndex(disp.tg_mem, 0);
         }
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: (n_rows as usize).div_ceil(disp.rows_per_tg),
             height: 1,
@@ -5997,7 +6053,8 @@ fn encode_moe_down_id(
             encoder.setThreadgroupMemoryLength_atIndex(disp.tg_mem, 0);
         }
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: (hidden_rows as usize).div_ceil(disp.rows_per_tg),
             height: 1,
@@ -6406,7 +6463,8 @@ pub(crate) fn encode_q4_0_moe_id(
                 4,
             );
         }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            encoder,
             MTLSize {
                 width: packed.hidden_rows.div_ceil(SUM_TG),
                 height: 1,
@@ -6444,7 +6502,8 @@ pub(crate) fn encode_q4_0_moe_id(
             );
         }
         let sum_elems = (n_tokens as usize) * packed.hidden_rows;
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            encoder,
             MTLSize {
                 width: sum_elems.div_ceil(SUM_TG),
                 height: 1,
@@ -6821,7 +6880,8 @@ pub(crate) fn encode_q4_0_moe_topk(
             21,
         );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: experts.len() * ffn.div_ceil(ROWS_PER_TG),
             height: 1,
@@ -6877,7 +6937,8 @@ pub(crate) fn encode_q4_0_moe_topk(
             14,
         );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: experts.len() * hidden.div_ceil(ROWS_PER_TG),
             height: 1,
@@ -6915,7 +6976,8 @@ pub(crate) fn encode_q4_0_moe_topk(
         );
     }
     const SUM_TG: usize = 256;
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: hidden.div_ceil(SUM_TG),
             height: 1,
@@ -7277,7 +7339,8 @@ pub(crate) fn encode_matvec_with_offsets(
         // threadgroup, NSG = min(4, ceil(ne00/128)) simdgroups sharing the
         // reduction axis. `MAX_NSG` in the kernel is 8.
         let nsg = cols.div_ceil(128).clamp(1, 4);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_counted(
+            encoder,
             MTLSize {
                 width: launch.rows.div_ceil(2),
                 height: 1,
@@ -7348,7 +7411,8 @@ pub(crate) fn encode_matvec_with_offsets(
             encoder.setThreadgroupMemoryLength_atIndex(tg_mem_bytes, 0);
         }
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,

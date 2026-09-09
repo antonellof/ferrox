@@ -26,32 +26,15 @@
 //! 1.00 means the pass is fully serialised, lower means dispatches are
 //! overlapping.
 
+use crate::dispatch::{metal_encode_stats, note_begin_op};
 use crate::gpu::memory_barrier_resources;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Process-wide barrier count across every tracked encode pass.
-static BARRIER_COUNT: AtomicU64 = AtomicU64::new(0);
-static BEGIN_OP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// True when barrier logging is requested (cached; read once).
 fn barrier_log_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FERROX_METAL_BARRIER_LOG").is_some())
-}
-
-/// Snapshot `(barriers, begin_ops)` since last reset (test / debug).
-pub fn metal_barrier_stats() -> (u64, u64) {
-    (
-        BARRIER_COUNT.load(Ordering::Relaxed),
-        BEGIN_OP_COUNT.load(Ordering::Relaxed),
-    )
-}
-
-pub fn metal_barrier_stats_reset() {
-    BARRIER_COUNT.store(0, Ordering::Relaxed);
-    BEGIN_OP_COUNT.store(0, Ordering::Relaxed);
 }
 
 #[derive(Default)]
@@ -133,21 +116,25 @@ impl MemRanges {
         srcs: &[&ProtocolObject<dyn MTLBuffer>],
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) {
-        BEGIN_OP_COUNT.fetch_add(1, Ordering::Relaxed);
+        note_begin_op();
         if !self.check(srcs, dsts) {
             // SAFETY: pointers were taken from live encoder-bound scratch /
             // weight buffers that outlive this encode pass.
             let refs: Vec<&ProtocolObject<dyn MTLBuffer>> =
                 self.bufs.iter().map(|&p| unsafe { &*p }).collect();
+            // Counts itself: see `crate::dispatch`.
             memory_barrier_resources(encoder, &refs);
             self.reset();
-            let n = BARRIER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if barrier_log_enabled() && n.is_multiple_of(4096) {
-                let begins = BEGIN_OP_COUNT.load(Ordering::Relaxed);
-                eprintln!(
-                    "ferrox: metal barriers={n} begin_ops={begins} (~{:.2} bar/op)",
-                    n as f64 / begins.max(1) as f64
-                );
+            if barrier_log_enabled() {
+                let s = metal_encode_stats();
+                if s.barriers.is_multiple_of(4096) {
+                    eprintln!(
+                        "ferrox: metal barriers={} begin_ops={} (~{:.2} bar/op)",
+                        s.barriers,
+                        s.begin_ops,
+                        s.barriers as f64 / s.begin_ops.max(1) as f64
+                    );
+                }
             }
         }
     }
