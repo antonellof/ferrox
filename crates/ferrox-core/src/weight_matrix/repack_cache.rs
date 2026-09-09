@@ -1,5 +1,6 @@
-//! Process-wide caches of interleaved ("repacked") weight bytes, keyed
-//! by the identity of the mapping the bytes came from.
+//! A process-wide, byte-budgeted cache of interleaved ("repacked")
+//! weight bytes, keyed by the identity of the mapping the bytes came
+//! from.
 //!
 //! A repack rewrites a whole matrix into the row-interleaved layout the
 //! `x4` / `x8` GEMV kernels read, so it costs a pass over every weight
@@ -19,9 +20,38 @@
 //! nothing making them agree, is this repo's dominant bug shape, so the
 //! typed lookups below take the [`WeightBytes`] and ask it themselves.
 //! A call site can no longer say "uncacheable" on its own authority.
+//!
+//! # The budget
+//!
+//! Caching a packing RETAINS a second copy of a matrix that is already
+//! mapped. Measured on TinyLlama-1.1B Q8_0, retaining the dense FFN
+//! gate/up packings cost **+527 MB of peak footprint** (685 MB to 1213
+//! MB), and that scales with gate/up bytes: an 8B checkpoint pays
+//! several GB, and a resident MoE pays it once per expert that has ever
+//! been routed to. Unbounded, it grows with the number of distinct
+//! matrices the process touches, which for an MoE is unbounded in
+//! practice.
+//!
+//! So there is ONE cache, not one per format, holding
+//! [`budget_bytes`] at most, evicting least-recently-used entries to
+//! stay under it. A matrix that does not fit is packed and returned
+//! uncached, so pressure degrades to recomputation and never to a wrong
+//! answer -- the same degradation
+//! [`crate::expert_store::ExpertStore::acquire`] makes, for the same
+//! reason.
+//!
+//! Five caches would be five budgets over one pool of RAM, which is the
+//! defect the budget exists to close, so the format is part of the key
+//! instead.
+//!
+//! The budget itself is DERIVED, in
+//! [`crate::host_memory::derived_copy_budget`], from a live probe of the
+//! host minus what `expert_store` has already committed. It can be zero,
+//! and zero means nothing is ever retained: exactly the behaviour before
+//! this cache existed.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use super::WeightBytes;
 
@@ -76,37 +106,205 @@ impl MapId {
                 .is_some_and(|m| Arc::as_ptr(&m) as usize == other.id)
     }
 
-    /// The cache key this identity contributes to, for `rows x cols`.
-    fn key(&self, rows: usize, cols: usize) -> RepackKey {
-        (self.id, self.offset, rows, cols)
+    /// The cache key this identity contributes to, for `format` at
+    /// `rows x cols`.
+    fn key(&self, format: Format, rows: usize, cols: usize) -> RepackKey {
+        (format, self.id, self.offset, rows, cols)
     }
 }
 
-/// `(mapping id, byte offset, rows, cols)`.
+/// Which interleaved layout a cached packing is in.
+///
+/// Part of the KEY rather than the identity of a separate cache: one
+/// budget over one map is the whole point, and five maps would be five
+/// budgets spending the same RAM.
+///
+/// Carrying it in the key is defensive rather than load-bearing, and
+/// saying so is the honest version: one mapping offset is one tensor,
+/// a tensor has one quant kind, and each kind reaches exactly one
+/// packer, so no call site today can ask for two formats at one
+/// address. The key names the packing anyway, so that invariant is not
+/// something a future format has to rediscover. A test cannot
+/// distinguish it for the same reason it cannot happen, so there is no
+/// test claiming to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Format {
+    /// `block_q4_Kx8`
+    Q4Kx8,
+    /// `block_q5_Kx8`
+    Q5Kx8,
+    /// `block_q6_Kx8`
+    Q6Kx8,
+    /// `block_q8_0x4`
+    Q8_0x4,
+    /// `block_q4_0x4`
+    Q4_0x4,
+}
+
+/// `(format, mapping id, byte offset, rows, cols)`.
 ///
 /// `cols` is in the key because two tensors of equal row count and
 /// unequal width are different matrices with different repacked lengths,
 /// and the old `(address, rows)` key called them the same one.
-type RepackKey = (usize, usize, usize, usize);
+type RepackKey = (Format, usize, usize, usize, usize);
 
 /// Interleaved bytes, beside the mapping identity that makes the key
-/// meaningful. See [`MapId`].
-type Entry = (MapId, Arc<[u8]>);
+/// meaningful ([`MapId`]) and the recency stamp eviction orders by.
+struct Entry {
+    id: MapId,
+    packed: Arc<[u8]>,
+    /// Monotonic; smallest is least recently used. A stamp per touch
+    /// rather than an LRU list, which is what
+    /// [`crate::expert_store`] does and for the same reason: an O(n)
+    /// scan is cheap at the few-hundred entries a checkpoint produces,
+    /// and a list is another structure to keep in agreement.
+    last_used: u64,
+}
 
-/// One format's process-wide cache.
-type RepackCache = Mutex<HashMap<RepackKey, Entry>>;
+/// The one cache. See the module docs for why it is one and not five.
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<RepackKey, Entry>,
+    /// Sum of `entries[..].packed.len()`, maintained on every insert and
+    /// every eviction so the budget check is O(1).
+    resident_bytes: usize,
+    clock: u64,
+}
 
-/// The one way any of this module takes a cache lock.
+impl Cache {
+    /// Drops one entry and un-accounts its bytes.
+    ///
+    /// The only way an entry leaves the map. A `remove` that forgot to
+    /// subtract would leak budget until the cache stopped caching
+    /// anything, which is exactly the kind of silent divergence this
+    /// repo keeps paying for, so there is one of these and everything
+    /// calls it.
+    fn evict(&mut self, key: &RepackKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(entry.packed.len());
+        }
+    }
+
+    /// The least recently used key, or `None` when the map is empty.
+    fn lru(&self) -> Option<RepackKey> {
+        self.entries
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(k, _)| *k)
+    }
+
+    /// Serves `key` if it holds a live packing for `id`, dropping a
+    /// stale entry rather than returning it.
+    ///
+    /// A dead `Weak` means the mapping that published this address is
+    /// gone and the address has been handed to somebody else, so the
+    /// entry is a textbook ABA and must not be served.
+    fn take_hit(&mut self, key: &RepackKey, id: &MapId) -> Option<Arc<[u8]>> {
+        match self.entries.get_mut(key) {
+            Some(entry) if entry.id.matches(id) => {
+                self.clock += 1;
+                entry.last_used = self.clock;
+                Some(Arc::clone(&entry.packed))
+            }
+            Some(_) => {
+                self.evict(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Retains `packed` under `key` if the budget can hold it, evicting
+    /// least-recently-used entries to make room.
+    ///
+    /// Returns without inserting when one packing alone exceeds the
+    /// budget -- including when the budget is zero, which is how "never
+    /// retain anything" is expressed. The caller already holds the
+    /// packing, so declining costs a recomputation next time and
+    /// nothing else.
+    fn insert_within_budget(&mut self, key: RepackKey, id: MapId, packed: Arc<[u8]>) {
+        let budget = budget_bytes();
+        let size = packed.len();
+        if size > budget {
+            return;
+        }
+        while self.resident_bytes + size > budget {
+            let Some(victim) = self.lru() else { break };
+            self.evict(&victim);
+        }
+        // The loop can only exit early when the map is empty, and an
+        // empty map holds zero bytes, so this cannot fail after it --
+        // but assert rather than assume, because the budget is the
+        // property the tests pin.
+        if self.resident_bytes + size > budget {
+            return;
+        }
+        self.clock += 1;
+        self.resident_bytes += size;
+        self.entries.insert(
+            key,
+            Entry {
+                id,
+                packed,
+                last_used: self.clock,
+            },
+        );
+    }
+}
+
+/// The process-wide cache, built on first use.
+fn cache() -> &'static Mutex<Cache> {
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Cache::default()))
+}
+
+/// The one way any of this module takes the cache lock.
 ///
 /// A poisoned lock is recovered from rather than propagated. The map
 /// holds no invariant a panic can leave half-built: entries are
-/// `(identity, immutable bytes)` pairs inserted whole, and every read
-/// re-checks the identity before trusting the bytes. Propagating the
-/// poison instead would let one panic anywhere in the process turn
-/// EVERY later matvec on this format into a panic, which is a much
-/// worse failure than serving a correct cached packing.
-fn lock(cache: &'static RepackCache) -> std::sync::MutexGuard<'static, HashMap<RepackKey, Entry>> {
-    cache.lock().unwrap_or_else(|e| e.into_inner())
+/// inserted whole, and every read re-checks the identity before trusting
+/// the bytes. Propagating the poison instead would let one panic
+/// anywhere in the process turn EVERY later matvec into a panic, which
+/// is a much worse failure than serving a correct cached packing.
+fn lock() -> MutexGuard<'static, Cache> {
+    cache().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bytes this cache may retain, decided once for the process.
+///
+/// `FERROX_REPACK_CACHE_BYTES` overrides it, and `0` is a legal value
+/// meaning "never retain anything" -- the behaviour before this cache
+/// existed, and the reason a memory-constrained host is expressible
+/// rather than merely given a smaller number.
+///
+/// Otherwise it is DERIVED by
+/// [`crate::host_memory::derived_copy_budget`] from what the host says
+/// is available, less the standard fit headroom, less what
+/// `expert_store` has already committed. That subtraction is the whole
+/// relationship between this budget and the expert one: they are not
+/// two independent numbers, they are one pool spent in a fixed order.
+fn budget_bytes() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(bytes) = tests::budget_override() {
+            return bytes;
+        }
+    }
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        if let Some(explicit) = std::env::var("FERROX_REPACK_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            return usize::try_from(explicit).unwrap_or(usize::MAX);
+        }
+        let derived = crate::host_memory::derived_copy_budget(
+            crate::host_memory::available_bytes(),
+            crate::host_memory::FIT_HEADROOM_BYTES,
+            crate::expert_store::committed_expert_bytes(),
+        );
+        usize::try_from(derived).unwrap_or(usize::MAX)
+    })
 }
 
 /// The one lookup every format's repack shares.
@@ -117,7 +315,7 @@ fn lock(cache: &'static RepackCache) -> std::sync::MutexGuard<'static, HashMap<R
 /// way for a matvec to reach this is through a typed lookup below, which
 /// derives `id` from the [`WeightBytes`] rather than accepting one.
 fn get_or_repack(
-    cache: &'static RepackCache,
+    format: Format,
     id: Option<MapId>,
     rows: usize,
     cols: usize,
@@ -126,80 +324,53 @@ fn get_or_repack(
     let Some(id) = id else {
         return Arc::from(repack().into_boxed_slice());
     };
-    let key = id.key(rows, cols);
-    {
-        let mut cache = lock(cache);
-        match cache.get(&key) {
-            Some((entry, hit)) if entry.matches(&id) => return Arc::clone(hit),
-            // The mapping that published this address is gone, so the
-            // address has been handed to somebody else. Drop the entry
-            // rather than leaving a `Weak` pinning a dead control block.
-            Some(_) => {
-                cache.remove(&key);
-            }
-            None => {}
-        }
+    let key = id.key(format, rows, cols);
+    if let Some(hit) = lock().take_hit(&key, &id) {
+        return hit;
     }
     let arc: Arc<[u8]> = Arc::from(repack().into_boxed_slice());
-    let mut cache = lock(cache);
+    let mut cache = lock();
     // Another thread may have won the race; prefer the existing entry,
     // but only if it is one this caller would have accepted above.
-    match cache.get(&key) {
-        Some((entry, hit)) if entry.matches(&id) => Arc::clone(hit),
-        _ => {
-            cache.insert(key, (id, Arc::clone(&arc)));
+    match cache.take_hit(&key, &id) {
+        Some(hit) => hit,
+        None => {
+            cache.insert_within_budget(key, id, Arc::clone(&arc));
             arc
         }
     }
 }
 
-/// Whether the packing of `data` (as `rows x cols`) is currently held in
-/// `cache` under a live identity. Tests only.
+/// Whether the packing of `data` (as `format` at `rows x cols`) is
+/// currently held under a live identity. Tests only.
 #[cfg(test)]
-fn is_cached(cache: &'static RepackCache, data: &WeightBytes, rows: usize, cols: usize) -> bool {
+fn is_cached(format: Format, data: &WeightBytes, rows: usize, cols: usize) -> bool {
     let Some(id) = data.map_id() else {
         return false;
     };
-    lock(cache)
-        .get(&id.key(rows, cols))
-        .is_some_and(|(entry, _)| entry.matches(&id))
+    lock()
+        .entries
+        .get(&id.key(format, rows, cols))
+        .is_some_and(|e| e.id.matches(&id))
 }
 
-/// One `static` cache per interleaved format, each behind a function so
-/// the `OnceLock` is spelled once.
-macro_rules! format_cache {
-    ($(#[$doc:meta])* $name:ident) => {
-        $(#[$doc])*
-        fn $name() -> &'static RepackCache {
-            static CACHE: OnceLock<RepackCache> = OnceLock::new();
-            CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-        }
-    };
+/// Bytes the cache currently holds. Diagnostics and tests.
+#[cfg(test)]
+fn resident_bytes() -> usize {
+    lock().resident_bytes
 }
 
-format_cache!(
-    /// Process-wide cache of interleaved Q4_K (`block_q4_Kx8`) bytes.
-    q4k_repack_cache
-);
-format_cache!(
-    /// Process-wide cache of interleaved Q5_K (`block_q5_Kx8`) bytes.
-    q5k_repack_cache
-);
-format_cache!(
-    /// Process-wide cache of interleaved Q6_K (`block_q6_Kx8`) bytes.
-    q6k_repack_cache
-);
-format_cache!(
-    /// Process-wide cache of interleaved Q8_0 (`block_q8_0x4`) bytes.
-    q8x4_repack_cache
-);
-format_cache!(
-    /// Process-wide cache of interleaved Q4_0 (`block_q4_0x4`) bytes.
-    q4x4_repack_cache
-);
+/// Empties the cache. Tests only: the cache is process-wide, so a test
+/// that asserts about the budget has to start from a known footprint.
+#[cfg(test)]
+fn clear() {
+    let mut cache = lock();
+    cache.entries.clear();
+    cache.resident_bytes = 0;
+}
 
 pub(super) fn get_or_repack_q4k(data: &WeightBytes, rows: usize, cols: usize) -> Arc<[u8]> {
-    get_or_repack(q4k_repack_cache(), data.map_id(), rows, cols, || {
+    get_or_repack(Format::Q4Kx8, data.map_id(), rows, cols, || {
         ferrox_quant::pack_q4_k_matrix_x8(
             data.as_slice(),
             rows,
@@ -210,7 +381,7 @@ pub(super) fn get_or_repack_q4k(data: &WeightBytes, rows: usize, cols: usize) ->
 }
 
 pub(super) fn get_or_repack_q5k(data: &WeightBytes, rows: usize, cols: usize) -> Arc<[u8]> {
-    get_or_repack(q5k_repack_cache(), data.map_id(), rows, cols, || {
+    get_or_repack(Format::Q5Kx8, data.map_id(), rows, cols, || {
         ferrox_quant::pack_q5_k_matrix_x8(
             data.as_slice(),
             rows,
@@ -221,7 +392,7 @@ pub(super) fn get_or_repack_q5k(data: &WeightBytes, rows: usize, cols: usize) ->
 }
 
 pub(super) fn get_or_repack_q6k(data: &WeightBytes, rows: usize, cols: usize) -> Arc<[u8]> {
-    get_or_repack(q6k_repack_cache(), data.map_id(), rows, cols, || {
+    get_or_repack(Format::Q6Kx8, data.map_id(), rows, cols, || {
         ferrox_quant::pack_q6_k_matrix_x8(
             data.as_slice(),
             rows,
@@ -232,7 +403,7 @@ pub(super) fn get_or_repack_q6k(data: &WeightBytes, rows: usize, cols: usize) ->
 }
 
 pub(super) fn get_or_repack_q8x4(data: &WeightBytes, rows: usize, cols: usize) -> Arc<[u8]> {
-    get_or_repack(q8x4_repack_cache(), data.map_id(), rows, cols, || {
+    get_or_repack(Format::Q8_0x4, data.map_id(), rows, cols, || {
         ferrox_quant::pack_q8_0_matrix_x4(
             data.as_slice(),
             rows,
@@ -243,7 +414,7 @@ pub(super) fn get_or_repack_q8x4(data: &WeightBytes, rows: usize, cols: usize) -
 }
 
 pub(super) fn get_or_repack_q4_0x4(data: &WeightBytes, rows: usize, cols: usize) -> Arc<[u8]> {
-    get_or_repack(q4x4_repack_cache(), data.map_id(), rows, cols, || {
+    get_or_repack(Format::Q4_0x4, data.map_id(), rows, cols, || {
         ferrox_quant::pack_q4_0_matrix_x4(
             data.as_slice(),
             rows,
@@ -257,7 +428,7 @@ pub(super) fn get_or_repack_q4_0x4(data: &WeightBytes, rows: usize, cols: usize)
 /// the `apply_cpu_q8` test below asks after one call.
 #[cfg(test)]
 pub(super) fn q8x4_is_cached(data: &WeightBytes, rows: usize, cols: usize) -> bool {
-    is_cached(q8x4_repack_cache(), data, rows, cols)
+    is_cached(Format::Q8_0x4, data, rows, cols)
 }
 
 #[cfg(test)]
@@ -265,6 +436,57 @@ mod tests {
     use super::super::tests::{f16_le, ForceIntDot};
     use super::super::{QuantKind, WeightMatrix};
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `usize::MAX` means "no override": a real budget of `usize::MAX`
+    /// is not reachable, since it is a quarter of a byte count that
+    /// came out of a memory probe.
+    static BUDGET_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// The budget [`super::budget_bytes`] should report, if a test has
+    /// pinned one.
+    pub(super) fn budget_override() -> Option<usize> {
+        match BUDGET_OVERRIDE.load(Ordering::Acquire) {
+            usize::MAX => None,
+            bytes => Some(bytes),
+        }
+    }
+
+    /// Pins the cache budget, and empties the cache, for the lifetime of
+    /// the guard.
+    ///
+    /// Both halves are necessary and both are here rather than at the
+    /// call sites: the cache and the budget are process-wide, so a test
+    /// that asserts about either has to own both, and two tests holding
+    /// different budgets at once would see each other's. The mutex is
+    /// what serializes them, the same shape as
+    /// `weight_matrix::tests::ForceIntDot`.
+    pub(super) struct ForceBudget {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ForceBudget {
+        fn new(bytes: usize) -> Self {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            BUDGET_OVERRIDE.store(bytes, Ordering::Release);
+            clear();
+            ForceBudget { _lock: lock }
+        }
+
+        /// Enough for any fixture here: the budget is not what the test
+        /// is about.
+        fn generous() -> Self {
+            Self::new(1 << 20)
+        }
+    }
+
+    impl Drop for ForceBudget {
+        fn drop(&mut self) {
+            clear();
+            BUDGET_OVERRIDE.store(usize::MAX, Ordering::Release);
+        }
+    }
 
     // -----------------------------------------------------------------
     // Repack cache identity (see `MapId`)
@@ -352,6 +574,7 @@ mod tests {
     /// would have left there.
     #[test]
     fn stale_repack_entry_is_replaced_not_served() {
+        let _budget = ForceBudget::generous();
         let (rows, cols) = (8usize, 64usize);
         let bytes = q8_0_matrix_bytes(rows, cols, 11);
         let (_mmap, view) = mapped("stale", &bytes);
@@ -361,17 +584,15 @@ mod tests {
         // matrix will look up, under an identity that can never upgrade.
         let poison = vec![0xABu8; 16];
         {
-            let mut cache = lock(q8x4_repack_cache());
-            cache.insert(
-                id.key(rows, cols),
-                (
-                    MapId {
-                        map: std::sync::Weak::new(),
-                        id: id.id,
-                        offset: id.offset,
-                    },
-                    Arc::from(poison.clone().into_boxed_slice()),
-                ),
+            let mut cache = lock();
+            cache.insert_within_budget(
+                id.key(Format::Q8_0x4, rows, cols),
+                MapId {
+                    map: std::sync::Weak::new(),
+                    id: id.id,
+                    offset: id.offset,
+                },
+                Arc::from(poison.clone().into_boxed_slice()),
             );
         }
 
@@ -386,12 +607,13 @@ mod tests {
         assert_eq!(&got[..], &want[..], "stale entry was not repacked");
 
         // And the dead entry is gone rather than pinning a control block.
-        let cache = lock(q8x4_repack_cache());
-        let (entry, _) = cache
-            .get(&id.key(rows, cols))
+        let cache = lock();
+        let entry = cache
+            .entries
+            .get(&id.key(Format::Q8_0x4, rows, cols))
             .expect("the live packing should now be cached");
         assert!(
-            entry.matches(&id),
+            entry.id.matches(&id),
             "the replacement entry must carry the LIVE identity"
         );
     }
@@ -405,6 +627,7 @@ mod tests {
     /// lookups exist to make impossible for production code.
     #[test]
     fn repack_key_separates_two_widths_at_one_address() {
+        let _budget = ForceBudget::generous();
         let rows = 8usize;
         let narrow = q8_0_matrix_bytes(rows, 32, 3);
         let wide = q8_0_matrix_bytes(rows, 64, 5);
@@ -412,10 +635,10 @@ mod tests {
         let id = view.map_id().expect("Mapped bytes must have an identity");
 
         let il = ferrox_quant::q8_0x4_interleave();
-        let a = get_or_repack(q8x4_repack_cache(), Some(id.clone()), rows, 32, || {
+        let a = get_or_repack(Format::Q8_0x4, Some(id.clone()), rows, 32, || {
             ferrox_quant::pack_q8_0_matrix_x4(&narrow, rows, 32, il)
         });
-        let b = get_or_repack(q8x4_repack_cache(), Some(id.clone()), rows, 64, || {
+        let b = get_or_repack(Format::Q8_0x4, Some(id.clone()), rows, 64, || {
             ferrox_quant::pack_q8_0_matrix_x4(&wide, rows, 64, il)
         });
         assert_eq!(
@@ -455,6 +678,7 @@ mod tests {
     /// Both halves are the contract the matvecs rely on.
     #[test]
     fn a_mapped_matrix_is_packed_once_and_an_owned_one_never_cached() {
+        let _budget = ForceBudget::generous();
         let (rows, cols) = (8usize, 64usize);
         let bytes = q8_0_matrix_bytes(rows, cols, 17);
         let (_mmap, view) = mapped("once", &bytes);
@@ -492,6 +716,7 @@ mod tests {
     #[test]
     fn apply_cpu_q8_caches_the_packing_of_a_mapped_matrix() {
         let _force = ForceIntDot::new(true);
+        let _budget = ForceBudget::generous();
         let (rows, cols) = (8usize, 64usize);
         let bytes = q8_0_matrix_bytes(rows, cols, 23);
         let (_mmap, view) = mapped("apply_q8", &bytes);
@@ -516,6 +741,155 @@ mod tests {
             q8x4_is_cached(data, rows, cols),
             "apply_cpu_q8 repacked a mapped matrix without caching it: \
              that is a full copy of the matrix per token (#128)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The budget
+    //
+    // The cache retains a SECOND copy of a matrix that is already
+    // mapped. Measured at +527 MB of peak footprint on TinyLlama-1.1B
+    // Q8_0 for the dense FFN gate/up packings alone, and a resident MoE
+    // pays that once per expert ever routed to. These tests are the
+    // bound on that.
+    // -----------------------------------------------------------------
+
+    /// The interleave the Q8_0 fixtures pack with, spelled once.
+    fn il() -> usize {
+        ferrox_quant::q8_0x4_interleave()
+    }
+
+    /// Ten distinct matrices under a budget that holds three of them.
+    ///
+    /// Three separate properties, because a cache can fail each one on
+    /// its own:
+    ///
+    /// 1. it never exceeds the budget, at any step;
+    /// 2. it still answers correctly for what it dropped;
+    /// 3. it EVICTS rather than stops caching. A cache that filled up
+    ///    and then refused every later matrix would satisfy (1) and (2)
+    ///    and be useless: decode walks every layer, so the first three
+    ///    matrices would be cached forever and every other matrix would
+    ///    repack per token, which is #128 again for all but three of
+    ///    them.
+    ///
+    /// Sabotage: insert unconditionally and (1) goes red; delete the
+    /// eviction loop and (3) goes red. Both were run.
+    #[test]
+    fn the_cache_never_exceeds_its_budget() {
+        let (rows, cols) = (8usize, 64usize);
+        let one_packing =
+            ferrox_quant::pack_q8_0_matrix_x4(&q8_0_matrix_bytes(rows, cols, 1), rows, cols, il())
+                .len();
+        // Room for three packings, and not a byte more.
+        let budget = one_packing * 3;
+        let _guard = ForceBudget::new(budget);
+
+        let mut held = Vec::new();
+        for seed in 0..10u32 {
+            let bytes = q8_0_matrix_bytes(rows, cols, seed + 1);
+            let (mmap, view) = mapped(&format!("budget{seed}"), &bytes);
+            let got = get_or_repack_q8x4(&view, rows, cols);
+            assert_eq!(
+                &got[..],
+                &ferrox_quant::pack_q8_0_matrix_x4(&bytes, rows, cols, il())[..],
+                "an evicting cache must still answer correctly"
+            );
+            assert!(
+                resident_bytes() <= budget,
+                "cache grew past its budget at matrix {seed}: {} > {budget}",
+                resident_bytes()
+            );
+            // Hold the mappings so no address is reused mid-test, which
+            // would make an eviction indistinguishable from an ABA drop.
+            held.push((mmap, view));
+        }
+        assert!(resident_bytes() <= budget);
+        assert!(
+            resident_bytes() >= one_packing,
+            "a budget that fits three packings must be holding some"
+        );
+
+        // (3): the LAST matrix is resident and the FIRST is not, which
+        // only an evicting cache can manage under this budget.
+        let (_, last) = held.last().expect("ten matrices were packed");
+        assert!(
+            q8x4_is_cached(last, rows, cols),
+            "the most recent matrix must be cached: a cache that stops \
+             caching once full leaves every later matrix repacking per \
+             token, which is the #128 defect for all but the first few"
+        );
+        let (_, first) = &held[0];
+        assert!(
+            !q8x4_is_cached(first, rows, cols),
+            "ten packings into a three-packing budget must have evicted \
+             the least recently used one"
+        );
+    }
+
+    /// A zero budget retains nothing, which is the behaviour before the
+    /// cache existed: every call repacks, into its own allocation, and
+    /// the answer is unchanged.
+    ///
+    /// This is what makes the memory-constrained host expressible rather
+    /// than merely given a smaller number.
+    ///
+    /// Sabotage: make `insert_within_budget` skip its `size > budget`
+    /// return and this goes red.
+    #[test]
+    fn a_zero_budget_retains_nothing_and_matches_the_pre_cache_behaviour() {
+        let _guard = ForceBudget::new(0);
+        let (rows, cols) = (8usize, 64usize);
+        let bytes = q8_0_matrix_bytes(rows, cols, 29);
+        let (_mmap, view) = mapped("zero_budget", &bytes);
+
+        let first = get_or_repack_q8x4(&view, rows, cols);
+        let second = get_or_repack_q8x4(&view, rows, cols);
+        assert_eq!(resident_bytes(), 0, "a zero budget retained something");
+        assert!(!q8x4_is_cached(&view, rows, cols));
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a zero budget must repack every call, as the engine did \
+             before this cache existed"
+        );
+        let want = ferrox_quant::pack_q8_0_matrix_x4(&bytes, rows, cols, il());
+        assert_eq!(&first[..], &want[..]);
+        assert_eq!(&second[..], &want[..], "same bytes, different allocation");
+    }
+
+    /// Every format spends the SAME budget. Five caches would be five
+    /// budgets over one pool of RAM, which is the defect
+    /// `expert_store`'s single-holder rule exists to prevent.
+    ///
+    /// Sabotage: ignore the budget in `insert_within_budget`, or delete
+    /// its eviction loop, and this goes red. Collapsing `Format` out of
+    /// the key does NOT turn it red, and the doc on `Format` says why:
+    /// the two fixtures are two mappings, so their keys differ with or
+    /// without it.
+    #[test]
+    fn every_format_spends_one_budget() {
+        let (rows, cols) = (8usize, 64usize);
+        let bytes = q8_0_matrix_bytes(rows, cols, 31);
+        let q8_len = ferrox_quant::pack_q8_0_matrix_x4(&bytes, rows, cols, il()).len();
+        let _guard = ForceBudget::new(q8_len);
+
+        let (_mmap, view) = mapped("one_budget_q8", &bytes);
+        let _ = get_or_repack_q8x4(&view, rows, cols);
+        assert!(q8x4_is_cached(&view, rows, cols), "the budget holds one");
+
+        // A Q4_0 packing of a DIFFERENT mapping, into a budget with room
+        // for exactly one entry.
+        let q4_bytes = vec![7u8; rows * (cols / 32) * 18];
+        let (_mmap4, view4) = mapped("one_budget_q4", &q4_bytes);
+        let _ = get_or_repack_q4_0x4(&view4, rows, cols);
+
+        assert!(
+            resident_bytes() <= q8_len,
+            "the two formats spent one budget, not two"
+        );
+        assert!(
+            !q8x4_is_cached(&view, rows, cols),
+            "the Q4_0 packing must have displaced the Q8_0 one"
         );
     }
 }
