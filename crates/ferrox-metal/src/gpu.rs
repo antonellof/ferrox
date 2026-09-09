@@ -103,20 +103,44 @@ pub(crate) fn memory_barrier_buffers(encoder: &ProtocolObject<dyn MTLComputeComm
     encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
 }
 
-/// Resource-scoped Concurrent barrier: only the listed buffers are ordered.
-/// Subsequent dispatches that don't touch these resources can overlap with
-/// in-flight work on other buffers (e.g. weight reads from a prior matvec).
+/// Resource-scoped Concurrent barrier over an ALREADY-BUILT resource list.
+///
+/// Only the listed buffers are ordered, so subsequent dispatches that
+/// don't touch them can overlap with in-flight work on other buffers
+/// (e.g. weight reads from a prior matvec).
+///
+/// This takes the list rather than building one because the hazard
+/// tracker already holds the pending set in exactly this form and reuses
+/// its allocation across the ~160 barriers a decode token emits;
+/// [`memory_barrier_resources`] is the convenience wrapper for the
+/// handful of call sites that name their buffers inline.
+#[inline]
+pub(crate) fn memory_barrier_resource_list(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    resources: &mut [NonNull<ProtocolObject<dyn MTLResource>>],
+) {
+    if resources.is_empty() {
+        // Nothing named: fall back to scope-Buffers, which is counted by
+        // the delegate.
+        memory_barrier_buffers(encoder);
+        return;
+    }
+    let head = NonNull::new(resources.as_mut_ptr()).expect("non-empty slice has a non-null base");
+    crate::dispatch::note_barrier();
+    // SAFETY: `head` points at `resources.len()` live resource pointers,
+    // each taken from a buffer bound into this encoder's command buffer
+    // and therefore alive for the whole encode pass.
+    unsafe {
+        encoder.memoryBarrierWithResources_count(head, resources.len());
+    }
+}
+
+/// Resource-scoped Concurrent barrier over buffers named inline.
 #[inline]
 pub(crate) fn memory_barrier_resources(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     bufs: &[&ProtocolObject<dyn MTLBuffer>],
 ) {
-    if bufs.is_empty() {
-        // Counted by the delegate.
-        memory_barrier_buffers(encoder);
-        return;
-    }
-    crate::dispatch::note_barrier();
     // MTLBuffer: MTLResource — build a contiguous pointer list for the API.
     let mut resources: Vec<NonNull<ProtocolObject<dyn MTLResource>>> =
         Vec::with_capacity(bufs.len());
@@ -124,12 +148,7 @@ pub(crate) fn memory_barrier_resources(
         let r: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(*b);
         resources.push(NonNull::from(r));
     }
-    unsafe {
-        encoder.memoryBarrierWithResources_count(
-            NonNull::new(resources.as_mut_ptr()).unwrap(),
-            resources.len(),
-        );
-    }
+    memory_barrier_resource_list(encoder, &mut resources);
 }
 
 /// Thread-local pointer + length for a Metal-resident activation buffer

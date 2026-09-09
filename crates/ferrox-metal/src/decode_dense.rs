@@ -9,8 +9,8 @@
 
 use crate::attn::{
     assert_freq_factors_len, borrow_decode_scratch, copy_f32_into, encode_attn_extras,
-    encode_gqa_with_kv, encode_kv_store_append, encode_rope, KvPlane, LayerRope, MetalKvBuffers,
-    MetalRope, ScratchCaps,
+    encode_gqa_with_kv, encode_kv_store_append, encode_rope, LayerRope, MetalKvBuffers, MetalRope,
+    RopeTarget, ScratchCaps,
 };
 use crate::elem::{
     encode_add_rms_norm, encode_argmax, encode_gelu_mul, encode_rms_norm, encode_silu_mul,
@@ -43,13 +43,28 @@ pub struct AttnExtras<'a> {
 }
 
 impl AttnExtras<'_> {
-    pub fn is_empty(&self) -> bool {
-        self.q_bias.is_none()
-            && self.k_bias.is_none()
-            && self.v_bias.is_none()
-            && self.q_norm.is_none()
-            && self.k_norm.is_none()
-            && self.attn_logit_softcap.is_none()
+    /// True when `encode_attn_extras` would encode at least one dispatch.
+    ///
+    /// `attn_logit_softcap` is deliberately NOT part of this: it is a
+    /// scalar consumed inside the GQA kernel, so a Gemma-2 layer that
+    /// sets only the softcap encodes nothing here.
+    ///
+    /// The caller uses this to skip the hazard check entirely. That
+    /// matters more than it looks: a `begin_op` around zero dispatches
+    /// still emits a full `memoryBarrierWithResources`, and on
+    /// Llama-3.2-1B -- no biases, no QK-norm -- that was 16 of the 176
+    /// barriers a decode token encoded, ordering nothing against
+    /// nothing (GitHub issue #149).
+    ///
+    /// `attn_extras_predicate_lists_every_field_that_encodes` destructures
+    /// the struct exhaustively, so a new field cannot be added without
+    /// deciding which side of this predicate it falls on.
+    pub fn encodes_anything(&self) -> bool {
+        self.q_bias.is_some()
+            || self.k_bias.is_some()
+            || self.v_bias.is_some()
+            || self.q_norm.is_some()
+            || self.k_norm.is_some()
     }
 }
 
@@ -301,44 +316,46 @@ pub fn launch_decode_dense_stack(
         encode_matvec(&encoder, device, &layer.v, &v_w, x_buf, v_buf)?;
         mrs.end_op(&[x_buf], &[q_buf, k_buf, v_buf]);
 
-        mrs.begin_op(&encoder, &[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
-        encode_attn_extras(
-            &encoder,
-            device,
-            &layer.extras,
-            q_buf,
-            k_buf,
-            v_buf,
-            layer.q.rows,
-            layer.k.rows,
-            layer.v.rows,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            rms_eps,
-        )?;
-        mrs.end_op(&[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
+        // Skipped entirely when the layer has no biases and no QK-norm:
+        // the hazard check around zero dispatches is still a real
+        // barrier. See `AttnExtras::encodes_anything`.
+        if layer.extras.encodes_anything() {
+            mrs.begin_op(&encoder, &[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
+            encode_attn_extras(
+                &encoder,
+                device,
+                &layer.extras,
+                q_buf,
+                k_buf,
+                v_buf,
+                layer.q.rows,
+                layer.k.rows,
+                layer.v.rows,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rms_eps,
+            )?;
+            mrs.end_op(&[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
+        }
 
         let layer_theta = layer.rope.theta;
         let ff_buf = ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref());
+        // Q and K in one dispatch: same theta, position and freq
+        // factors, different buffers, and RoPE is per-head independent.
         mrs.begin_op(&encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
         encode_rope(
             &encoder,
             device,
             rope_layout,
-            q_buf,
-            n_heads as u32,
-            head_dim as u32,
-            layer_theta,
-            pos as u32,
-            ff_buf,
-        )?;
-        encode_rope(
-            &encoder,
-            device,
-            rope_layout,
-            k_buf,
-            n_kv_heads as u32,
+            RopeTarget {
+                vecs: q_buf,
+                n_heads: n_heads as u32,
+            },
+            Some(RopeTarget {
+                vecs: k_buf,
+                n_heads: n_kv_heads as u32,
+            }),
             head_dim as u32,
             layer_theta,
             pos as u32,
@@ -349,8 +366,9 @@ pub fn launch_decode_dense_stack(
         let token_elems = (n_kv_heads * head_dim) as u32;
         let offset = (pos * n_kv_heads * head_dim) as u32;
         mrs.begin_op(&encoder, &[k_buf, v_buf], &[kv_k, kv_v]);
-        encode_kv_store_append(&encoder, device, k_buf, kv, KvPlane::K, offset, token_elems)?;
-        encode_kv_store_append(&encoder, device, v_buf, kv, KvPlane::V, offset, token_elems)?;
+        // K and V in one dispatch: same offset, same length, disjoint
+        // destinations.
+        encode_kv_store_append(&encoder, device, k_buf, v_buf, kv, offset, token_elems)?;
         mrs.end_op(&[k_buf, v_buf], &[kv_k, kv_v]);
 
         let new_seq = (pos + 1) as u32;
@@ -573,4 +591,80 @@ pub fn launch_decode_dense_stack(
     };
     let out_ptr = src.contents();
     Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, download_n).to_vec() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AttnExtras;
+
+    /// `encodes_anything` decides whether the decode stack pays a barrier
+    /// for this layer's attention epilogue, so a field it forgets is a
+    /// silently skipped dispatch -- the repo's dominant defect shape,
+    /// two structures that must agree with nothing enforcing it.
+    ///
+    /// The exhaustive destructure below has no `..`, so adding a field to
+    /// `AttnExtras` fails to COMPILE here until somebody decides whether
+    /// it encodes a dispatch.
+    #[test]
+    fn attn_extras_predicate_lists_every_field_that_encodes() {
+        let w = [1.0f32];
+        let base = AttnExtras::default();
+        let AttnExtras {
+            q_bias,
+            k_bias,
+            v_bias,
+            q_norm,
+            k_norm,
+            attn_logit_softcap,
+        } = &base;
+        assert!(q_bias.is_none());
+        assert!(k_bias.is_none());
+        assert!(v_bias.is_none());
+        assert!(q_norm.is_none());
+        assert!(k_norm.is_none());
+        assert!(attn_logit_softcap.is_none());
+        assert!(
+            !base.encodes_anything(),
+            "an empty epilogue encodes nothing, so it must not take a barrier"
+        );
+
+        // Every field that DOES encode a dispatch, one at a time.
+        let encoders: [AttnExtras<'_>; 5] = [
+            AttnExtras {
+                q_bias: Some(&w),
+                ..AttnExtras::default()
+            },
+            AttnExtras {
+                k_bias: Some(&w),
+                ..AttnExtras::default()
+            },
+            AttnExtras {
+                v_bias: Some(&w),
+                ..AttnExtras::default()
+            },
+            AttnExtras {
+                q_norm: Some(&w),
+                ..AttnExtras::default()
+            },
+            AttnExtras {
+                k_norm: Some(&w),
+                ..AttnExtras::default()
+            },
+        ];
+        for (i, e) in encoders.iter().enumerate() {
+            assert!(e.encodes_anything(), "field {i} encodes but is not listed");
+        }
+
+        // And the one that does not: the softcap is read inside the GQA
+        // kernel, never encoded by `encode_attn_extras`.
+        let softcap_only = AttnExtras {
+            attn_logit_softcap: Some(30.0),
+            ..AttnExtras::default()
+        };
+        assert!(
+            !softcap_only.encodes_anything(),
+            "attn_logit_softcap encodes no dispatch of its own, so it must \
+             not force a barrier around zero work"
+        );
+    }
 }

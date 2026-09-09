@@ -16,7 +16,7 @@
 //! alloc — equivalent for our non-view scratch buffers, each of which is
 //! its own `MTLBuffer` and is always touched whole).
 //!
-//! Barriers use [`memory_barrier_resources`] on the pending set (not
+//! Barriers use [`memory_barrier_resource_list`] on the pending set (not
 //! scope-Buffers as llama does) so weight-buffer traffic from prior
 //! matvecs does not stall the next activation-only dispatch — measured
 //! ~2× GPU-idle on OLMoE when every conflict used scope-Buffers.
@@ -27,9 +27,10 @@
 //! overlapping.
 
 use crate::dispatch::{metal_encode_stats, note_begin_op};
-use crate::gpu::memory_barrier_resources;
+use crate::gpu::memory_barrier_resource_list;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLResource};
+use std::ptr::NonNull;
 
 /// True when barrier logging is requested (cached; read once).
 fn barrier_log_enabled() -> bool {
@@ -39,10 +40,20 @@ fn barrier_log_enabled() -> bool {
 
 #[derive(Default)]
 pub(crate) struct MemRanges {
-    /// Pending Concurrent-set buffers (srcs ∪ dsts), for resource barriers.
-    bufs: Vec<*const ProtocolObject<dyn MTLBuffer>>,
+    /// Buffer identities read by a pending op.
     srcs: Vec<usize>,
+    /// Buffer identities written by a pending op.
     dsts: Vec<usize>,
+    /// The same buffers as `srcs ∪ dsts`, in the form the barrier API
+    /// wants. Written only by [`MemRanges::push_src`] /
+    /// [`MemRanges::push_dst`], which push here and to the key list in
+    /// the same call, so the resource list cannot fall out of step with
+    /// the ranges it is supposed to order.
+    ///
+    /// Kept across barriers (cleared, not dropped) because a decode token
+    /// takes ~160 of them and this used to allocate twice per barrier on
+    /// the per-token path.
+    res: Vec<NonNull<ProtocolObject<dyn MTLResource>>>,
 }
 
 #[inline]
@@ -56,9 +67,55 @@ impl MemRanges {
     }
 
     pub(crate) fn reset(&mut self) {
-        self.bufs.clear();
         self.srcs.clear();
         self.dsts.clear();
+        self.res.clear();
+    }
+
+    /// The hazard rule, stated once on opaque identities so it can be
+    /// tested without a GPU: an op conflicts with the pending set when it
+    /// READS something pending writes, or WRITES something pending reads
+    /// or writes. Two reads of the same buffer do not conflict.
+    fn keys_conflict(
+        &self,
+        srcs: impl Iterator<Item = usize>,
+        dsts: impl Iterator<Item = usize>,
+    ) -> bool {
+        for k in srcs {
+            if self.dsts.contains(&k) {
+                return true;
+            }
+        }
+        for k in dsts {
+            if self.srcs.contains(&k) || self.dsts.contains(&k) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn push_res(&mut self, b: &ProtocolObject<dyn MTLBuffer>) {
+        let r: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(b);
+        let p = NonNull::from(r);
+        if !self.res.contains(&p) {
+            self.res.push(p);
+        }
+    }
+
+    fn push_src(&mut self, b: &ProtocolObject<dyn MTLBuffer>) {
+        let k = buf_key(b);
+        if !self.srcs.contains(&k) {
+            self.srcs.push(k);
+        }
+        self.push_res(b);
+    }
+
+    fn push_dst(&mut self, b: &ProtocolObject<dyn MTLBuffer>) {
+        let k = buf_key(b);
+        if !self.dsts.contains(&k) {
+            self.dsts.push(k);
+        }
+        self.push_res(b);
     }
 
     /// Return false if `srcs`/`dsts` conflict with the pending Concurrent set.
@@ -67,19 +124,10 @@ impl MemRanges {
         srcs: &[&ProtocolObject<dyn MTLBuffer>],
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) -> bool {
-        for s in srcs {
-            let k = buf_key(s);
-            if self.dsts.contains(&k) {
-                return false;
-            }
-        }
-        for d in dsts {
-            let k = buf_key(d);
-            if self.srcs.contains(&k) || self.dsts.contains(&k) {
-                return false;
-            }
-        }
-        true
+        !self.keys_conflict(
+            srcs.iter().map(|b| buf_key(b)),
+            dsts.iter().map(|b| buf_key(b)),
+        )
     }
 
     pub(crate) fn add(
@@ -88,28 +136,21 @@ impl MemRanges {
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) {
         for s in srcs {
-            let k = buf_key(s);
-            if !self.srcs.contains(&k) {
-                self.srcs.push(k);
-            }
-            let p: *const ProtocolObject<dyn MTLBuffer> = *s;
-            if !self.bufs.contains(&p) {
-                self.bufs.push(p);
-            }
+            self.push_src(s);
         }
         for d in dsts {
-            let k = buf_key(d);
-            if !self.dsts.contains(&k) {
-                self.dsts.push(k);
-            }
-            let p: *const ProtocolObject<dyn MTLBuffer> = *d;
-            if !self.bufs.contains(&p) {
-                self.bufs.push(p);
-            }
+            self.push_dst(d);
         }
     }
 
     /// llama `concurrency_check` + optional `concurrency_reset` (barrier).
+    ///
+    /// A barrier is emitted ONLY on a real hazard, never per op: an op
+    /// whose reads and writes are disjoint from everything pending is
+    /// encoded straight into the concurrent pass. `FERROX_METAL_GPU_TIMING`
+    /// reports the resulting barriers-per-op ratio, which on a dense decode
+    /// token is ~0.99 -- the chain really is serial -- while the four
+    /// intra-group pairs (Q∥K∥V, gate∥up) overlap for free.
     pub(crate) fn begin_op(
         &mut self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -118,12 +159,8 @@ impl MemRanges {
     ) {
         note_begin_op();
         if !self.check(srcs, dsts) {
-            // SAFETY: pointers were taken from live encoder-bound scratch /
-            // weight buffers that outlive this encode pass.
-            let refs: Vec<&ProtocolObject<dyn MTLBuffer>> =
-                self.bufs.iter().map(|&p| unsafe { &*p }).collect();
             // Counts itself: see `crate::dispatch`.
-            memory_barrier_resources(encoder, &refs);
+            memory_barrier_resource_list(encoder, &mut self.res);
             self.reset();
             if barrier_log_enabled() {
                 let s = metal_encode_stats();
@@ -145,6 +182,79 @@ impl MemRanges {
         dsts: &[&ProtocolObject<dyn MTLBuffer>],
     ) {
         self.add(srcs, dsts);
+    }
+}
+
+#[cfg(test)]
+mod hazard_tests {
+    use super::MemRanges;
+
+    /// Build a tracker whose pending set is the given identities. The
+    /// hazard rule is pure -- it compares buffer identities, never touches
+    /// the GPU -- so it is tested here with plain integers rather than
+    /// behind `#[ignore]` on hardware.
+    fn pending(srcs: &[usize], dsts: &[usize]) -> MemRanges {
+        MemRanges {
+            srcs: srcs.to_vec(),
+            dsts: dsts.to_vec(),
+            res: Vec::new(),
+        }
+    }
+
+    /// A barrier per encoded op would read as correctness and cost the
+    /// whole point of the concurrent encoder: on a Llama-3.2-1B decode
+    /// token that is ~240 `memoryBarrierWithResources` calls instead of
+    /// ~160, and command encoding is 26-29% of Metal decode wall time
+    /// (GitHub issue #149). Disjoint work must stay barrier-free.
+    #[test]
+    fn a_write_then_a_read_of_a_different_buffer_needs_no_barrier() {
+        // Pending: op wrote buffer 2, reading buffer 1.
+        let m = pending(&[1], &[2]);
+        // A later op reading 3 and writing 4 touches neither.
+        assert!(
+            !m.keys_conflict([3].into_iter(), [4].into_iter()),
+            "disjoint ranges must not force a barrier"
+        );
+        // Two READS of the same buffer are also free: SRC∩SRC is allowed.
+        assert!(
+            !m.keys_conflict([1].into_iter(), [4].into_iter()),
+            "two ops reading the same buffer must not force a barrier"
+        );
+    }
+
+    /// And the other half: an overlap really is ordered, exactly once.
+    #[test]
+    fn a_read_after_a_pending_write_needs_exactly_one_barrier() {
+        let m = pending(&[1], &[2]);
+        // Read-after-write on buffer 2.
+        assert!(m.keys_conflict([2].into_iter(), [4].into_iter()));
+        // Write-after-write on buffer 2.
+        assert!(m.keys_conflict([3].into_iter(), [2].into_iter()));
+        // Write-after-read on buffer 1.
+        assert!(m.keys_conflict([3].into_iter(), [1].into_iter()));
+
+        // One conflicting op reports ONE conflict however many buffers it
+        // names, so the encode loop emits one barrier and resets, rather
+        // than one barrier per overlapping buffer.
+        assert!(m.keys_conflict([2, 2, 2].into_iter(), [1, 2].into_iter()));
+    }
+
+    /// `reset` after a barrier must clear the resource list too, or the
+    /// next barrier orders buffers no pending op touches -- which is a
+    /// silently wider barrier, not a wrong answer, and so would never
+    /// show up as a failure anywhere else.
+    #[test]
+    fn a_barrier_reset_clears_the_resource_list_with_the_ranges() {
+        let mut m = pending(&[1], &[2]);
+        m.res.push(std::ptr::NonNull::dangling());
+        m.reset();
+        assert!(m.srcs.is_empty());
+        assert!(m.dsts.is_empty());
+        assert!(
+            m.res.is_empty(),
+            "the resource list is the pending set in another form; \
+             clearing one without the other is how they drift"
+        );
     }
 }
 
