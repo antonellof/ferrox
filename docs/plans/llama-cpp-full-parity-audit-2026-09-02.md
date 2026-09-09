@@ -19,7 +19,7 @@
 | Source files (C++/CUDA/Metal) | **1,103** mapped | **308** Rust files, **~230k** lines | Structural: 140 per-arch graphs vs 1 decoder |
 | Architecture graphs | **140** hand-written | **16** audited + 4 dedicated engines | **P0** — 124 graphs unported |
 | Backends | CPU, CUDA, Metal, Vulkan, SYCL, HIP, OpenCL, … | CPU, Metal, CUDA (partial), Vulkan (beachhead) | **P0** Vulkan; **P1** CUDA GEMM |
-| CLI tools | 15+ binaries | 20+ subcommands; most core tools present | **P2** gguf-split, imatrix, batched-bench |
+| CLI tools | 15+ binaries | 21+ subcommands; most core tools present | **P2** imatrix, batched-bench (gguf-split ported 2026-09-09) |
 | Logit parity (local sweep) | reference | 19 models tested | **2 WRONG**, 8 DRIFT (expected K-quant), 6 MATCH, 1 TIE-FLIP, 2 encoder skip |
 
 ### Live parity sweep (2026-09-02)
@@ -122,7 +122,7 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 | `llama-quantize` | `ferrox quantize` | partial — Q8_0 byte-identical; K-quants missing |
 | `llama-perplexity` | `ferrox perplexity` | partial — corpus ppl; no HellaSwag |
 | `llama-tokenize` | via `ferrox parity` tokenizer sweep | partial |
-| `llama-gguf-split` | — | **missing** |
+| `llama-gguf-split` | `ferrox gguf-split` | **ported**: split by tensors or size, merge, `--no-tensor-first-split`, `--dry-run` |
 | `llama-imatrix` | — | **missing** |
 | `llama-batched-bench` | — | **missing** |
 | `llama-mtmd` (multimodal) | — | **missing** |
@@ -188,7 +188,7 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 | `-b` / `-ub` batch flags | yes | env only |
 | Partial `-ngl` | yes | all-or-nothing |
 | Streamed CB output | token stream | buffers full completion |
-| gguf-split merge/split | yes | read shards only |
+| gguf-split merge/split | yes | **`ferrox gguf-split`**, both directions |
 | imatrix | yes | **missing** |
 
 ### 2.5 Sampling (mostly closed)
@@ -234,7 +234,7 @@ Ranked per [`north-star.md`](north-star.md) and [`roadmap.md`](roadmap.md).
 | 7 | **CUDA mul_mm + mmvq** — port from Metal `mul_mm_sg_impl` | L | CUDA prefill |
 | 8 | **Server: `-np`, slot save/load, streamed CB** | M | Serving parity |
 | 9 | **Embedding model path** — WordPiece + BERT loader | L | BGE/E5/nomic-embed |
-| 10 | **gguf-split utility** | S | Shard management |
+| ~~10~~ | ~~**gguf-split utility**~~ | S | **done 2026-09-09**: `ferrox gguf-split` |
 
 ### P2 — Hardware reach (this quarter)
 
