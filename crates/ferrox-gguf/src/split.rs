@@ -11,22 +11,22 @@
 //! What llama.cpp's tool does, with the lines this port follows:
 //!
 //! * The first shard carries the whole source metadata
-//!   (`gguf-split.cpp:236`); every later shard carries ONLY `split.no`
+//!   (`gguf-split.cpp:234-236`); every later shard carries ONLY `split.no`
 //!   (u16, 0-based), `split.count` (u16) and `split.tensors.count`
 //!   (i32, the total across all shards) (`:238-240`, `:272`).
 //! * Tensor mode starts a new shard every N tensors (`:288`); size mode
 //!   starts one when the running sum of alignment-padded tensor bytes
 //!   would exceed the limit (`:256-258`, `:285`). A shard is never
 //!   left empty, which is only possible when the first tensor alone
-//!   exceeds the size limit (`:227`), except the first shard under
-//!   `--no-tensor-first-split` (`:247-249`).
+//!   exceeds the size limit (`:226-228`), except the first shard under
+//!   `--no-tensor-first-split` (`:246-248`).
 //! * Filenames are `<prefix>-NNNNN-of-MMMMM.gguf`, 1-based
 //!   (`src/llama.cpp:537`, `llama_split_path`).
 //! * Merge takes the FIRST shard by name (`:474`), requires
 //!   `split.count` (`:449`), keeps the first shard's metadata with
 //!   `split.count` rewritten to 0 so the output is not itself read as
 //!   a shard (`:486`), and refuses to overwrite an existing output
-//!   (`:410`).
+//!   (`:409-411`).
 //!
 //! Two deliberate differences, both from choices the rest of this crate
 //! already made: metadata keys are written in sorted order, because the
@@ -248,7 +248,9 @@ pub fn plan_split(source: &GgufFile, opts: &SplitOptions) -> Result<SplitPlan, S
                 // overflowed the previous one.
                 let max = match opts.mode {
                     SplitMode::MaxBytes(max) => max,
-                    SplitMode::MaxTensors(_) => unreachable!("tensor mode never closes an empty shard"),
+                    SplitMode::MaxTensors(_) => {
+                        unreachable!("tensor mode never closes an empty shard")
+                    }
                 };
                 return Err(SplitError::TensorExceedsShard {
                     name: t.name.clone(),
@@ -327,11 +329,8 @@ pub fn write_split(
         let path = shard_path(prefix, no, count)?;
         on_shard(&path);
         let file = File::create(&path).map_err(|e| io_err(&path, e))?;
-        let mut w = GgufWriter::create(
-            BufWriter::new(file),
-            &shard.metadata,
-            shard.tensors.clone(),
-        )?;
+        let mut w =
+            GgufWriter::create(BufWriter::new(file), &shard.metadata, shard.tensors.clone())?;
         for t in &shard.tensors {
             w.write_tensor(&t.name, source.tensor_bytes(&t.name)?)?;
         }
@@ -351,7 +350,14 @@ pub fn plan_merge(first: &Path) -> Result<MergePlan, SplitError> {
     let name = ShardName::parse(first)
         .filter(|n| n.no == 1)
         .ok_or_else(|| SplitError::NotFirstShard(display.clone()))?;
-    let first_file = GgufFile::open(first)?;
+    // `GgufError::Io` carries no path, and a merge that cannot find its
+    // FIRST shard would otherwise report a bare "No such file or
+    // directory" while `ShardError::MissingShard` names every later
+    // one. Both halves of the refusal name the file they wanted.
+    let first_file = GgufFile::open(first).map_err(|e| match e {
+        GgufError::Io(source) => io_err(first, source),
+        other => SplitError::Gguf(other),
+    })?;
     let count = first_file
         .metadata_u64(SPLIT_COUNT_KEY)
         .ok_or_else(|| SplitError::NotSplit(display.clone()))?;
@@ -373,7 +379,7 @@ pub fn plan_merge(first: &Path) -> Result<MergePlan, SplitError> {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    // `gguf-split.cpp:486`: the merged file keeps split.no and
+    // `gguf-split.cpp:485-486`: the merged file keeps split.no and
     // split.tensors.count, and gets split.count = 0 so nothing reads it
     // as a shard again.
     metadata.insert(SPLIT_COUNT_KEY.to_string(), GgufValue::U16(0));
@@ -390,7 +396,7 @@ pub fn plan_merge(first: &Path) -> Result<MergePlan, SplitError> {
 }
 
 /// Writes the merged file. Refuses an existing `out` the way llama.cpp
-/// does (`gguf-split.cpp:410`).
+/// does (`gguf-split.cpp:409-411`).
 pub fn write_merge(plan: &MergePlan, out: &Path) -> Result<(), SplitError> {
     if out.exists() {
         return Err(SplitError::OutputExists(out.display().to_string()));
@@ -460,7 +466,7 @@ mod tests {
             mk("blk.0.attn_q.weight", vec![32, 3], GgmlType::Q8_0, 5), // 102
             mk("blk.0.attn_norm.weight", vec![5], GgmlType::F32, 7), // 20
             mk("blk.1.ffn_up.weight", vec![7, 3], GgmlType::F16, 11), // 42
-            mk("output_norm.weight", vec![9], GgmlType::F32, 13),   // 36
+            mk("output_norm.weight", vec![9], GgmlType::F32, 13),  // 36
         ]
     }
 
@@ -512,7 +518,11 @@ mod tests {
     }
 
     fn assert_same_values(a: &GgufValue, b: &GgufValue, key: &str) {
-        assert_eq!(format!("{a:?}"), format!("{b:?}"), "metadata '{key}' changed");
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "metadata '{key}' changed"
+        );
     }
 
     /// The property the module exists for: the shards this writes are
@@ -589,7 +599,7 @@ mod tests {
     /// Where llama.cpp's own tool is byte-identical, so is this one: a
     /// source that already carries `split.no = 0`, `split.count = 0`
     /// and `split.tensors.count = N` (what a previous merge leaves
-    /// behind, `gguf-split.cpp:486`) survives split then merge without
+    /// behind, `gguf-split.cpp:485-486`) survives split then merge without
     /// a single byte changing.
     #[test]
     fn merging_the_shards_reproduces_a_merged_source_byte_for_byte() {
@@ -655,13 +665,26 @@ mod tests {
         std::fs::remove_file(&paths[1]).unwrap();
 
         let err = plan_merge(&paths[0]).unwrap_err();
-        match err {
+        match &err {
             SplitError::Shard(ShardError::MissingShard(path, 3)) => {
-                assert_eq!(path, paths[1].display().to_string());
+                assert_eq!(path, &paths[1].display().to_string());
             }
             other => panic!("expected MissingShard naming shard 2, got {other:?}"),
         }
+        assert!(
+            err.to_string().contains(&paths[1].display().to_string()),
+            "the refusal has to print the missing shard's path: {err}"
+        );
         assert!(!dir.path("merged.gguf").exists());
+
+        // The FIRST shard missing is the same refusal, by the other
+        // half: `GgufError::Io` carries no path of its own.
+        std::fs::remove_file(&paths[0]).unwrap();
+        let err = plan_merge(&paths[0]).unwrap_err();
+        assert!(
+            matches!(&err, SplitError::Io { path, .. } if path == &paths[0].display().to_string()),
+            "got {err:?}"
+        );
     }
 
     /// Size mode groups by alignment-PADDED bytes (`gguf-split.cpp:256`),
@@ -690,13 +713,32 @@ mod tests {
 
         // Unpadded 192+102+20 = 314 < 330 would have put three in the
         // first shard; the padded arithmetic is what decides.
-        let plan = plan_split(
-            &source,
-            &SplitMode::MaxBytes(314).with_no_first(false),
-        )
-        .unwrap();
+        let plan = plan_split(&source, &SplitMode::MaxBytes(314).with_no_first(false)).unwrap();
         let groups: Vec<usize> = plan.shards.iter().map(|s| s.tensors.len()).collect();
         assert_eq!(groups, vec![1, 4], "192 alone; 128+32+64+64 = 288");
+
+        // The boundary is `next > max`, not `>=` (`gguf-split.cpp:285`):
+        // a shard that comes out EXACTLY at the limit is full and
+        // legal. Every other limit in this test leaves the prefix sums
+        // off the boundary, so `>` and `>=` behave identically at them
+        // and a sabotage of the comparison survives. 320 is 192 + 128
+        // exactly, which is the only value that tells the two apart.
+        let plan = plan_split(&source, &SplitMode::MaxBytes(320).with_no_first(false)).unwrap();
+        let groups: Vec<usize> = plan.shards.iter().map(|s| s.tensors.len()).collect();
+        assert_eq!(
+            groups,
+            vec![2, 3],
+            "192 + 128 == 320 must FILL the first shard, not overflow it"
+        );
+        assert_eq!(
+            plan.shards[0]
+                .tensors
+                .iter()
+                .map(|t| (t.byte_len as u64).next_multiple_of(32))
+                .sum::<u64>(),
+            320,
+            "the shard that proves `>` from `>=` has to sit on the limit"
+        );
     }
 
     impl SplitMode {
@@ -710,7 +752,7 @@ mod tests {
 
     /// The only way a shard can end up empty in size mode is the first
     /// tensor alone exceeding the limit; llama.cpp exits with "one of
-    /// splits have 0 tensors" (`gguf-split.cpp:227`). This names the
+    /// splits have 0 tensors" (`gguf-split.cpp:226-228`). This names the
     /// tensor and the two numbers instead.
     #[test]
     fn a_first_tensor_larger_than_the_size_limit_is_refused_by_name() {
@@ -727,7 +769,10 @@ mod tests {
         // Same with a metadata-only first shard: the SECOND shard is the
         // one that would be empty.
         let err = plan_split(&source, &SplitMode::MaxBytes(100).with_no_first(true)).unwrap_err();
-        assert!(matches!(err, SplitError::TensorExceedsShard { .. }), "got {err:?}");
+        assert!(
+            matches!(err, SplitError::TensorExceedsShard { .. }),
+            "got {err:?}"
+        );
     }
 
     /// `--no-tensor-first-split` produces the metadata-only first shard
@@ -784,10 +829,7 @@ mod tests {
         let (_, paths) = split_to(&dir, &src, &by_tensors(2));
         let shard = GgufFile::open(&paths[1]).unwrap();
         let err = plan_split(&shard, &by_tensors(2)).unwrap_err();
-        assert!(
-            matches!(err, SplitError::InputIsSplit(3)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, SplitError::InputIsSplit(3)), "got {err:?}");
     }
 
     #[test]
@@ -808,7 +850,7 @@ mod tests {
         let err = plan_merge(&plain).unwrap_err();
         assert!(matches!(err, SplitError::NotSplit(_)), "got {err:?}");
 
-        // gguf-split.cpp:410: never overwrite.
+        // gguf-split.cpp:409-411: never overwrite.
         let plan = plan_merge(&paths[0]).unwrap();
         let err = write_merge(&plan, &src).unwrap_err();
         assert!(matches!(err, SplitError::OutputExists(_)), "got {err:?}");
