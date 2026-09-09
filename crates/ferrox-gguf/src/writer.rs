@@ -133,74 +133,14 @@ impl<W: Write> GgufWriter<W> {
         metadata: &BTreeMap<String, GgufValue>,
         plan: Vec<TensorPlan>,
     ) -> Result<Self, GgufWriteError> {
-        let declared_alignment = metadata
-            .get("general.alignment")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_ALIGNMENT as u64);
-        let alignment = usize::try_from(declared_alignment)
-            .ok()
-            .filter(|a| a.is_power_of_two())
-            .ok_or(GgufWriteError::BadAlignment(declared_alignment))?;
-
-        let mut seen = std::collections::HashSet::with_capacity(plan.len());
-        for t in &plan {
-            if t.shape.is_empty() {
-                return Err(GgufWriteError::NoDimensions(t.name.clone()));
-            }
-            if !seen.insert(t.name.as_str()) {
-                return Err(GgufWriteError::DuplicateTensor(t.name.clone()));
-            }
-        }
-
+        let alignment = declared_alignment(metadata.get("general.alignment"))?;
         // The header goes into a buffer first: the tensor-data offsets
         // are relative to the start of the data section, so they do not
         // depend on the header's own length, but writing to a buffer
         // keeps the whole header one `write_all` and lets `create` fail
         // before touching the file for a metadata value it cannot
         // encode.
-        let mut buf: Vec<u8> = Vec::new();
-        buf.write_u32::<LittleEndian>(GGUF_MAGIC)?;
-        buf.write_u32::<LittleEndian>(GGUF_WRITE_VERSION)?;
-        buf.write_u64::<LittleEndian>(plan.len() as u64)?;
-        buf.write_u64::<LittleEndian>(metadata.len() as u64)?;
-
-        for (key, value) in metadata {
-            write_string(&mut buf, key)?;
-            buf.write_u32::<LittleEndian>(value_tag(value))?;
-            write_value(&mut buf, key, value)?;
-        }
-
-        let mut offset: usize = 0;
-        for t in &plan {
-            write_string(&mut buf, &t.name)?;
-            buf.write_u32::<LittleEndian>(t.shape.len() as u32)?;
-            for &dim in &t.shape {
-                buf.write_u64::<LittleEndian>(dim)?;
-            }
-            buf.write_u32::<LittleEndian>(t.dtype.to_tag())?;
-            buf.write_u64::<LittleEndian>(offset as u64)?;
-            // Every tensor starts on an alignment boundary, so the
-            // offset advances by the padded length. `checked_*`
-            // throughout: `byte_len` may come from a file's own header.
-            offset = offset
-                .checked_add(t.byte_len)
-                .and_then(|o| o.checked_next_multiple_of(alignment))
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "tensor '{}' pushes the data section past the address space",
-                            t.name
-                        ),
-                    )
-                })?;
-        }
-
-        // Pad the header up to the data section, exactly as the reader
-        // computes `data_start`.
-        let pad = buf.len().next_multiple_of(alignment) - buf.len();
-        buf.extend(std::iter::repeat_n(0u8, pad));
-
+        let buf = encode_header(metadata, &plan)?;
         out.write_all(&buf)?;
         Ok(GgufWriter {
             out,
@@ -252,6 +192,88 @@ impl<W: Write> GgufWriter<W> {
         self.out.flush()?;
         Ok(self.out)
     }
+}
+
+/// The data-section alignment a `general.alignment` value declares, or
+/// [`DEFAULT_ALIGNMENT`] when the key is absent. One function for both
+/// the writer and `split`, which has to size shards with the alignment
+/// the writer will pad with: two readings of the key would be two
+/// structures that must agree about one number.
+pub fn declared_alignment(value: Option<&GgufValue>) -> Result<usize, GgufWriteError> {
+    let declared = value
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_ALIGNMENT as u64);
+    usize::try_from(declared)
+        .ok()
+        .filter(|a| a.is_power_of_two())
+        .ok_or(GgufWriteError::BadAlignment(declared))
+}
+
+/// The complete header for `metadata` and `plan`: magic, counts, every
+/// key/value, every tensor descriptor, and the pad up to the data
+/// section. These are EXACTLY the bytes [`GgufWriter::create`] writes
+/// before the first tensor, and its length is what llama.cpp calls
+/// `gguf_get_meta_size`, so a dry run that reports a shard's size and
+/// the write that produces it cannot disagree.
+pub fn encode_header(
+    metadata: &BTreeMap<String, GgufValue>,
+    plan: &[TensorPlan],
+) -> Result<Vec<u8>, GgufWriteError> {
+    let alignment = declared_alignment(metadata.get("general.alignment"))?;
+
+    let mut seen = std::collections::HashSet::with_capacity(plan.len());
+    for t in plan {
+        if t.shape.is_empty() {
+            return Err(GgufWriteError::NoDimensions(t.name.clone()));
+        }
+        if !seen.insert(t.name.as_str()) {
+            return Err(GgufWriteError::DuplicateTensor(t.name.clone()));
+        }
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.write_u32::<LittleEndian>(GGUF_MAGIC)?;
+    buf.write_u32::<LittleEndian>(GGUF_WRITE_VERSION)?;
+    buf.write_u64::<LittleEndian>(plan.len() as u64)?;
+    buf.write_u64::<LittleEndian>(metadata.len() as u64)?;
+
+    for (key, value) in metadata {
+        write_string(&mut buf, key)?;
+        buf.write_u32::<LittleEndian>(value_tag(value))?;
+        write_value(&mut buf, key, value)?;
+    }
+
+    let mut offset: usize = 0;
+    for t in plan {
+        write_string(&mut buf, &t.name)?;
+        buf.write_u32::<LittleEndian>(t.shape.len() as u32)?;
+        for &dim in &t.shape {
+            buf.write_u64::<LittleEndian>(dim)?;
+        }
+        buf.write_u32::<LittleEndian>(t.dtype.to_tag())?;
+        buf.write_u64::<LittleEndian>(offset as u64)?;
+        // Every tensor starts on an alignment boundary, so the
+        // offset advances by the padded length. `checked_*`
+        // throughout: `byte_len` may come from a file's own header.
+        offset = offset
+            .checked_add(t.byte_len)
+            .and_then(|o| o.checked_next_multiple_of(alignment))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "tensor '{}' pushes the data section past the address space",
+                        t.name
+                    ),
+                )
+            })?;
+    }
+
+    // Pad the header up to the data section, exactly as the reader
+    // computes `data_start`.
+    let pad = buf.len().next_multiple_of(alignment) - buf.len();
+    buf.extend(std::iter::repeat_n(0u8, pad));
+    Ok(buf)
 }
 
 fn write_string(buf: &mut Vec<u8>, s: &str) -> Result<(), GgufWriteError> {

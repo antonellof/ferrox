@@ -5,6 +5,7 @@
 //! See docs/THIRD_PARTY_NOTICES.md for design-credit details.
 
 pub mod sharded;
+pub mod split;
 pub mod writer;
 pub use sharded::{ShardError, ShardName, ShardedGguf};
 pub use writer::{GgufWriteError, GgufWriter, TensorPlan};
