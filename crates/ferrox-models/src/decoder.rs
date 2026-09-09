@@ -2772,7 +2772,10 @@ impl Decoder {
         hidden_dim: usize,
         act: GluAct,
     ) -> Option<Vec<(Vec<f32>, f32)>> {
-        if !ferrox_core::weight_matrix::cpu_int_dot_enabled() || !normed2.len().is_multiple_of(32) {
+        if !ferrox_core::weight_matrix::cpu_int_dot_for(
+            ferrox_core::weight_matrix::IntDotShape::Matvec,
+        ) || !normed2.len().is_multiple_of(32)
+        {
             return None;
         }
         let n_slots = decision.expert_ids.len();
@@ -2876,8 +2879,9 @@ impl Decoder {
         plan: Option<&PlacementPlan>,
         act: GluAct,
     ) -> Vec<(Vec<f32>, f32)> {
-        let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_enabled()
-            && normed2.len().is_multiple_of(32)
+        let shared_act = if ferrox_core::weight_matrix::cpu_int_dot_for(
+            ferrox_core::weight_matrix::IntDotShape::Matvec,
+        ) && normed2.len().is_multiple_of(32)
             && plan
                 .map(|p| {
                     decision

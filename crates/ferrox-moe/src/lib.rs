@@ -1026,7 +1026,9 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f3
     }
     // Share one Q8 activation quant across gate+up when INT_DOT is on
     // (OLMoE: avoids 2× quantize_activations_q8 per expert).
-    if ferrox_core::weight_matrix::cpu_int_dot_enabled() && hidden.len().is_multiple_of(32) {
+    if ferrox_core::weight_matrix::cpu_int_dot_for(ferrox_core::weight_matrix::IntDotShape::Matvec)
+        && hidden.len().is_multiple_of(32)
+    {
         let act_q8 = ferrox_quant::quantize_activations_q8(hidden);
         // gate and up are independent over the same activation, so their
         // parallel regions can overlap instead of running back to back.

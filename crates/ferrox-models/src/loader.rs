@@ -3364,7 +3364,9 @@ mod tests {
     /// so four sigma keeps better than 2x headroom while still failing
     /// that 5% injection.
     fn fused_dot_tolerance(weights: &[f32], x: &[f32], exact_bound: f32) -> f32 {
-        if !ferrox_core::weight_matrix::cpu_int_dot_enabled() {
+        if !ferrox_core::weight_matrix::cpu_int_dot_for(
+            ferrox_core::weight_matrix::IntDotShape::Matvec,
+        ) {
             return exact_bound;
         }
         let amax = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
