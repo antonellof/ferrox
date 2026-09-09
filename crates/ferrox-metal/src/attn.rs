@@ -48,14 +48,18 @@
 //! environment variable.
 //!
 //! `FERROX_CTK` selects KV dtype ([`MetalKvDtype`]); see [`is_implemented`].
+pub use crate::decode_dense::{
+    launch_decode_dense_stack, AttnExtras, DenseLayerMetal, EmbdGatherMetal,
+};
+use crate::dispatch::dispatch_counted;
 use crate::elem::{
     encode_act_mul_f32_to_f16, encode_add_rms_norm, encode_add_rms_norm_batch,
-    encode_add_rms_norm_f32_to_f16_batch, encode_argmax, encode_f32_to_f16, encode_gelu_mul,
-    encode_rms_norm, encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_f32_to_f16_batch,
+    encode_add_rms_norm_f32_to_f16_batch, encode_argmax, encode_f32_to_f16, encode_rms_norm,
+    encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_f32_to_f16_batch,
     encode_rms_norm_per_head_batch, encode_silu_mul, encode_vec_add, encode_vec_add_at,
     warm_prefill_elem_pipelines,
 };
-use crate::embd::{encode_get_rows, EmbdKind};
+use crate::embd::encode_get_rows;
 use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, encode_moe_topk_softmax_batch, encode_mul_mm_sg_f16,
     encode_q4_0_moe_gate_up_id, encode_q4_0_moe_id, encode_q4_0_moe_topk, ensure_pipeline,
@@ -199,6 +203,14 @@ pub fn metal_greedy_argmax_active() -> bool {
 // layout so `encode_rope` only swaps the entry point. Math mirrors
 // `ferrox_core::attention::{apply_rope_interleaved, apply_rope}` —
 // no Candle / third-party RoPE dependency.
+//
+// Both take TWO destinations (buffers 0/1 and 9/10) because every decode
+// call site ropes Q and then K with the same theta, position and freq
+// factors, and RoPE touches each head independently, so the two are one
+// dispatch. GitHub issue #149: 26-29% of Metal decode wall time is host
+// command encoding, and this pair was 16 of the 242 dispatches a
+// Llama-3.2-1B token encoded. A caller with one destination passes
+// `n_heads2 = 0`, which makes the second range empty.
 const ROPE_NORM_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -213,10 +225,17 @@ kernel void rope_interleaved_heads(
     constant uint& use_freq_factors [[buffer(6)]],
     constant uint& rot_dim [[buffer(7)]],
     constant float& mscale [[buffer(8)]],
+    device float* vecs2 [[buffer(9)]],
+    constant uint& n_heads2 [[buffer(10)]],
     uint h [[thread_position_in_grid]]
 ) {
-    if (h >= n_heads) return;
-    device float* vec = vecs + h * head_dim;
+    if (h >= n_heads + n_heads2) return;
+    // Heads [0, n_heads) rotate `vecs`; [n_heads, n_heads + n_heads2)
+    // rotate `vecs2`. Distinct buffers, one head each, so the two
+    // ranges never alias.
+    device float* base = (h < n_heads) ? vecs : vecs2;
+    uint head = (h < n_heads) ? h : (h - n_heads);
+    device float* vec = base + head * head_dim;
     // ggml `n_dims`: the rotary width. `kernel_rope_norm` rotates
     // `[0, n_dims)` and copies `[n_dims, ne0)` straight through, and the
     // frequency exponent is `-i0/n_dims`, not `-i0/head_dim`.
@@ -255,10 +274,17 @@ kernel void rope_neox_heads(
     constant uint& use_freq_factors [[buffer(6)]],
     constant uint& rot_dim [[buffer(7)]],
     constant float& mscale [[buffer(8)]],
+    device float* vecs2 [[buffer(9)]],
+    constant uint& n_heads2 [[buffer(10)]],
     uint h [[thread_position_in_grid]]
 ) {
-    if (h >= n_heads) return;
-    device float* vec = vecs + h * head_dim;
+    if (h >= n_heads + n_heads2) return;
+    // Heads [0, n_heads) rotate `vecs`; [n_heads, n_heads + n_heads2)
+    // rotate `vecs2`. Distinct buffers, one head each, so the two
+    // ranges never alias.
+    device float* base = (h < n_heads) ? vecs : vecs2;
+    uint head = (h < n_heads) ? h : (h - n_heads);
+    device float* vec = base + head * head_dim;
     // `kernel_rope_neox` pairs `ic` with `ic + n_dims/2` — the split is
     // over the ROTARY width, not the head, so partial rotary changes
     // which channel each one is paired with, not just how many rotate.
@@ -287,16 +313,25 @@ const KV_APPEND_KERNEL_SRC: &str = r#"
 using namespace metal;
 
 // Append f32 K/V token into an f16-resident cache (llama.cpp default).
+//
+// K and V are one dispatch: the grid's HEIGHT is the plane count, so
+// `gid.y` picks the pair of buffers and no uniform has to carry it.
+// Every call site appends K and V at the same offset and length, and
+// GitHub issue #149 makes the second encode worth removing.
 kernel void kv_append(
     device const float* src [[buffer(0)]],
     device half* dst [[buffer(1)]],
     constant uint& offset_elems [[buffer(2)]],
     constant uint& n_elems [[buffer(3)]],
-    uint i [[thread_position_in_grid]]
+    device const float* src2 [[buffer(4)]],
+    device half* dst2 [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
 ) {
-    if (i < n_elems) {
-        dst[offset_elems + i] = half(src[i]);
-    }
+    uint i = gid.x;
+    if (i >= n_elems) return;
+    device const float* s = (gid.y == 0u) ? src : src2;
+    device half* d = (gid.y == 0u) ? dst : dst2;
+    d[offset_elems + i] = half(s[i]);
 }
 "#;
 
@@ -305,13 +340,20 @@ const KV_APPEND_Q8_0_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+// K and V in one dispatch; grid height is the plane count (see
+// `kv_append`).
 kernel void kv_append_q8_0(
-    device const float* src [[buffer(0)]],
-    device uchar* dst [[buffer(1)]],
+    device const float* src_in [[buffer(0)]],
+    device uchar* dst_in [[buffer(1)]],
     constant uint& offset_elems [[buffer(2)]],
     constant uint& n_elems [[buffer(3)]],
-    uint b [[thread_position_in_grid]]
+    device const float* src2 [[buffer(4)]],
+    device uchar* dst2 [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
 ) {
+    uint b = gid.x;
+    device const float* src = (gid.y == 0u) ? src_in : src2;
+    device uchar* dst = (gid.y == 0u) ? dst_in : dst2;
     const uint BLOCK = 32u;
     const uint BLOCK_BYTES = 34u;
     uint n_blocks = n_elems / BLOCK;
@@ -366,13 +408,20 @@ const KV_APPEND_TURBO4_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+// K and V in one dispatch; grid height is the plane count (see
+// `kv_append`).
 kernel void kv_append_turbo4(
-    device const float* src [[buffer(0)]],
-    device uchar* dst [[buffer(1)]],
+    device const float* src_in [[buffer(0)]],
+    device uchar* dst_in [[buffer(1)]],
     constant uint& offset_elems [[buffer(2)]],
     constant uint& n_elems [[buffer(3)]],
-    uint b [[thread_position_in_grid]]
+    device const float* src2 [[buffer(4)]],
+    device uchar* dst2 [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
 ) {
+    uint b = gid.x;
+    device const float* src = (gid.y == 0u) ? src_in : src2;
+    device uchar* dst = (gid.y == 0u) ? dst_in : dst2;
     const uint BLOCK = 32u;
     const uint BLOCK_BYTES = 18u;
     uint n_blocks = n_elems / BLOCK;
@@ -2147,12 +2196,12 @@ kernel void rope_neox_heads_batch(
 /// read f16 via a process-wide dequant scratch shared across layers.
 pub struct MetalKvBuffers {
     dtype: MetalKvDtype,
-    k: Retained<ProtocolObject<dyn MTLBuffer>>,
-    v: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) k: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) v: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub seq_len: usize,
-    capacity: usize,
+    pub(crate) capacity: usize,
 }
 
 // SAFETY: shared-mode MTLBuffers created once and mutated only from the
@@ -2391,13 +2440,6 @@ impl MetalKvBuffers {
     }
 }
 
-/// K or V plane when appending into [`MetalKvBuffers`].
-#[derive(Clone, Copy)]
-enum KvPlane {
-    K,
-    V,
-}
-
 /// Process-wide f16 view of Q8_0 KV for FA/GQA (one pair shared across layers).
 struct Q8AttnScratch {
     k: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -2492,7 +2534,7 @@ fn upload_f16_from_f32(
     .ok_or(MetalError::BufferAllocFailed)
 }
 
-fn copy_f32_into(buf: &ProtocolObject<dyn MTLBuffer>, data: &[f32]) {
+pub(crate) fn copy_f32_into(buf: &ProtocolObject<dyn MTLBuffer>, data: &[f32]) {
     let nbytes = data.len() * 4;
     debug_assert!(buf.length() >= nbytes);
     unsafe {
@@ -2506,22 +2548,22 @@ fn copy_f32_into(buf: &ProtocolObject<dyn MTLBuffer>, data: &[f32]) {
 
 /// Process-wide activation scratch for [`launch_decode_dense_stack`].
 /// Avoids allocating ~10 MTLBuffers every decode token.
-struct DecodeScratch {
-    h: Retained<ProtocolObject<dyn MTLBuffer>>,
-    x: Retained<ProtocolObject<dyn MTLBuffer>>,
-    x2: Retained<ProtocolObject<dyn MTLBuffer>>,
-    q: Retained<ProtocolObject<dyn MTLBuffer>>,
-    k: Retained<ProtocolObject<dyn MTLBuffer>>,
-    v: Retained<ProtocolObject<dyn MTLBuffer>>,
-    attn: Retained<ProtocolObject<dyn MTLBuffer>>,
-    o: Retained<ProtocolObject<dyn MTLBuffer>>,
-    gate: Retained<ProtocolObject<dyn MTLBuffer>>,
-    up: Retained<ProtocolObject<dyn MTLBuffer>>,
-    act: Retained<ProtocolObject<dyn MTLBuffer>>,
-    down: Retained<ProtocolObject<dyn MTLBuffer>>,
-    logits: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+pub(crate) struct DecodeScratch {
+    pub(crate) h: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) x: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) x2: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) q: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) k: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) v: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) attn: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) o: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) gate: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) up: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) act: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) down: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) logits: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// Single u32 slot for greedy argmax-in-stack (always resident; 4 bytes).
-    argmax_idx: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) argmax_idx: Retained<ProtocolObject<dyn MTLBuffer>>,
     hidden_cap: usize,
     max_q_cap: usize,
     max_kv_cap: usize,
@@ -2795,13 +2837,13 @@ pub fn metal_graph() -> std::sync::MutexGuard<'static, MetalGraph> {
         .unwrap()
 }
 
-struct ScratchCaps {
-    hidden: usize,
-    max_q: usize,
-    max_kv: usize,
-    attn: usize,
-    max_gate: usize,
-    logits: usize,
+pub(crate) struct ScratchCaps {
+    pub(crate) hidden: usize,
+    pub(crate) max_q: usize,
+    pub(crate) max_kv: usize,
+    pub(crate) attn: usize,
+    pub(crate) max_gate: usize,
+    pub(crate) logits: usize,
 }
 
 struct PrefillScratchCaps {
@@ -2812,7 +2854,7 @@ struct PrefillScratchCaps {
     max_gate: usize,
 }
 
-fn borrow_decode_scratch(
+pub(crate) fn borrow_decode_scratch(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     caps: ScratchCaps,
 ) -> Result<std::sync::MutexGuard<'static, Option<DecodeScratch>>, MetalError> {
@@ -2911,24 +2953,53 @@ fn borrow_prefill_scratch(
 /// `n_rot/2` entries, which is narrower than `head_dim/2` under partial
 /// rotary. Checking it against the head width instead rejects every
 /// Phi-3/Phi-4 checkpoint at the door.
-fn assert_freq_factors_len(freq_factors: Option<&[f32]>, rope: MetalRope, head_dim: usize) {
+pub(crate) fn assert_freq_factors_len(
+    freq_factors: Option<&[f32]>,
+    rope: MetalRope,
+    head_dim: usize,
+) {
     if let Some(ff) = freq_factors {
         assert_eq!(ff.len(), rope.rot_dim.unwrap_or(head_dim) / 2);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_rope(
+/// One RoPE destination: `n_heads` contiguous `head_dim` f32 heads.
+pub(crate) struct RopeTarget<'a> {
+    pub(crate) vecs: &'a ProtocolObject<dyn MTLBuffer>,
+    pub(crate) n_heads: u32,
+}
+
+/// RoPE one or two destinations in a SINGLE dispatch.
+///
+/// Every call site rotates Q and then K with the same `theta`, `pos`,
+/// `head_dim` and `freq_factors`, into different buffers, and RoPE is
+/// independent per head -- so the pair is one dispatch, not two. Taking
+/// `second` as a parameter rather than adding a fused twin is what keeps
+/// the single- and two-destination paths from drifting: there is one
+/// kernel and one encoder, and `None` simply makes the second range
+/// empty.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_rope(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     rope: MetalRope,
-    vecs: &ProtocolObject<dyn MTLBuffer>,
-    n_heads: u32,
+    first: RopeTarget<'_>,
+    second: Option<RopeTarget<'_>>,
     head_dim: u32,
     theta: f32,
     pos: u32,
     freq_factors: Option<&ProtocolObject<dyn MTLBuffer>>,
 ) -> Result<(), MetalError> {
+    let vecs = first.vecs;
+    let n_heads = first.n_heads;
+    // With no second destination the kernel's `h < n_heads` branch is the
+    // only reachable one, so binding `vecs` again at index 9 is a valid
+    // buffer the kernel never reads.
+    let (vecs2, n_heads2) = match &second {
+        Some(t) => (t.vecs, t.n_heads),
+        None => (vecs, 0),
+    };
     let (src, name) = match rope.layout {
         MetalRopeLayout::Norm => (ROPE_NORM_KERNEL_SRC, "rope_interleaved_heads"),
         MetalRopeLayout::Neox => (ROPE_NEOX_KERNEL_SRC, "rope_neox_heads"),
@@ -2996,10 +3067,18 @@ fn encode_rope(
             4,
             8,
         );
+        encoder.setBuffer_offset_atIndex(Some(vecs2), 0, 9);
+        let mut n_heads2_u = n_heads2;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_heads2_u as *mut u32 as *mut _).unwrap(),
+            4,
+            10,
+        );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
-            width: n_heads as usize,
+            width: (n_heads + n_heads2) as usize,
             height: 1,
             depth: 1,
         },
@@ -3101,7 +3180,8 @@ fn encode_rope_batch(
             9,
         );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: n_tokens as usize,
@@ -3116,88 +3196,41 @@ fn encode_rope_batch(
     Ok(())
 }
 
-fn encode_kv_append(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    src: &ProtocolObject<dyn MTLBuffer>,
-    dst: &ProtocolObject<dyn MTLBuffer>,
-    offset_elems: u32,
-    n_elems: u32,
-) -> Result<(), MetalError> {
-    let pipe = ensure_pipeline(device, KV_APPEND_KERNEL_SRC, "kv_append")?;
-    encoder.setComputePipelineState(&pipe.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
-        let mut off = offset_elems;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut off as *mut u32 as *mut _).unwrap(),
-            4,
-            2,
-        );
-        let mut n = n_elems;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 3);
-    }
-    let tg = 256usize.min(n_elems as usize).max(1);
-    let n_tg = (n_elems as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: n_tg,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
+/// Kernel + block geometry for one KV wire format.
+///
+/// One table rather than three near-identical encoders: the f16, Q8_0
+/// and Turbo4 appends previously restated the same threadgroup sizing,
+/// the same alignment check and the same buffer bindings, which is the
+/// shape that loses a fix in two of three copies.
+struct KvAppendKernel {
+    src: &'static str,
+    name: &'static str,
+    /// f32 elements one dispatched unit handles: 1 for the f16 copy, the
+    /// block size for a quantized wire, which is also the alignment
+    /// `offset_elems` and `n_elems` must satisfy.
+    elems_per_unit: u32,
 }
 
-fn encode_kv_append_q8_0(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    src: &ProtocolObject<dyn MTLBuffer>,
-    dst: &ProtocolObject<dyn MTLBuffer>,
-    offset_elems: u32,
-    n_elems: u32,
-) -> Result<(), MetalError> {
-    if !offset_elems.is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS as u32)
-        || !n_elems.is_multiple_of(ferrox_quant::Q8_0_BLOCK_ELEMS as u32)
-    {
-        return Err(MetalError::CommandFailed);
+fn kv_append_kernel(dtype: MetalKvDtype) -> KvAppendKernel {
+    if dtype.is_q8_wire() {
+        return KvAppendKernel {
+            src: KV_APPEND_Q8_0_KERNEL_SRC,
+            name: "kv_append_q8_0",
+            elems_per_unit: ferrox_quant::Q8_0_BLOCK_ELEMS as u32,
+        };
     }
-    let pipe = ensure_pipeline(device, KV_APPEND_Q8_0_KERNEL_SRC, "kv_append_q8_0")?;
-    encoder.setComputePipelineState(&pipe.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
-        let mut off = offset_elems;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut off as *mut u32 as *mut _).unwrap(),
-            4,
-            2,
-        );
-        let mut n = n_elems;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 3);
+    match dtype {
+        MetalKvDtype::Turbo4 => KvAppendKernel {
+            src: KV_APPEND_TURBO4_KERNEL_SRC,
+            name: "kv_append_turbo4",
+            elems_per_unit: ferrox_quant::TURBO4_KV_GROUP as u32,
+        },
+        _ => KvAppendKernel {
+            src: KV_APPEND_KERNEL_SRC,
+            name: "kv_append",
+            elems_per_unit: 1,
+        },
     }
-    let n_blocks = (n_elems as usize) / ferrox_quant::Q8_0_BLOCK_ELEMS;
-    let tg = 256usize.min(n_blocks).max(1);
-    let n_tg = n_blocks.div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: n_tg,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
 }
 
 fn encode_dequant_q8_0_to_f16(
@@ -3225,52 +3258,8 @@ fn encode_dequant_q8_0_to_f16(
     let n_blocks = (n_elems as usize) / ferrox_quant::Q8_0_BLOCK_ELEMS;
     let tg = 256usize.min(n_blocks).max(1);
     let n_tg = n_blocks.div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: n_tg,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
-fn encode_kv_append_turbo4(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    src: &ProtocolObject<dyn MTLBuffer>,
-    dst: &ProtocolObject<dyn MTLBuffer>,
-    offset_elems: u32,
-    n_elems: u32,
-) -> Result<(), MetalError> {
-    if !offset_elems.is_multiple_of(ferrox_quant::TURBO4_KV_GROUP as u32)
-        || !n_elems.is_multiple_of(ferrox_quant::TURBO4_KV_GROUP as u32)
-    {
-        return Err(MetalError::CommandFailed);
-    }
-    let pipe = ensure_pipeline(device, KV_APPEND_TURBO4_KERNEL_SRC, "kv_append_turbo4")?;
-    encoder.setComputePipelineState(&pipe.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
-        let mut off = offset_elems;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut off as *mut u32 as *mut _).unwrap(),
-            4,
-            2,
-        );
-        let mut n = n_elems;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 3);
-    }
-    let n_blocks = (n_elems as usize) / ferrox_quant::TURBO4_KV_GROUP;
-    let tg = 256usize.min(n_blocks).max(1);
-    let n_tg = n_blocks.div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -3310,7 +3299,8 @@ fn encode_dequant_turbo4_to_f16(
     let n_blocks = (n_elems as usize) / ferrox_quant::TURBO4_KV_GROUP;
     let tg = 256usize.min(n_blocks).max(1);
     let n_tg = n_blocks.div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -3340,34 +3330,74 @@ fn encode_kv_dequant_to_f16(
     }
 }
 
-fn encode_kv_store_append(
+/// Append this token's K and V into the layer's cache in ONE dispatch.
+///
+/// Both planes always land at the same `offset_elems` with the same
+/// `n_elems` -- there is no caller that appends one without the other --
+/// so the kernel takes the second pair of buffers and the grid's height
+/// selects between them. That halves this step's encode cost, which is
+/// the whole point of GitHub issue #149: the K and V appends were 32 of
+/// the 242 dispatches a Llama-3.2-1B decode token encoded.
+///
+/// Taking both planes as parameters is also why there is no `KvPlane`
+/// enum any more: a single-plane entry point would be a second code path
+/// to keep in step with this one.
+pub(crate) fn encode_kv_store_append(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    src: &ProtocolObject<dyn MTLBuffer>,
+    k_src: &ProtocolObject<dyn MTLBuffer>,
+    v_src: &ProtocolObject<dyn MTLBuffer>,
     kv: &MetalKvBuffers,
-    plane: KvPlane,
     offset_elems: u32,
     n_elems: u32,
 ) -> Result<(), MetalError> {
-    let dst: &ProtocolObject<dyn MTLBuffer> = match plane {
-        KvPlane::K => &kv.k,
-        KvPlane::V => &kv.v,
-    };
-    match kv.dtype {
-        d if d.is_q8_wire() => {
-            encode_kv_append_q8_0(encoder, device, src, dst, offset_elems, n_elems)
-        }
-        MetalKvDtype::Turbo4 => {
-            encode_kv_append_turbo4(encoder, device, src, dst, offset_elems, n_elems)
-        }
-        _ => encode_kv_append(encoder, device, src, dst, offset_elems, n_elems),
+    let kernel = kv_append_kernel(kv.dtype);
+    let unit = kernel.elems_per_unit;
+    // A quantized wire writes whole blocks, so a token that does not sit
+    // on a block boundary would corrupt its neighbour. Refuse instead.
+    if !offset_elems.is_multiple_of(unit) || !n_elems.is_multiple_of(unit) {
+        return Err(MetalError::CommandFailed);
     }
+    let units = (n_elems / unit) as usize;
+    let pipe = ensure_pipeline(device, kernel.src, kernel.name)?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(k_src), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(&kv.k), 0, 1);
+        let mut off = offset_elems;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut off as *mut u32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+        let mut n = n_elems;
+        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 3);
+        encoder.setBuffer_offset_atIndex(Some(v_src), 0, 4);
+        encoder.setBuffer_offset_atIndex(Some(&kv.v), 0, 5);
+    }
+    let tg = 256usize.min(units).max(1);
+    let n_tg = units.div_ceil(tg);
+    dispatch_counted(
+        encoder,
+        MTLSize {
+            width: n_tg,
+            // Plane 0 is K, plane 1 is V.
+            height: 2,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
 }
 
 /// Decode GQA against the layer's KV cache, hazard-tracked through `mrs`.
 /// Same shared-f16-scratch caveat as [`encode_gqa_prefill_with_kv`].
 #[allow(clippy::too_many_arguments)]
-fn encode_gqa_with_kv(
+pub(crate) fn encode_gqa_with_kv(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     mrs: &mut MemRanges,
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
@@ -3626,7 +3656,8 @@ fn encode_gqa_prefill_fa_ext(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: n_q.div_ceil(QN) as usize,
@@ -3746,7 +3777,8 @@ fn encode_gqa_prefill_fa_vec(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: n_q as usize,
@@ -3823,7 +3855,8 @@ fn encode_gqa_fa_vec(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: 1,
@@ -3894,7 +3927,8 @@ fn encode_gqa(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: 1,
@@ -3976,7 +4010,8 @@ fn encode_gqa_prefill(
         encoder.setBytes_length_atIndex(NonNull::new(&mut sc as *mut f32 as *mut _).unwrap(), 4, 9);
         encoder.setThreadgroupMemoryLength_atIndex(tg_mem, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_heads as usize,
             height: n_q as usize,
@@ -3996,7 +4031,7 @@ fn encode_gqa_prefill(
 /// whole-vector (`weight.len() == q_rows` / `k_rows`, OLMoE). No-ops
 /// when `extras` is empty. Single-token path used by decode.
 #[allow(clippy::too_many_arguments)]
-fn encode_attn_extras(
+pub(crate) fn encode_attn_extras(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     device: &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
     extras: &AttnExtras<'_>,
@@ -4269,19 +4304,14 @@ pub fn launch_decode_attn_block(
         &encoder,
         device,
         rope_layout,
-        &q_buf,
-        n_heads as u32,
-        head_dim as u32,
-        rope_theta,
-        pos as u32,
-        ff_buf.as_deref(),
-    )?;
-    encode_rope(
-        &encoder,
-        device,
-        rope_layout,
-        &k_buf,
-        n_kv_heads as u32,
+        RopeTarget {
+            vecs: &q_buf,
+            n_heads: n_heads as u32,
+        },
+        Some(RopeTarget {
+            vecs: &k_buf,
+            n_heads: n_kv_heads as u32,
+        }),
         head_dim as u32,
         rope_theta,
         pos as u32,
@@ -4290,24 +4320,7 @@ pub fn launch_decode_attn_block(
 
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-    encode_kv_store_append(
-        &encoder,
-        device,
-        &k_buf,
-        kv,
-        KvPlane::K,
-        offset,
-        token_elems,
-    )?;
-    encode_kv_store_append(
-        &encoder,
-        device,
-        &v_buf,
-        kv,
-        KvPlane::V,
-        offset,
-        token_elems,
-    )?;
+    encode_kv_store_append(&encoder, device, &k_buf, &v_buf, kv, offset, token_elems)?;
 
     let new_seq = (kv.seq_len + 1) as u32;
     encode_gqa_with_kv(
@@ -4631,19 +4644,14 @@ pub fn launch_moe_decode_pre(
             &encoder,
             device,
             rope_layout,
-            &scratch.q,
-            n_heads as u32,
-            head_dim as u32,
-            rope_theta,
-            pos as u32,
-            ff_buf.as_deref(),
-        )?;
-        encode_rope(
-            &encoder,
-            device,
-            rope_layout,
-            &scratch.k,
-            n_kv_heads as u32,
+            RopeTarget {
+                vecs: &scratch.q,
+                n_heads: n_heads as u32,
+            },
+            Some(RopeTarget {
+                vecs: &scratch.k,
+                n_heads: n_kv_heads as u32,
+            }),
             head_dim as u32,
             rope_theta,
             pos as u32,
@@ -4655,17 +4663,8 @@ pub fn launch_moe_decode_pre(
             &encoder,
             device,
             &scratch.k,
-            kv,
-            KvPlane::K,
-            offset,
-            token_elems,
-        )?;
-        encode_kv_store_append(
-            &encoder,
-            device,
             &scratch.v,
             kv,
-            KvPlane::V,
             offset,
             token_elems,
         )?;
@@ -4981,19 +4980,14 @@ fn encode_moe_layer_fused(
             encoder,
             device,
             rope_layout,
-            &scratch.q,
-            n_heads as u32,
-            head_dim as u32,
-            rope_theta,
-            pos as u32,
-            ff_buf,
-        )?;
-        encode_rope(
-            encoder,
-            device,
-            rope_layout,
-            &scratch.k,
-            n_kv_heads as u32,
+            RopeTarget {
+                vecs: &scratch.q,
+                n_heads: n_heads as u32,
+            },
+            Some(RopeTarget {
+                vecs: &scratch.k,
+                n_heads: n_kv_heads as u32,
+            }),
             head_dim as u32,
             rope_theta,
             pos as u32,
@@ -5012,17 +5006,8 @@ fn encode_moe_layer_fused(
             encoder,
             device,
             &scratch.k,
-            kv,
-            KvPlane::K,
-            offset,
-            token_elems,
-        )?;
-        encode_kv_store_append(
-            encoder,
-            device,
             &scratch.v,
             kv,
-            KvPlane::V,
             offset,
             token_elems,
         )?;
@@ -5623,19 +5608,14 @@ pub fn launch_decode_dense_layer(
         &encoder,
         device,
         rope_layout,
-        &q_buf,
-        n_heads as u32,
-        head_dim as u32,
-        rope_theta,
-        pos as u32,
-        ff_buf.as_deref(),
-    )?;
-    encode_rope(
-        &encoder,
-        device,
-        rope_layout,
-        &k_buf,
-        n_kv_heads as u32,
+        RopeTarget {
+            vecs: &q_buf,
+            n_heads: n_heads as u32,
+        },
+        Some(RopeTarget {
+            vecs: &k_buf,
+            n_heads: n_kv_heads as u32,
+        }),
         head_dim as u32,
         rope_theta,
         pos as u32,
@@ -5644,24 +5624,7 @@ pub fn launch_decode_dense_layer(
 
     let token_elems = (n_kv_heads * head_dim) as u32;
     let offset = (kv.seq_len * n_kv_heads * head_dim) as u32;
-    encode_kv_store_append(
-        &encoder,
-        device,
-        &k_buf,
-        kv,
-        KvPlane::K,
-        offset,
-        token_elems,
-    )?;
-    encode_kv_store_append(
-        &encoder,
-        device,
-        &v_buf,
-        kv,
-        KvPlane::V,
-        offset,
-        token_elems,
-    )?;
+    encode_kv_store_append(&encoder, device, &k_buf, &v_buf, kv, offset, token_elems)?;
 
     let new_seq = (kv.seq_len + 1) as u32;
     encode_gqa_with_kv(
@@ -5710,556 +5673,6 @@ pub fn launch_decode_dense_layer(
 
     let out_ptr = h_buf.contents();
     Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, hidden_dim).to_vec() })
-}
-
-/// Optional attention epilogue ops applied between the QKV matvecs and
-/// RoPE, in CPU-path order: bias add (Qwen2-family `qkv_bias`), then
-/// QK-RMSNorm — per-head (Qwen3 / Gemma-3, `weight.len() == head_dim`)
-/// or whole-vector (OLMoE, `weight.len() == n_heads|n_kv_heads * head_dim`).
-/// `attn_logit_softcap` is applied inside GQA after score scaling
-/// (Gemma-2); when set, FA-vec is skipped in favour of the legacy kernel
-/// unless the FA-vec softcap path is enabled.
-#[derive(Default)]
-pub struct AttnExtras<'a> {
-    pub q_bias: Option<&'a [f32]>,
-    pub k_bias: Option<&'a [f32]>,
-    pub v_bias: Option<&'a [f32]>,
-    pub q_norm: Option<&'a [f32]>,
-    pub k_norm: Option<&'a [f32]>,
-    pub attn_logit_softcap: Option<f32>,
-}
-
-impl AttnExtras<'_> {
-    pub fn is_empty(&self) -> bool {
-        self.q_bias.is_none()
-            && self.k_bias.is_none()
-            && self.v_bias.is_none()
-            && self.q_norm.is_none()
-            && self.k_norm.is_none()
-            && self.attn_logit_softcap.is_none()
-    }
-}
-
-/// Per-layer launches + norms for [`launch_decode_dense_stack`].
-pub struct DenseLayerMetal<'a> {
-    pub attn_norm_w: &'a [f32],
-    pub ffn_norm_w: &'a [f32],
-    pub q: MatvecLaunch<'a>,
-    pub k: MatvecLaunch<'a>,
-    pub v: MatvecLaunch<'a>,
-    pub o: MatvecLaunch<'a>,
-    pub gate: MatvecLaunch<'a>,
-    pub up: MatvecLaunch<'a>,
-    pub down: MatvecLaunch<'a>,
-    pub extras: AttnExtras<'a>,
-    /// This layer's RoPE base AND divisors. Both halves, always: a
-    /// Gemma-3 SWA layer differs from its full-attention neighbours in
-    /// both (`rope_theta_swa`, and no linear scale folded into the
-    /// divisors). See [`LayerRope`].
-    pub rope: LayerRope<'a>,
-    /// Sliding-window size for this layer (`None` = full causal).
-    pub window: Option<usize>,
-    /// Gemma post-attention / post-FFN sandwich norms, applied to the
-    /// block output *before* the residual add.
-    pub post_attn_norm: Option<&'a [f32]>,
-    pub post_ffn_norm: Option<&'a [f32]>,
-}
-
-/// Optional on-GPU embedding gather at the start of
-/// [`launch_decode_dense_stack`] (skips host `dequant_row` + upload).
-pub struct EmbdGatherMetal<'a> {
-    pub kind: EmbdKind,
-    pub weights: &'a [u8],
-    pub rows: usize,
-    pub row_bytes: usize,
-    pub n_cols: usize,
-    pub token_id: usize,
-}
-
-/// All dense layers in **one** command buffer (one wait). Hidden stays on
-/// GPU across layers — Crane-style residency for B=1 decode.
-/// When `embd` is `Some`, gathers that token row into scratch `h` on-GPU
-/// instead of copying a host-provided `hidden` slice.
-/// When `final_norm_w` + `output` are provided, also runs final RMSNorm +
-/// lm_head on-GPU. With `argmax_only`, runs argmax and returns a
-/// **1-element** `vec![token_id as f32]`; otherwise downloads vocab logits.
-///
-/// Chunked multi-CB early-commit (llama `n_main` style) was tried on Host B
-/// and regressed decode tok/s — see `…_multicb*` receipts; kept single CB.
-#[allow(clippy::too_many_arguments)]
-pub fn launch_decode_dense_stack(
-    hidden: &[f32],
-    layers: &[DenseLayerMetal<'_>],
-    kvs: &mut [MetalKvBuffers],
-    n_heads: usize,
-    rope_layout: MetalRope,
-    pos: usize,
-    rms_eps: f32,
-    final_norm_w: Option<&[f32]>,
-    output: Option<&MatvecLaunch<'_>>,
-    argmax_only: bool,
-    embd: Option<&EmbdGatherMetal<'_>>,
-    gelu_ffn: bool,
-) -> Result<Vec<f32>, MetalError> {
-    assert_eq!(layers.len(), kvs.len());
-    assert!(!layers.is_empty());
-    let hidden_dim = match embd {
-        Some(e) => e.n_cols,
-        None => hidden.len(),
-    };
-    assert!(hidden_dim > 0);
-    let head_dim = kvs[0].head_dim;
-    let n_kv_heads = kvs[0].n_kv_heads;
-    for kv in kvs.iter() {
-        assert_eq!(kv.head_dim, head_dim);
-        assert_eq!(kv.n_kv_heads, n_kv_heads);
-        assert_eq!(pos, kv.seq_len);
-        if kv.seq_len >= kv.capacity {
-            return Err(MetalError::CommandFailed);
-        }
-    }
-    for layer in layers.iter() {
-        assert_freq_factors_len(layer.rope.freq_factors, rope_layout, head_dim);
-    }
-
-    let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
-    let max_kv = layers.iter().map(|l| l.k.rows).max().unwrap();
-    let max_gate = layers.iter().map(|l| l.gate.rows).max().unwrap();
-    let attn_elems = n_heads * head_dim;
-    let logits_rows = output.map(|o| o.rows);
-
-    let shared = shared_metal()?;
-    let device = &shared.device;
-    let queue = &shared.queue;
-
-    let scratch_guard = borrow_decode_scratch(
-        device,
-        ScratchCaps {
-            hidden: hidden_dim,
-            max_q,
-            max_kv,
-            attn: attn_elems,
-            max_gate,
-            logits: logits_rows.unwrap_or(0),
-        },
-    )?;
-    let scratch = scratch_guard.as_ref().expect("scratch just ensured");
-    let h_buf = &scratch.h;
-    if let Some(e) = embd {
-        assert_eq!(e.n_cols, hidden_dim);
-        assert!(e.token_id < e.rows);
-        assert_eq!(e.weights.len(), e.rows * e.row_bytes);
-        // Gather runs in the same CB below (after encoder create).
-    } else {
-        assert_eq!(hidden.len(), hidden_dim);
-        copy_f32_into(h_buf, hidden);
-    }
-    let x_buf = &scratch.x;
-    let x2_buf = &scratch.x2;
-    let q_buf = &scratch.q;
-    let k_buf = &scratch.k;
-    let v_buf = &scratch.v;
-    let attn_buf = &scratch.attn;
-    let o_buf = &scratch.o;
-    let gate_buf = &scratch.gate;
-    let up_buf = &scratch.up;
-    let act_buf = &scratch.act;
-    let down_buf = &scratch.down;
-    let logits_buf = scratch.logits.as_ref();
-    let argmax_idx_buf = &scratch.argmax_idx;
-
-    // One resident buffer PER LAYER. `resident_f32_buffer` keys its
-    // cache on (pointer, len), so the at-most-two distinct divisor sets
-    // an alternating-SWA model has are uploaded once each and every
-    // layer past the first two is a cache hit -- no per-layer upload,
-    // and no table of "which set does layer i use" for a call site to
-    // get out of step with.
-    let ff_resident = layers
-        .iter()
-        .map(|l| match l.rope.freq_factors {
-            Some(ff) => resident_f32_buffer(device, ff).map(Some),
-            None => Ok(None),
-        })
-        .collect::<Result<Vec<_>, MetalError>>()?;
-
-    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    // Gemma-style post-norms ("sandwich"): these layers take the EAGER
-    // residual path below, which is what makes concurrent encode safe here.
-    let sandwich = layers
-        .iter()
-        .any(|l| l.post_attn_norm.is_some() || l.post_ffn_norm.is_some());
-    // Every model encodes concurrently: gate∥up and Q∥K∥V overlap, and the
-    // hazard tracker emits a barrier only where a dispatch reads or
-    // overwrites something still in flight, narrowed to those resources.
-    //
-    // Sandwich models (Gemma post-norms) used to be forced onto the serial
-    // encoder, because concurrent dispatch with in-place RMSNorm and
-    // DEFERRED residuals diverged from CPU on Gemma-2 B=1 decode. That fix
-    // landed two changes at once -- serial encode AND eager residuals -- and
-    // the eager residuals are the half that mattered: with them, every op in
-    // this function declares its own reads and writes (`encode_gqa_with_kv`
-    // self-tracks, including the f16 dequant scratch no caller can name), so
-    // concurrency is safe by construction rather than by scheduling luck.
-    //
-    // Measured on an M2 Pro, interleaved, GPU-clock: Gemma-2-2B Q4_K_M decode
-    // 13.23 -> 12.20 ms/token, and greedy output stays byte-identical to the
-    // serial encoder across Gemma-2 and Gemma-3 on every prompt tried.
-    let (encoder, mut mrs) = (compute_encoder_concurrent(&cmd_buf)?, MemRanges::new());
-
-    let embd_resident = if let Some(e) = embd {
-        let w = resident_weight_buffer(device, e.weights)?;
-        mrs.begin_op(&encoder, &[], &[h_buf]);
-        encode_get_rows(
-            &encoder,
-            device,
-            e.kind,
-            &w,
-            h_buf,
-            e.row_bytes as u32,
-            e.n_cols as u32,
-            e.token_id as u32,
-        )?;
-        mrs.end_op(&[], &[h_buf]);
-        Some(w)
-    } else {
-        None
-    };
-    let _embd_resident = embd_resident;
-
-    // Gemma sandwich (post_attn / post_ffn) must apply residuals eagerly —
-    // same shape as the working prefill stack / CPU path. Deferred
-    // `h += down` fused into the next layer's attn_norm matches SmolLM2
-    // (no post-norms) but diverges for Gemma-2 Metal greedy (BOS loops /
-    // `*` spam) even when GQA unit tests pass.
-    // `sandwich` was computed above (also selects serial encoder).
-
-    for (layer_idx, (layer, kv)) in layers.iter().zip(kvs.iter_mut()).enumerate() {
-        assert_eq!(layer.attn_norm_w.len(), hidden_dim);
-        assert_eq!(layer.ffn_norm_w.len(), hidden_dim);
-        assert_eq!(layer.o.rows, hidden_dim);
-        assert_eq!(layer.down.rows, hidden_dim);
-        assert_eq!(layer.gate.rows, layer.up.rows);
-
-        let attn_nw = resident_f32_buffer(device, layer.attn_norm_w)?;
-        let ffn_nw = resident_f32_buffer(device, layer.ffn_norm_w)?;
-        let q_w = resident_weight_buffer(device, layer.q.weights)?;
-        let k_w = resident_weight_buffer(device, layer.k.weights)?;
-        let v_w = resident_weight_buffer(device, layer.v.weights)?;
-        let o_w = resident_weight_buffer(device, layer.o.weights)?;
-        let gate_w = resident_weight_buffer(device, layer.gate.weights)?;
-        let up_w = resident_weight_buffer(device, layer.up.weights)?;
-        let down_w = resident_weight_buffer(device, layer.down.weights)?;
-        let kv_k = kv.k.as_ref();
-        let kv_v = kv.v.as_ref();
-
-        // Pre-LN: layer 0 norms raw hidden; later layers either fuse the
-        // previous FFN residual into attn_norm (non-sandwich) or just
-        // RMSNorm (sandwich already applied `h += down` eagerly).
-        if layer_idx == 0 || sandwich {
-            mrs.begin_op(&encoder, &[h_buf], &[x_buf]);
-            encode_rms_norm(
-                &encoder,
-                device,
-                h_buf,
-                &attn_nw.buffer,
-                x_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[h_buf], &[x_buf]);
-        } else {
-            mrs.begin_op(&encoder, &[h_buf, down_buf], &[h_buf, x_buf]);
-            encode_add_rms_norm(
-                &encoder,
-                device,
-                h_buf,
-                down_buf,
-                &attn_nw.buffer,
-                x_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[h_buf, down_buf], &[h_buf, x_buf]);
-        }
-        // Q∥K∥V
-        mrs.begin_op(&encoder, &[x_buf], &[q_buf, k_buf, v_buf]);
-        encode_matvec(&encoder, device, &layer.q, &q_w, x_buf, q_buf)?;
-        encode_matvec(&encoder, device, &layer.k, &k_w, x_buf, k_buf)?;
-        encode_matvec(&encoder, device, &layer.v, &v_w, x_buf, v_buf)?;
-        mrs.end_op(&[x_buf], &[q_buf, k_buf, v_buf]);
-
-        mrs.begin_op(&encoder, &[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
-        encode_attn_extras(
-            &encoder,
-            device,
-            &layer.extras,
-            q_buf,
-            k_buf,
-            v_buf,
-            layer.q.rows,
-            layer.k.rows,
-            layer.v.rows,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            rms_eps,
-        )?;
-        mrs.end_op(&[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
-
-        let layer_theta = layer.rope.theta;
-        let ff_buf = ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref());
-        mrs.begin_op(&encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
-        encode_rope(
-            &encoder,
-            device,
-            rope_layout,
-            q_buf,
-            n_heads as u32,
-            head_dim as u32,
-            layer_theta,
-            pos as u32,
-            ff_buf,
-        )?;
-        encode_rope(
-            &encoder,
-            device,
-            rope_layout,
-            k_buf,
-            n_kv_heads as u32,
-            head_dim as u32,
-            layer_theta,
-            pos as u32,
-            ff_buf,
-        )?;
-        mrs.end_op(&[q_buf, k_buf], &[q_buf, k_buf]);
-
-        let token_elems = (n_kv_heads * head_dim) as u32;
-        let offset = (pos * n_kv_heads * head_dim) as u32;
-        mrs.begin_op(&encoder, &[k_buf, v_buf], &[kv_k, kv_v]);
-        encode_kv_store_append(&encoder, device, k_buf, kv, KvPlane::K, offset, token_elems)?;
-        encode_kv_store_append(&encoder, device, v_buf, kv, KvPlane::V, offset, token_elems)?;
-        mrs.end_op(&[k_buf, v_buf], &[kv_k, kv_v]);
-
-        let new_seq = (pos + 1) as u32;
-        // Sliding window: only the last `window` positions (incl. current)
-        // are visible, matching `causal_gqa_attention_windowed`.
-        let kv_start = match layer.window {
-            Some(w) => (pos + 1).saturating_sub(w) as u32,
-            None => 0,
-        };
-        // Self-tracking: with a quantized KV cache this also writes a shared
-        // f16 dequant scratch that no caller can name.
-        encode_gqa_with_kv(
-            &encoder,
-            &mut mrs,
-            device,
-            q_buf,
-            kv,
-            attn_buf,
-            n_heads as u32,
-            n_kv_heads as u32,
-            head_dim as u32,
-            new_seq,
-            kv_start,
-            layer.extras.attn_logit_softcap,
-        )?;
-
-        mrs.begin_op(&encoder, &[attn_buf], &[o_buf]);
-        encode_matvec(&encoder, device, &layer.o, &o_w, attn_buf, o_buf)?;
-        mrs.end_op(&[attn_buf], &[o_buf]);
-
-        // Gemma sandwich norm: normalize the attn block output *before*
-        // the residual add (in-place: each thread reads x[i] only after
-        // the barriered reduction, so out == x is safe).
-        if let Some(post) = layer.post_attn_norm {
-            assert_eq!(post.len(), hidden_dim);
-            let pw = resident_f32_buffer(device, post)?;
-            mrs.begin_op(&encoder, &[o_buf], &[o_buf]);
-            encode_rms_norm(
-                &encoder,
-                device,
-                o_buf,
-                &pw.buffer,
-                o_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[o_buf], &[o_buf]);
-        }
-        // Attn residual + ffn_norm in one dispatch, for every model.
-        //
-        // Sandwich layers used to split this into `vec_add` then `rms_norm`,
-        // which is the same arithmetic in two dispatches: `post_attn_norm`
-        // has already been applied to `o_buf` in place above, so both paths
-        // compute `h += o` then `x2 = rms_norm(h)`. The split was a leftover
-        // from the serial-encoder era -- `encode_add_rms_norm` writes `h`
-        // itself, so the residual is just as eager as the two-dispatch form.
-        mrs.begin_op(&encoder, &[h_buf, o_buf], &[h_buf, x2_buf]);
-        encode_add_rms_norm(
-            &encoder,
-            device,
-            h_buf,
-            o_buf,
-            &ffn_nw.buffer,
-            x2_buf,
-            hidden_dim as u32,
-            rms_eps,
-        )?;
-        mrs.end_op(&[h_buf, o_buf], &[h_buf, x2_buf]);
-        // gate ∥ up (llama concurrent)
-        mrs.begin_op(&encoder, &[x2_buf], &[gate_buf, up_buf]);
-        encode_matvec(&encoder, device, &layer.gate, &gate_w, x2_buf, gate_buf)?;
-        encode_matvec(&encoder, device, &layer.up, &up_w, x2_buf, up_buf)?;
-        mrs.end_op(&[x2_buf], &[gate_buf, up_buf]);
-
-        mrs.begin_op(&encoder, &[gate_buf, up_buf], &[act_buf]);
-        if gelu_ffn {
-            encode_gelu_mul(
-                &encoder,
-                device,
-                gate_buf,
-                up_buf,
-                act_buf,
-                layer.gate.rows as u32,
-            )?;
-        } else {
-            encode_silu_mul(
-                &encoder,
-                device,
-                gate_buf,
-                up_buf,
-                act_buf,
-                layer.gate.rows as u32,
-            )?;
-        }
-        mrs.end_op(&[gate_buf, up_buf], &[act_buf]);
-
-        mrs.begin_op(&encoder, &[act_buf], &[down_buf]);
-        encode_matvec(&encoder, device, &layer.down, &down_w, act_buf, down_buf)?;
-        mrs.end_op(&[act_buf], &[down_buf]);
-
-        if let Some(post) = layer.post_ffn_norm {
-            assert_eq!(post.len(), hidden_dim);
-            let pw = resident_f32_buffer(device, post)?;
-            mrs.begin_op(&encoder, &[down_buf], &[down_buf]);
-            encode_rms_norm(
-                &encoder,
-                device,
-                down_buf,
-                &pw.buffer,
-                down_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[down_buf], &[down_buf]);
-        }
-        if sandwich {
-            // Eager FFN residual — next layer attn_norm is plain RMSNorm.
-            mrs.begin_op(&encoder, &[h_buf, down_buf], &[h_buf]);
-            encode_vec_add(&encoder, device, h_buf, down_buf, hidden_dim as u32)?;
-            mrs.end_op(&[h_buf, down_buf], &[h_buf]);
-        }
-        // Non-sandwich: defer `h += down` until the next layer's attn_norm
-        // (or final_norm) so it fuses with that RMSNorm. `down_buf` stays in
-        // the tracker's dst set, so the next layer's fused norm barriers
-        // against it exactly once. Last layer handled below.
-    }
-
-    // Final norm / lm_head. Sandwich already applied every FFN residual;
-    // non-sandwich still has a deferred last-layer `down` to fold in.
-    let (download_n, norm_resident) = if let Some(fnw) = final_norm_w {
-        assert_eq!(fnw.len(), hidden_dim);
-        let fn_buf = resident_f32_buffer(device, fnw)?;
-        if sandwich {
-            mrs.begin_op(&encoder, &[h_buf], &[x_buf]);
-            encode_rms_norm(
-                &encoder,
-                device,
-                h_buf,
-                &fn_buf.buffer,
-                x_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[h_buf], &[x_buf]);
-        } else {
-            mrs.begin_op(&encoder, &[h_buf, down_buf], &[h_buf, x_buf]);
-            encode_add_rms_norm(
-                &encoder,
-                device,
-                h_buf,
-                down_buf,
-                &fn_buf.buffer,
-                x_buf,
-                hidden_dim as u32,
-                rms_eps,
-            )?;
-            mrs.end_op(&[h_buf, down_buf], &[h_buf, x_buf]);
-        }
-        if let (Some(out_l), Some(logits)) = (output, logits_buf) {
-            assert_eq!(out_l.rows, logits_rows.unwrap());
-            // RAW: lm_head reads `x_buf` written by the norm above. Without
-            // ordering here Metal may overlap the matvec with the norm on
-            // small hiddens (SmolLM2 h=576) and produce garbage logits /
-            // greedy tokens while host lm_head after wait looks fine — the
-            // tracker sees `x_buf` as src-after-dst and barriers.
-            mrs.begin_op(&encoder, &[x_buf], &[logits.as_ref()]);
-            let out_w = resident_weight_buffer(device, out_l.weights)?;
-            encode_matvec(&encoder, device, out_l, &out_w, x_buf, logits)?;
-            mrs.end_op(&[x_buf], &[logits.as_ref()]);
-            if argmax_only {
-                mrs.begin_op(&encoder, &[logits.as_ref()], &[argmax_idx_buf]);
-                encode_argmax(&encoder, device, logits, argmax_idx_buf, out_l.rows as u32)?;
-                mrs.end_op(&[logits.as_ref()], &[argmax_idx_buf]);
-                (1, false)
-            } else {
-                (out_l.rows, false)
-            }
-        } else {
-            // final_norm ran but no lm_head — download normalized hidden
-            // and mark x_buf resident for the next apply_gpu.
-            (hidden_dim, true)
-        }
-    } else if sandwich {
-        (hidden_dim, false)
-    } else {
-        // No final_norm: still apply the deferred last-layer FFN residual.
-        mrs.begin_op(&encoder, &[h_buf, down_buf], &[h_buf]);
-        encode_vec_add(&encoder, device, h_buf, down_buf, hidden_dim as u32)?;
-        mrs.end_op(&[h_buf, down_buf], &[h_buf]);
-        (hidden_dim, false)
-    };
-
-    encoder.endEncoding();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
-    crate::gpu::gpu_timing_note(&cmd_buf, "dense-decode/tok", 32);
-
-    for kv in kvs.iter_mut() {
-        kv.seq_len = pos + 1;
-    }
-
-    // If final_norm ran but no lm_head, mark normalized hidden (x_buf)
-    // as resident so the next apply_gpu can skip re-upload.
-    if norm_resident {
-        crate::gpu::set_resident_activation(x_buf, hidden_dim);
-    }
-
-    if argmax_only && download_n == 1 && output.is_some() {
-        let ptr = argmax_idx_buf.contents();
-        let idx = unsafe { *(ptr.as_ptr() as *const u32) as usize };
-        return Ok(vec![idx as f32]);
-    }
-
-    let src: &ProtocolObject<dyn MTLBuffer> = if norm_resident {
-        x_buf
-    } else if download_n == hidden_dim {
-        h_buf
-    } else {
-        logits_buf.expect("logits buffer when downloading logits")
-    };
-    let out_ptr = src.contents();
-    Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, download_n).to_vec() })
 }
 
 /// Per-layer `mul_mm_sg` launches for [`launch_prefill_dense_layer`] /
@@ -6538,8 +5951,7 @@ fn encode_prefill_dense_layer(
     let token_elems = (batch * kv_width) as u32;
     let offset = (kv.seq_len * kv_width) as u32;
     mrs.begin_op(encoder, &[k_buf, v_buf], &[kv_k, kv_v]);
-    encode_kv_store_append(encoder, device, k_buf, kv, KvPlane::K, offset, token_elems)?;
-    encode_kv_store_append(encoder, device, v_buf, kv, KvPlane::V, offset, token_elems)?;
+    encode_kv_store_append(encoder, device, k_buf, v_buf, kv, offset, token_elems)?;
     mrs.end_op(&[k_buf, v_buf], &[kv_k, kv_v]);
 
     encode_gqa_prefill_with_kv(
@@ -6996,8 +6408,11 @@ pub fn launch_rope_heads_host(
         &encoder,
         device,
         layout,
-        &buf,
-        n_heads as u32,
+        RopeTarget {
+            vecs: &buf,
+            n_heads: n_heads as u32,
+        },
+        None,
         head_dim as u32,
         theta,
         pos as u32,
@@ -7169,24 +6584,7 @@ pub fn launch_prefill_attn_block(
 
     let token_elems = (n_q * kv_width) as u32;
     let offset = (kv.seq_len * kv_width) as u32;
-    encode_kv_store_append(
-        &encoder,
-        device,
-        &k_buf,
-        kv,
-        KvPlane::K,
-        offset,
-        token_elems,
-    )?;
-    encode_kv_store_append(
-        &encoder,
-        device,
-        &v_buf,
-        kv,
-        KvPlane::V,
-        offset,
-        token_elems,
-    )?;
+    encode_kv_store_append(&encoder, device, &k_buf, &v_buf, kv, offset, token_elems)?;
 
     let prefill_result = encode_gqa_prefill_with_kv(
         &encoder,

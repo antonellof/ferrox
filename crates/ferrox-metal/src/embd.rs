@@ -5,6 +5,7 @@
 //! `copy_f32_into` into the dense-stack scratch — a pure host edge before
 //! an otherwise fused CB. These kernels write straight into `scratch.h`.
 
+use crate::dispatch::dispatch_counted;
 use crate::gpu::{
     ensure_pipeline, resident_weight_buffer, shared_metal, MetalError, ResidentWeightBuffer,
 };
@@ -163,7 +164,8 @@ pub(crate) fn encode_get_rows(
     }
     let tg = 256usize;
     let n_tg = (n_cols as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,

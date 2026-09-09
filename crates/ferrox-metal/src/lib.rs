@@ -21,13 +21,19 @@ pub mod gpu;
 pub mod attn;
 
 #[cfg(feature = "metal")]
+pub mod decode_dense;
+
+#[cfg(feature = "metal")]
+mod dispatch;
+
+#[cfg(feature = "metal")]
 mod mem_ranges;
 
 #[cfg(feature = "metal")]
 mod moe_ids;
 
 #[cfg(feature = "metal")]
-pub use mem_ranges::{metal_barrier_stats, metal_barrier_stats_reset};
+pub use dispatch::{metal_encode_stats, metal_encode_stats_reset, EncodeStats};
 
 #[cfg(feature = "metal")]
 pub mod elem;

@@ -2,6 +2,7 @@
 //! add, and SiLU×up (SwiGLU pair). Used by the fused dense-layer path
 //! so activations stay on-GPU between attention and FFN.
 
+use crate::dispatch::dispatch_counted;
 use crate::gpu::{ensure_pipeline, MetalError};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -499,7 +500,8 @@ pub(crate) fn encode_rms_norm_at(
         // One float per simdgroup (simd_sum path).
         encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: 1,
             height: 1,
@@ -555,7 +557,8 @@ pub(crate) fn encode_rms_norm_batch(
         );
         encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: batch as usize,
             height: 1,
@@ -606,7 +609,8 @@ pub(crate) fn encode_rms_norm_f32_to_f16_batch(
         );
         encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: batch as usize,
             height: 1,
@@ -653,7 +657,8 @@ pub(crate) fn encode_f32_to_f16(
     }
     let tg = 256usize;
     let n_tg = (n as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -691,7 +696,8 @@ pub(crate) fn encode_vec_add_at(
     }
     let tg = 256usize;
     let n_tg = (n as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -742,7 +748,8 @@ pub(crate) fn encode_add_rms_norm(
         // One float per simdgroup (tg/32).
         encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: 1,
             height: 1,
@@ -799,7 +806,8 @@ pub(crate) fn encode_add_rms_norm_batch(
         );
         encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: batch as usize,
             height: 1,
@@ -863,7 +871,8 @@ pub(crate) fn encode_add_rms_norm_f32_to_f16_batch(
         );
         encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: batch as usize,
             height: 1,
@@ -923,7 +932,8 @@ pub(crate) fn encode_rms_norm_per_head_batch(
             3,
         );
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: (n_heads * batch) as usize,
             height: 1,
@@ -961,7 +971,8 @@ pub(crate) fn encode_silu_mul(
     }
     let tg = 256usize;
     let n_tg = (n as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -1005,7 +1016,8 @@ pub(crate) fn encode_axpy(
     }
     let tg = 256usize;
     let n_tg = (n as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -1054,7 +1066,8 @@ pub(crate) fn encode_act_mul_f32_to_f16(
     }
     let tg = 256usize;
     let n_tg = (n as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -1092,7 +1105,8 @@ pub(crate) fn encode_gelu_mul(
     }
     let tg = 256usize;
     let n_tg = (n as usize).div_ceil(tg);
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: n_tg,
             height: 1,
@@ -1131,7 +1145,8 @@ pub(crate) fn encode_argmax(
         encoder.setThreadgroupMemoryLength_atIndex((tg as usize) * 4, 0);
         encoder.setThreadgroupMemoryLength_atIndex((tg as usize) * 4, 1);
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+    dispatch_counted(
+        encoder,
         MTLSize {
             width: 1,
             height: 1,
