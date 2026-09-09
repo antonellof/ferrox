@@ -1,10 +1,11 @@
-//! The Q4_K weight encoder: a transcription of llama.cpp's
-//! `quantize_row_q4_K_ref` (`ggml/src/ggml-quants.c`), not a
+//! The Q4_K weight encoder: a transcription of llama.cpp b7650's
+//! `quantize_row_q4_K_ref` (`ggml/src/ggml-quants.c:1280`), not a
 //! reimplementation of it.
 //!
 //! A K-quant is NOT min/max over a block. Q4_K's 256-element
-//! super-block is fitted in three stages, and every one of them has to
-//! be reproduced exactly or the file differs:
+//! super-block is fitted in three stages, all of which live in
+//! [`super::fit`] because Q5_K's fit is the same three stages with four
+//! numbers changed:
 //!
 //! 1. Each of the 8 sub-blocks of 32 gets an **iterative** affine fit
 //!    (`make_qkx2_quants`): 21 candidate inverse scales are tried, each
@@ -20,157 +21,24 @@
 //!
 //! A naive min/max encoder skips all three and produces a file that
 //! loads and generates measurably worse text. That is the failure this
-//! module exists to not ship, so the arithmetic below is deliberately
-//! the same shape as the C, down to the operation order in the
-//! least-squares accumulation.
+//! module exists to not ship, so the arithmetic in [`super::fit`] is
+//! deliberately the same shape as the C, down to the operation order in
+//! the least-squares accumulation.
 //!
-//! Deviations from upstream, all of them shown not to change a byte by
-//! `q4_k_matches_llama_cpp_quantize_row_q4_k_ref` in `tests`:
-//!
-//! * `nearest_int`'s `assert(fabsf(fval) <= 4194303.f)` is not
-//!   reproduced. It is compiled out of the release `libggml` that
-//!   `llama-quantize` actually links, so asserting here would make
-//!   ferrox stop where llama.cpp proceeds -- a refusal that fires on
-//!   input llama.cpp handles is not coverage, it is a different tool.
-//! * The 6-bit scale/min are unpacked for stage 3 by the same
-//!   [`crate::q4_k_scale_min`] the *reader* uses, rather than by a
-//!   second copy of `get_scale_min_k4`. Two copies of that bit-packing
-//!   is precisely the shape of bug this repo keeps finding; one
-//!   function means the encoder and the decoder cannot disagree about
-//!   what was packed.
+//! What is left HERE is only what is Q4_K's own: the candidate grid it
+//! passes to the shared fit, and the nibble packing.
 
-use half::f16;
+use super::fit::{fit_qk_super_block, make_qkx2_quants, QkFit, QK_SUB_ELEMS};
+use crate::{Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS};
 
-use crate::{q4_k_scale_min, Q4_K_BLOCK_BYTES, Q4_K_BLOCK_ELEMS, Q4_K_SCALE_BYTES};
-
-/// Sub-blocks per Q4_K super-block, and elements in each.
-const SUB: usize = 8;
-const SUB_ELEMS: usize = Q4_K_BLOCK_ELEMS / SUB; // 32
-
-/// ggml's `nearest_int`: add 1.5 * 2^23 so the mantissa's low bits hold
-/// the rounded integer, then read them back out.
-///
-/// This is **round-half-to-even**, because it is the FPU's own rounding
-/// mode that does the work. `f32::round` is round-half-away-from-zero
-/// and disagrees on every exact tie -- and ties are not rare here: the
-/// candidate inverse scales in [`make_qkx2_quants`] walk a 0.1-wide
-/// grid, so `iscale * (x - min)` lands on `.5` constantly.
-#[inline]
-fn nearest_int(fval: f32) -> i32 {
-    let val = fval + 12_582_912.0f32;
-    let i = val.to_bits() as i32;
-    (i & 0x007f_ffff) - 0x0040_0000
-}
-
-/// llama.cpp's `make_qkx2_quants`: fit `x[i] ~= scale * L[i] - the_min`
-/// with `L[i]` in `0..=nmax`, minimising the `weights`-weighted error.
-///
-/// Returns `(scale, the_min)` and fills `l`. `laux` is scratch, passed
-/// in rather than allocated because the C does the same and this runs
-/// once per 32 weights of the checkpoint.
-///
-/// The signature is upstream's, `use_mad` and all: Q2_K passes `true`
-/// with `n = 16`, Q5_K passes `nmax = 31`. Keeping the parameters means
-/// the next K-quant is a call, not a copy of this function with two
-/// constants changed -- which is how this repo has lost a model feature
-/// eight times.
-#[allow(clippy::too_many_arguments)]
-fn make_qkx2_quants(
-    x: &[f32],
-    weights: &[f32],
-    l: &mut [u8],
-    laux: &mut [u8],
-    nmax: i32,
-    rmin: f32,
-    rdelta: f32,
-    nstep: i32,
-    use_mad: bool,
-) -> (f32, f32) {
-    let n = x.len();
-    debug_assert_eq!(weights.len(), n);
-    debug_assert_eq!(l.len(), n);
-    debug_assert!(laux.len() >= n);
-
-    // Deliberately not `min.min(x[i])` / `max.max(x[i])`. They differ
-    // from the C comparisons only when `x[0]` is NaN -- Rust's
-    // `f32::min` returns the non-NaN operand, `x[i] < NaN` is false and
-    // keeps the NaN -- so no fixture can tell them apart on a real
-    // checkpoint. The C's shape is kept anyway, because a checkpoint
-    // with a NaN weight should produce llama.cpp's bytes rather than
-    // politely different ones. Same choice, same reason, as the `amax`
-    // fold in the Q8_0 encoder next door.
-    let mut min = x[0];
-    let mut max = x[0];
-    let mut sum_w = weights[0];
-    let mut sum_x = sum_w * x[0];
-    for i in 1..n {
-        if x[i] < min {
-            min = x[i];
-        }
-        if x[i] > max {
-            max = x[i];
-        }
-        let w = weights[i];
-        sum_w += w;
-        sum_x += w * x[i];
-    }
-    if min > 0.0 {
-        min = 0.0;
-    }
-    if max == min {
-        l[..n].fill(0);
-        return (0.0, -min);
-    }
-
-    let mut iscale = nmax as f32 / (max - min);
-    let mut scale = 1.0 / iscale;
-    let mut best_error = 0.0f32;
-    for i in 0..n {
-        let li = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
-        l[i] = li as u8;
-        let diff = scale * l[i] as f32 + min - x[i];
-        let diff = if use_mad { diff.abs() } else { diff * diff };
-        best_error += weights[i] * diff;
-    }
-    if nstep < 1 {
-        return (scale, -min);
-    }
-
-    for is in 0..=nstep {
-        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
-        let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0f32, 0.0f32, 0.0f32);
-        for i in 0..n {
-            let li = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
-            laux[i] = li as u8;
-            let w = weights[i];
-            sum_l += w * li as f32;
-            sum_l2 += w * li as f32 * li as f32;
-            sum_xl += w * li as f32 * x[i];
-        }
-        let det = sum_w * sum_l2 - sum_l * sum_l;
-        if det > 0.0 {
-            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / det;
-            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
-            if this_min > 0.0 {
-                this_min = 0.0;
-                this_scale = sum_xl / sum_l2;
-            }
-            let mut cur_error = 0.0f32;
-            for i in 0..n {
-                let diff = this_scale * laux[i] as f32 + this_min - x[i];
-                let diff = if use_mad { diff.abs() } else { diff * diff };
-                cur_error += weights[i] * diff;
-            }
-            if cur_error < best_error {
-                l[..n].copy_from_slice(&laux[..n]);
-                best_error = cur_error;
-                scale = this_scale;
-                min = this_min;
-            }
-        }
-    }
-    (scale, -min)
-}
+/// Q4_K's half of the shared super-block fit: 4-bit codes, and the
+/// `(-1.0, 0.1, 20)` candidate grid from `ggml-quants.c:1301`.
+const Q4_K_FIT: QkFit = QkFit {
+    nmax: 15,
+    rmin: -1.0,
+    rdelta: 0.1,
+    nstep: 20,
+};
 
 /// Runs one 32-element sub-block through exactly the path
 /// [`encode_block_q4_k`] uses and returns its `(scale, min)`.
@@ -182,138 +50,39 @@ fn make_qkx2_quants(
 /// loop, and `examples/q4k_probe.rs` is the other half of it.
 #[doc(hidden)]
 pub fn probe_sub_block(xs: &[f32]) -> (f32, f32) {
-    assert_eq!(xs.len(), SUB_ELEMS);
-    let mut l = [0u8; SUB_ELEMS];
-    let mut laux = [0u8; SUB_ELEMS];
-    let mut weights = [0f32; SUB_ELEMS];
-    let mut sum_x2 = 0f32;
-    for &v in xs {
-        sum_x2 += v * v;
-    }
-    let av_x = (sum_x2 / SUB_ELEMS as f32).sqrt();
-    for (w, &v) in weights.iter_mut().zip(xs) {
-        *w = av_x + v.abs();
-    }
-    make_qkx2_quants(xs, &weights, &mut l, &mut laux, 15, -1.0, 0.1, 20, false)
+    assert_eq!(xs.len(), QK_SUB_ELEMS);
+    let mut l = [0u8; QK_SUB_ELEMS];
+    let mut laux = [0u8; QK_SUB_ELEMS];
+    let mut weights = [0f32; QK_SUB_ELEMS];
+    super::fit::qk_sub_block_weights(xs, &mut weights);
+    make_qkx2_quants(
+        xs,
+        &weights,
+        &mut l,
+        &mut laux,
+        Q4_K_FIT.nmax,
+        Q4_K_FIT.rmin,
+        Q4_K_FIT.rdelta,
+        Q4_K_FIT.nstep,
+        false,
+    )
 }
 
 /// Encodes one Q4_K super-block (exactly [`Q4_K_BLOCK_ELEMS`] values)
 /// and appends its [`Q4_K_BLOCK_BYTES`] bytes to `out`.
 pub fn encode_block_q4_k(block: &[f32; Q4_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
-    // `l` is deliberately carried from stage 1 into stage 3. Stage 3
-    // skips any sub-block whose reconstructed `d` rounded to zero (`if
-    // (!d) continue;` upstream), and the codes then written are the
-    // ones stage 1 left behind -- NOT zeros. Clearing `l` per sub-block
-    // reads as tidier and writes a different file.
-    let mut l = [0u8; Q4_K_BLOCK_ELEMS];
-    let mut laux = [0u8; SUB_ELEMS];
-    let mut weights = [0f32; SUB_ELEMS];
-    let mut mins = [0f32; SUB];
-    let mut scales = [0f32; SUB];
-
-    let mut max_scale = 0f32; // deducting the min keeps scales positive
-    let mut max_min = 0f32;
-    for j in 0..SUB {
-        let lo = SUB_ELEMS * j;
-        let xs = &block[lo..lo + SUB_ELEMS];
-        let mut sum_x2 = 0f32;
-        for &v in xs {
-            sum_x2 += v * v;
-        }
-        let av_x = (sum_x2 / SUB_ELEMS as f32).sqrt();
-        for (w, &v) in weights.iter_mut().zip(xs) {
-            *w = av_x + v.abs();
-        }
-        let (scale, min) = make_qkx2_quants(
-            xs,
-            &weights,
-            &mut l[lo..lo + SUB_ELEMS],
-            &mut laux,
-            15,
-            -1.0,
-            0.1,
-            20,
-            false,
-        );
-        scales[j] = scale;
-        mins[j] = min;
-        if scale > max_scale {
-            max_scale = scale;
-        }
-        if min > max_min {
-            max_min = min;
-        }
-    }
-
-    let inv_scale = if max_scale > 0.0 {
-        63.0 / max_scale
-    } else {
-        0.0
-    };
-    let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
-    let mut packed = [0u8; Q4_K_SCALE_BYTES];
-    for j in 0..SUB {
-        // Upstream's `MIN(63, ls)`. It cannot fire on THIS path:
-        // `inv_scale` is `63/max_scale` and `max_scale` is the largest
-        // of `scales`, so the product is at most 63 plus an ulp and
-        // rounds to 63. It is kept because it is what the C says and
-        // because the imatrix variant of this encoder
-        // (`quantize_row_q4_K_impl`) reaches the same packing from
-        // `make_qp_quants`, where the bound is not automatic -- but no
-        // fixture here can turn its removal red, and saying so is
-        // better than implying the golden covers it.
-        // The cast comes BEFORE the clamp, because upstream's does:
-        //
-        //     uint8_t ls = nearest_int(inv_scale*scales[j]);
-        //     ls = MIN(63, ls);
-        //
-        // `nearest_int` returns `int`, and storing it in a `uint8_t`
-        // truncates to eight bits FIRST. Clamping to 63 and casting
-        // afterwards is the same for every value in `0..=255` and
-        // different for a negative one: C wraps -1 to 255 and then
-        // clamps to 63, this order clamps -1 to -1 and casts to 255.
-        //
-        // A negative reaches here when a sub-block's least-squares fit
-        // returns a negative scale while some other sub-block's is
-        // positive, so `inv_scale` is positive and the product is not.
-        // Upstream's comment says scales are always positive "as we are
-        // deducting the min", which is the assumption this arithmetic
-        // quietly does not rely on. Rare, and it was 0.55% of the
-        // super-blocks in a real Qwen3-0.6B tensor.
-        let ls = (nearest_int(inv_scale * scales[j]) as u8).min(63);
-        let lm = (nearest_int(inv_min * mins[j]) as u8).min(63);
-        if j < 4 {
-            packed[j] = ls;
-            packed[j + 4] = lm;
-        } else {
-            packed[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
-            packed[j - 4] |= (ls >> 4) << 6;
-            packed[j] |= (lm >> 4) << 6;
-        }
-    }
-    let d = f16::from_f32(max_scale / 63.0);
-    let dmin = f16::from_f32(max_min / 63.0);
-
-    for j in 0..SUB {
-        let (sc, m) = q4_k_scale_min(j, &packed);
-        let dj = d.to_f32() * sc as f32;
-        if dj == 0.0 {
-            continue;
-        }
-        let dm = dmin.to_f32() * m as f32;
-        for ii in 0..SUB_ELEMS {
-            let idx = SUB_ELEMS * j + ii;
-            l[idx] = nearest_int((block[idx] + dm) / dj).clamp(0, 15) as u8;
-        }
-    }
+    let fitted = fit_qk_super_block(block, Q4_K_FIT);
 
     out.reserve(Q4_K_BLOCK_BYTES);
-    out.extend_from_slice(&d.to_le_bytes());
-    out.extend_from_slice(&dmin.to_le_bytes());
-    out.extend_from_slice(&packed);
+    out.extend_from_slice(&fitted.d.to_le_bytes());
+    out.extend_from_slice(&fitted.dmin.to_le_bytes());
+    out.extend_from_slice(&fitted.packed);
+    // Two 32-element halves of every 64 elements share a byte: the low
+    // nibble is the first half, the high nibble the second. The reader
+    // in `dequant_q4_k` walks the same pairing.
     for j in (0..Q4_K_BLOCK_ELEMS).step_by(64) {
         for i in 0..32 {
-            out.push(l[j + i] | (l[j + i + 32] << 4));
+            out.push(fitted.l[j + i] | (fitted.l[j + i + 32] << 4));
         }
     }
 }
@@ -323,11 +92,11 @@ pub fn encode_block_q4_k(block: &[f32; Q4_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
 ///
 /// Returns `None` when `src.len()` is not a multiple of the super-block
 /// size. llama.cpp handles that case by silently *changing type* --
-/// `tensor_type_fallback` rewrites a Q4_K tensor with an awkward row
-/// length to Q5_0, and to F16 if that does not fit either -- and ferrox
-/// has neither encoder, so this refuses instead of padding. Padding
-/// would write more elements than the tensor's shape declares and every
-/// following row would decode shifted.
+/// `convert_incompatible_tensor` rewrites a Q4_K tensor with an awkward
+/// row length to Q5_0, and to F16 if that does not fit either -- and
+/// ferrox has neither encoder, so this refuses instead of padding.
+/// Padding would write more elements than the tensor's shape declares
+/// and every following row would decode shifted.
 pub fn encode_row_q4_k(src: &[f32], out: &mut Vec<u8>) -> Option<()> {
     let (blocks, rest) = src.as_chunks::<Q4_K_BLOCK_ELEMS>();
     if !rest.is_empty() {
@@ -343,107 +112,23 @@ pub fn encode_row_q4_k(src: &[f32], out: &mut Vec<u8>) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dequant_q4_k;
+    use crate::encode::fit::QK_SUBS;
+    use crate::encode::testdata::k_quant_fixture;
+    use crate::{dequant_q4_k, q4_k_scale_min, Q4_K_SCALE_BYTES};
+    use half::f16;
 
-    /// Four super-blocks of deterministic, **f16-shaped** input, built
-    /// so that every branch of the reference a plausible rewrite would
-    /// get wrong is exercised at least once.
+    /// llama.cpp's own bytes for [`k_quant_fixture`].
     ///
-    /// f16-shaped is not decoration. Step 1 of this work learned it the
-    /// expensive way: its Q8_0 golden was documented as catching
-    /// `v * (1/d)` versus `v / d` and did not, because over uniform f32
-    /// noise the two spellings agree for 8192 consecutive values. f16's
-    /// 11-bit mantissa lands on rounding boundaries constantly, and
-    /// real weights are f16, so the fixture is f16.
-    ///
-    /// The sub-block roster, by index (32 sub-blocks of 32 values):
-    ///
-    /// * 8 -- all zero: `max == min`, the early return that fills the
-    ///   codes with 0 and reports a scale of 0.
-    /// * 9 -- constant non-zero: `max == min` again, but with a min
-    ///   that is clamped to 0 because it is positive.
-    /// * 10 -- all positive: exercises `if (min > 0) min = 0`.
-    /// * 11 -- all negative: `max` is negative and `min` is not clamped.
-    /// * 17 -- four orders of magnitude smaller than its super-block's
-    ///   neighbours, so its 6-bit scale rounds to **zero** and stage 3
-    ///   skips it. The codes written for it are the ones stage 1 left
-    ///   in `l`; an encoder that clears `l` per sub-block writes 32
-    ///   different bytes here and nowhere else.
-    /// * everything else -- weight-like noise at one of four gains, so
-    ///   sub-blocks within a super-block disagree about scale and the
-    ///   6-bit scale quantization actually has to do something.
-    ///
-    /// **The seed is not decorative either.** Two of the reference's
-    /// decisions -- `nearest_int`'s round-half-to-even and the
-    /// `this_min > 0` clamp inside the least-squares step -- only show
-    /// up on some data, and the first seed tried exercised neither: the
-    /// whole golden stayed green with `f32::round` substituted for
-    /// `nearest_int`. This one was picked by encoding 3999 candidate
-    /// fixtures twice, once with each spelling of every decision in the
-    /// reference, and keeping a seed where all of them differ. 255 of
-    /// the 3999 qualify, so this is a fixture chosen to be able to
-    /// fail, not a seed fitted to one assertion.
-    fn sample_input() -> Vec<f32> {
-        const GAINS: [f32; 4] = [0.02, 0.05, 0.1, 0.25];
-        let mut state: u32 = 0xb54c_da26;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            // [-1, 1)
-            ((state >> 8) as f32 / 8_388_608.0) - 1.0
-        };
-        let mut out = Vec::with_capacity(4 * Q4_K_BLOCK_ELEMS);
-        for sub in 0..4 * SUB {
-            for _ in 0..SUB_ELEMS {
-                let v = next();
-                let shaped = match sub {
-                    8 => 0.0,
-                    9 => 0.125,
-                    10 => v.abs() * 0.05 + 0.01,
-                    11 => -(v.abs() * 0.05 + 0.01),
-                    17 => v * 1e-4,
-                    _ => v * GAINS[sub % GAINS.len()],
-                };
-                out.push(f16::from_f32(shaped).to_f32());
-            }
-        }
-        out
-    }
-
-    /// Regenerates the golden below. Ignored, because it needs a
-    /// llama.cpp checkout: it writes [`sample_input`] as raw
-    /// little-endian f32 to `$FERROX_Q4_K_FIXTURE_OUT`, which the C
-    /// harness described in the PR body then feeds to llama.cpp's own
-    /// encoder.
-    ///
-    /// The input lives here and only here. A C harness that re-derived
-    /// the same values from a copy of the generator would be two
-    /// structures that must agree with nothing enforcing it -- this
-    /// repo's dominant bug shape -- and it would silently compare two
-    /// different inputs the day one copy drifted.
-    #[test]
-    #[ignore = "developer tool: regenerates LLAMA_CPP_Q4_K_GOLDEN"]
-    fn dump_the_fixture_the_c_harness_reads() {
-        let path = std::env::var("FERROX_Q4_K_FIXTURE_OUT")
-            .expect("set FERROX_Q4_K_FIXTURE_OUT to the path to write");
-        let mut bytes = Vec::new();
-        for v in sample_input() {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        std::fs::write(path, bytes).unwrap();
-    }
-
-    /// llama.cpp's own bytes for [`sample_input`].
-    ///
-    /// Produced by linking `.scratch/llama.cpp/build/bin/libggml-base`
-    /// and calling the exported `quantize_row_q4_K_ref` on the f32s
-    /// [`dump_the_fixture_the_c_harness_reads`] writes. The same
-    /// harness also calls `ggml_quantize_chunk(GGML_TYPE_Q4_K, ...)` --
+    /// Produced by the C harness described in the PR body: it links
+    /// llama.cpp b7650's `libggml-base` and calls the exported
+    /// `quantize_row_q4_K_ref` on the f32s
+    /// `encode::testdata::dump_the_fixture_the_c_harness_reads` writes.
+    /// The same harness also calls `ggml_quantize_chunk(GGML_TYPE_Q4_K,
+    /// ...)` --
     /// the entry point `llama-quantize` itself goes through -- and
     /// asserts the two agree, so this is what the real tool writes and
     /// not merely what a reference function does.
-    const LLAMA_CPP_Q4_K_GOLDEN: [u8; 4 * Q4_K_BLOCK_BYTES] = [
+    const LLAMA_CPP_Q4_K_GOLDEN: [u8; 12 * Q4_K_BLOCK_BYTES] = [
         0x32, 0x10, 0x14, 0x1c, 0x05, 0x0c, 0x59, 0xff, 0x04, 0x0b, 0x58, 0xff, 0x55, 0xcc, 0x8a,
         0xb3, 0xed, 0xc8, 0xba, 0x4e, 0xeb, 0x91, 0x85, 0xa6, 0x9c, 0x87, 0xd8, 0xab, 0x42, 0xe9,
         0x87, 0x0b, 0xb3, 0x82, 0x59, 0xb2, 0xc0, 0x80, 0x87, 0xa7, 0x98, 0x62, 0x75, 0x94, 0x31,
@@ -482,7 +167,84 @@ mod tests {
         0x5c, 0xa1, 0x6a, 0xbd, 0xbe, 0x72, 0xa4, 0x3d, 0x61, 0x76, 0xcb, 0x55, 0x2a, 0x01, 0x8d,
         0x14, 0xcb, 0xdc, 0x4f, 0x6f, 0x15, 0x46, 0x6e, 0xe8, 0x5d, 0x6d, 0xf0, 0xea, 0x0d, 0xaa,
         0x8f, 0xdd, 0xd7, 0x3e, 0x52, 0x20, 0x24, 0x1b, 0x15, 0x62, 0x98, 0x0a, 0xf4, 0x42, 0x9b,
-        0xdc, 0x8a, 0xb7, 0xab, 0xae, 0x57,
+        0xdc, 0x8a, 0xb7, 0xab, 0xae, 0x57, 0xb2, 0x04, 0x0f, 0x11, 0xe9, 0xe8, 0xf8, 0xf4, 0xac,
+        0xa9, 0xb1, 0xd7, 0xc6, 0xc5, 0x5c, 0xff, 0x7c, 0xa8, 0xf7, 0x8b, 0x09, 0x68, 0x8b, 0xa0,
+        0x69, 0x6f, 0x9d, 0xb0, 0xbb, 0xe7, 0xc9, 0x87, 0x6e, 0xfe, 0x58, 0xca, 0x56, 0xad, 0xb9,
+        0xb4, 0xd4, 0x7b, 0x96, 0x0b, 0x19, 0x71, 0xea, 0xd2, 0x87, 0x37, 0x18, 0x9e, 0x47, 0x09,
+        0x0b, 0x37, 0x05, 0x22, 0x43, 0x2a, 0x6a, 0x7a, 0x07, 0x3d, 0x53, 0x0f, 0x28, 0x37, 0x57,
+        0x3b, 0x7b, 0x68, 0x7c, 0x55, 0x99, 0x0a, 0x6c, 0x26, 0x20, 0xf7, 0x81, 0x7c, 0x53, 0x43,
+        0xf5, 0xd4, 0x77, 0x37, 0x66, 0x89, 0xc7, 0x17, 0xbf, 0xad, 0x73, 0x48, 0xc2, 0x86, 0x39,
+        0x7e, 0x86, 0x63, 0x5d, 0x5c, 0xb0, 0x73, 0x04, 0x77, 0x98, 0x72, 0xd3, 0xcd, 0x97, 0x44,
+        0x35, 0xb6, 0xb5, 0x06, 0x75, 0xcc, 0xb2, 0x81, 0xa5, 0xe7, 0x67, 0x76, 0xf1, 0xbc, 0x4a,
+        0xa6, 0x77, 0x9b, 0x78, 0x95, 0xb5, 0x96, 0x53, 0x95, 0x9e, 0xd2, 0x61, 0x86, 0xa9, 0x90,
+        0xfe, 0x09, 0x83, 0x16, 0xb6, 0xb2, 0xa9, 0xff, 0xad, 0xa8, 0xaa, 0xbf, 0x3b, 0x7a, 0xcf,
+        0x04, 0xc8, 0xba, 0x14, 0x42, 0x87, 0x7a, 0xb5, 0x8a, 0x65, 0x84, 0x84, 0x04, 0x56, 0x96,
+        0xab, 0x24, 0xb2, 0x61, 0xc8, 0x85, 0x53, 0x84, 0x65, 0x80, 0x6e, 0x57, 0x73, 0x7a, 0x35,
+        0x5a, 0x0b, 0xf7, 0xbc, 0x88, 0xa8, 0xca, 0x82, 0x85, 0x30, 0xba, 0xaa, 0x98, 0x97, 0x88,
+        0x78, 0xfc, 0x7a, 0x96, 0xd8, 0x07, 0x9d, 0x98, 0x6c, 0x88, 0x78, 0x7a, 0xa2, 0x4b, 0x8b,
+        0xa8, 0xcf, 0xdd, 0x85, 0xb4, 0xc7, 0x93, 0xa8, 0x6e, 0x47, 0x26, 0x74, 0x96, 0x53, 0xba,
+        0x53, 0xba, 0x67, 0x79, 0xc5, 0x06, 0xf6, 0x9a, 0xe0, 0x4e, 0x74, 0x03, 0x74, 0x83, 0x82,
+        0xa8, 0x9a, 0x8a, 0xb6, 0xad, 0xbb, 0x74, 0x7f, 0x37, 0xc0, 0x49, 0x9b, 0x16, 0x68, 0x84,
+        0x89, 0x39, 0x98, 0x49, 0x7c, 0x25, 0x5a, 0x23, 0x99, 0x37, 0x45, 0x05, 0x03, 0x27, 0x35,
+        0x49, 0x32, 0xed, 0x65, 0x1b, 0x34, 0xcd, 0xa6, 0x89, 0x58, 0x09, 0x9c, 0x14, 0xb0, 0xe2,
+        0xbf, 0xee, 0xe8, 0xe5, 0xbf, 0xfa, 0xaf, 0x12, 0xff, 0xf2, 0x76, 0x65, 0x95, 0x54, 0x70,
+        0x99, 0xa5, 0x14, 0x00, 0xfc, 0x93, 0xa3, 0x24, 0xc7, 0x78, 0x27, 0x58, 0x73, 0x54, 0x53,
+        0x5c, 0xf6, 0x3a, 0xa4, 0x56, 0xaa, 0x64, 0x36, 0x83, 0x6d, 0x72, 0x7f, 0xe6, 0x57, 0x57,
+        0x67, 0xc2, 0x98, 0x54, 0x06, 0x86, 0x58, 0xbf, 0x7a, 0x99, 0xf4, 0xb7, 0xa8, 0xf6, 0x7b,
+        0xc9, 0xb8, 0x58, 0x97, 0x96, 0xc5, 0x30, 0xb8, 0xa6, 0x77, 0x89, 0x99, 0xd4, 0xa7, 0x46,
+        0x79, 0x8a, 0x89, 0x9c, 0x78, 0x09, 0x83, 0x99, 0x2c, 0x74, 0x75, 0x78, 0xb9, 0x89, 0x40,
+        0x88, 0xfa, 0x84, 0x6e, 0x7c, 0x93, 0xab, 0x26, 0x87, 0x4e, 0xa8, 0x5c, 0x6a, 0x97, 0xaa,
+        0x57, 0x92, 0x84, 0x96, 0xd0, 0x93, 0x6c, 0x07, 0x86, 0x87, 0xa5, 0x8b, 0xc9, 0xd9, 0xa9,
+        0xa4, 0x98, 0x81, 0xc6, 0x94, 0xeb, 0xd4, 0x9a, 0x74, 0xaa, 0x4a, 0x85, 0x5f, 0x33, 0x7c,
+        0x86, 0x5a, 0xd6, 0xb7, 0x08, 0x9e, 0x15, 0xf5, 0xfa, 0xf6, 0xff, 0xa1, 0x9c, 0xa1, 0xbf,
+        0xc8, 0x69, 0x65, 0xcf, 0x13, 0x08, 0x63, 0x85, 0x10, 0x75, 0x37, 0x21, 0x5b, 0xb1, 0x27,
+        0x07, 0xe7, 0x18, 0x17, 0x12, 0x13, 0x8b, 0x51, 0x64, 0x2f, 0x35, 0x67, 0x73, 0x37, 0x62,
+        0x25, 0x96, 0xbe, 0x4b, 0x93, 0x44, 0xb5, 0x81, 0x98, 0x95, 0x96, 0xa5, 0x43, 0xba, 0x6a,
+        0x06, 0x9d, 0xb9, 0x9a, 0xc8, 0xc4, 0xf3, 0x82, 0xa4, 0xdc, 0xc0, 0xb6, 0xd7, 0xb4, 0xa5,
+        0x90, 0xaf, 0xbb, 0x7a, 0xad, 0x75, 0xc2, 0x97, 0x69, 0x23, 0x72, 0xaa, 0x73, 0x25, 0x9e,
+        0x4c, 0xa8, 0xe8, 0x74, 0x65, 0x6d, 0xf2, 0x84, 0xa9, 0xa0, 0x4c, 0xc8, 0x87, 0xb5, 0x4a,
+        0xa4, 0x5c, 0x8d, 0x85, 0xc3, 0xd2, 0x33, 0xa3, 0x87, 0x0b, 0x0b, 0x75, 0x4f, 0x97, 0x77,
+        0x84, 0xa8, 0xb9, 0xc8, 0x8a, 0x97, 0x66, 0x65, 0x9b, 0x68, 0xf4, 0x6c, 0x86, 0x49, 0x80,
+        0x66, 0x35, 0x75, 0x75, 0xb2, 0x74, 0x26, 0x88, 0x5b, 0xa3, 0x65, 0xa9, 0x80, 0x09, 0x7e,
+        0x16, 0xfb, 0xf5, 0xf9, 0xb5, 0xa6, 0xb2, 0xf4, 0x6c, 0x60, 0x2f, 0xfb, 0xed, 0x56, 0x2a,
+        0xf7, 0x93, 0xc5, 0xb5, 0x85, 0xc5, 0xb5, 0x83, 0xa4, 0x79, 0xb2, 0x74, 0x96, 0x98, 0x79,
+        0x96, 0x38, 0xb2, 0xc8, 0xb7, 0x66, 0x85, 0x46, 0x8f, 0x44, 0x95, 0x6d, 0xb8, 0xa7, 0x00,
+        0x7b, 0x40, 0x7b, 0x58, 0x8f, 0xa9, 0xc6, 0x9b, 0x6d, 0x6e, 0x55, 0x8c, 0x49, 0xd9, 0xe8,
+        0x61, 0x29, 0x8b, 0x88, 0x76, 0x95, 0x1a, 0xb9, 0x45, 0x6f, 0x0f, 0x89, 0xf6, 0x86, 0x5d,
+        0x7a, 0xaa, 0x8d, 0x48, 0xa1, 0xa7, 0x29, 0x47, 0x97, 0x74, 0x57, 0x69, 0x3b, 0x98, 0x51,
+        0x78, 0x79, 0x40, 0x68, 0x42, 0x5d, 0x09, 0x8c, 0x5f, 0x78, 0x94, 0xf6, 0x89, 0x98, 0x62,
+        0x46, 0x5a, 0x68, 0x34, 0x98, 0x0b, 0x4a, 0x4b, 0x9c, 0x28, 0x7e, 0x00, 0x66, 0xad, 0xca,
+        0x69, 0x4d, 0x7c, 0x8a, 0xc6, 0x7e, 0x8e, 0x27, 0x3d, 0x2b, 0x6f, 0x0a, 0x7c, 0x79, 0xa6,
+        0xaa, 0xf7, 0x6e, 0x06, 0xbb, 0x49, 0xaf, 0x08, 0x4f, 0x14, 0xfe, 0xb6, 0xef, 0xfb, 0xff,
+        0xee, 0xed, 0xed, 0xef, 0x9e, 0xb9, 0xee, 0xb8, 0x17, 0x4b, 0xbf, 0x84, 0x35, 0x98, 0x98,
+        0x59, 0x18, 0xe0, 0x64, 0x45, 0xc6, 0x04, 0x58, 0xa6, 0xac, 0x44, 0x67, 0x9a, 0x59, 0x98,
+        0xc5, 0x12, 0x44, 0xf8, 0x20, 0x63, 0x66, 0x18, 0x59, 0xe2, 0x23, 0x32, 0xb9, 0x49, 0x28,
+        0x6d, 0x86, 0x4a, 0xdb, 0xbb, 0xa7, 0x75, 0x32, 0x05, 0x7a, 0x18, 0x3c, 0x4f, 0x16, 0x05,
+        0xd0, 0x85, 0x84, 0x58, 0x21, 0x96, 0xa7, 0x62, 0x8b, 0xa9, 0x73, 0x1a, 0xf8, 0xd7, 0x83,
+        0x57, 0x57, 0x53, 0x6f, 0x80, 0x56, 0xcb, 0xaa, 0x96, 0x73, 0x79, 0xf6, 0xa5, 0xb8, 0x47,
+        0x78, 0x14, 0xad, 0xa7, 0xb3, 0x08, 0xd5, 0xb3, 0xd6, 0xf4, 0x48, 0xf3, 0x7a, 0x49, 0xa5,
+        0x94, 0x35, 0xeb, 0x98, 0x5d, 0x0f, 0x82, 0x66, 0x88, 0x77, 0x46, 0xac, 0x2c, 0x67, 0xc7,
+        0x72, 0x98, 0xf7, 0x78, 0x50, 0x75, 0x7d, 0x32, 0x92, 0xa5, 0xcd, 0x9a, 0x59, 0x60, 0xf9,
+        0xd9, 0x0a, 0x01, 0x18, 0xb0, 0xf4, 0xfd, 0xf5, 0x6b, 0x68, 0xb3, 0xdf, 0x9d, 0x7c, 0x7f,
+        0xf9, 0x94, 0xd8, 0xa7, 0xf0, 0x7e, 0x9f, 0x9a, 0x99, 0x7e, 0x35, 0x85, 0x6c, 0x69, 0x5a,
+        0x74, 0x0d, 0x98, 0x76, 0x64, 0x99, 0x38, 0x8c, 0x5d, 0x74, 0x6a, 0xb4, 0x8e, 0x77, 0x8c,
+        0x63, 0x7a, 0x8d, 0x07, 0xb7, 0x77, 0x88, 0x4c, 0x6a, 0xf8, 0x35, 0x9b, 0x53, 0x83, 0x23,
+        0x28, 0xc4, 0x48, 0x5a, 0x84, 0x45, 0x4c, 0x17, 0xc2, 0x38, 0xa7, 0xc5, 0x90, 0x4f, 0x7c,
+        0x47, 0x86, 0x89, 0x79, 0x58, 0x3a, 0x41, 0x92, 0x7b, 0x41, 0x30, 0x25, 0x69, 0x89, 0x22,
+        0x37, 0x05, 0x25, 0x64, 0xf5, 0x38, 0x42, 0x32, 0x22, 0x54, 0x5a, 0x0f, 0x52, 0x52, 0x94,
+        0xa4, 0x21, 0x20, 0x79, 0x2c, 0x17, 0x46, 0xa2, 0x96, 0xa5, 0xc5, 0xb6, 0x97, 0xa6, 0xc5,
+        0xb5, 0xa0, 0x87, 0x93, 0xb3, 0xb2, 0xb9, 0x87, 0xd6, 0xa4, 0x0b, 0xb7, 0x6a, 0xc6, 0x3b,
+        0xf7, 0xc2, 0xc2, 0x85, 0xc5, 0xb7, 0xa6, 0x7b, 0xef, 0x45, 0x0b, 0xc5, 0x16, 0xf5, 0xf0,
+        0xaf, 0xef, 0xef, 0xfd, 0xa4, 0xf2, 0x87, 0x43, 0x8b, 0xff, 0xc7, 0x1b, 0x83, 0xc9, 0x19,
+        0x36, 0x72, 0x75, 0xcf, 0x90, 0xcc, 0x88, 0xf7, 0x54, 0x52, 0x2a, 0x0e, 0x85, 0x8a, 0x17,
+        0xaa, 0xe1, 0xa6, 0xd6, 0xe4, 0xe4, 0x73, 0xd3, 0xf7, 0xfd, 0xa6, 0x7d, 0xb7, 0x34, 0x87,
+        0x68, 0xd7, 0x52, 0xc2, 0xb3, 0xb3, 0x39, 0xa4, 0xc5, 0xcc, 0x80, 0x21, 0xd5, 0x5c, 0x64,
+        0x83, 0x99, 0x66, 0x76, 0x85, 0x6a, 0xea, 0x8e, 0xb3, 0xb2, 0x9f, 0x29, 0x52, 0x07, 0x47,
+        0x46, 0x69, 0x77, 0x89, 0x8a, 0x48, 0xa4, 0x8c, 0x82, 0xa7, 0x6a, 0x78, 0x66, 0xaf, 0x99,
+        0x61, 0x77, 0xb4, 0xb8, 0x26, 0x65, 0xba, 0x7a, 0xed, 0x59, 0x09, 0xab, 0x80, 0xf6, 0x16,
+        0x2b, 0xa6, 0x62, 0x9b, 0x53, 0x17, 0x5c, 0xb4, 0x8a, 0xd7, 0x87, 0xd0, 0x4d, 0x69, 0xac,
+        0x8b, 0x39, 0x0d, 0x97, 0x54, 0x84, 0x8b, 0xb9, 0xa7, 0xff, 0x75, 0x60, 0x8a, 0x7d, 0xb7,
+        0xa8, 0x98, 0x57,
     ];
 
     /// The property that makes `ferrox quantize --type q4_k_s --pure`'s
@@ -494,7 +256,7 @@ mod tests {
     /// catches that.
     #[test]
     fn q4_k_matches_llama_cpp_quantize_row_q4_k_ref() {
-        let x = sample_input();
+        let x = k_quant_fixture();
         let mut got = Vec::new();
         encode_row_q4_k(&x, &mut got).unwrap();
         assert_eq!(got.len(), LLAMA_CPP_Q4_K_GOLDEN.len());
@@ -542,7 +304,7 @@ mod tests {
     /// purpose.)
     #[test]
     fn every_element_lands_on_its_nearest_representable_level() {
-        let x = sample_input();
+        let x = k_quant_fixture();
         let mut bytes = Vec::new();
         encode_row_q4_k(&x, &mut bytes).unwrap();
         let back = dequant_q4_k(&bytes).unwrap();
@@ -552,11 +314,11 @@ mod tests {
             let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
             let dmin = f16::from_le_bytes([block[2], block[3]]).to_f32();
             let packed: [u8; Q4_K_SCALE_BYTES] = block[4..16].try_into().unwrap();
-            for j in 0..SUB {
+            for j in 0..QK_SUBS {
                 let (sc, m) = q4_k_scale_min(j, &packed);
                 let (dj, dm) = (d * sc as f32, dmin * m as f32);
-                for ii in 0..SUB_ELEMS {
-                    let idx = b * Q4_K_BLOCK_ELEMS + SUB_ELEMS * j + ii;
+                for ii in 0..QK_SUB_ELEMS {
+                    let idx = b * Q4_K_BLOCK_ELEMS + QK_SUB_ELEMS * j + ii;
                     let chosen = (x[idx] - back[idx]).abs();
                     for k in 0..=15u8 {
                         let level = dj * k as f32 - dm;

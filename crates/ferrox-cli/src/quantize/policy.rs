@@ -2,14 +2,20 @@
 //! follow from them:
 //!
 //! 1. **Which target may be written at all.** ferrox READS every quant
-//!    kind the engine runs and can WRITE two: Q8_0 and Q4_K. A
-//!    `quantize` subcommand whose name implies llama.cpp's range while
-//!    it can emit two formats is the half-support this repo refuses, so
-//!    a target ferrox cannot encode is refused BY NAME, with what it
-//!    CAN write spelled out. A target whose llama.cpp MIX ferrox cannot
-//!    reproduce -- Q4_K_S and Q4_K_M promote several tensors to Q5_K
-//!    and Q6_K -- is refused too, unless `--pure` says to write the
-//!    uniform file `llama-quantize --pure` would.
+//!    kind the engine runs and can WRITE four: Q8_0, Q4_K, Q5_K and
+//!    Q6_K. A `quantize` subcommand whose name implies llama.cpp's
+//!    range while it can emit four formats is the half-support this
+//!    repo refuses, so a target ferrox cannot encode is refused BY
+//!    NAME, with what it CAN write spelled out.
+//!
+//!    The `_S`/`_M` names are MIXES, not block formats: `Q4_K_M`
+//!    promotes `output.weight` to Q6_K and some layers' `attn_v` and
+//!    `ffn_down` to Q6_K. Those mixes used to be refused unless
+//!    `--pure` said to write the uniform file instead, because ferrox
+//!    had no Q5_K or Q6_K encoder. It has both now, so the mixes are
+//!    written for real; [`super::recipe`] is the transcription, and
+//!    `--pure` survives as what it is upstream -- an option to skip
+//!    the mix, not a workaround for a missing encoder.
 //! 2. **Which tensors get quantized.** llama.cpp keeps a specific set
 //!    at source precision, and the set is not obvious: it is not "the
 //!    small ones", it is a list of tensors whose values are used as
@@ -23,17 +29,16 @@ use ferrox_gguf::GgmlType;
 
 /// The quantization targets `ferrox quantize` can actually encode.
 ///
-/// Two encoders, three names: `Q4_K_S` and `Q4_K_M` are the same Q4_K
-/// blocks and differ only in the `general.file_type` they record, which
-/// is exactly how `llama-quantize --pure` behaves. See
-/// [`Target::mix_promotes_to`] for why `--pure` is not optional for
-/// them.
+/// Four encoders, six names: `Q4_K_S` and `Q4_K_M` start from the same
+/// Q4_K blocks (as `Q5_K_S` and `Q5_K_M` do from Q5_K) and differ in
+/// the MIX they apply on top -- see [`super::recipe`] -- and in the
+/// `general.file_type` they record.
 ///
 /// It is an enum rather than a string so that adding the next one means
 /// adding the match arms the compiler asks for -- in [`Target::name`],
 /// [`Target::ggml_type`], [`Target::llama_ftype`],
-/// [`Target::mix_promotes_to`], [`Target::fallback_note`] and the
-/// encoder dispatch -- instead of a name landing in the CLI's help text
+/// [`Target::fallback_note`] and `quantize::encode_row` -- instead of a
+/// name landing in the CLI's help text
 /// ahead of a kernel, which is how a format gets "supported" in a table
 /// and nowhere else.
 // The variants are spelled the way `llama-quantize --type` spells
@@ -46,35 +51,42 @@ pub enum Target {
     Q8_0,
     Q4_K_S,
     Q4_K_M,
+    Q5_K_S,
+    Q5_K_M,
+    Q6_K,
 }
 
 impl Target {
     /// Every target this build can write. The refusal message below is
     /// generated from this, so it cannot fall out of date with the
     /// encoder the way a hand-written "we support: Q8_0" string would.
-    pub const ALL: &'static [Target] = &[Target::Q8_0, Target::Q4_K_S, Target::Q4_K_M];
+    pub const ALL: &'static [Target] = &[
+        Target::Q8_0,
+        Target::Q4_K_S,
+        Target::Q4_K_M,
+        Target::Q5_K_S,
+        Target::Q5_K_M,
+        Target::Q6_K,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Target::Q8_0 => "Q8_0",
             Target::Q4_K_S => "Q4_K_S",
             Target::Q4_K_M => "Q4_K_M",
+            Target::Q5_K_S => "Q5_K_S",
+            Target::Q5_K_M => "Q5_K_M",
+            Target::Q6_K => "Q6_K",
         }
     }
 
+    /// The block format a tensor gets unless the mix promotes it.
     pub fn ggml_type(self) -> GgmlType {
         match self {
             Target::Q8_0 => GgmlType::Q8_0,
             Target::Q4_K_S | Target::Q4_K_M => GgmlType::Q4K,
-        }
-    }
-
-    /// The block format's own name, which stops being the target's name
-    /// once one encoder serves two mixes.
-    pub fn ggml_type_name(self) -> &'static str {
-        match self {
-            Target::Q8_0 => "Q8_0",
-            Target::Q4_K_S | Target::Q4_K_M => "Q4_K",
+            Target::Q5_K_S | Target::Q5_K_M => GgmlType::Q5K,
+            Target::Q6_K => GgmlType::Q6K,
         }
     }
 
@@ -86,33 +98,9 @@ impl Target {
             Target::Q8_0 => 7,    // LLAMA_FTYPE_MOSTLY_Q8_0
             Target::Q4_K_S => 14, // LLAMA_FTYPE_MOSTLY_Q4_K_S
             Target::Q4_K_M => 15, // LLAMA_FTYPE_MOSTLY_Q4_K_M
-        }
-    }
-
-    /// The types llama.cpp's MIX for this target promotes some tensors
-    /// to, over and above [`Target::ggml_type`]. Empty means the mix is
-    /// uniform and `--pure` changes nothing.
-    ///
-    /// This is the difference between "ferrox can encode Q4_K" and
-    /// "ferrox can write a Q4_K_M file", and conflating the two would
-    /// be exactly the half-support this subcommand exists to refuse:
-    /// `llama_tensor_get_type_impl` sends `output.weight` to Q6_K for
-    /// any Q4_K target, `attn_v` and `ffn_down` to Q5_K or Q6_K on some
-    /// layers, and (for Q4_K_M) `attn_qkv` to Q5_K. A file with those
-    /// tensors left at Q4_K is a DIFFERENT file that would still be
-    /// called Q4_K_M.
-    ///
-    /// So a non-empty list means `--pure` is required, and with it the
-    /// output matches `llama-quantize --pure --type <name>` instead of
-    /// pretending to match the mix.
-    pub fn mix_promotes_to(self) -> &'static [&'static str] {
-        match self {
-            // Not "nothing special happens": `output.weight` DOES reach
-            // the output arm and comes back Q8_0, because the promotion
-            // there is `else if (new_type != GGML_TYPE_Q8_0) new_type =
-            // GGML_TYPE_Q6_K;`.
-            Target::Q8_0 => &[],
-            Target::Q4_K_S | Target::Q4_K_M => &["Q5_K", "Q6_K"],
+            Target::Q5_K_S => 16, // LLAMA_FTYPE_MOSTLY_Q5_K_S
+            Target::Q5_K_M => 17, // LLAMA_FTYPE_MOSTLY_Q5_K_M
+            Target::Q6_K => 18,   // LLAMA_FTYPE_MOSTLY_Q6_K
         }
     }
 
@@ -125,21 +113,33 @@ impl Target {
         match self {
             // `tensor_type_fallback` has no Q8_0 arm: it throws.
             Target::Q8_0 => "llama.cpp has no fallback type for Q8_0 either -- it stops here too.",
-            // `tensor_type_fallback`: Q4_K -> Q5_0, and then -> F16 if
-            // the row is not a multiple of 32 either.
+            // `convert_incompatible_tensor`: Q4_K -> Q5_0, and then
+            // -> F16 if the row is not a multiple of 32 either.
             Target::Q4_K_S | Target::Q4_K_M => {
                 "llama.cpp answers this by changing the tensor's TYPE (Q4_K -> Q5_0, or F16 if the \
                  row is not a multiple of 32 either); ferrox can write neither, so it stops rather \
                  than write a file whose name says Q4_K."
             }
+            // Q5_K -> Q5_1 -> F16.
+            Target::Q5_K_S | Target::Q5_K_M => {
+                "llama.cpp answers this by changing the tensor's TYPE (Q5_K -> Q5_1, or F16 if the \
+                 row is not a multiple of 32 either); ferrox can write neither, so it stops rather \
+                 than write a file whose name says Q5_K."
+            }
+            // Q6_K -> Q8_0 -> F16. ferrox HAS a Q8_0 encoder, and
+            // still stops: the fallback also bumps llama.cpp's
+            // `n_fallback`, which changes how a `--tensor-type`
+            // override is applied, and a quantizer that silently wrote
+            // a different type for one tensor than the plan it printed
+            // is the failure this whole subcommand is shaped around.
+            // Following the fallback is a change to the PLANNER, with
+            // its own receipt, not something the encoder does quietly.
+            Target::Q6_K => {
+                "llama.cpp answers this by changing the tensor's TYPE (Q6_K -> Q8_0, or F16 if the \
+                 row is not a multiple of 32 either); ferrox stops rather than write a tensor \
+                 whose type disagrees with the plan it printed."
+            }
         }
-    }
-
-    /// Elements per block. A tensor whose row length is not a multiple
-    /// of this cannot be encoded; [`Target::fallback_note`] says what
-    /// llama.cpp does about it.
-    pub fn block_elems(self) -> usize {
-        self.ggml_type().block_layout().1
     }
 }
 
@@ -186,10 +186,10 @@ const LLAMA_CPP_TARGETS: &[(&str, Option<Target>)] = &[
     ("q4_k", Some(Target::Q4_K_M)),
     ("q4_k_s", Some(Target::Q4_K_S)),
     ("q4_k_m", Some(Target::Q4_K_M)),
-    ("q5_k", None),
-    ("q5_k_s", None),
-    ("q5_k_m", None),
-    ("q6_k", None),
+    ("q5_k", Some(Target::Q5_K_M)),
+    ("q5_k_s", Some(Target::Q5_K_S)),
+    ("q5_k_m", Some(Target::Q5_K_M)),
+    ("q6_k", Some(Target::Q6_K)),
     ("q8_0", Some(Target::Q8_0)),
     ("f16", None),
     ("bf16", None),
@@ -197,19 +197,22 @@ const LLAMA_CPP_TARGETS: &[(&str, Option<Target>)] = &[
     ("copy", None),
 ];
 
-/// Why a requested target was refused. Three arms, because three very
+/// Why a requested target was refused. Two arms, because two very
 /// different things go wrong and the user needs to know which: a gap in
-/// ferrox, a typo, and a target ferrox can write only in llama.cpp's
-/// `--pure` shape.
+/// ferrox, and a typo.
+///
+/// A third arm used to live here, `MixNeedsPure`: ferrox could encode
+/// Q4_K blocks but not the Q5_K and Q6_K its MIX promotes some tensors
+/// to, so the mix names were admitted only under `--pure`. Both
+/// encoders exist now and [`super::recipe`] applies the mix, so the
+/// refusal is DELETED rather than kept as a condition nothing can trip
+/// -- a gate that cannot fire reads as coverage.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TargetRefusal {
     /// A real llama.cpp target that ferrox has no encoder for.
     NotWritableYet(String),
     /// Not a quantization type at all.
     Unknown(String),
-    /// ferrox has the block encoder, but llama.cpp's mix of this name
-    /// promotes some tensors to types ferrox cannot write.
-    MixNeedsPure(Target),
 }
 
 impl std::fmt::Display for TargetRefusal {
@@ -231,36 +234,21 @@ impl std::fmt::Display for TargetRefusal {
                 f,
                 "'{name}' is not a quantization type. `ferrox quantize` writes: {writable}."
             ),
-            TargetRefusal::MixNeedsPure(target) => write!(
-                f,
-                "ferrox can encode {ty} blocks, but it cannot write llama.cpp's {name} MIX: that \
-                 mix promotes output.weight, and attn_v / ffn_down / attn_qkv on some layers, to \
-                 {promotes}, and ferrox has no encoder for those.\n\
-                 Pass --pure to write uniform {ty}, which is what `llama-quantize --pure --type \
-                 {lower}` writes. Without --pure the file would be named {name} and not be one.",
-                ty = target.ggml_type_name(),
-                name = target.name(),
-                lower = target.name().to_ascii_lowercase(),
-                promotes = target.mix_promotes_to().join(" / "),
-            ),
         }
     }
 }
 
 /// What `ferrox quantize` can write, in the form a user has to type it.
-/// Generated from [`Target::ALL`] and [`Target::mix_promotes_to`], so
-/// no message can promise a target the encoder dispatch does not have
-/// or omit the `--pure` a target needs.
+/// Generated from [`Target::ALL`], so no message can promise a target
+/// the encoder dispatch does not have.
+///
+/// It is the one string every refusal quotes, which is why it is
+/// derived and not restated: when Q4_K landed, a restated version would
+/// still have advertised Q8_0 alone with nothing going red.
 pub fn writable_targets() -> String {
     Target::ALL
         .iter()
-        .map(|t| {
-            if t.mix_promotes_to().is_empty() {
-                t.name().to_string()
-            } else {
-                format!("{} (--pure only)", t.name())
-            }
-        })
+        .map(|t| t.name())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -269,11 +257,9 @@ pub fn writable_targets() -> String {
 /// `llama-quantize` does, and admits it only if this build can actually
 /// produce that file.
 ///
-/// `pure` is a parameter rather than a check the caller does afterwards
-/// on purpose: every reason a target can be refused lives in this one
-/// function, so a second call site cannot admit a target by forgetting
-/// one of them.
-pub fn parse_target(raw: &str, pure: bool) -> Result<Target, TargetRefusal> {
+/// Every reason a target can be refused lives in this one function, so
+/// a second call site cannot admit a target by forgetting one of them.
+pub fn parse_target(raw: &str) -> Result<Target, TargetRefusal> {
     let lower = raw.to_ascii_lowercase();
     let Some((_, encoder)) = LLAMA_CPP_TARGETS.iter().find(|(n, _)| *n == lower) else {
         return Err(TargetRefusal::Unknown(raw.to_string()));
@@ -281,17 +267,16 @@ pub fn parse_target(raw: &str, pure: bool) -> Result<Target, TargetRefusal> {
     let Some(target) = encoder else {
         return Err(TargetRefusal::NotWritableYet(raw.to_string()));
     };
-    if !pure && !target.mix_promotes_to().is_empty() {
-        return Err(TargetRefusal::MixNeedsPure(*target));
-    }
     Ok(*target)
 }
 
 /// What happens to one tensor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition {
-    /// Re-encode to the target type.
-    Quantize,
+    /// Re-encode to this type. It is the MIX's choice for this tensor,
+    /// not the target's block format: under `Q4_K_M` a `ffn_down` on
+    /// one layer carries `Q6K` here and its neighbour `Q4K`.
+    Quantize(GgmlType),
     /// Copy the source bytes through unchanged, for the stated reason.
     Copy(&'static str),
 }
@@ -361,44 +346,48 @@ fn ggml_n_dims(shape: &[u64]) -> usize {
     1
 }
 
-/// What `ferrox quantize` does with one tensor, matching llama.cpp's
-/// `MOSTLY_Q8_0` mix.
+/// llama.cpp's `tensor_allows_quantization`: `None` if the tensor is
+/// eligible, `Some(reason)` if it stays at source precision.
 ///
-/// Deliberately NOT parameterised on anything llama.cpp's
-/// `llama_tensor_get_type` varies per layer, because for every target
-/// this build writes it does not vary:
+/// Split out from [`disposition`] because it is the predicate that
+/// decides whether [`super::recipe::Recipe::tensor_type`] is called at
+/// all, and those counters are positional: calling it for one extra
+/// tensor shifts every later layer's promotion by one. Two spellings
+/// of "is this tensor eligible" -- one here and one at the recipe's
+/// call site -- is the shape this repo pays for, so there is one.
 ///
-/// * For `MOSTLY_Q8_0` the per-layer function is a no-op.
-///   `token_embd.weight` and `output.weight` do reach its
-///   output/embedding special cases and both come back Q8_0 -- the
-///   `else if (new_type != GGML_TYPE_Q8_0) new_type = GGML_TYPE_Q6_K;`
-///   arm that bumps other mixes' output head does not fire when the
-///   target already IS Q8_0.
-/// * For the Q4_K targets it is not reached at all: they are admitted
-///   only under `--pure`, and `--pure` is precisely the flag that skips
-///   `llama_tensor_get_type_impl`. That is the whole reason
-///   [`Target::mix_promotes_to`] makes `--pure` mandatory for them
-///   rather than leaving a per-layer table here to be half-filled.
-///
-/// So this stays a uniform mix, and the tensor keep-list below --
-/// llama.cpp's `tensor_allows_quantization`, which `--pure` does NOT
-/// skip -- is the only thing that varies per tensor.
-pub fn disposition(name: &str, shape: &[u64], dtype: GgmlType, target: Target) -> Disposition {
+/// `--pure` does NOT skip this list. A norm quantized to Q4_K is a
+/// broken model whichever mix asked for it.
+pub fn allows_quantization(name: &str, shape: &[u64]) -> Option<&'static str> {
     if ggml_n_dims(shape) < 2 {
-        return Disposition::Copy("1-D");
+        return Some("1-D");
     }
     if !name.ends_with("weight") {
-        return Disposition::Copy("not a weight");
+        return Some("not a weight");
     }
     for (needle, reason) in KEEP_AT_SOURCE_PRECISION {
         if name.contains(needle) {
-            return Disposition::Copy(reason);
+            return Some(reason);
         }
     }
-    if dtype == target.ggml_type() {
+    None
+}
+
+/// What `ferrox quantize` does with one tensor, given the type the mix
+/// already chose for it.
+///
+/// `chosen` comes from [`super::recipe::Recipe::tensor_type`] (or from
+/// the target's block format under `--pure`), never from `target`
+/// directly. That separation is the whole point: llama.cpp decides the
+/// type first and only then asks whether re-encoding is a no-op
+/// (`quantize = cur_type != new_type`), and folding the two together is
+/// what let an earlier version of this file believe every mix was
+/// uniform.
+pub fn disposition(dtype: GgmlType, chosen: GgmlType) -> Disposition {
+    if dtype == chosen {
         return Disposition::Copy("already the target type");
     }
-    Disposition::Quantize
+    Disposition::Quantize(chosen)
 }
 
 #[cfg(test)]
@@ -410,10 +399,13 @@ mod tests {
     /// handed a plausible-looking file.
     #[test]
     fn a_target_with_no_encoder_is_refused_by_name_and_says_what_can_be_written() {
-        let err = parse_target("q6_k", false).unwrap_err();
-        assert_eq!(err, TargetRefusal::NotWritableYet("q6_k".into()));
+        // Q6_K used to be the example here and is now writable, which
+        // is the point of this change. Q3_K_M is the next mix up the
+        // same family with no encoder.
+        let err = parse_target("q3_k_m").unwrap_err();
+        assert_eq!(err, TargetRefusal::NotWritableYet("q3_k_m".into()));
         let msg = err.to_string();
-        assert!(msg.contains("cannot WRITE q6_k"), "{msg}");
+        assert!(msg.contains("cannot WRITE q3_k_m"), "{msg}");
         // What it CAN write, generated from `Target::ALL`.
         assert!(msg.contains("writes: Q8_0"), "{msg}");
         // And it must say ferrox STOPS, not that it did something
@@ -422,23 +414,18 @@ mod tests {
         assert!(msg.contains("stops here instead of writing it"), "{msg}");
     }
 
-    /// The refusal step 2 adds. `q4_k_m` names a MIX, and ferrox has
-    /// only the block encoder for it; writing uniform Q4_K under that
-    /// name would be a file whose `general.file_type` says Q4_K_M while
-    /// its output head is four bits instead of six.
-    ///
-    /// The message has to name the way forward, because there is one --
-    /// this is not a gap the user can do nothing about.
+    /// The K-quant MIX names are admitted outright now. They used to
+    /// need `--pure`, because ferrox could encode Q4_K blocks and not
+    /// the Q5_K / Q6_K the mix promotes some tensors to. Both encoders
+    /// exist, so this asserts the refusal is GONE rather than that it
+    /// still fires with a nicer message -- a stale refusal is a target
+    /// a user cannot reach for no reason.
     #[test]
-    fn the_q4_k_mixes_are_refused_without_pure_and_the_message_names_pure() {
-        for name in ["q4_k", "q4_k_s", "q4_k_m"] {
-            let err = parse_target(name, false).unwrap_err();
-            let msg = err.to_string();
-            assert!(matches!(err, TargetRefusal::MixNeedsPure(_)), "{name}");
-            assert!(msg.contains("cannot write llama.cpp's"), "{msg}");
-            assert!(msg.contains("Q5_K / Q6_K"), "{msg}");
-            assert!(msg.contains("Pass --pure"), "{msg}");
-            assert!(parse_target(name, true).is_ok(), "{name} with --pure");
+    fn the_k_quant_mixes_no_longer_need_pure() {
+        for name in [
+            "q4_k", "q4_k_s", "q4_k_m", "q5_k", "q5_k_s", "q5_k_m", "q6_k",
+        ] {
+            assert!(parse_target(name).is_ok(), "{name}");
         }
     }
 
@@ -448,9 +435,9 @@ mod tests {
     /// which tool ran it.
     #[test]
     fn q4_k_is_the_same_target_as_q4_k_m_the_way_llama_quantize_aliases_it() {
-        assert_eq!(parse_target("q4_k", true).unwrap(), Target::Q4_K_M);
-        assert_eq!(parse_target("q4_k_m", true).unwrap(), Target::Q4_K_M);
-        assert_eq!(parse_target("q4_k_s", true).unwrap(), Target::Q4_K_S);
+        assert_eq!(parse_target("q4_k").unwrap(), Target::Q4_K_M);
+        assert_eq!(parse_target("q4_k_m").unwrap(), Target::Q4_K_M);
+        assert_eq!(parse_target("q4_k_s").unwrap(), Target::Q4_K_S);
         // Same blocks, different declared mix. Both halves matter: the
         // first is why one encoder serves both, the second is why they
         // are two variants and not one.
@@ -468,12 +455,11 @@ mod tests {
 
     /// Every llama.cpp target ferrox has no encoder for refuses, and
     /// none of them refuses as "unknown" -- a gap and a typo are
-    /// different problems and get different messages. Run with
-    /// `pure = true` so the only thing under test is the encoder gap.
+    /// different problems and get different messages.
     #[test]
     fn every_llama_cpp_target_ferrox_cannot_write_refuses_as_a_gap_not_a_typo() {
         for (name, encoder) in LLAMA_CPP_TARGETS {
-            let parsed = parse_target(name, true);
+            let parsed = parse_target(name);
             match encoder {
                 Some(t) => assert_eq!(parsed.as_ref().ok(), Some(t), "{name} should be writable"),
                 None => assert_eq!(
@@ -515,29 +501,27 @@ mod tests {
     /// Q4_K without editing it would have advertised Q8_0 only, and
     /// nothing would have gone red.
     #[test]
-    fn the_writable_summary_names_every_target_and_flags_the_ones_needing_pure() {
+    fn the_writable_summary_names_every_target() {
         let s = writable_targets();
         for t in Target::ALL {
             assert!(s.contains(t.name()), "{s} is missing {}", t.name());
         }
-        assert!(s.contains("Q4_K_M (--pure only)"), "{s}");
-        assert!(!s.contains("Q8_0 (--pure only)"), "{s}");
     }
 
     #[test]
     fn a_name_that_is_not_a_quant_at_all_says_so() {
-        let err = parse_target("q4_k_ultra", true).unwrap_err();
+        let err = parse_target("q4_k_ultra").unwrap_err();
         assert_eq!(err, TargetRefusal::Unknown("q4_k_ultra".into()));
         assert!(err.to_string().contains("is not a quantization type"));
     }
 
     #[test]
     fn target_names_are_case_insensitive_like_llama_quantize() {
-        assert_eq!(parse_target("q8_0", false).unwrap(), Target::Q8_0);
-        assert_eq!(parse_target("Q8_0", false).unwrap(), Target::Q8_0);
-        assert_eq!(parse_target("Q4_K_M", true).unwrap(), Target::Q4_K_M);
+        assert_eq!(parse_target("q8_0").unwrap(), Target::Q8_0);
+        assert_eq!(parse_target("Q8_0").unwrap(), Target::Q8_0);
+        assert_eq!(parse_target("Q4_K_M").unwrap(), Target::Q4_K_M);
         assert_eq!(
-            parse_target("Q8_o", false).unwrap_err(),
+            parse_target("Q8_o").unwrap_err(),
             TargetRefusal::Unknown("Q8_o".into())
         );
     }
@@ -554,6 +538,10 @@ mod tests {
         assert_eq!(ggml_n_dims(&[4096, 1, 8]), 3);
     }
 
+    /// llama.cpp's keep-list, which `--pure` does not skip. This is the
+    /// predicate that also decides whether the mix's counters advance,
+    /// so a name landing on the wrong side of it shifts every later
+    /// layer's promotion as well as changing one tensor's type.
     #[test]
     fn the_tensors_llama_cpp_keeps_at_source_precision_are_kept() {
         let two_d = [4096u64, 4096];
@@ -573,13 +561,14 @@ mod tests {
             ("v.patch_embd.weight", false),
         ];
         for (name, want_quantized) in cases {
-            let got = disposition(name, &two_d, GgmlType::F16, Target::Q8_0);
-            assert_eq!(
-                got == Disposition::Quantize,
-                *want_quantized,
-                "{name} -> {got:?}"
-            );
+            let got = allows_quantization(name, &two_d);
+            assert_eq!(got.is_none(), *want_quantized, "{name} -> {got:?}");
         }
+        // A 1-D tensor is kept whatever its name.
+        assert_eq!(
+            allows_quantization("blk.0.attn_q.weight", &[4096]),
+            Some("1-D")
+        );
     }
 
     /// Requantizing is not what this subcommand is for, but a tensor
@@ -589,13 +578,12 @@ mod tests {
     #[test]
     fn a_tensor_already_in_the_target_type_is_copied_not_re_encoded() {
         assert_eq!(
-            disposition(
-                "blk.0.attn_q.weight",
-                &[4096, 4096],
-                GgmlType::Q8_0,
-                Target::Q8_0
-            ),
+            disposition(GgmlType::Q8_0, GgmlType::Q8_0),
             Disposition::Copy("already the target type")
+        );
+        assert_eq!(
+            disposition(GgmlType::F16, GgmlType::Q6K),
+            Disposition::Quantize(GgmlType::Q6K)
         );
     }
 }

@@ -1,14 +1,23 @@
 //! Weight *encoders*: f32 in, GGUF block bytes out.
 //!
 //! The rest of this crate reads quantized blocks. This module is the
-//! only place that writes them, and today it writes two formats: Q8_0
-//! here, and Q4_K in [`q4_k`]. The rest is not an oversight, it is the
-//! scope: llama.cpp's remaining K-quant and IQ encoders each need their
-//! own transcription (and, for the IQ tiers, a lattice search over a
-//! codebook), and a naive min/max encoder wearing a K-quant's name
-//! produces a file that loads and generates measurably worse text.
-//! `ferrox quantize` refuses every target this module cannot encode, by
-//! name.
+//! only place that writes them, and today it writes four formats: Q8_0
+//! here, and Q4_K, Q5_K and Q6_K in [`q4_k`], [`q5_k`] and [`q6_k`].
+//! The rest is not an oversight, it is the scope: llama.cpp's remaining
+//! K-quant and IQ encoders each need their own transcription (and, for
+//! the IQ tiers, a lattice search over a codebook), and a naive min/max
+//! encoder wearing a K-quant's name produces a file that loads and
+//! generates measurably worse text. `ferrox quantize` refuses every
+//! target this module cannot encode, by name.
+//!
+//! The three K-quants share ONE transcription of the per-sub-block fit,
+//! in [`fit`]. Q4_K and Q5_K differ by four numbers in a `QkFit`, not by
+//! a second copy of `make_qkx2_quants`; Q6_K reaches the same module for
+//! `nearest_int` and `make_qx_quants`. Two copies of a fit that must
+//! agree is this repo's dominant bug shape, and a K-quant encoder is
+//! about the worst place to have one: the copies would agree the day
+//! they were written and diverge invisibly, since both would still
+//! dequantize to plausible weights.
 //!
 //! Each format lands with a **byte-identical** golden against
 //! llama.cpp's own encoder, never a tolerance: two encoders can agree
@@ -21,7 +30,12 @@
 //! indistinguishable from `llama-quantize --type Q8_0`'s. See
 //! `q8_0_matches_llama_cpp_quantize_row_q8_0_ref` for the golden.
 
+pub mod fit;
 pub mod q4_k;
+pub mod q5_k;
+pub mod q6_k;
+#[cfg(test)]
+mod testdata;
 
 use half::f16;
 
