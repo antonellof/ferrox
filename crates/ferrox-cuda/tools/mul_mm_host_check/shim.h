@@ -21,6 +21,23 @@
 struct Dim3 {
     unsigned int x, y, z;
 };
+
+// CUDA's four-float vector type, which the GEMM's inner loop reads its
+// micro-tile operands through. Deliberately NOT `alignas(16)`: the
+// kernel reinterpret-casts a `__shared__` row into one of these, and
+// this shim maps `__shared__` onto a function-`static` array whose
+// alignment nothing guarantees. Over-declaring the alignment would let
+// the compiler assume something the host stand-in does not provide,
+// which is a different bug from the one this tool is looking for.
+//
+// Its absence is why this tool checked NOTHING between the `float4`
+// inner loop landing and 2026-09-09: every kind failed to COMPILE, the
+// `set -e` at the top of run.sh aborted the script, and the run was
+// simply never green rather than quietly wrong. A tool that cannot
+// compile the thing it checks is worse than no tool.
+struct float4 {
+    float x, y, z, w;
+};
 thread_local Dim3 blockIdx;
 thread_local Dim3 threadIdx;
 Dim3 blockDim, gridDim;
@@ -51,6 +68,12 @@ static inline float __int_as_float(int i) {
     return f;
 }
 
+// A `__constant__` array is device-global read-only storage; on the
+// host a plain namespace-scope array is the faithful stand-in. It is
+// deliberately NOT `static const`: the codebook kinds are the only
+// users, every one of them reads theirs, and `static const` would
+// invite `-Wunused-const-variable` on any kind that stopped.
+#define __constant__
 #define __global__
 #define __device__
 #define __forceinline__ inline

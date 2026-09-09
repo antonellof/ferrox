@@ -16,12 +16,22 @@
 pub mod capability;
 pub mod coalesced_twin;
 
+/// The per-kind CUDA matvec (decode) kernel table. Always compiled,
+/// for the same reason [`mul_mm`] is: it is kernel text plus three
+/// strings per row, and `ferrox-core` derives its CUDA decode
+/// capability from it on builds that do not link `cudarc`.
+pub mod matvec_kinds;
+
 /// The `mul_mm` kernel source and its per-quant-kind dispatch table.
 /// Always compiled: it is CUDA C *text* plus a scalar twin, neither of
 /// which needs `cudarc`, so the default `cargo test -p ferrox-cuda` run
 /// on a GPU-less host still exercises the arithmetic the kernel encodes.
 /// Only the launch path ([`mul_mm_launch`]) is feature-gated.
 pub mod mul_mm;
+/// One module per quant-format family, holding the [`mul_mm::KINDS`]
+/// rows. Split out of `mul_mm.rs` so that adding a format is a new file
+/// rather than a new section of a file nobody wants to open.
+pub mod mul_mm_kinds;
 pub mod mul_mm_ref;
 
 #[cfg(feature = "cuda")]

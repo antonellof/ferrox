@@ -229,14 +229,19 @@ fn metal_matvec_launch(kind: QuantKind) -> Option<MetalMatvecLaunchFn> {
 /// in `launch_matvec` and therefore had no guard at all — the hole that
 /// cost Metal a Q5_0 decode path.
 #[cfg(feature = "cuda")]
-fn cuda_matvec_launch(kind: QuantKind) -> Option<CudaMatvecLaunchFn> {
+pub(crate) fn cuda_matvec_launch(kind: QuantKind) -> Option<CudaMatvecLaunchFn> {
     match kind {
         QuantKind::Q8_0 => Some(ferrox_cuda::gpu::launch_q8_0_matvec),
         QuantKind::Q4_0 => Some(ferrox_cuda::gpu::launch_q4_0_matvec),
         QuantKind::Q5_0 => Some(ferrox_cuda::gpu::launch_q5_0_matvec),
+        QuantKind::Q2K => Some(ferrox_cuda::gpu::launch_q2_k_matvec),
+        QuantKind::Q3K => Some(ferrox_cuda::gpu::launch_q3_k_matvec),
         QuantKind::Q4K => Some(ferrox_cuda::gpu::launch_q4_k_matvec),
         QuantKind::Q5K => Some(ferrox_cuda::gpu::launch_q5_k_matvec),
         QuantKind::Q6K => Some(ferrox_cuda::gpu::launch_q6_k_matvec),
+        QuantKind::IQ4NL => Some(ferrox_cuda::gpu::launch_iq4_nl_matvec),
+        QuantKind::IQ4XS => Some(ferrox_cuda::gpu::launch_iq4_xs_matvec),
+        QuantKind::Mxfp4Gguf => Some(ferrox_cuda::gpu::launch_mxfp4_matvec),
         _ => None,
     }
 }
@@ -359,27 +364,35 @@ impl BackendCaps for Cuda {
     /// matvec per position for every kind off [`Cuda::gemm_supported`].
     const GEMM_FALLBACK: &'static str = "CUDA per-position matvec";
 
-    /// The decode path, and the arm that has actually run on a GPU.
+    /// The decode path, and the arm that has actually run on a GPU --
+    /// for six of its nine kinds.
     ///
-    /// Wider than [`Cuda::gemm_supported`]. The name is returned only to
-    /// share [`BackendCaps::matvec_kernel`]'s shape with Metal; nothing
-    /// on the CUDA path reads it, because `ferrox-cuda`'s launchers are
-    /// named functions rather than entries in a string-keyed table.
+    /// **DERIVED from `ferrox_cuda::matvec_kinds::KINDS`, not restated.**
+    /// That table is compiled on every build (it is CUDA C text and
+    /// three strings per row; nothing in it needs `cudarc`), and
+    /// `ferrox-cuda` is an unconditional dependency for exactly this
+    /// reason. The set used to be written out here as a `matches!` and
+    /// checked against the kernel table by a test that only ran under
+    /// `--features cuda`; over-claiming there sends a decode to an
+    /// NVRTC module that does not exist, and under-claiming leaves a
+    /// kernel nothing ever calls. Both have happened.
+    ///
+    /// The name is returned only to share
+    /// [`BackendCaps::matvec_kernel`]'s shape with Metal; nothing on the
+    /// CUDA path reads it, because `ferrox-cuda`'s launchers are named
+    /// functions rather than entries in a string-keyed table.
     fn matvec_kernel(kind: QuantKind) -> Option<&'static str> {
-        match kind {
-            QuantKind::Q8_0
-            | QuantKind::Q4_0
-            | QuantKind::Q5_0
-            | QuantKind::Q4K
-            | QuantKind::Q5K
-            | QuantKind::Q6K => Some(kind.name()),
-            _ => None,
-        }
+        ferrox_cuda::matvec_kinds::kind_by_name(kind.name()).map(|_| kind.name())
     }
 
     /// The `mul_mm` prefill path.
     ///
-    /// Now matches [`Cuda::matvec_kernel`] for every affine kind.
+    /// **DERIVED from `ferrox_cuda::mul_mm::KINDS`**, for the same
+    /// reason and by the same mechanism as [`Cuda::matvec_kernel`]
+    /// above. It equals that set, and
+    /// `the_matvec_table_and_the_mul_mm_table_name_the_same_kinds` in
+    /// `ferrox-cuda` is what keeps it equal -- a kind with one kernel
+    /// and not the other splits a forward pass across two devices.
     ///
     /// It did not until 2026-09-04: only Q8_0 and Q4_0 had a
     /// matrix-matrix product, so a K-quant prefill decomposed into one
@@ -395,31 +408,18 @@ impl BackendCaps for Cuda {
     /// Metal a Q5_0 decode path: GPU prefill with every decode step on
     /// the host.
     ///
-    /// Stated here rather than delegating to
-    /// `ferrox_cuda::mul_mm::kind_by_name`, because `ferrox-cuda` is
-    /// only a dependency under the `cuda` feature and this predicate is
-    /// compiled unconditionally (the capability report reads it on every
-    /// build).
-    ///
-    /// Two tables that must agree about one set is the failure this
-    /// codebase keeps paying for, so the agreement is a TEST rather than
-    /// a hope: `the_cuda_gemm_kinds_match_the_kernel_table` runs under
-    /// `--features cuda` and compares this against `kind_by_name` for
-    /// every `QuantKind`.
+    /// IQ4_NL, IQ4_XS and MXFP4 joined on 2026-09-09, matvec and GEMM
+    /// together. They are CODEBOOK formats: the stored 4-bit code is an
+    /// index into a sixteen-entry table, not a magnitude, so the kernel
+    /// carries that table in `__constant__` memory. gpt-oss ships
+    /// MXFP4 and no GPU backend had it at all, so every expert decoded
+    /// on the host with the device idle.
     ///
     /// **UNRUN ON HARDWARE.** The kernel is checked against a scalar
     /// twin and by executing the emitted CUDA C on the host, and has
     /// never executed on a GPU. See `crates/ferrox-cuda/src/mul_mm.rs`.
     fn gemm_supported(kind: QuantKind) -> bool {
-        matches!(
-            kind,
-            QuantKind::Q8_0
-                | QuantKind::Q4_0
-                | QuantKind::Q5_0
-                | QuantKind::Q4K
-                | QuantKind::Q5K
-                | QuantKind::Q6K
-        )
+        ferrox_cuda::mul_mm::kind_by_name(kind.name()).is_some()
     }
 }
 
@@ -590,9 +590,39 @@ impl BackendDispatch for Cuda {
         row_bytes: usize,
     ) -> Option<Result<Vec<f32>, BackendError>> {
         let launch = cuda_matvec_launch(kind)?;
+
+        // `FERROX_CUDA=0` must mean the CPU, and a build with the
+        // `cuda` feature on a host with no driver must fall back, not
+        // die. Neither was true here until 2026-09-09.
+        //
+        // `Vulkan::launch_matvec` has carried this guard since it
+        // landed, and its comment said Metal and CUDA did not need one
+        // because "their launchers no-op into an error when their
+        // device is absent". That is true of Metal. It is NOT true of
+        // CUDA: `cudarc` resolves `libcuda` through a lazily loaded
+        // symbol table and PANICS (`cudarc-0.11.9/src/lib.rs:98`,
+        // "Unable to dynamically load the cuda shared library") rather
+        // than returning an error, so the `Result` this arm is written
+        // around never gets a chance to be `Err`. A panic in a rayon
+        // worker is not a fallback.
+        //
+        // It was latent rather than harmless: any quantized matvec on
+        // such a build aborted the process. Nothing in the suite
+        // reached it because the one test that dispatches a real kind
+        // through here is `#[ignore]`d, and the test that dispatches an
+        // unsupported one picked a kind that returned `None` above --
+        // until Q2_K gained a kernel and stopped being unsupported.
+        //
+        // `dense_enabled()` is a `OnceLock` over a probe that catches
+        // its own panics, so this costs one atomic load after the first
+        // call.
+        if !Self::dense_enabled() {
+            return None;
+        }
+
         // Derived here rather than at the seam: `block_bytes_for_kind`
-        // is `unreachable!()` outside these five kinds, and reaching it
-        // is gated on the match above having named one of them.
+        // is `unreachable!()` outside the CUDA-dispatchable kinds, and
+        // reaching it is gated on the match above having named one.
         let n_blocks_per_row =
             row_bytes / crate::weight_matrix::WeightMatrix::block_bytes_for_kind(kind);
         Some(launch(weights, x, rows, row_bytes, n_blocks_per_row).map_err(BackendError::new))
@@ -664,9 +694,11 @@ impl BackendDispatch for Vulkan {
     ) -> Option<Result<Vec<f32>, BackendError>> {
         let launch = vulkan_matvec_launch(kind)?;
 
-        // Unlike Metal and CUDA, whose launchers no-op into an error
-        // when their device is absent, `ferrox-vulkan` has no global to
-        // consult -- so the env grammar is honoured here or not at all.
+        // Unlike Metal, whose launcher no-ops into an error when its
+        // device is absent, `ferrox-vulkan` has no global to consult --
+        // so the env grammar is honoured here or not at all. (CUDA was
+        // in this sentence too, and should not have been: see
+        // `Cuda::launch_matvec`, which now carries the same guard.)
         // `FERROX_VULKAN=0` must mean the CPU, not "open a device
         // anyway". Returning `None` (rather than an error) is right:
         // "this backend is not running here" is the same answer as "no

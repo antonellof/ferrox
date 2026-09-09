@@ -13,7 +13,16 @@ categories = ["algorithms", "science"]
 [dependencies]
 ferrox-gguf = { workspace = true }
 ferrox-quant = { workspace = true }
-ferrox-cuda = { workspace = true, optional = true }
+# NOT optional, and that is the point. Without the `cuda` feature this
+# crate is `thiserror` and two tables of CUDA C text -- no `cudarc`, no
+# toolkit, no link step. Making it unconditional lets `Cuda::matvec_kernel`
+# and `Cuda::gemm_supported` DERIVE from `ferrox_cuda`'s own kernel
+# tables instead of restating them, on every build. They were restated
+# for exactly one reason: this dependency used to be optional and the
+# capability report is compiled unconditionally. Two tables that must
+# agree about one set, with only a `#[cfg(feature = "cuda")]` test
+# between them, is this repo's dominant bug shape; it is now one table.
+ferrox-cuda = { workspace = true }
 ferrox-metal = { workspace = true, optional = true }
 ferrox-vulkan = { workspace = true, optional = true }
 memmap2 = { workspace = true }
@@ -54,7 +63,7 @@ default = []
 # Propagates to ferrox-cuda's own `cuda` feature (real NVRTC-compiled
 # kernel dispatch, dynamic-loaded -- builds fine without a CUDA
 # toolkit/GPU present, see ferrox-cuda's Cargo.toml comment).
-cuda = ["dep:ferrox-cuda", "ferrox-cuda/cuda", "dep:cudarc"]
+cuda = ["ferrox-cuda/cuda", "dep:cudarc"]
 # Propagates to ferrox-metal's `metal` feature (Apple Silicon only;
 # see ferrox-metal's Cargo.toml). Shares WeightMatrix::apply_gpu with CUDA.
 metal = ["dep:ferrox-metal", "ferrox-metal/metal"]

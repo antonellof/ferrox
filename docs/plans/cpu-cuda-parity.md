@@ -86,15 +86,25 @@ tok/s column cannot show.
 | Q5_K | yes | yes | **new** | yes |
 | Q6_K | yes | yes | **new** | yes |
 | Q5_0 | no | **new** | **new** | yes |
-| IQ4_XS / IQ4_NL | no | **no** | **no** | matvec+GEMM |
-| Q2_K, Q3_K | no | **no** | **no** | **no** |
+| IQ4_NL | yes | **new, unverified** | **new, unverified** | **no** |
+| IQ4_XS | yes | **new, unverified** | **new, unverified** | matvec+GEMM |
+| Q2_K | yes | **new, unverified** | **new, unverified** | **no** |
+| Q3_K | yes | **new, unverified** | **new, unverified** | **no** |
 | Q4_1, Q5_1, Q8_1 | no | **no** | **no** | **no** |
 | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S | IQ1_M only | **no** | **no** | **no** |
-| MXFP4 | yes | **no** | **no** | **no** |
+| MXFP4 | yes | **new, unverified** | **new, unverified** | **no** |
 
 "no" means the tensor is decoded on the host and the GPU is idle for
 that matmul. It still answers correctly, which is why this never
 surfaced as a bug.
+
+"new, unverified" means the kernel exists, its arithmetic is checked
+against `ferrox_quant` by a Rust twin, and for the GEMM the emitted
+CUDA C is executed on a host CPU and compared to that twin bit for bit
+(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`, 75,042 positions
+over eleven kinds and three shapes each, zero mismatches on 2026-09-09).
+**No GPU has run it.** `cargo test -p ferrox-cuda --features cuda --
+--ignored` on a real device is the exit criterion, plus a bench row.
 
 ## The four kinds of gap, and why the distinction matters
 
@@ -296,17 +306,33 @@ in the wild uses it:
   Rust twin bit for bit; the matvec's C has no such harness and no GPU
   has run either. `cargo test -p ferrox-cuda --features cuda --
   --ignored` is the exit criterion, plus a Q5_0 bench row.
-- **CUDA IQ4_XS.** Metal has it; CUDA does not. It is a codebook
-  lookup, so it needs its own `MulMmKind` shape rather than an affine
-  `dequant_src`: the kernel needs the 16-entry `KVALUES_IQ4NL` table
-  visible to every thread (a `__constant__` array, not a per-block
-  scale) and its `dequant_src` contract would have to become "given
-  the block and `il`, index the codebook" rather than "multiply by a
-  scale and add a bias". The `dequant_twin` seam survives unchanged;
-  only the emitted helper's shape differs.
-- **Q2_K and Q3_K everywhere.** Common in small-memory builds, and
-  absent on all three GPU backends.
-- **MXFP4 on GPU.** gpt-oss ships it. CPU has it; no GPU does.
+- **CUDA IQ4_NL and IQ4_XS, landed 2026-09-09, UNVERIFIED ON
+  HARDWARE.** Matvec and GEMM together. They are codebook formats, so
+  `MulMmKind` grew a `codebook: Option<Codebook>` field and
+  `kernel_src` emits it as a `__constant__ float[16]` ahead of
+  `dequant_src`; the `dequant_twin` seam is unchanged, because its
+  contract was always "given the block and `il`, write 16 floats in
+  ascending element order" and a table lookup satisfies it exactly as
+  an affine transform does. The GEMM's `Codebook` row is ONE slice: the
+  emitter formats it into the CUDA and the Rust twin indexes it, so
+  there is nothing to drift. The matvec kernels are `&'static str` and
+  carry the sixteen values as a literal, which is a second structure --
+  `every_embedded_codebook_is_the_mul_mm_codebook` parses them back out
+  of the kernel text and holds them to the `Codebook`, bit for bit.
+- **MXFP4 on GPU, landed 2026-09-09, UNVERIFIED ON HARDWARE.** gpt-oss
+  ships it and no GPU backend had it at all, so every expert decoded on
+  the host with the device idle. Matvec and GEMM, the same codebook
+  seam, with the E2M1 table and an E8M0 scale helper. 17-byte blocks:
+  the only odd stride in the table, so nothing in either kernel may
+  assume a block pointer is aligned to anything.
+- **CUDA Q2_K and Q3_K, landed 2026-09-09, UNVERIFIED ON HARDWARE.**
+  Common in small-memory builds, and they were absent on all three GPU
+  backends. Matvec and GEMM, both affine. Q3_K is the fiddly one: its
+  third quant bit is a bit plane in `hmask` and it is INVERTED (a set
+  bit means bias 0, a clear one bias 4), and its six-bit scales use a
+  four-arm packing that is not Q4_K's. Sabotaging that inversion in the
+  emitted CUDA alone makes the host check report 3,968 mismatches out
+  of 4,096, so the check sees it. Metal still has neither.
 - The IQ1/IQ2/IQ3 family last: rare, and each is a separate codebook.
 
 **Exit per kind:** a kernel, a scalar twin, a `parity` run, and a bench
@@ -363,5 +389,5 @@ all, which is honest and temporary.
 | 4 fixed per-token cost | #128 | not started |
 | 5 x86 decode | #127 | **done**: default was wrong, 6.8x to 1.4x |
 | 5b x86 prefill | | not started, now the largest CPU gap (6x to 10x) |
-| 6 kernel coverage | | Q4_K/Q5_K/Q6_K landed on CUDA, Q5_0 2026-09-05 (unverified); 15 kinds still host-only |
+| 6 kernel coverage | | Q4_K/Q5_K/Q6_K landed on CUDA, Q5_0 2026-09-05, Q2_K/Q3_K/IQ4_NL/IQ4_XS/MXFP4 2026-09-09 (all unverified on hardware); 10 kinds still host-only |
 | 7 ledger | #126 | **done**: three hosts, and a committed-receipt check |

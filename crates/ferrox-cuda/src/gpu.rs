@@ -144,241 +144,6 @@ pub fn probe() -> Option<CudaInfo> {
     result.unwrap_or(None)
 }
 
-/// CUDA C source for a fused Q8_0 dequant+dot kernel: one thread block
-/// per output row, each thread handling a subset of the row's Q8_0
-/// blocks, block-level reduction into the row's output element. This
-/// mirrors `ferrox_quant::dot_q8_0_f32_scalar`'s math exactly (same
-/// block layout: 2-byte f16 scale + 32 int8 values per 34-byte block).
-///
-/// Verified: compiled by NVRTC and executed on a real GPU (RTX 3060),
-/// matching the CPU reference exactly -- see the module doc comment.
-pub const Q8_0_MATVEC_KERNEL_SRC: &str = r#"
-extern "C" __global__ void q8_0_matvec(
-    const unsigned char* weights, // [rows * row_bytes]
-    const float* x,               // [cols]
-    float* out,                   // [rows]
-    int rows,
-    int row_bytes,
-    int n_blocks_per_row
-) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
-
-    __shared__ float partial[256];
-    float acc = 0.0f;
-
-    for (int b = threadIdx.x; b < n_blocks_per_row; b += blockDim.x) {
-        const unsigned char* block = row_ptr + b * 34;
-        unsigned short bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
-        unsigned int sign = (bits >> 15) & 0x1u;
-        unsigned int exp = (bits >> 10) & 0x1Fu;
-        unsigned int mant = bits & 0x3FFu;
-        float scale;
-        if (exp == 0) {
-            scale = ldexpf((float)mant, -24);
-        } else if (exp == 31) {
-            scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
-        } else {
-            scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
-        }
-        if (sign) scale = -scale;
-
-        int base = b * 32;
-        float block_acc = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 32; i++) {
-            signed char q = (signed char)block[2 + i];
-            block_acc += (float)q * x[base + i];
-        }
-        acc += block_acc * scale;
-    }
-
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        out[row] = partial[0];
-    }
-}
-"#;
-
-/// CUDA C source for a fused Q4_0 dequant+dot kernel, the same
-/// one-block-per-row / block-level-reduction structure as
-/// `Q8_0_MATVEC_KERNEL_SRC` above, but unpacking Q4_0's 18-byte blocks
-/// (2-byte f16 scale + 16 bytes of packed 4-bit nibbles, low nibble =
-/// element `i`, high nibble = element `i+16`, both biased by -8) to
-/// mirror `ferrox_quant::dot_q4_0_f32_scalar`'s exact math.
-///
-/// Verified: compiled by NVRTC and executed on a real GPU (RTX 3060),
-/// matching the CPU reference exactly -- see the module doc comment.
-pub const Q4_0_MATVEC_KERNEL_SRC: &str = r#"
-extern "C" __global__ void q4_0_matvec(
-    const unsigned char* weights, // [rows * row_bytes]
-    const float* x,               // [cols]
-    float* out,                   // [rows]
-    int rows,
-    int row_bytes,
-    int n_blocks_per_row
-) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
-
-    __shared__ float partial[256];
-    float acc = 0.0f;
-
-    for (int b = threadIdx.x; b < n_blocks_per_row; b += blockDim.x) {
-        const unsigned char* block = row_ptr + b * 18;
-        unsigned short bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
-        unsigned int sign = (bits >> 15) & 0x1u;
-        unsigned int exp = (bits >> 10) & 0x1Fu;
-        unsigned int mant = bits & 0x3FFu;
-        float scale;
-        if (exp == 0) {
-            scale = ldexpf((float)mant, -24);
-        } else if (exp == 31) {
-            scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
-        } else {
-            scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
-        }
-        if (sign) scale = -scale;
-
-        int base = b * 32;
-        float block_acc = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            unsigned char byte = block[2 + i];
-            int lo = (int)(byte & 0x0F) - 8;
-            int hi = (int)((byte >> 4) & 0x0F) - 8;
-            block_acc += (float)lo * x[base + i];
-            block_acc += (float)hi * x[base + i + 16];
-        }
-        acc += block_acc * scale;
-    }
-
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        out[row] = partial[0];
-    }
-}
-"#;
-
-/// CUDA C source for a fused Q5_0 dequant+dot kernel, the same
-/// one-block-per-lane / block-level-reduction structure as
-/// `Q4_0_MATVEC_KERNEL_SRC` above, but unpacking Q5_0's 22-byte blocks:
-/// 2-byte f16 scale, a 4-byte `qh` bitplane, then 16 bytes of packed
-/// 4-bit nibbles. Element `j` takes the low nibble of `qs[j]` with bit
-/// `j` of `qh` as its fifth bit; element `j + 16` takes the high nibble
-/// with bit `j + 16`. Both are biased by -16. This mirrors
-/// `ferrox_quant::dot_q5_0_f32_scalar`'s exact math, and is `ggml`'s
-/// `dequantize_row_q5_0` reference form rather than the nibble-packed
-/// `ushort` trick `Q4_0_MATVEC_KERNEL_SRC` uses -- the same choice
-/// `ferrox-metal`'s `Q5_0_MATVEC_KERNEL_SRC` made and for the same
-/// reason: the fifth bit is indexed differently in the two halves, so
-/// folding it into the activation scaling needs two more shift chains
-/// and is much easier to get subtly wrong.
-///
-/// **UNVERIFIED ON HARDWARE.** No GPU has run this. Unlike the GEMM in
-/// `mul_mm.rs`, whose emitted C is executed on the host by
-/// `tools/mul_mm_host_check/run.sh` and compared bit for bit against a
-/// Rust twin, there is no host harness for the matvec kernels: the only
-/// check on this text is `launch_q5_0_matvec_matches_cpu_reference`,
-/// which is `#[ignore]`d and needs a device. Run it with
-/// `cargo test -p ferrox-cuda --features cuda -- --ignored` before any
-/// doc calls Q5_0 a measured CUDA capability.
-pub const Q5_0_MATVEC_KERNEL_SRC: &str = r#"
-extern "C" __global__ void q5_0_matvec(
-    const unsigned char* weights, // [rows * row_bytes]
-    const float* x,               // [cols]
-    float* out,                   // [rows]
-    int rows,
-    int row_bytes,
-    int n_blocks_per_row
-) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
-
-    __shared__ float partial[256];
-    float acc = 0.0f;
-
-    for (int b = threadIdx.x; b < n_blocks_per_row; b += blockDim.x) {
-        const unsigned char* block = row_ptr + (size_t)b * 22;
-        unsigned short bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
-        unsigned int sign = (bits >> 15) & 0x1u;
-        unsigned int exp = (bits >> 10) & 0x1Fu;
-        unsigned int mant = bits & 0x3FFu;
-        float scale;
-        if (exp == 0) {
-            scale = ldexpf((float)mant, -24);
-        } else if (exp == 31) {
-            scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
-        } else {
-            scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
-        }
-        if (sign) scale = -scale;
-
-        const unsigned int qh = (unsigned int)block[2]
-            | ((unsigned int)block[3] << 8)
-            | ((unsigned int)block[4] << 16)
-            | ((unsigned int)block[5] << 24);
-        const unsigned char* qs = block + 6;
-
-        int base = b * 32;
-        float block_acc = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            // ggml `dequantize_row_q5_0`: the low half takes bit `j` of
-            // qh shifted UP into position 4, the high half takes bit
-            // `j + 16` shifted DOWN into it -- hence `j + 12`, not
-            // `j + 16`, because the bit is left in place rather than
-            // moved to position 0.
-            unsigned int xh_0 = ((qh >> j) << 4) & 0x10u;
-            unsigned int xh_1 = (qh >> (j + 12)) & 0x10u;
-            int x0 = (int)(((unsigned int)qs[j] & 0x0Fu) | xh_0) - 16;
-            int x1 = (int)(((unsigned int)qs[j] >> 4) | xh_1) - 16;
-            block_acc += (float)x0 * x[base + j];
-            block_acc += (float)x1 * x[base + j + 16];
-        }
-        acc += block_acc * scale;
-    }
-
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        out[row] = partial[0];
-    }
-}
-"#;
-
 /// CUDA C source for a fused Q4_K dequant+dot kernel: mirrors
 /// `ferrox_quant::dot_q4_k_f32_scalar`'s exact math (144-byte
 /// super-blocks of 256 elements: 2-byte f16 `d` + 2-byte f16 `dmin` +
@@ -726,284 +491,6 @@ extern "C" __global__ void q4_k_matvec_coalesced(
 }
 "#;
 
-pub const Q4_K_MATVEC_KERNEL_SRC: &str = r#"
-extern "C" __device__ float ferrox_f16_to_f32(unsigned short bits) {
-    unsigned int sign = (bits >> 15) & 0x1u;
-    unsigned int exp = (bits >> 10) & 0x1Fu;
-    unsigned int mant = bits & 0x3FFu;
-    float scale;
-    if (exp == 0) {
-        scale = ldexpf((float)mant, -24);
-    } else if (exp == 31) {
-        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
-    } else {
-        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
-    }
-    return sign ? -scale : scale;
-}
-
-extern "C" __device__ void ferrox_q4_k_scale_min(
-    int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
-) {
-    if (j < 4) {
-        *sc = scales[j] & 63;
-        *m = scales[j + 4] & 63;
-    } else {
-        *sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
-        *m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
-    }
-}
-
-extern "C" __global__ void q4_k_matvec(
-    const unsigned char* weights, // [rows * row_bytes], row_bytes = n_blocks_per_row * 144
-    const float* x,               // [cols]
-    float* out,                   // [rows]
-    int rows,
-    int row_bytes,
-    int n_blocks_per_row
-) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
-
-    __shared__ float partial[256];
-    float acc = 0.0f;
-
-    for (int blk = threadIdx.x; blk < n_blocks_per_row; blk += blockDim.x) {
-        const unsigned char* block = row_ptr + blk * 144;
-        unsigned short d_bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
-        unsigned short dmin_bits = (unsigned short)block[2] | ((unsigned short)block[3] << 8);
-        float d = ferrox_f16_to_f32(d_bits);
-        float dmin = ferrox_f16_to_f32(dmin_bits);
-        const unsigned char* scales = block + 4;
-        const unsigned char* qs = block + 16;
-        int x_base = blk * 256;
-
-        int is = 0, q_off = 0, base = 0;
-        #pragma unroll
-        for (int oi = 0; oi < 4; oi++) {
-            unsigned char sc1, m1, sc2, m2;
-            ferrox_q4_k_scale_min(is, scales, &sc1, &m1);
-            ferrox_q4_k_scale_min(is + 1, scales, &sc2, &m2);
-            float d1 = d * (float)sc1, min1 = dmin * (float)m1;
-            float d2 = d * (float)sc2, min2 = dmin * (float)m2;
-            #pragma unroll
-            for (int l = 0; l < 32; l++) {
-                acc += (d1 * (float)(qs[q_off + l] & 0x0F) - min1) * x[x_base + base + l];
-            }
-            #pragma unroll
-            for (int l = 0; l < 32; l++) {
-                acc += (d2 * (float)(qs[q_off + l] >> 4) - min2) * x[x_base + base + 32 + l];
-            }
-            q_off += 32;
-            base += 64;
-            is += 2;
-        }
-    }
-
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        out[row] = partial[0];
-    }
-}
-"#;
-
-/// CUDA C source for a fused Q5_K dequant+dot kernel: same super-block/
-/// scale-min structure as Q4_K, but each nibble gets a 5th bit from a
-/// 32-byte `qh` buffer (mirrors `ferrox_quant::dot_q5_k_f32_scalar`
-/// exactly: 176-byte blocks = 2-byte `d` + 2-byte `dmin` + 12 bytes
-/// scales + 32 bytes `qh` + 128 bytes `qs`).
-///
-/// Verified: compiled by NVRTC and executed on a real GPU, matching
-/// the CPU reference exactly -- see the module doc comment.
-pub const Q5_K_MATVEC_KERNEL_SRC: &str = r#"
-extern "C" __device__ float ferrox_f16_to_f32(unsigned short bits) {
-    unsigned int sign = (bits >> 15) & 0x1u;
-    unsigned int exp = (bits >> 10) & 0x1Fu;
-    unsigned int mant = bits & 0x3FFu;
-    float scale;
-    if (exp == 0) {
-        scale = ldexpf((float)mant, -24);
-    } else if (exp == 31) {
-        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
-    } else {
-        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
-    }
-    return sign ? -scale : scale;
-}
-
-extern "C" __device__ void ferrox_q4_k_scale_min(
-    int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
-) {
-    if (j < 4) {
-        *sc = scales[j] & 63;
-        *m = scales[j + 4] & 63;
-    } else {
-        *sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
-        *m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
-    }
-}
-
-extern "C" __global__ void q5_k_matvec(
-    const unsigned char* weights, // [rows * row_bytes], row_bytes = n_blocks_per_row * 176
-    const float* x,               // [cols]
-    float* out,                   // [rows]
-    int rows,
-    int row_bytes,
-    int n_blocks_per_row
-) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
-
-    __shared__ float partial[256];
-    float acc = 0.0f;
-
-    for (int blk = threadIdx.x; blk < n_blocks_per_row; blk += blockDim.x) {
-        const unsigned char* block = row_ptr + blk * 176;
-        unsigned short d_bits = (unsigned short)block[0] | ((unsigned short)block[1] << 8);
-        unsigned short dmin_bits = (unsigned short)block[2] | ((unsigned short)block[3] << 8);
-        float d = ferrox_f16_to_f32(d_bits);
-        float dmin = ferrox_f16_to_f32(dmin_bits);
-        const unsigned char* scales = block + 4;
-        const unsigned char* qh = block + 16;
-        const unsigned char* qs = block + 48;
-        int x_base = blk * 256;
-
-        int is = 0;
-        unsigned char u1 = 1, u2 = 2;
-        #pragma unroll
-        for (int oi = 0; oi < 4; oi++) {
-            unsigned char sc1, m1, sc2, m2;
-            ferrox_q4_k_scale_min(is, scales, &sc1, &m1);
-            ferrox_q4_k_scale_min(is + 1, scales, &sc2, &m2);
-            float d1 = d * (float)sc1, min1 = dmin * (float)m1;
-            float d2 = d * (float)sc2, min2 = dmin * (float)m2;
-            const unsigned char* ql = qs + oi * 32;
-            int xb = x_base + oi * 64;
-            #pragma unroll
-            for (int l = 0; l < 32; l++) {
-                int hi = (qh[l] & u1) ? 16 : 0;
-                acc += (d1 * (float)((ql[l] & 0x0F) + hi) - min1) * x[xb + l];
-            }
-            #pragma unroll
-            for (int l = 0; l < 32; l++) {
-                int hi = (qh[l] & u2) ? 16 : 0;
-                acc += (d2 * (float)((ql[l] >> 4) + hi) - min2) * x[xb + 32 + l];
-            }
-            is += 2;
-            u1 <<= 2;
-            u2 <<= 2;
-        }
-    }
-
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        out[row] = partial[0];
-    }
-}
-"#;
-
-/// CUDA C source for a fused Q6_K dequant+dot kernel: mirrors
-/// `ferrox_quant::dot_q6_k_f32_scalar`'s exact math (210-byte blocks of
-/// 256 elements: 128 bytes `ql` + 64 bytes `qh` + 16 *signed* int8
-/// scale bytes + 2-byte `d`, split into two 128-element halves). The
-/// 16 per-sub-block scales are signed in the GGUF Q6_K format --
-/// an earlier version of this kernel (and of the scalar CPU path it
-/// mirrors) read them as unsigned, which agreed with itself but not
-/// with the format; both were fixed together and are covered by the
-/// negative-scale golden in `ferrox-quant`
-/// (`q6_k_signed_scale_dequant_matches_independent_python_reference`).
-pub const Q6_K_MATVEC_KERNEL_SRC: &str = r#"
-extern "C" __device__ float ferrox_f16_to_f32(unsigned short bits) {
-    unsigned int sign = (bits >> 15) & 0x1u;
-    unsigned int exp = (bits >> 10) & 0x1Fu;
-    unsigned int mant = bits & 0x3FFu;
-    float scale;
-    if (exp == 0) {
-        scale = ldexpf((float)mant, -24);
-    } else if (exp == 31) {
-        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
-    } else {
-        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
-    }
-    return sign ? -scale : scale;
-}
-
-extern "C" __global__ void q6_k_matvec(
-    const unsigned char* weights, // [rows * row_bytes], row_bytes = n_blocks_per_row * 210
-    const float* x,               // [cols]
-    float* out,                   // [rows]
-    int rows,
-    int row_bytes,
-    int n_blocks_per_row
-) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
-
-    __shared__ float partial[256];
-    float acc = 0.0f;
-
-    for (int blk = threadIdx.x; blk < n_blocks_per_row; blk += blockDim.x) {
-        const unsigned char* block = row_ptr + blk * 210;
-        const unsigned char* ql_full = block;
-        const unsigned char* qh_full = block + 128;
-        const unsigned char* sc_full = block + 192;
-        unsigned short d_bits = (unsigned short)block[208] | ((unsigned short)block[209] << 8);
-        float d = ferrox_f16_to_f32(d_bits);
-        int x_base = blk * 256;
-
-        #pragma unroll
-        for (int half = 0; half < 2; half++) {
-            const unsigned char* ql = ql_full + half * 64;
-            const unsigned char* qh = qh_full + half * 32;
-            const unsigned char* sc = sc_full + half * 8;
-            int xh_base = x_base + half * 128;
-
-            #pragma unroll
-            for (int l = 0; l < 32; l++) {
-                int is = l / 16;
-                int q1 = (int)((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) - 32;
-                int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) - 32;
-                int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) - 32;
-                int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) - 32;
-                acc += d * (float)(signed char)sc[is] * (float)q1 * x[xh_base + l];
-                acc += d * (float)(signed char)sc[is + 2] * (float)q2 * x[xh_base + l + 32];
-                acc += d * (float)(signed char)sc[is + 4] * (float)q3 * x[xh_base + l + 64];
-                acc += d * (float)(signed char)sc[is + 6] * (float)q4 * x[xh_base + l + 96];
-            }
-        }
-    }
-
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        out[row] = partial[0];
-    }
-}
-"#;
-
 /// Process-wide CUDA device handle, created once and reused for every
 /// kernel launch. Before this existed, `launch_matvec` called
 /// `CudaDevice::new(0)` on *every single call* -- a fresh CUDA context
@@ -1319,6 +806,21 @@ pub(crate) fn resident_cuda_weights(
     Ok(cached)
 }
 
+// The kernel TEXT moved to `matvec_kinds`, one module per format
+// family; `gpu.rs` keeps the device plumbing. Re-exported so every
+// existing path still resolves -- a refactor that moves a definition
+// should not move a public name.
+pub use crate::matvec_kinds::codebook::{
+    IQ4_NL_MATVEC_KERNEL_SRC, IQ4_XS_MATVEC_KERNEL_SRC, MXFP4_MATVEC_KERNEL_SRC,
+};
+pub use crate::matvec_kinds::kquant::{
+    Q2_K_MATVEC_KERNEL_SRC, Q3_K_MATVEC_KERNEL_SRC, Q4_K_MATVEC_KERNEL_SRC, Q5_K_MATVEC_KERNEL_SRC,
+    Q6_K_MATVEC_KERNEL_SRC,
+};
+pub use crate::matvec_kinds::legacy::{
+    Q4_0_MATVEC_KERNEL_SRC, Q5_0_MATVEC_KERNEL_SRC, Q8_0_MATVEC_KERNEL_SRC,
+};
+
 /// The per-kind matvec table, keyed by GGUF quant name: source, NVRTC
 /// module cache key, entry point. `None` means CUDA has no matvec for
 /// that format and the caller must fall back and say so.
@@ -1333,15 +835,7 @@ pub(crate) fn resident_cuda_weights(
 /// `QuantKind::name()`, so `ferrox-core` can ask for a kind without
 /// depending on a CUDA type.
 pub fn matvec_launch_meta(kind_name: &str) -> Option<(&'static str, &'static str, &'static str)> {
-    match kind_name {
-        "Q8_0" => Some((Q8_0_MATVEC_KERNEL_SRC, "ferrox_q8_0", "q8_0_matvec")),
-        "Q4_0" => Some((Q4_0_MATVEC_KERNEL_SRC, "ferrox_q4_0", "q4_0_matvec")),
-        "Q5_0" => Some((Q5_0_MATVEC_KERNEL_SRC, "ferrox_q5_0", "q5_0_matvec")),
-        "Q4_K" => Some((Q4_K_MATVEC_KERNEL_SRC, "ferrox_q4_k", "q4_k_matvec")),
-        "Q5_K" => Some((Q5_K_MATVEC_KERNEL_SRC, "ferrox_q5_k", "q5_k_matvec")),
-        "Q6_K" => Some((Q6_K_MATVEC_KERNEL_SRC, "ferrox_q6_k", "q6_k_matvec")),
-        _ => None,
-    }
+    crate::matvec_kinds::kind_by_name(kind_name).map(|k| (k.src, k.module_name, k.fn_name))
 }
 
 /// Looks a kind up in [`matvec_launch_meta`] and launches it. Every
@@ -1403,6 +897,66 @@ pub fn launch_q5_0_matvec(
     n_blocks_per_row: usize,
 ) -> Result<Vec<f32>, CudaError> {
     launch_matvec_by_kind("Q5_0", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q2_K matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::kquant`] for what is and is not established.
+pub fn launch_q2_k_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q2_K", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q3_K matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::kquant`] for what is and is not established.
+pub fn launch_q3_k_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q3_K", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the IQ4_NL matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::codebook`] for what is and is not established.
+pub fn launch_iq4_nl_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("IQ4_NL", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the IQ4_XS matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::codebook`] for what is and is not established.
+pub fn launch_iq4_xs_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("IQ4_XS", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the MXFP4 matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::codebook`] for what is and is not established.
+pub fn launch_mxfp4_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("MXFP4", weights, x, rows, row_bytes, n_blocks_per_row)
 }
 
 /// Launches the Q4_K matvec kernel. Verified on real GPU hardware -- see module docs.
@@ -1842,36 +1396,36 @@ mod tests {
         }
     }
 
-    /// The three strings a matvec launch needs live in exactly one
-    /// table, and each source has to define the entry point its row
-    /// names. Runnable without a device, because the failure this
-    /// guards against -- a row whose `fn_name` and source disagree --
-    /// is a `KernelCompile` error at a user's first token, not
-    /// something a GPU is needed to see.
+    /// Every row of the matvec table has to be launchable through
+    /// [`matvec_launch_meta`], and the meta lookup has to be the table
+    /// rather than a second copy of it.
+    ///
+    /// This used to spell six kind names and six negatives. It is
+    /// driven by [`crate::matvec_kinds::KINDS`] now, so a format added
+    /// to the table is covered here the moment it exists, and the
+    /// negatives moved to `matvec_kinds`'s own
+    /// `a_kind_with_no_matvec_does_not_resolve` -- where the table is.
+    /// Naming three kinds that "must not resolve" beside a table that
+    /// decides it is exactly the pair of structures this repo keeps
+    /// paying for: IQ4_XS was on that negative list until it got a
+    /// kernel, and moving it meant remembering two files.
     #[test]
-    fn matvec_launch_meta_defines_every_entry_point_it_names() {
-        let mut modules = std::collections::HashSet::new();
-        for name in ["Q8_0", "Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K"] {
-            let (src, module, func) = matvec_launch_meta(name)
-                .unwrap_or_else(|| panic!("{name} must have a CUDA matvec"));
+    fn matvec_launch_meta_is_the_matvec_table() {
+        for k in crate::matvec_kinds::KINDS {
+            let (src, module, func) = matvec_launch_meta(k.name)
+                .unwrap_or_else(|| panic!("{}: in the table but not launchable", k.name));
+            assert_eq!(module, k.module_name, "{}", k.name);
+            assert_eq!(func, k.fn_name, "{}", k.name);
             assert!(
                 src.contains(&format!("void {func}(")),
-                "{name}: the source in {module} does not define {func}"
-            );
-            assert!(
-                modules.insert(module),
-                "{name}: module cache key {module} collides with another kind"
+                "{}: the source in {module} does not define {func}",
+                k.name
             );
         }
-        // A kind with no kernel must not resolve to one. Resolving
-        // would send a matmul to a module that cannot compile, and the
-        // caller would have no way to fall back honestly.
-        for name in ["Q2_K", "Q3_K", "Q5_1", "IQ4_XS", "MXFP4"] {
-            assert!(
-                matvec_launch_meta(name).is_none(),
-                "{name} resolved to a CUDA matvec that does not exist"
-            );
-        }
+        assert!(
+            matvec_launch_meta("Q4_1").is_none(),
+            "a kind with no kernel resolved to a CUDA matvec"
+        );
     }
 
     /// The Q5_0 kernel's block stride and element stride are literals in
