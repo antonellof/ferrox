@@ -1,10 +1,12 @@
 //! `ferrox quantize`: read a GGUF, write a GGUF whose eligible tensors
 //! are re-encoded to a quantization ferrox can actually produce.
 //!
-//! Today that is Q8_0, and Q4_K under `--pure`. See [`policy`] for why
-//! the other targets refuse by name instead of being approximated, why
-//! `--pure` is mandatory for the Q4_K names rather than optional, and
-//! for the tensor-eligibility rules this shares with llama.cpp.
+//! Today that is Q8_0, Q4_K, Q5_K and Q6_K, and the six llama.cpp mixes
+//! built from them. See [`policy`] for why the other targets refuse by
+//! name instead of being approximated and for the tensor-eligibility
+//! rules this shares with llama.cpp, and [`recipe`] for the per-tensor
+//! MIX -- the reason a `Q4_K_M` file has a Q6_K output head and Q6_K
+//! `ffn_down` on a quarter of its layers.
 //!
 //! The pass is streaming: the input is mmap'd, tensors are re-encoded
 //! one at a time, and the output is written through a `BufWriter`. A
@@ -12,6 +14,9 @@
 //! expansion, not the model.
 
 pub mod policy;
+pub mod recipe;
+#[cfg(test)]
+mod recipe_golden;
 
 use std::collections::BTreeMap;
 use std::io::BufWriter;
@@ -22,7 +27,8 @@ use clap::Parser;
 use ferrox_gguf::{GgmlType, GgufFile, GgufValue, GgufWriter, TensorPlan};
 use rayon::prelude::*;
 
-use policy::{disposition, parse_target, Disposition, Target};
+use policy::{allows_quantization, disposition, parse_target, Disposition, Target};
+use recipe::{ModelShape, Recipe};
 
 /// `general.quantization_version`, ggml's `GGML_QNT_VERSION`. Every
 /// tool in the ecosystem reads it; a file without it looks pre-2023.
@@ -46,22 +52,20 @@ pub struct QuantizeArgs {
     /// share one; this one does not.)
     pub output: Option<PathBuf>,
 
-    /// Quantization to write. ferrox can write Q8_0, and Q4_K_S /
-    /// Q4_K_M with --pure. Every other llama.cpp target is refused BY
-    /// NAME -- ferrox reads them all and encodes two, and a subcommand
-    /// that pretended otherwise would hand back a file that loads and
-    /// is worse.
+    /// Quantization to write: Q8_0, Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M or
+    /// Q6_K. Every other llama.cpp target is refused BY NAME -- ferrox
+    /// reads them all and encodes four, and a subcommand that pretended
+    /// otherwise would hand back a file that loads and is worse.
     #[arg(long = "type", default_value = "Q8_0")]
     pub ty: String,
 
     /// Skip llama.cpp's per-tensor mix and write every quantizable
     /// tensor as `--type`, the way `llama-quantize --pure` does.
     ///
-    /// Required for the Q4_K targets: their mixes promote
-    /// `output.weight` to Q6_K and several per-layer tensors to Q5_K or
-    /// Q6_K, and ferrox has no encoder for either, so it can write the
-    /// pure file or nothing. A no-op for Q8_0, whose mix is already
-    /// uniform.
+    /// Optional, and it changes the file: without it a `Q4_K_M` output
+    /// head is Q6_K and a quarter of its `ffn_down` tensors are too.
+    /// This used to be MANDATORY for the K-quant mixes, because ferrox
+    /// had no Q5_K or Q6_K encoder to promote anything to.
     #[arg(long)]
     pub pure: bool,
 
@@ -88,7 +92,7 @@ struct Planned {
 }
 
 pub fn run(args: QuantizeArgs) -> Result<()> {
-    let target = parse_target(&args.ty, args.pure).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let target = parse_target(&args.ty).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let file =
         GgufFile::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
@@ -124,7 +128,7 @@ pub fn run(args: QuantizeArgs) -> Result<()> {
         }
     }
 
-    let planned = plan(&file, target)?;
+    let planned = plan(&file, target, args.pure)?;
 
     let mut metadata: BTreeMap<String, GgufValue> = file
         .metadata
@@ -211,7 +215,7 @@ pub fn run(args: QuantizeArgs) -> Result<()> {
         if p.copy_reason.is_some() {
             writer.write_tensor(&p.name, src)?;
         } else {
-            let encoded = encode_tensor(p, src, target)?;
+            let encoded = encode_tensor(p, src)?;
             writer.write_tensor(&p.name, &encoded)?;
         }
     }
@@ -233,9 +237,35 @@ fn default_output_path(input: &Path, target: Target) -> PathBuf {
 /// single byte is written. The refusals here are the point: a tensor
 /// this build cannot encode must stop the run, not be quietly copied
 /// through at F16 into a file labelled Q8_0.
-fn plan(file: &GgufFile, target: Target) -> Result<Vec<Planned>> {
-    let block_elems = target.block_elems();
+fn plan(file: &GgufFile, target: Target, pure: bool) -> Result<Vec<Planned>> {
     let mut out = Vec::with_capacity(file.tensors.len());
+
+    // The mix is positional -- `i_attention_wv` and `i_ffn_down` are
+    // running counters -- and the order they advance in is llama.cpp's
+    // `weight_name_comparer`, NOT this file's tensor order. So the
+    // whole map is resolved up front by `resolve_all`, which owns that
+    // ordering, and this loop only looks types up. Walking
+    // `file.tensors` and asking per tensor was the obvious thing and it
+    // was wrong for 12 of Llama-3.2-1B's 113 tensors.
+    //
+    // `--pure` is llama.cpp's `if (!params->pure && ...)`: the mix is
+    // not consulted AND its counters do not advance, so there is
+    // nothing to resolve.
+    let chosen_types = if pure {
+        BTreeMap::new()
+    } else {
+        let tensors: Vec<(String, Vec<u64>)> = file
+            .tensors
+            .iter()
+            .map(|t| (t.name.clone(), t.shape.clone()))
+            .collect();
+        Recipe::resolve_all(
+            target,
+            ModelShape::from_header(file),
+            &tensors,
+            |name, shape| allows_quantization(name, shape).is_none(),
+        )
+    };
 
     for t in &file.tensors {
         let source_bytes = t.byte_len().ok_or_else(|| {
@@ -246,18 +276,37 @@ fn plan(file: &GgufFile, target: Target) -> Result<Vec<Planned>> {
                 t.dtype
             )
         })?;
+        let copy_through = |reason: &'static str| Planned {
+            name: t.name.clone(),
+            shape: t.shape.clone(),
+            source_dtype: t.dtype,
+            out_dtype: t.dtype,
+            source_bytes,
+            out_bytes: source_bytes,
+            copy_reason: Some(reason),
+        };
 
-        match disposition(&t.name, &t.shape, t.dtype, target) {
-            Disposition::Copy(reason) => out.push(Planned {
-                name: t.name.clone(),
-                shape: t.shape.clone(),
-                source_dtype: t.dtype,
-                out_dtype: t.dtype,
-                source_bytes,
-                out_bytes: source_bytes,
-                copy_reason: Some(reason),
-            }),
-            Disposition::Quantize => {
+        if let Some(reason) = allows_quantization(&t.name, &t.shape) {
+            out.push(copy_through(reason));
+            continue;
+        }
+
+        let chosen = if pure {
+            target.ggml_type()
+        } else {
+            // Every eligible tensor is in the map: `resolve_all` was
+            // given the same `allows_quantization` this loop just
+            // consulted. `expect` rather than a fallback, because a
+            // fallback here would silently write the target's block
+            // format for a tensor the mix meant to promote.
+            *chosen_types
+                .get(&t.name)
+                .expect("resolve_all and allows_quantization disagree about a tensor")
+        };
+
+        match disposition(t.dtype, chosen) {
+            Disposition::Copy(reason) => out.push(copy_through(reason)),
+            Disposition::Quantize(ty) => {
                 if !matches!(t.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
                     bail!(
                         "tensor '{}' is {:?}. `ferrox quantize` reads F32/F16/BF16 sources only: \
@@ -268,25 +317,31 @@ fn plan(file: &GgufFile, target: Target) -> Result<Vec<Planned>> {
                         t.dtype
                     );
                 }
+                let (block_bytes, block_elems) = ty.block_layout();
                 let n_cols = t.shape[0] as usize;
-                if !n_cols.is_multiple_of(block_elems) {
+                // The block size that matters is the CHOSEN type's, not
+                // the target's: under Q4_K_M an `output.weight` is Q6_K
+                // and a Q4_K-sized check would pass a row Q6_K cannot
+                // tile. Both are 256 today and would be the same
+                // number, which is exactly why reading it off the wrong
+                // one is a bug nothing would notice.
+                if block_elems == 0 || !n_cols.is_multiple_of(block_elems) {
                     bail!(
-                        "tensor '{}' has {n_cols} columns, which is not a multiple of {}'s block \
-                         size ({block_elems}). {}",
+                        "tensor '{}' has {n_cols} columns, which is not a multiple of {:?}'s \
+                         block size ({block_elems}). {}",
                         t.name,
-                        target.ggml_type_name(),
+                        ty,
                         target.fallback_note()
                     );
                 }
                 let n_elements = t.element_count().ok_or_else(|| {
                     anyhow::anyhow!("tensor '{}' declares an unrepresentable shape", t.name)
                 })?;
-                let (block_bytes, _) = target.ggml_type().block_layout();
                 out.push(Planned {
                     name: t.name.clone(),
                     shape: t.shape.clone(),
                     source_dtype: t.dtype,
-                    out_dtype: target.ggml_type(),
+                    out_dtype: ty,
                     source_bytes,
                     out_bytes: n_elements / block_elems * block_bytes,
                     copy_reason: None,
@@ -306,7 +361,7 @@ fn plan(file: &GgufFile, target: Target) -> Result<Vec<Planned>> {
 /// row-wise and flat tilings identical -- but relying on that instead
 /// of tiling per row is how the next format, with a 256-element block,
 /// would silently break.
-fn encode_tensor(p: &Planned, src: &[u8], target: Target) -> Result<Vec<u8>> {
+fn encode_tensor(p: &Planned, src: &[u8]) -> Result<Vec<u8>> {
     let n_cols = p.shape[0] as usize;
     let n_rows = (p.shape.iter().product::<u64>() as usize)
         .checked_div(n_cols)
@@ -323,17 +378,11 @@ fn encode_tensor(p: &Planned, src: &[u8], target: Target) -> Result<Vec<u8>> {
             for &r in rows {
                 let row = &src[r * src_row_bytes..(r + 1) * src_row_bytes];
                 decode_source_row(p.source_dtype, row, &mut scratch)?;
-                let encoded = match target {
-                    Target::Q8_0 => ferrox_quant::encode_row_q8_0(&scratch, &mut buf),
-                    Target::Q4_K_S | Target::Q4_K_M => {
-                        ferrox_quant::encode_row_q4_k(&scratch, &mut buf)
-                    }
-                };
-                encoded.ok_or_else(|| {
+                encode_row(p.out_dtype, &scratch, &mut buf)?.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "tensor '{}' row length {n_cols} is not a whole number of {} blocks",
+                        "tensor '{}' row length {n_cols} is not a whole number of {:?} blocks",
                         p.name,
-                        target.ggml_type_name()
+                        p.out_dtype
                     )
                 })?;
             }
@@ -347,6 +396,28 @@ fn encode_tensor(p: &Planned, src: &[u8], target: Target) -> Result<Vec<u8>> {
     }
     debug_assert_eq!(out.len(), p.out_bytes);
     Ok(out)
+}
+
+/// The one place a ggml type is turned into the encoder that writes it.
+///
+/// Keyed on the tensor's CHOSEN type, not on the target, because under
+/// a mix they differ per tensor: one `Q4_K_M` run writes Q4_K, Q5_K,
+/// Q6_K and Q8_0 rows. `Err` for a type `plan` should have refused
+/// before reaching here -- an encoder dispatch whose fallthrough
+/// silently copies or zero-fills is how a format becomes "supported" in
+/// a table and nowhere else.
+fn encode_row(ty: GgmlType, row: &[f32], out: &mut Vec<u8>) -> Result<Option<()>> {
+    Ok(match ty {
+        GgmlType::Q8_0 => ferrox_quant::encode_row_q8_0(row, out),
+        GgmlType::Q4K => ferrox_quant::encode_row_q4_k(row, out),
+        GgmlType::Q5K => ferrox_quant::encode_row_q5_k(row, out),
+        GgmlType::Q6K => ferrox_quant::encode_row_q6_k(row, out),
+        other => bail!(
+            "the mix chose {other:?} for a tensor and `ferrox quantize` has no encoder for it. \
+             This is a bug in the recipe table, not in the checkpoint: `plan` refuses an \
+             unwritable type before any byte is written."
+        ),
+    })
 }
 
 fn source_bytes_per_element(dtype: GgmlType) -> usize {
@@ -425,10 +496,15 @@ mod tests {
     /// dimension rule alone, so deleting `_norm.weight` from the
     /// keep-list would leave this test green -- which it did, until the
     /// sabotage pass found it.
-    /// `n_cols` is a parameter because the two targets have different
-    /// block sizes: 64 columns is a whole number of Q8_0 blocks and NOT
-    /// of Q4_K super-blocks, and a fixture that only ever had one width
+    /// `n_cols` is a parameter because the targets have different block
+    /// sizes: 64 columns is a whole number of Q8_0 blocks and NOT of
+    /// Q4_K super-blocks, and a fixture that only ever had one width
     /// could not tell the two refusals apart.
+    ///
+    /// `output.weight` is here so the MIX has something to promote. It
+    /// is the tensor every K-quant mix sends to Q6_K, so without it a
+    /// `--pure` run and a mixed run of this fixture would produce
+    /// identical files and the mix would be untested end to end.
     fn write_f16_source(path: &Path, n_cols: usize) -> Vec<f32> {
         let n = n_cols;
         let values: Vec<f32> = (0..n * 2)
@@ -450,6 +526,7 @@ mod tests {
         let one_d = f16_bytes(&values[..n]);
         let norm = f16_bytes(&values);
         let gate = f16_bytes(&values);
+        let head = f16_bytes(&values);
         let plan = vec![
             TensorPlan {
                 name: "blk.0.attn_q.weight".into(),
@@ -475,6 +552,12 @@ mod tests {
                 dtype: GgmlType::F16,
                 byte_len: gate.len(),
             },
+            TensorPlan {
+                name: "output.weight".into(),
+                shape: vec![n as u64, 2],
+                dtype: GgmlType::F16,
+                byte_len: head.len(),
+            },
         ];
         let f = std::fs::File::create(path).unwrap();
         let mut wr = GgufWriter::create(BufWriter::new(f), &metadata, plan).unwrap();
@@ -482,6 +565,7 @@ mod tests {
         wr.write_tensor("blk.0.attn_q.bias", &one_d).unwrap();
         wr.write_tensor("blk.0.attn_norm.weight", &norm).unwrap();
         wr.write_tensor("blk.0.ffn_gate_inp.weight", &gate).unwrap();
+        wr.write_tensor("output.weight", &head).unwrap();
         wr.finish().unwrap().into_inner().unwrap();
         values
     }
@@ -567,9 +651,12 @@ mod tests {
         let src = dir.join("src.gguf");
         let dst = dir.join("dst.gguf");
         write_f16_source(&src, 64);
-        let err = run(args(&src, &dst, "Q6_K")).unwrap_err();
+        // Q6_K used to be the example here and is writable now, which
+        // is what this change is for. Q3_K_M is the next mix up with no
+        // encoder.
+        let err = run(args(&src, &dst, "Q3_K_M")).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("cannot WRITE Q6_K"), "{msg}");
+        assert!(msg.contains("cannot WRITE Q3_K_M"), "{msg}");
         assert!(msg.contains("Q8_0"), "{msg}");
         assert!(!dst.exists(), "a refused run must not leave a file behind");
         std::fs::remove_dir_all(&dir).ok();
@@ -651,27 +738,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `--type q4_k_m` names a MIX, and ferrox has only the block
-    /// encoder for it. Writing uniform Q4_K under that name would
-    /// produce a file whose `general.file_type` says Q4_K_M while its
-    /// output head is four bits where llama.cpp's is six -- a file that
-    /// loads, runs, and is not what it says it is.
+    /// `--type q4_k_m` names a MIX, and the mix is now applied: the
+    /// same file quantized with and without `--pure` must DIFFER, and
+    /// differ in the tensor the mix promotes.
     ///
-    /// This is the refusal step 2 adds, and the one most likely to be
-    /// argued away later, so it is asserted through the real entry
-    /// point and it checks that nothing was written.
+    /// This replaces the refusal that used to stand here. It is the
+    /// assertion most likely to be argued away later ("Q4_K everywhere
+    /// is close enough"), so it goes through the real entry point and
+    /// names the tensor.
     #[test]
-    fn asking_for_the_q4_k_mix_without_pure_refuses_and_writes_nothing() {
+    fn the_q4_k_m_mix_promotes_the_output_head_and_pure_does_not() {
         let dir = tmp_dir("mix");
         let src = dir.join("src.gguf");
-        let dst = dir.join("dst.gguf");
         write_f16_source(&src, 256);
-        let err = run(args(&src, &dst, "q4_k_m")).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("cannot write llama.cpp's Q4_K_M MIX"), "{msg}");
-        assert!(msg.contains("Q5_K / Q6_K"), "{msg}");
-        assert!(msg.contains("Pass --pure"), "{msg}");
-        assert!(!dst.exists(), "a refused run must not leave a file behind");
+
+        let mixed = dir.join("mixed.gguf");
+        run(args(&src, &mixed, "q4_k_m")).unwrap();
+        let pure = dir.join("pure.gguf");
+        run(QuantizeArgs {
+            pure: true,
+            ..args(&src, &pure, "q4_k_m")
+        })
+        .unwrap();
+
+        let m = GgufFile::open(&mixed).unwrap();
+        let p = GgufFile::open(&pure).unwrap();
+        // The mix sends `output.weight` to Q6_K; `--pure` leaves it at
+        // the target's block format.
+        assert_eq!(m.find_tensor("output.weight").unwrap().dtype, GgmlType::Q6K);
+        assert_eq!(p.find_tensor("output.weight").unwrap().dtype, GgmlType::Q4K);
+        // And the tensor the mix does NOT touch is Q4_K in both.
+        for f in [&m, &p] {
+            assert_eq!(
+                f.find_tensor("blk.0.attn_q.weight").unwrap().dtype,
+                GgmlType::Q4K
+            );
+        }
+        // Both still declare Q4_K_M, which is precisely why the bytes
+        // having to differ is worth asserting: `general.file_type`
+        // alone cannot tell the two files apart.
+        assert_eq!(m.metadata_u64("general.file_type"), Some(15));
+        assert_eq!(p.metadata_u64("general.file_type"), Some(15));
+        assert_ne!(
+            std::fs::read(&mixed).unwrap(),
+            std::fs::read(&pure).unwrap()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -749,7 +860,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("not a multiple of Q4_K's block size (256)"),
+            msg.contains("not a multiple of Q4K's block size (256)"),
             "{msg}"
         );
         assert!(msg.contains("Q4_K -> Q5_0"), "{msg}");
