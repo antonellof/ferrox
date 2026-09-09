@@ -91,6 +91,35 @@ pub fn interleaved_gemm_is_accelerated(interleave: usize) -> bool {
     interleave == 8 && AccelX4::detect().is_simd()
 }
 
+/// The qs interleave width a matrix should be packed with on this host:
+/// 8 wherever the `×4` GEMMs have a SIMD kernel, 4 otherwise.
+///
+/// **One width, derived from the kernel choice.** The five
+/// `q*_interleave` entry points below used to answer this separately,
+/// and they had already drifted: the K-quants returned 8 on x86
+/// unconditionally while Q8_0 and Q4_0 returned 4 there, so packing an
+/// x86 host for the AVX2 GEMM would have given three kinds the layout
+/// its kernel reads and two kinds a layout with none. Asking
+/// [`AccelX4::detect`] once removes that possibility instead of fixing
+/// its instance.
+///
+/// The width is a pure function of the host, so it is constant for the
+/// life of the process — which is what lets the repack cache in
+/// `ferrox_core::weight_matrix::repack_cache` key on `(mapping, format,
+/// rows, cols)` without the width in the key. If this ever became a
+/// per-matrix choice, the width would have to join that key: two
+/// packings of one matrix at different widths are different bytes, and
+/// serving one where the other was asked for is a wrong answer rather
+/// than a panic.
+#[inline]
+pub fn preferred_interleave() -> usize {
+    if AccelX4::detect().is_simd() {
+        8
+    } else {
+        4
+    }
+}
+
 /// Decode one 12-byte packed scale/min group into 8 scales + 8 mins (u8).
 #[inline]
 pub(crate) fn decode_scales_mins(

@@ -18,20 +18,12 @@ pub const Q6_KX8_BLOCK_BYTES: usize = 1680;
 /// Number of Q6_K rows packed into one interleaved block.
 pub const Q6_KX8_NROWS: usize = 8;
 
-/// Preferred ql/qh interleave width: 8 on x86 AVX2 and ARM i8mm
-/// (`ggml_gemm_q6_K_8x8_q8_K`), 4 on DotProd-only NEON.
+/// Preferred ql/qh interleave width: 8 where a `×4` GEMM kernel exists
+/// (x86 AVX2 and ARM i8mm), 4 on DotProd-only NEON. One answer for
+/// every kind — see [`preferred_interleave`].
 #[inline]
 pub fn q6_kx8_interleave() -> usize {
-    if cfg!(target_arch = "x86_64") {
-        return 8;
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("i8mm") {
-            return 8;
-        }
-    }
-    4
+    preferred_interleave()
 }
 
 /// Pack eight canonical Q6_K super-blocks into one `block_q6_Kx8`.

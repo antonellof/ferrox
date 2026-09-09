@@ -713,10 +713,21 @@ mod tests {
     ///
     /// Sabotage: make `get_or_repack_q8x4` pass `None` instead of
     /// `data.map_id()` and this goes red.
+    ///
+    /// Two preconditions, both of which have to hold before there is
+    /// anything to assert. The budget must be non-zero, or nothing is
+    /// retained by design. And `apply_cpu_q8` is a MATVEC, so it only
+    /// exists on a host that takes the matvec half of the int-dot tier
+    /// (#152 turned that half off on x86, where it measured 4x to 8.8x
+    /// slower than the AVX2 f32 dot). Where it does not, the guard skips
+    /// rather than asserting a `None` is a `Some`.
     #[test]
     fn apply_cpu_q8_caches_the_packing_of_a_mapped_matrix() {
         let _force = ForceIntDot::new(true);
         let _budget = ForceBudget::generous();
+        if !super::super::cpu_int_dot_for(super::super::IntDotShape::Matvec) {
+            return;
+        }
         let (rows, cols) = (8usize, 64usize);
         let bytes = q8_0_matrix_bytes(rows, cols, 23);
         let (_mmap, view) = mapped("apply_q8", &bytes);
@@ -824,6 +835,87 @@ mod tests {
             !q8x4_is_cached(first, rows, cols),
             "ten packings into a three-packing budget must have evicted \
              the least recently used one"
+        );
+    }
+
+    /// The batched GEMM path answers the same with the cache holding its
+    /// packing and with the cache disabled.
+    ///
+    /// This is where #152 and #158 have to compose. #152 turns the
+    /// batch half of the int-dot tier ON for x86, so a prefill there now
+    /// repacks matrices that nothing repacked before; #158 bounds what
+    /// those packings may retain. They meet at `get_or_repack_*`, which
+    /// is the ONE budgeted lookup either half reaches -- the batch path
+    /// opens no cache of its own, so there is one pool, not two.
+    ///
+    /// What must hold across that meeting is that the budget decides
+    /// only where the interleaved bytes LIVE, never what they are. A
+    /// miss under a tight budget returns a fresh packing and the GEMM
+    /// must produce bit-identical output, or a memory-constrained host
+    /// would silently answer differently from a roomy one.
+    ///
+    /// So the generous side runs the GEMM TWICE: once cold, which
+    /// misses and inserts, and once warm, which is served the retained
+    /// packing. Comparing warm against cold is what puts the hit path
+    /// under test; comparing either against the zero-budget run is what
+    /// puts the budget under test. A first draft compared one cold run
+    /// against one zero-budget run and survived zeroing the miss path,
+    /// because that corrupts both sides identically -- it asserted that
+    /// two equally wrong answers agreed.
+    ///
+    /// Sabotage: return zeroed bytes from `Cache::take_hit`, and this
+    /// goes red where the miss-path version did not.
+    #[test]
+    fn the_batch_path_answers_the_same_with_the_cache_full_and_disabled() {
+        let _force = ForceIntDot::new(true);
+        if !super::super::cpu_int_dot_for(super::super::IntDotShape::BatchGemm) {
+            return;
+        }
+        // Two row-groups plus a tail, and a batch that straddles the
+        // 4-wide activation quad, so the GEMM takes both its full-tile
+        // and partial-tile paths under each budget.
+        let (rows, cols, batch) = (19usize, 64usize, 6usize);
+        let bytes = q8_0_matrix_bytes(rows, cols, 71);
+        let (_mmap, view) = mapped("batch_budget", &bytes);
+        let m = WeightMatrix::Quantized {
+            data: view,
+            rows,
+            cols,
+            kind: QuantKind::Q8_0,
+        };
+        let x: Vec<f32> = (0..batch * cols)
+            .map(|i| ((i as f32) * 0.013 - 0.7).sin() * 1.4)
+            .collect();
+
+        let cached = {
+            let _budget = ForceBudget::generous();
+            let cold = m.apply_batch(&x, batch);
+            assert!(
+                resident_bytes() > 0,
+                "a generous budget retained nothing, so the second call \
+                 below would miss too and the hit path would go untested"
+            );
+            let warm = m.apply_batch(&x, batch);
+            assert_eq!(
+                cold.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                warm.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "the retained packing served a different answer than the \
+                 one that built it"
+            );
+            warm
+        };
+        let uncached = {
+            let _budget = ForceBudget::new(0);
+            let out = m.apply_batch(&x, batch);
+            assert_eq!(resident_bytes(), 0, "a zero budget retained something");
+            out
+        };
+
+        assert_eq!(
+            cached.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            uncached.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the repack budget changed the answer, not just where the \
+             interleaved bytes live"
         );
     }
 

@@ -383,6 +383,11 @@ pub fn cuda_dense_enabled() -> bool {
 /// crate's golden cross-validation against the independent NumPy
 /// reference asserts exact agreement. So the *inference product*
 /// defaults to fast and the *library default* stays reference-exact.
+///
+/// **This is the master switch, not the dispatch rule.** It says whether
+/// the tier is on at all; whether a given piece of work should take it
+/// is [`cpu_int_dot_for`], which also asks whether this host has the
+/// kernel for that workload's shape. Production dispatch calls that one.
 pub fn cpu_int_dot_enabled() -> bool {
     #[cfg(test)]
     {
@@ -455,14 +460,119 @@ pub unsafe fn default_cpu_int_dot_on() {
 /// is consistent: prefill goes through the batched GEMM rather than
 /// this dot.
 ///
-/// aarch64 keeps the default, where it is worth ~28% and the kernels it
-/// selects are the ones that were actually written.
+/// **That measurement is per WORKLOAD, and the flag was per process.**
+/// It says the matvec half of the tier loses on x86 and says nothing
+/// against the batch half; the batch half simply had no x86 kernel to
+/// try, which is #152. Now that it does, the rule is
+/// [`int_dot_tier_here`] and this function is only its "is any half
+/// worth turning on by default" summary.
 ///
 /// This is a DEFAULT, not a gate: `FERROX_CPU_INT_DOT=1` still turns it
-/// on anywhere, which is what an x86 VNNI implementation would want in
-/// order to measure itself against the f32 path.
+/// on anywhere.
 fn int_dot_is_a_win_here() -> bool {
-    cfg!(target_arch = "aarch64")
+    let tier = int_dot_tier_here();
+    tier.matvec || tier.batch_gemm
+}
+
+/// Which shape of work a call site is asking the repacked integer tier
+/// for. Not a hint: the two are different kernels and, on x86, different
+/// answers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntDotShape {
+    /// One activation against the whole matrix — `apply`, `apply_cpu_q8`,
+    /// the MoE per-expert dots. Decode, and the `nrc == 1` GEMV kernels.
+    Matvec,
+    /// A batch of activations at once, through the interleaved `×4`
+    /// GEMMs. Prefill.
+    BatchGemm,
+}
+
+/// **The** predicate for "does this work take the repacked integer
+/// tier". Every call site asks this and none restates it.
+///
+/// Two things have to be true: `FERROX_CPU_INT_DOT` is on (the master
+/// switch, [`cpu_int_dot_enabled`]), and this host has kernels worth
+/// taking for `shape` ([`int_dot_tier_here`]).
+///
+/// Splitting by shape is the whole point. The tier used to be one
+/// process-wide flag over two unrelated kernel families, so x86 had to
+/// choose between a batched GEMM it wanted and a matvec that cost it 4x
+/// to 8.8x of decode — and chose neither.
+pub fn cpu_int_dot_for(shape: IntDotShape) -> bool {
+    cpu_int_dot_enabled() && int_dot_tier_here().covers(shape)
+}
+
+/// Which halves of the repacked integer tier are worth taking on this
+/// host.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct IntDotTier {
+    matvec: bool,
+    batch_gemm: bool,
+}
+
+impl IntDotTier {
+    /// Exhaustive on purpose, with no `_` arm: a third workload shape
+    /// must state its own answer rather than inherit one.
+    fn covers(self, shape: IntDotShape) -> bool {
+        match shape {
+            IntDotShape::Matvec => self.matvec,
+            IntDotShape::BatchGemm => self.batch_gemm,
+        }
+    }
+}
+
+/// The per-host, per-workload rule, in one place.
+///
+/// - **aarch64**: both halves. The interleave-8 NEON GEMV and the i8mm
+///   SMMLA GEMMs are the kernels this tier was written for, worth ~28%
+///   of decode and 15x of prefill (`FERROX_CPU_INT_DOT=0` takes
+///   Llama-3.2-1B Q4_K_M pp512 from 420.34 to 27.81 tok/s, #152).
+/// - **x86_64**: the batch half only, and only when the AVX2 `×4` GEMMs
+///   are actually present. The matvec half stays off because it was
+///   MEASURED to lose — see the table above — and nothing in this change
+///   touches the kernel it loses to.
+/// - anywhere else: neither, because neither has a kernel.
+///
+/// `batch_gemm` is not a written-down claim about x86; it asks
+/// `ferrox_quant` whether the `×4` GEMMs have a SIMD kernel at the width
+/// this host packs with. A kind cannot be told the tier is a win while
+/// its kernel is missing, and an x86 host without AVX2 gets the same
+/// answer a RISC-V one does.
+///
+/// # On the `cfg!` in here
+///
+/// `par::policy` warns against exactly this shape — "an
+/// architecture-conditional default is what `FERROX_CPU_INT_DOT` was" —
+/// and it is right that an *unmeasured* one is how this went wrong.
+/// This one is the measurement: the x86 matvec row above is a real
+/// before/after on a quiet host, and the x86 batch row is gated on a
+/// runtime probe rather than a guess. The two predicates also answer
+/// different questions and must not be merged: `policy::backend` picks
+/// the SCHEDULER by work size; this picks the KERNEL by workload shape.
+fn int_dot_tier_here() -> IntDotTier {
+    #[cfg(target_arch = "aarch64")]
+    {
+        IntDotTier {
+            matvec: true,
+            batch_gemm: true,
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        IntDotTier {
+            matvec: false,
+            batch_gemm: ferrox_quant::interleaved_gemm_is_accelerated(
+                ferrox_quant::preferred_interleave(),
+            ),
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        IntDotTier {
+            matvec: false,
+            batch_gemm: false,
+        }
+    }
 }
 
 /// A batch of activations quantized once for reuse across several
@@ -1092,12 +1202,19 @@ impl WeightMatrix {
                 // FERROX_CPU_INT_DOT=1: quantize the shared activation once,
                 // then every row dot is int8×int8 → i32 (llama.cpp CPU matmul).
                 // Q8_0/Q4_0 use 32-elem Q8_0 acts; Q4_K/Q5_K/Q6_K use Q8_K.
-                if cpu_int_dot_enabled() {
+                if cpu_int_dot_for(IntDotShape::Matvec) {
                     match *kind {
                         QuantKind::Q8_0 if x.len().is_multiple_of(32) => {
                             let act = ferrox_quant::quantize_activations_q8(x);
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             let serial = Self::prefer_serial_matvec(*rows, *cols);
+                            // Probed once per matvec, not once per row-group:
+                            // `q*_interleave` reads a CPU feature bit, and LLVM
+                            // cannot hoist that relaxed atomic load out of the
+                            // caller's loop. `is_aarch64_feature_detected!` ran
+                            // 131k times in one Mistral-7B projection before the
+                            // last one of these was hoisted.
+                            let interleave = ferrox_quant::q8_0x4_interleave();
                             if n_groups > 0 {
                                 let packed = get_or_repack_q8x4(data, *rows, *cols);
                                 if serial {
@@ -1106,12 +1223,7 @@ impl WeightMatrix {
                                         .enumerate()
                                     {
                                         ferrox_quant::gemv_q8_0x4_group(
-                                            &packed,
-                                            g,
-                                            &act,
-                                            *cols,
-                                            ferrox_quant::q8_0x4_interleave(),
-                                            chunk,
+                                            &packed, g, &act, *cols, interleave, chunk,
                                         );
                                     }
                                 } else {
@@ -1121,12 +1233,7 @@ impl WeightMatrix {
                                         Self::min_rows_per_task(n_groups).max(1),
                                         |g, chunk| {
                                             ferrox_quant::gemv_q8_0x4_group(
-                                                &packed,
-                                                g,
-                                                &act,
-                                                *cols,
-                                                ferrox_quant::q8_0x4_interleave(),
-                                                chunk,
+                                                &packed, g, &act, *cols, interleave, chunk,
                                             );
                                         },
                                     );
@@ -1176,6 +1283,13 @@ impl WeightMatrix {
                             let act = ferrox_quant::quantize_activations_q8(x);
                             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
                             let serial = Self::prefer_serial_matvec(*rows, *cols);
+                            // Probed once per matvec, not once per row-group:
+                            // `q*_interleave` reads a CPU feature bit, and LLVM
+                            // cannot hoist that relaxed atomic load out of the
+                            // caller's loop. `is_aarch64_feature_detected!` ran
+                            // 131k times in one Mistral-7B projection before the
+                            // last one of these was hoisted.
+                            let interleave = ferrox_quant::q4_0x4_interleave();
                             if n_groups > 0 {
                                 let packed = get_or_repack_q4_0x4(data, *rows, *cols);
                                 if serial {
@@ -1184,12 +1298,7 @@ impl WeightMatrix {
                                         .enumerate()
                                     {
                                         ferrox_quant::gemv_q4_0x4_group(
-                                            &packed,
-                                            g,
-                                            &act,
-                                            *cols,
-                                            ferrox_quant::q4_0x4_interleave(),
-                                            chunk,
+                                            &packed, g, &act, *cols, interleave, chunk,
                                         );
                                     }
                                 } else {
@@ -1199,12 +1308,7 @@ impl WeightMatrix {
                                         Self::min_rows_per_task(n_groups).max(1),
                                         |g, chunk| {
                                             ferrox_quant::gemv_q4_0x4_group(
-                                                &packed,
-                                                g,
-                                                &act,
-                                                *cols,
-                                                ferrox_quant::q4_0x4_interleave(),
-                                                chunk,
+                                                &packed, g, &act, *cols, interleave, chunk,
                                             );
                                         },
                                     );
@@ -1420,7 +1524,9 @@ impl WeightMatrix {
         else {
             return None;
         };
-        if !matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0) || !cpu_int_dot_enabled() {
+        if !matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0)
+            || !cpu_int_dot_for(IntDotShape::Matvec)
+        {
             return None;
         }
         if act.q.len() != *cols || !cols.is_multiple_of(32) {
@@ -1437,15 +1543,15 @@ impl WeightMatrix {
             if n_groups > 0 {
                 let packed = get_or_repack_q8x4(data, *rows, *cols);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
+                // Probed once per matvec, not once per row-group:
+                // `q*_interleave` reads a CPU feature bit, and LLVM
+                // cannot hoist that relaxed atomic load out of the
+                // caller's loop. `is_aarch64_feature_detected!` ran
+                // 131k times in one Mistral-7B projection before the
+                // last one of these was hoisted.
+                let interleave = ferrox_quant::q8_0x4_interleave();
                 let body = |g: usize, chunk: &mut [f32]| {
-                    ferrox_quant::gemv_q8_0x4_group(
-                        &packed,
-                        g,
-                        act,
-                        *cols,
-                        ferrox_quant::q8_0x4_interleave(),
-                        chunk,
-                    );
+                    ferrox_quant::gemv_q8_0x4_group(&packed, g, act, *cols, interleave, chunk);
                 };
                 if serial {
                     for (g, chunk) in out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
@@ -1492,15 +1598,15 @@ impl WeightMatrix {
             if n_groups > 0 {
                 let packed = get_or_repack_q4_0x4(data, *rows, *cols);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
+                // Probed once per matvec, not once per row-group:
+                // `q*_interleave` reads a CPU feature bit, and LLVM
+                // cannot hoist that relaxed atomic load out of the
+                // caller's loop. `is_aarch64_feature_detected!` ran
+                // 131k times in one Mistral-7B projection before the
+                // last one of these was hoisted.
+                let interleave = ferrox_quant::q4_0x4_interleave();
                 let body = |g: usize, chunk: &mut [f32]| {
-                    ferrox_quant::gemv_q4_0x4_group(
-                        &packed,
-                        g,
-                        act,
-                        *cols,
-                        ferrox_quant::q4_0x4_interleave(),
-                        chunk,
-                    );
+                    ferrox_quant::gemv_q4_0x4_group(&packed, g, act, *cols, interleave, chunk);
                 };
                 if serial {
                     for (g, chunk) in out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
@@ -1580,7 +1686,9 @@ impl WeightMatrix {
         else {
             return None;
         };
-        if !matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0) || !cpu_int_dot_enabled() {
+        if !matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0)
+            || !cpu_int_dot_for(IntDotShape::Matvec)
+        {
             return None;
         }
         if act.q.len() != *cols || !cols.is_multiple_of(32) || row + 1 >= *rows {
@@ -1614,7 +1722,7 @@ impl WeightMatrix {
         };
         if row >= *rows
             || !matches!(*kind, QuantKind::Q8_0 | QuantKind::Q4_0)
-            || !cpu_int_dot_enabled()
+            || !cpu_int_dot_for(IntDotShape::Matvec)
             || act.q.len() != *cols
             || !cols.is_multiple_of(32)
         {
@@ -1688,7 +1796,7 @@ impl WeightMatrix {
         let WeightMatrix::Quantized { cols, kind, .. } = self else {
             return None;
         };
-        if !cpu_int_dot_enabled() || x_batch.len() != batch_size * cols {
+        if !cpu_int_dot_for(IntDotShape::BatchGemm) || x_batch.len() != batch_size * cols {
             return None;
         }
         let cols = *cols;
@@ -1925,7 +2033,7 @@ impl WeightMatrix {
 
                 // Prefill INT_DOT: quantize each activation once, then
                 // reuse Q8 packs across all weight rows (llama CPU path).
-                if cpu_int_dot_enabled() {
+                if cpu_int_dot_for(IntDotShape::BatchGemm) {
                     match *kind {
                         QuantKind::Q8_0 if cols.is_multiple_of(32) => {
                             let mut acts_owned = Vec::new();
@@ -3239,8 +3347,8 @@ impl WeightMatrix {
         // record its tier too: integer vec_dot, or the much slower f32
         // dequant-dot.
         if !matvec || !gemm {
-            let int_dot =
-                cpu_int_dot_enabled() && kind.is_some_and(|k| cpu_int_dot_kind_supported(k, cols));
+            let int_dot = cpu_int_dot_for(IntDotShape::Matvec)
+                && kind.is_some_and(|k| cpu_int_dot_kind_supported(k, cols));
             reg.record_build_at(
                 loc,
                 Lookup {
@@ -3577,7 +3685,7 @@ mod tests {
         // each element moves by at most `d/2`, and the dot's error is
         // bounded by that times the row's L1 norm.
         let bound = |row: &[f32]| {
-            if !cpu_int_dot_enabled() {
+            if !cpu_int_dot_for(IntDotShape::Matvec) {
                 return 1e-4;
             }
             let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -3800,6 +3908,13 @@ mod tests {
 
     #[test]
     fn apply_batch_with_batch_size_one_matches_apply() {
+        // Pinned, not inherited. This asserts `apply` and `apply_batch`
+        // are BIT-identical, which is only true while both take the same
+        // kernel -- and since #152 they do not on x86, where the batch
+        // half of the int-dot tier is taken and the matvec half is not.
+        // The override is process-global, so without the guard a
+        // concurrent test holding it on decides this one's result.
+        let _int_dot = ForceIntDot::new(false);
         let weights: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.13).collect();
         let x: Vec<f32> = (0..32).map(|i| (i as f32) * 0.02 - 0.3).collect();
 
@@ -3920,9 +4035,28 @@ mod tests {
             .fold(0.0f32, |a, v| a.max(v.abs()))
             .max(1.0);
         // A GPU build compares Metal against the CPU; a CPU build
-        // compares the CPU against itself.
+        // compares the CPU against itself -- UNLESS this host takes only
+        // one half of the int-dot tier, in which case `apply` and
+        // `apply_batch` are not the same arithmetic at all.
+        //
+        // That is x86 since #152: the batch half runs the AVX2
+        // interleaved GEMM over an int8-quantized activation while the
+        // matvec half stays on the f32 AVX2 dot, because the int8 matvec
+        // measured 4x to 8.8x slower there. The gap between the two
+        // sides is then the ACTIVATION quantization floor -- each element
+        // of `x` moves by up to `d/2` at `d = amax/127` -- not float
+        // summation order, and a 1e-4 bar describes the wrong thing.
+        //
+        // Measured across every shape in these tests on a linux/amd64
+        // container with real AVX2 (2026-09-09): worst 7.9e-3 of the row
+        // scale. 6e-2 keeps a 7.6x margin, the same discipline as
+        // `int_dot_batch_matches_dequant_dot_reference`, and is still far
+        // inside a mis-pack, which decorrelates the two outputs entirely.
+        let mixed = cpu_int_dot_for(IntDotShape::Matvec) != cpu_int_dot_for(IntDotShape::BatchGemm);
         let bound = if cfg!(any(feature = "metal", feature = "cuda")) {
             5e-3
+        } else if mixed {
+            6e-2
         } else {
             1e-4
         };
@@ -4001,7 +4135,7 @@ mod tests {
         assert_eq!(batched.len(), batch_size * rows);
         let ctx = format!(
             "rows {rows} cols {cols} batch_size {batch_size} int_dot {}",
-            cpu_int_dot_enabled()
+            cpu_int_dot_for(IntDotShape::BatchGemm)
         );
         for b in 0..batch_size {
             let x = &x_batch[b * cols..(b + 1) * cols];
@@ -4108,7 +4242,14 @@ mod tests {
     #[test]
     fn int_dot_batch_matches_dequant_dot_reference() {
         let _g = ForceIntDot::new(true);
-        assert!(cpu_int_dot_enabled(), "this test needs the packed path");
+        // The batch half needs a SIMD `x4` GEMM, so a host without
+        // one (an x86 box with no AVX2, Rosetta included) has no
+        // packed path to test. Skipping is honest; asserting would
+        // make the suite red for a host that is behaving correctly.
+        assert!(cpu_int_dot_enabled(), "forcing on must enable int dot");
+        if !cpu_int_dot_for(IntDotShape::BatchGemm) {
+            return;
+        }
         for kind in BATCH_SHAPE_KINDS {
             // Rows straddle both tile widths: below the tile, one short
             // of it, exactly it, one past it, and multi-group with a
@@ -4192,6 +4333,11 @@ mod tests {
     /// than misused.
     #[test]
     fn apply_batch_with_shared_acts_matches_apply_batch() {
+        // Shared quads are built under one setting and consumed under
+        // another if a concurrent test flips the global mid-run; pin it
+        // on, which is also the setting that gives this test something
+        // to compare.
+        let _int_dot = ForceIntDot::new(true);
         let rows = 19;
         let cols = 512;
         let batch_size = 6;
@@ -4327,7 +4473,11 @@ mod tests {
     /// INT_DOT build. Run the suite both ways.
     #[test]
     fn shared_quads_are_what_each_consumer_would_have_built_itself() {
-        if !cpu_int_dot_enabled() {
+        // The early return below reads a process-global, so it has to be
+        // pinned or a neighbour can turn the tier off between the check
+        // and the assertions it guards.
+        let _int_dot = ForceIntDot::new(true);
+        if !cpu_int_dot_for(IntDotShape::BatchGemm) {
             return;
         }
         let rows = 24;
@@ -4659,28 +4809,72 @@ mod tests {
 
 #[cfg(test)]
 mod int_dot_default_tests {
-    /// The int-dot default follows the architecture that has the
-    /// kernels, not the wish that every architecture did.
+    use super::{IntDotShape, IntDotTier};
+
+    /// The int-dot rule follows the kernels that exist, per workload,
+    /// not the wish that every architecture had every kernel.
     ///
-    /// Turning it on where the interleaved kernels do not exist selects
-    /// a scalar integer loop and skips the AVX2 f32 dot that does, which
-    /// measured 4x to 8.8x of x86 decode (#127). A future x86 VNNI
-    /// implementation should flip this deliberately, with its own
-    /// before/after, rather than by inheriting a default nobody
-    /// measured.
+    /// Taking the MATVEC half where the interleaved kernels do not exist
+    /// selects a scalar integer loop and skips the AVX2 f32 dot that
+    /// does, which measured 4x to 8.8x of x86 decode (#127). Adding AVX2
+    /// GEMMs (#152) does not change that: they are batch kernels, and
+    /// the matvec half of x86 is still the f32 dot's.
     #[test]
-    fn the_int_dot_default_is_on_only_where_its_kernels_are() {
-        let on_by_default = super::int_dot_is_a_win_here();
+    fn the_matvec_half_is_taken_only_where_its_kernels_are() {
         assert_eq!(
-            on_by_default,
+            super::int_dot_tier_here().matvec,
             cfg!(target_arch = "aarch64"),
-            "int-dot defaults on for aarch64 (i8mm, interleave-8 NEON) and off elsewhere"
+            "the matvec half is aarch64's (i8mm, interleave-8 NEON) and nowhere else; \
+             x86 measured 4x to 8.8x slower with it on"
         );
-        // The env var still wins in both directions: this is a default,
-        // not a gate, so an x86 VNNI port can measure itself.
-        assert!(
-            !on_by_default || cfg!(target_arch = "aarch64"),
-            "no architecture may default on without the kernels"
+    }
+
+    /// The BATCH half is not a `cfg!` claim: it asks the kernels.
+    ///
+    /// A host may only be told the batch tier is a win if
+    /// `ferrox_quant` reports a SIMD `×4` GEMM at the width this host
+    /// packs with. That is what stops the two structures — the list of
+    /// architectures believed to have kernels, and the kernels — from
+    /// drifting apart, which is how the 4x-to-8.8x regression happened
+    /// in the first place.
+    #[test]
+    fn the_batch_half_is_taken_only_where_a_simd_gemm_answers_for_it() {
+        assert_eq!(
+            super::int_dot_tier_here().batch_gemm,
+            ferrox_quant::interleaved_gemm_is_accelerated(ferrox_quant::preferred_interleave())
+                && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")),
+            "the batch half must agree with the kernel probe, not with a written-down list"
         );
+    }
+
+    /// `int_dot_is_a_win_here` — the thing `default_cpu_int_dot_on`
+    /// consults — is the OR of the two halves, so a host with only the
+    /// batch half still gets the env default it needs to reach it.
+    #[test]
+    fn the_default_is_on_when_either_half_is_a_win() {
+        let tier = super::int_dot_tier_here();
+        assert_eq!(
+            super::int_dot_is_a_win_here(),
+            tier.matvec || tier.batch_gemm
+        );
+    }
+
+    /// `covers` must actually separate the two shapes, in both
+    /// directions — otherwise every call site below asks a question with
+    /// one answer and the split is decoration.
+    #[test]
+    fn covers_answers_per_shape_rather_than_per_host() {
+        let matvec_only = IntDotTier {
+            matvec: true,
+            batch_gemm: false,
+        };
+        let batch_only = IntDotTier {
+            matvec: false,
+            batch_gemm: true,
+        };
+        assert!(matvec_only.covers(IntDotShape::Matvec));
+        assert!(!matvec_only.covers(IntDotShape::BatchGemm));
+        assert!(!batch_only.covers(IntDotShape::Matvec));
+        assert!(batch_only.covers(IntDotShape::BatchGemm));
     }
 }

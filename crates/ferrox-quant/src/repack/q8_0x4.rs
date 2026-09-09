@@ -20,18 +20,15 @@ pub const Q8_0X4_NROWS: usize = 4;
 /// DotProd-only default; [`q8_0x4_interleave`] picks 8 on i8mm hosts.
 pub const Q8_0X4_INTERLEAVE: usize = 4;
 
-/// Preferred qs interleave width: 8 on ARM i8mm (`ggml_gemm_q8_0_4x8_q8_0`
-/// via `ggml_repack_get_optimal_repack_type`), 4 on DotProd-only NEON and
-/// everywhere else (the scalar fallback handles either).
+/// Preferred qs interleave width: 8 where a `×4` GEMM kernel exists —
+/// ARM i8mm (`ggml_gemm_q8_0_4x8_q8_0` via
+/// `ggml_repack_get_optimal_repack_type`) and now x86 AVX2 — 4 on
+/// DotProd-only NEON and everywhere else, where the scalar fallback
+/// handles either. One answer for every kind — see
+/// [`preferred_interleave`].
 #[inline]
 pub fn q8_0x4_interleave() -> usize {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("i8mm") {
-            return 8;
-        }
-    }
-    Q8_0X4_INTERLEAVE
+    preferred_interleave()
 }
 
 /// Pack four canonical Q8_0 blocks (same column-block) into one

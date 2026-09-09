@@ -13,20 +13,13 @@ pub const Q4_KX8_BLOCK_BYTES: usize = 1152;
 /// Number of Q4_K rows packed into one interleaved block.
 pub const Q4_KX8_NROWS: usize = 8;
 
-/// Preferred qs interleave width for this CPU: 8 on x86 AVX2 and ARM i8mm
-/// (`ggml_gemm_q4_K_8x8_q8_K`), 4 on DotProd-only NEON (`ggml_gemm_q4_K_8x4_q8_K`).
+/// Preferred qs interleave width for this CPU: 8 where a `×4` GEMM
+/// kernel exists (`ggml_gemm_q4_K_8x8_q8_K` on x86 AVX2 and ARM i8mm),
+/// 4 on DotProd-only NEON (`ggml_gemm_q4_K_8x4_q8_K`). One answer for
+/// every kind — see [`preferred_interleave`].
 #[inline]
 pub fn q4_kx8_interleave() -> usize {
-    if cfg!(target_arch = "x86_64") {
-        return 8;
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("i8mm") {
-            return 8;
-        }
-    }
-    4
+    preferred_interleave()
 }
 
 /// Pack eight canonical Q4_K super-blocks (same column-block index) into
