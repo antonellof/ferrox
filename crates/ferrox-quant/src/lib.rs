@@ -14,6 +14,8 @@
 
 pub mod encode;
 pub use encode::q4_k::{encode_block_q4_k, encode_row_q4_k};
+pub use encode::q5_k::{encode_block_q5_k, encode_row_q5_k};
+pub use encode::q6_k::{encode_block_q6_k, encode_row_q6_k};
 pub use encode::{encode_block_q8_0, encode_row_q8_0};
 
 pub mod iq_tables;
