@@ -1,20 +1,21 @@
 {
-  "approx_params": 8046772224,
+  "accelerator": "Apple M2 Pro",
+  "approx_params": 1599078400,
   "arch": "llama",
   "backend": "metal",
   "backend_active": "Metal",
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.13.3",
-  "host_load_1min_end": 1.06,
-  "host_load_1min_start": 1.16,
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 1.76,
+  "host_load_1min_start": 1.91,
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
     "cpu": "Apple M2 Pro",
-    "label": "Apple M2 Pro (10c/6p) macOS 26.6.1",
-    "os": "macOS 26.6.1",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.2",
+    "os": "macOS 26.6.2",
     "perf_cores": 6,
     "ram_gb": 32.0
   },
@@ -32,39 +33,39 @@
     "pressure": "nominal",
     "source": "NSProcessInfo.thermalState"
   },
-  "id": "mistral_7b_q4km",
+  "id": "llama32_1b_q6k",
   "kind": "engine",
-  "load_s": 0.0053175,
-  "model_path": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
+  "load_s": 0.037645208,
+  "model_path": "models/Llama-3.2-1B-Instruct-Q6_K.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 4368439584,
+  "size_bytes": 1021800576,
   "tests": [
     {
       "ferrox_samples": [
-        271.2482605701998,
-        271.28149581742906,
-        271.34205275827543
+        1711.86359924337,
+        1712.8428926637969,
+        1711.4933174308862
       ],
-      "ferrox_stddev": 0.03882825329729505,
-      "ferrox_tps": 271.28149581742906,
-      "gap": 1.013817765827617,
-      "llama_tps": 275.03,
+      "ferrox_stddev": 0.5693541695283217,
+      "ferrox_tps": 1711.86359924337,
+      "gap": 1.0790287268310546,
+      "llama_tps": 1847.15,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        32.28576975857618,
-        32.39239642902932,
-        32.25259391373163
+        137.2637595524987,
+        135.4221792574669,
+        135.97249212747155
       ],
-      "ferrox_stddev": 0.05964210557486707,
-      "ferrox_tps": 32.28576975857618,
-      "gap": 0.9945558132920312,
-      "llama_tps": 32.11,
+      "ferrox_stddev": 0.7718400669740405,
+      "ferrox_tps": 135.97249212747155,
+      "gap": 0.9685782612304686,
+      "llama_tps": 131.7,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

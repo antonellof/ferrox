@@ -1,20 +1,21 @@
 {
-  "approx_params": 692846592,
-  "arch": "qwen3",
+  "accelerator": "Apple M2 Pro",
+  "approx_params": 1599078400,
+  "arch": "llama",
   "backend": "metal",
   "backend_active": "Metal",
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.13.3",
-  "host_load_1min_end": 1.88,
-  "host_load_1min_start": 1.95,
+  "ferrox_version": "0.17.1",
+  "host_load_1min_end": 1.55,
+  "host_load_1min_start": 1.68,
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
     "cpu": "Apple M2 Pro",
-    "label": "Apple M2 Pro (10c/6p) macOS 26.6.1",
-    "os": "macOS 26.6.1",
+    "label": "Apple M2 Pro (10c/6p) macOS 26.6.2",
+    "os": "macOS 26.6.2",
     "perf_cores": 6,
     "ram_gb": 32.0
   },
@@ -22,49 +23,49 @@
     "cpu_speed_limit_percent": null,
     "degraded": false,
     "measured": true,
-    "pressure": "fair",
+    "pressure": "nominal",
     "source": "NSProcessInfo.thermalState"
   },
   "host_thermal_start": {
     "cpu_speed_limit_percent": null,
     "degraded": false,
     "measured": true,
-    "pressure": "fair",
+    "pressure": "nominal",
     "source": "NSProcessInfo.thermalState"
   },
-  "id": "qwen3_06b_q8",
+  "id": "llama32_1b_q5km",
   "kind": "engine",
-  "load_s": 0.044061,
-  "model_path": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
+  "load_s": 0.038263083,
+  "model_path": "models/Llama-3.2-1B-Instruct-Q5_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 639446688,
+  "size_bytes": 911503488,
   "tests": [
     {
       "ferrox_samples": [
-        3312.799969346248,
-        3083.1270177395304,
-        3423.8788802846097
+        1648.793333658047,
+        1659.3709064968575,
+        1658.6387095337304
       ],
-      "ferrox_stddev": 141.89198590748717,
-      "ferrox_tps": 3312.799969346248,
-      "gap": 1.059291243803203,
-      "llama_tps": 3509.22,
+      "ferrox_stddev": 4.82300719568477,
+      "ferrox_tps": 1658.6387095337304,
+      "gap": 1.0219163403442384,
+      "llama_tps": 1694.99,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        159.5793752967888,
-        159.8129439432689,
-        159.4920262696625
+        129.3187713634484,
+        129.2953127671293,
+        129.2866771720509
       ],
-      "ferrox_stddev": 0.13547132471953735,
-      "ferrox_tps": 159.5793752967888,
-      "gap": 0.7179499217046094,
-      "llama_tps": 114.57,
+      "ferrox_stddev": 0.013560221094069392,
+      "ferrox_tps": 129.2953127671293,
+      "gap": 0.9018115003906249,
+      "llama_tps": 116.6,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }
