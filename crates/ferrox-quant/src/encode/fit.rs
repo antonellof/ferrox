@@ -26,6 +26,32 @@
 //! so asserting here would make ferrox stop where llama.cpp proceeds --
 //! a refusal that fires on input llama.cpp handles is not coverage, it
 //! is a different tool.
+//!
+//! # Every `mul_add` here is load-bearing. Do not "simplify" one.
+//!
+//! `sumlx += w*x[i]*l` in the C is **one fused multiply-add**, not a
+//! multiply followed by an add: the compiler that builds `libggml`
+//! contracts it, so the intermediate product is never rounded to f32.
+//! Rust does not contract, so every such site is spelled `mul_add`
+//! explicitly. Writing `sumlx += w * x[i] * l as f32` instead is one
+//! rounding more, and that rounding is not cosmetic: these fits choose
+//! between candidate scales with `sumlx*sumlx > best*suml2`, a
+//! comparison that is a near-tie often enough that ONE ulp flips which
+//! candidate wins and rewrites the whole super-block.
+//!
+//! Measured on an F16 Llama-3.2-1B, against the installed
+//! `llama-quantize` b7650: with these `mul_add`s, ferrox writes
+//! byte-identical files -- 0 of 3244032 Q4_K super-blocks differ, 0 of
+//! 3244032 Q5_K, 0 of 4827136 Q6_K. Remove them and it is 1.15%, 0.15%
+//! and 1.39% respectively. That is the entire difference between "a
+//! file llama.cpp would have written" and "a file that decodes to
+//! similar numbers".
+//!
+//! Nine of the thirteen sites have a real-weight super-block in
+//! `testdata::REAL_WEIGHT_BLOCKS` that turns a golden red when that one
+//! `mul_add` is removed; the fixture doc names the four that do not and
+//! why. Synthetic noise pins NONE of them, which is how they were
+//! nearly shipped wrong.
 
 use half::f16;
 
@@ -104,7 +130,7 @@ pub(crate) fn make_qkx2_quants(
         }
         let w = weights[i];
         sum_w += w;
-        sum_x += w * x[i];
+        sum_x = w.mul_add(x[i], sum_x);
     }
     if min > 0.0 {
         min = 0.0;
@@ -120,9 +146,9 @@ pub(crate) fn make_qkx2_quants(
     for i in 0..n {
         let li = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
         l[i] = li as u8;
-        let diff = scale * l[i] as f32 + min - x[i];
+        let diff = scale.mul_add(l[i] as f32, min) - x[i];
         let diff = if use_mad { diff.abs() } else { diff * diff };
-        best_error += weights[i] * diff;
+        best_error = weights[i].mul_add(diff, best_error);
     }
     if nstep < 1 {
         return (scale, -min);
@@ -135,23 +161,23 @@ pub(crate) fn make_qkx2_quants(
             let li = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
             laux[i] = li as u8;
             let w = weights[i];
-            sum_l += w * li as f32;
-            sum_l2 += w * li as f32 * li as f32;
-            sum_xl += w * li as f32 * x[i];
+            sum_l = w.mul_add(li as f32, sum_l);
+            sum_l2 = (w * li as f32).mul_add(li as f32, sum_l2);
+            sum_xl = (w * li as f32).mul_add(x[i], sum_xl);
         }
-        let det = sum_w * sum_l2 - sum_l * sum_l;
+        let det = sum_w.mul_add(sum_l2, -(sum_l * sum_l));
         if det > 0.0 {
-            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / det;
-            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+            let mut this_scale = sum_w.mul_add(sum_xl, -(sum_x * sum_l)) / det;
+            let mut this_min = sum_l2.mul_add(sum_x, -(sum_l * sum_xl)) / det;
             if this_min > 0.0 {
                 this_min = 0.0;
                 this_scale = sum_xl / sum_l2;
             }
             let mut cur_error = 0.0f32;
             for i in 0..n {
-                let diff = this_scale * laux[i] as f32 + this_min - x[i];
+                let diff = this_scale.mul_add(laux[i] as f32, this_min) - x[i];
                 let diff = if use_mad { diff.abs() } else { diff * diff };
-                cur_error += weights[i] * diff;
+                cur_error = weights[i].mul_add(diff, cur_error);
             }
             if cur_error < best_error {
                 l[..n].copy_from_slice(&laux[..n]);
@@ -244,8 +270,8 @@ pub(crate) fn make_qx_quants(
         let li = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
         l[i] = (li + nmax) as i8;
         let w = qx_weight(x, qw, rmse_type, i);
-        sumlx += w * x[i] * li as f32;
-        suml2 += w * li as f32 * li as f32;
+        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+        suml2 = (w * li as f32).mul_add(li as f32, suml2);
     }
     let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
     if return_early {
@@ -266,8 +292,8 @@ pub(crate) fn make_qx_quants(
         for i in 0..n {
             let li = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
             let w = qx_weight(x, qw, rmse_type, i);
-            sumlx += w * x[i] * li as f32;
-            suml2 += w * li as f32 * li as f32;
+            sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+            suml2 = (w * li as f32).mul_add(li as f32, suml2);
         }
         if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
             for i in 0..n {
