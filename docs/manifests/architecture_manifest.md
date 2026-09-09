@@ -32,6 +32,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `dots1` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `hunyuan-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `seed_oss` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `hunyuan-dense` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `exaone` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `bailingmoe2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `plamo3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -44,7 +45,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `apertus` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `exaone-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `grovemoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `hunyuan-dense` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `laguna` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `step35` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mistral` | TextGeneration | StandardGqa | KvGqa | generic-gqa |

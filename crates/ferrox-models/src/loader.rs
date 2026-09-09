@@ -242,12 +242,17 @@ const LEADING_DENSE_KEY_IS_INERT: &[&str] = &["bailingmoe"];
 /// - `hunyuan-moe`: `src/models/hunyuan-moe.cpp:93,104` rope, `:110,115`
 ///   norm.
 ///
+/// - `hunyuan-dense`: it has no graph of its own --
+///   `src/models/models.h:1830-1834` derives `llama_model_hunyuan_dense`
+///   from `llama_model_hunyuan_vl` and reuses its graph -- so the lines
+///   are `hunyuan-vl.cpp:56-66` (rope) then `:73-81` (norm). Its second
+///   blocker, the NTK-alpha RoPE base rescale, is implemented too; see
+///   [`crate::rope_ntk_alpha`].
+///
 /// The audited majority is the other way round -- `qwen3moe.cpp:99,108`
 /// and `bailingmoe2.cpp:123-135` both norm first -- which is why the
 /// decoder's default is "before" and this list is the exception.
-/// `hunyuan-dense` shares the ordering but is NOT here: it has a second
-/// blocker (`{arch}.rope.scaling.alpha`) and stays refusing.
-const QK_NORM_AFTER_ROPE_ARCHITECTURES: &[&str] = &["hunyuan-moe", "maincoder"];
+const QK_NORM_AFTER_ROPE_ARCHITECTURES: &[&str] = &["hunyuan-dense", "hunyuan-moe", "maincoder"];
 
 fn metadata_u64_any(file: &impl TensorSource, keys: &[String]) -> Option<u64> {
     keys.iter().find_map(|k| file.metadata_u64(k))
@@ -421,6 +426,19 @@ impl ModelConfig {
             best_effort_fields.push("rope_theta (no rope.freq_base key; defaulted to 10000.0)");
             10000.0
         });
+        // NTK-alpha: `{arch}.rope.scaling.alpha` is read for every
+        // architecture (llama-model.cpp:1186) and APPLIED by two
+        // (`hunyuan-vl.cpp:8-12`, inherited by `hunyuan-dense`). The
+        // list and the arithmetic live together in one module so the
+        // key's readers and its appliers cannot drift apart -- see
+        // `crate::rope_ntk_alpha`, which also records why a converted
+        // `hunyuan-dense` file carries the already-scaled base instead.
+        let rope_theta = crate::rope_ntk_alpha::ntk_alpha_scaled_rope_base(
+            &arch,
+            rope_theta,
+            head_dim,
+            metadata_f32_any(file, &[key("rope.scaling.alpha")]),
+        );
         let rms_norm_eps = metadata_f32_any(
             file,
             &[
@@ -488,6 +506,21 @@ impl ModelConfig {
         } else {
             metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize
         };
+        // The OTHER half of llama.cpp's dense-vs-MoE rule.
+        // `ModelConfig::layer_is_dense` implements the leading-dense
+        // prefix and not the `(il + 1) % n_moe_layer_step == 0` at
+        // `src/models/ernie4-5-moe.cpp:64`, so a file whose step would
+        // change the answer stops here rather than looking for expert
+        // tensors on a layer that stores dense ones. `moe_interleave`
+        // records what building the fixture found: llama.cpp cannot load
+        // such a file either, because its own tensor loader has no step
+        // in it.
+        if let Some(reason) = crate::moe_interleave::interleave_step_refusal(
+            &arch,
+            metadata_u64_any(file, &[key("interleave_moe_layer_step")]),
+        ) {
+            return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
+        }
 
         // ik_llama.cpp's real gating-function hparam
         // (LLM_KV_EXPERT_GATING_FUNC: 1=softmax, 2=sigmoid) if the file

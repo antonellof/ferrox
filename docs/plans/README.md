@@ -60,15 +60,15 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **23** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **26** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 34 |
+| Refuses as **unaudited**, now triaged | 31 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (11 of
+regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (26 of
 them audited), 58 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
@@ -78,15 +78,18 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 34 unaudited refusals split 1 fixture-away / 3 one-match-arm /
+The 31 unaudited refusals split 0 fixture-away / 1 one-match-arm /
 26 new-code / 4 unknown, each naming the `llama.cpp/src/models/*.cpp`
-line that decides it. Five of the seven one-match-arm rows were closed on
-2026-09-02 (`seed_oss`, `maincoder`, `bailingmoe`, `deepseek`,
-`hunyuan-moe`), each with a libllama-golden fixture.
+line that decides it. **Fixture-away is empty**: every row that only
+needed evidence has it, so what is left needs code or a reading. Five
+one-match-arm rows closed on 2026-09-02 (`seed_oss`, `maincoder`,
+`bailingmoe`, `deepseek`, `hunyuan-moe`), seven fixture-away rows on
+2026-09-03, and `gemma`, `hunyuan-dense` and `ernie4_5-moe` after them,
+each with a libllama-golden fixture.
 
 | | llama.cpp | ferrox |
 |---|---|---|
-| Per-architecture graphs | 140 hand-written | 150 catalog rows, **23 proven** |
+| Per-architecture graphs | 140 hand-written | 150 catalog rows, **26 proven** |
 | Metal `pp512` | baseline | 0.98x-1.10x, at parity |
 | Metal `tg128` | baseline | **8 of 12 rows faster** |
 | CPU, all rows | baseline | **1.41x-5.06x slower** |
