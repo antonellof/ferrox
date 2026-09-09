@@ -30,6 +30,7 @@ __device__ __forceinline__ void ferrox_dequant_sub(
 }
 "#,
     dequant_twin: dequant_sub_q8_0,
+    codebook: None,
 };
 
 /// Scalar twin of [`Q8_0`]'s `dequant_src`. Read the two side by side:
@@ -80,6 +81,7 @@ __device__ __forceinline__ void ferrox_dequant_sub(
 }
 "#,
     dequant_twin: dequant_sub_q4_0,
+    codebook: None,
 };
 
 /// Scalar twin of [`Q4_0`]'s `dequant_src`.
@@ -156,6 +158,7 @@ __device__ __forceinline__ void ferrox_dequant_sub(
 }
 "#,
     dequant_twin: dequant_sub_q5_0,
+    codebook: None,
 };
 
 /// Scalar twin of [`Q5_0`]'s `dequant_src`.

@@ -17,11 +17,15 @@
 //! 1. **It is a port, not a design.** The arithmetic comes from
 //!    `ferrox-metal`'s `mul_mm_sg_impl` (`crates/ferrox-metal/src/gpu.rs`),
 //!    which is at parity with llama.cpp on Metal and has goldens. The
-//!    per-kind unpack functions below are line-for-line transcriptions of
-//!    that file's `Q8_0Dequant` / `Q4_0Dequant` / `Q5_0Dequant` /
-//!    `Q5KDequant` / `Q6KDequant` functors, which are themselves
-//!    llama's `dequantize_q8_0` / `dequantize_q4_0` /
-//!    `dequantize_q5_0` / `dequantize_q5_K` / `dequantize_q6_K`.
+//!    per-kind unpack functions in [`crate::mul_mm_kinds`] are
+//!    line-for-line transcriptions of that file's `Q8_0Dequant` /
+//!    `Q4_0Dequant` / `Q5_0Dequant` / `Q5KDequant` / `Q6KDequant`
+//!    functors, which are themselves llama's `dequantize_q8_0` /
+//!    `dequantize_q4_0` / `dequantize_q5_0` / `dequantize_q5_K` /
+//!    `dequantize_q6_K`. The three codebook rows come from llama's
+//!    `ggml/src/ggml-cuda/dequantize.cuh` directly (`:408`, `:424`,
+//!    `:439`), because Metal has no MXFP4 and its IQ4_XS functor uses a
+//!    different sub-block partition.
 //! 2. **It has a scalar twin.** [`crate::mul_mm_ref`] emulates this
 //!    kernel on the CPU -- same tiling, same clamping, same index
 //!    arithmetic, same accumulation order -- and its tests, which run in
@@ -54,6 +58,18 @@
 //!    NOTHING. A tool that cannot fire is worse than no tool; `n_cols`
 //!    is now rounded up per kind. Sabotaging Q5_0's `qh` shift
 //!    (`12` for `16`) makes it report 6,096 mismatches.
+//!
+//!    Re-run on 2026-09-09 over all ELEVEN kinds -- the three codebook
+//!    formats, Q2_K and Q3_K included: **zero mismatches**, 75,042
+//!    compared positions.
+//!    That run was also the tool's first since the inner loop started
+//!    reading its operands as `float4` -- the host shim had no such
+//!    type, so every kind failed to compile and `set -e` aborted the
+//!    script. It was never green rather than green and blind, but the
+//!    effect on coverage was the same. Sabotaging IQ4_XS's `scales_h`
+//!    shift (`2 * il` for `2 * ib`) in the CUDA only makes it report
+//!    4,000 mismatches out of 4,096, and inverting Q3_K's `hmask` bias
+//!    test the same way reports 3,968.
 //!
 //! What none of that covers, and what only hardware can settle: that
 //! NVRTC accepts the source (clang and NVRTC are different front ends),
@@ -150,12 +166,62 @@ pub struct MulMmKind {
     /// `void ferrox_dequant_sub(const unsigned char* xb, int il, float* reg)`,
     /// writing `SUB` floats: the elements at `[SUB*il, SUB*il + SUB)`
     /// of the super-block at `xb`, in ascending element order.
+    ///
+    /// **The contract is that signature and nothing narrower.** It was
+    /// once informally "multiply the stored code by a scale and add a
+    /// bias", which is true of every affine format and true of no
+    /// codebook one: IQ4_NL, IQ4_XS and MXFP4 read a 4-bit code and
+    /// *index a table* with it. Those kinds fill [`Self::codebook`] and
+    /// look the value up; nothing else about the seam changes, which is
+    /// the point of the seam.
     pub dequant_src: &'static str,
+    /// The 16-entry table `dequant_src` indexes, for the formats whose
+    /// stored code is an index rather than a magnitude. `None` for the
+    /// affine kinds, which need no table.
+    ///
+    /// [`kernel_src`] emits this as a `__constant__` array ahead of
+    /// `dequant_src`, so it is visible to every thread of the block
+    /// without being reloaded per element.
+    pub codebook: Option<Codebook>,
     /// The scalar twin of `dequant_src`: the same arithmetic in Rust,
     /// on the host, in the same order. It sits in this struct rather
     /// than in a parallel table so a kind cannot be added without one --
     /// the untestable half and the testable half are the same row.
     pub dequant_twin: fn(xb: &[u8], il: usize, reg: &mut [f32; SUB]),
+}
+
+/// The 16-entry value table a codebook format's 4-bit code indexes.
+///
+/// One slice serves both halves of the kernel: [`kernel_src`] formats
+/// [`Self::values`] into the emitted `__constant__` array, and the Rust
+/// `dequant_twin` beside it indexes the same `values`. There is no
+/// second copy of the numbers to drift, which matters more here than
+/// for an affine format -- a codebook is 16 arbitrary constants that no
+/// arithmetic can re-derive, so a single transposed pair would decode
+/// every tensor slightly wrong and nothing would look obviously broken.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Codebook {
+    /// The `__constant__` array's identifier in the emitted CUDA C.
+    /// Must be what `dequant_src` spells.
+    pub c_name: &'static str,
+    /// The values, code 0 first.
+    pub values: &'static [f32; 16],
+}
+
+/// Emits one codebook as a `__constant__` array.
+///
+/// `{:?}` on an `f32` round-trips in Rust, and every value in every
+/// table here is exactly representable, so the emitted literal names the
+/// same float the twin uses. `-0.0` survives it, which MXFP4 needs: its
+/// code 8 is negative zero and printing it as `0` would be a different
+/// number.
+fn codebook_src(cb: &Codebook) -> String {
+    let values: Vec<String> = cb.values.iter().map(|v| format!("{v:?}f")).collect();
+    format!(
+        "\n__constant__ float {}[16] = {{{}}};\n",
+        cb.c_name,
+        values.join(", ")
+    )
 }
 
 impl MulMmKind {
@@ -173,7 +239,9 @@ impl MulMmKind {
 // caller and every test already uses, and a refactor that moves a
 // definition should not move a public name.
 pub use crate::mul_mm_kinds::kquant::K_SCALE_MIN_SRC;
-pub use crate::mul_mm_kinds::{Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0};
+pub use crate::mul_mm_kinds::{
+    IQ4_NL, IQ4_XS, MXFP4, Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0,
+};
 
 /// Scalar twin of the CUDA `ferrox_f16_to_f32` in `F16_SRC`: the same
 /// bit surgery, including the `exp == 31` NaN/Inf arm. `ldexpf(m, e)`
@@ -206,7 +274,9 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 
 /// The dispatch table. A caller looks up by GGUF quant name; a new
 /// format is one row here.
-pub const KINDS: &[MulMmKind] = &[Q8_0, Q4_0, Q5_0, Q4_K, Q5_K, Q6_K];
+pub const KINDS: &[MulMmKind] = &[
+    Q8_0, Q4_0, Q5_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4,
+];
 
 /// Looks up a kind by its GGUF quant name (`"Q4_0"`, `"Q8_0"`).
 /// `None` means this GEMM does not implement that format -- the caller
@@ -400,13 +470,16 @@ pub fn kernel_src(kind: &MulMmKind) -> String {
         kind.block_bytes,
     );
     let body = BODY_SRC.replace("FX_FN_NAME", kind.fn_name);
+    // The codebook comes from the kind's own row, so this is not a
+    // second table that has to agree with `KINDS` -- it is `KINDS`.
+    let codebook = kind.codebook.as_ref().map(codebook_src).unwrap_or_default();
     // Q4_K and Q5_K share llama's 6-bit scale/min unpack. It is emitted
     // for every kind rather than conditionally: an unused `__device__`
     // helper costs nothing after NVRTC's dead-code pass, and a
     // per-kind include list is one more table that has to agree with
     // another one.
     format!(
-        "{defines}{F16_SRC}{K_SCALE_MIN_SRC}{}{body}",
+        "{defines}{F16_SRC}{K_SCALE_MIN_SRC}{codebook}{}{body}",
         kind.dequant_src
     )
 }
@@ -546,18 +619,6 @@ pub fn grid_dims(n_rows: usize, batch: usize) -> (usize, usize) {
 mod dequant_twin_tests {
     use super::*;
 
-    /// Deterministic pseudo-random bytes: a block's contents only have
-    /// to be varied and reproducible, not meaningful.
-    fn bytes(n: usize, seed: u32) -> Vec<u8> {
-        let mut s = seed | 1;
-        (0..n)
-            .map(|_| {
-                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (s >> 24) as u8
-            })
-            .collect()
-    }
-
     /// Every twin, against the CPU dequant this project already holds
     /// against llama.cpp.
     ///
@@ -567,59 +628,41 @@ mod dequant_twin_tests {
     /// 16*il+16)` of it. A transcription that mixes up llama's three
     /// different uses of `il` produces plausible numbers from the wrong
     /// offsets, and that is exactly what this catches.
+    ///
+    /// The case list is checked to COVER [`KINDS`]: a kind added to the
+    /// table with no `ferrox_quant` dequant beside it gets a kernel, a
+    /// twin, and no evidence that either decodes the format. The scale
+    /// pinning comes from [`crate::mul_mm_ref::fixtures`], the one
+    /// place that knows where each format keeps its scales.
     #[test]
     fn every_dequant_twin_matches_the_cpu_dequant() {
-        struct Case {
-            kind: &'static MulMmKind,
-            dequant: fn(&[u8]) -> Result<Vec<f32>, ferrox_quant::QuantError>,
-        }
-        let cases = [
-            Case {
-                kind: &Q5_0,
-                dequant: ferrox_quant::dequant_q5_0,
-            },
-            Case {
-                kind: &Q4_K,
-                dequant: ferrox_quant::dequant_q4_k,
-            },
-            Case {
-                kind: &Q5_K,
-                dequant: ferrox_quant::dequant_q5_k,
-            },
-            Case {
-                kind: &Q6_K,
-                dequant: ferrox_quant::dequant_q6_k,
-            },
+        type Dequant = fn(&[u8]) -> Result<Vec<f32>, ferrox_quant::QuantError>;
+        let cases: &[(&MulMmKind, Dequant)] = &[
+            (&Q8_0, ferrox_quant::dequant_q8_0),
+            (&Q4_0, ferrox_quant::dequant_q4_0),
+            (&Q5_0, ferrox_quant::dequant_q5_0),
+            (&Q4_K, ferrox_quant::dequant_q4_k),
+            (&Q5_K, ferrox_quant::dequant_q5_k),
+            (&Q2_K, ferrox_quant::dequant_q2_k),
+            (&Q3_K, ferrox_quant::dequant_q3_k),
+            (&Q6_K, ferrox_quant::dequant_q6_k),
+            (&IQ4_NL, ferrox_quant::dequant_iq4_nl),
+            (&IQ4_XS, ferrox_quant::dequant_iq4_xs),
+            (&MXFP4, ferrox_quant::dequant_mxfp4_gguf),
         ];
 
-        for case in &cases {
-            let k = case.kind;
+        for k in KINDS {
+            assert!(
+                cases.iter().any(|(c, _)| c.name == k.name),
+                "{}: in KINDS with no dequant-twin case",
+                k.name
+            );
+        }
+
+        for (k, dequant) in cases {
             for seed in [1u32, 7, 12345] {
-                let mut block = bytes(k.block_bytes, seed);
-                // Random bytes make a random `half`, and a random half
-                // is Inf or NaN often enough to be the usual outcome.
-                // The scales get finite values so the comparison is
-                // about the UNPACK: 0x2C00 is 0.0625, 0x2800 is
-                // 0.03125. Everything else stays random -- for Q5_0
-                // that deliberately includes the four `qh` bytes at
-                // 2..6, which carry the fifth bit of all 32 quants and
-                // are the half of the format a transcription gets
-                // wrong.
-                let (d_at, dmin_at) = match k.name {
-                    "Q6_K" => (208, None),
-                    // Q5_0 has no `dmin`; bytes 2..6 are `qh`, and
-                    // pinning them would blind the fifth-bit check.
-                    "Q5_0" => (0, None),
-                    _ => (0, Some(2)),
-                };
-                block[d_at] = 0x00;
-                block[d_at + 1] = 0x2C;
-                if let Some(at) = dmin_at {
-                    block[at] = 0x00;
-                    block[at + 1] = 0x28;
-                }
-                let block = block;
-                let want = (case.dequant)(&block).expect("cpu dequant");
+                let block = crate::mul_mm_ref::fixtures::block(k, seed);
+                let want = dequant(&block).expect("cpu dequant");
                 assert_eq!(want.len(), k.block_elems, "{} block size", k.name);
 
                 for il in 0..k.nl() {
@@ -644,28 +687,179 @@ mod dequant_twin_tests {
     /// format actually has, or the GEMM walks the row with the wrong
     /// stride and every number after the first block is garbage.
     ///
-    /// `nl` is part of that geometry and is NOT the same for every row:
-    /// the K-quants are 256-element super-blocks (`nl` 16) and Q5_0 is a
-    /// 32-element legacy block (`nl` 2). A Q5_0 row that inherited the
-    /// K-quant assumption would ask the kernel for sub-blocks 2..16 of a
-    /// block that has two, so the expectation is per row rather than one
-    /// shared constant.
+    /// Driven by [`KINDS`] and answered from `ferrox_quant`'s
+    /// constants, so neither half is a hand-written list: a row added
+    /// to the table with no `ferrox_quant` geometry beside it fails
+    /// here, and a row whose geometry is a literal that drifted from
+    /// the format fails here too.
+    ///
+    /// `nl` is part of that geometry and is NOT the same for every row.
+    /// It falls out of `block_elems / SUB`, so the assertion is that
+    /// `block_elems` is a whole number of sub-blocks rather than a
+    /// restated 2 or 16 -- the K-quants are 256-element super-blocks
+    /// (`nl` 16) and the legacy and codebook 32-element kinds are `nl`
+    /// 2, and inheriting the wrong one asks the kernel for sub-blocks
+    /// 2..16 of a block that has two.
     #[test]
     fn declared_block_geometry_is_the_gguf_geometry() {
-        for (k, bytes_, elems, nl) in [
+        let geometry: &[(&str, usize, usize)] = &[
             (
-                &Q5_0,
+                "Q8_0",
+                ferrox_quant::Q8_0_BLOCK_BYTES,
+                ferrox_quant::Q8_0_BLOCK_ELEMS,
+            ),
+            (
+                "Q4_0",
+                ferrox_quant::Q4_0_BLOCK_BYTES,
+                ferrox_quant::Q4_0_BLOCK_ELEMS,
+            ),
+            (
+                "Q5_0",
                 ferrox_quant::Q5_0_BLOCK_BYTES,
                 ferrox_quant::Q5_0_BLOCK_ELEMS,
-                2,
             ),
-            (&Q4_K, 144, 256, 16),
-            (&Q5_K, 176, 256, 16),
-            (&Q6_K, 210, 256, 16),
-        ] {
-            assert_eq!(k.block_bytes, bytes_, "{} block_bytes", k.name);
-            assert_eq!(k.block_elems, elems, "{} block_elems", k.name);
-            assert_eq!(k.nl(), nl, "{} sub-blocks per super-block", k.name);
+            (
+                "Q4_K",
+                ferrox_quant::Q4_K_BLOCK_BYTES,
+                ferrox_quant::Q4_K_BLOCK_ELEMS,
+            ),
+            (
+                "Q5_K",
+                ferrox_quant::Q5_K_BLOCK_BYTES,
+                ferrox_quant::Q5_K_BLOCK_ELEMS,
+            ),
+            (
+                "Q2_K",
+                ferrox_quant::Q2_K_BLOCK_BYTES,
+                ferrox_quant::Q2_K_BLOCK_ELEMS,
+            ),
+            (
+                "Q3_K",
+                ferrox_quant::Q3_K_BLOCK_BYTES,
+                ferrox_quant::Q3_K_BLOCK_ELEMS,
+            ),
+            (
+                "Q6_K",
+                ferrox_quant::Q6_K_BLOCK_BYTES,
+                ferrox_quant::Q6_K_BLOCK_ELEMS,
+            ),
+            (
+                "IQ4_NL",
+                ferrox_quant::IQ4_NL_BLOCK_BYTES,
+                ferrox_quant::IQ4_NL_BLOCK_ELEMS,
+            ),
+            (
+                "IQ4_XS",
+                ferrox_quant::IQ4_XS_BLOCK_BYTES,
+                ferrox_quant::IQ4_XS_BLOCK_ELEMS,
+            ),
+            (
+                "MXFP4",
+                ferrox_quant::MXFP4_GGUF_BLOCK_BYTES,
+                ferrox_quant::MXFP4_GGUF_BLOCK_ELEMS,
+            ),
+        ];
+
+        for k in KINDS {
+            let (_, bytes_, elems) = geometry
+                .iter()
+                .find(|(name, _, _)| *name == k.name)
+                .unwrap_or_else(|| panic!("{}: in KINDS with no ferrox_quant geometry", k.name));
+            assert_eq!(k.block_bytes, *bytes_, "{} block_bytes", k.name);
+            assert_eq!(k.block_elems, *elems, "{} block_elems", k.name);
+            assert_eq!(
+                k.block_elems,
+                k.nl() * SUB,
+                "{}: nl() must partition the super-block into {SUB}-element sub-blocks",
+                k.name
+            );
+            assert_eq!(
+                kind_by_name(k.name).map(|f| f.name),
+                Some(k.name),
+                "{}: does not resolve by its own name",
+                k.name
+            );
         }
+
+        // Two kinds must not collide in the process-wide NVRTC module
+        // cache, and two must not share an entry point.
+        for (i, a) in KINDS.iter().enumerate() {
+            for b in &KINDS[i + 1..] {
+                assert_ne!(a.module_name, b.module_name, "{} vs {}", a.name, b.name);
+                assert_ne!(a.fn_name, b.fn_name, "{} vs {}", a.name, b.name);
+            }
+        }
+
+        // A kind with no kernel must not resolve. Resolving would send
+        // a GEMM to a module that cannot compile, and the caller would
+        // have no way to fall back honestly.
+        for absent in ["Q4_1", "Q5_1", "Q8_1", "IQ1_S", "IQ2_XXS", "IQ3_S"] {
+            assert!(
+                kind_by_name(absent).is_none(),
+                "{absent} resolved to a mul_mm kernel that does not exist"
+            );
+        }
+    }
+
+    /// Every codebook row's `dequant_src` has to actually spell the
+    /// `__constant__` array its [`Codebook`] declares, and the emitted
+    /// array has to carry that row's values -- parsed back out of the
+    /// text rather than compared to a second copy of the formatting.
+    ///
+    /// This is what makes "one slice serves both halves" true rather
+    /// than intended: the numbers are read out of the generated CUDA C
+    /// and held against the slice the Rust twin indexes.
+    ///
+    /// Sabotage: change one entry of `KVALUES_IQ4NL` and this names the
+    /// index; rename `c_name` without renaming it in `dequant_src` and
+    /// the first assertion fires.
+    #[test]
+    fn an_emitted_codebook_is_the_slice_the_twin_indexes() {
+        let mut seen = 0usize;
+        for k in KINDS {
+            let Some(cb) = k.codebook else {
+                assert!(
+                    !kernel_src(k).contains("__constant__"),
+                    "{}: no codebook declared but one is emitted",
+                    k.name
+                );
+                continue;
+            };
+            seen += 1;
+            let src = kernel_src(k);
+            assert!(
+                k.dequant_src.contains(cb.c_name),
+                "{}: dequant_src never indexes {}",
+                k.name,
+                cb.c_name
+            );
+            let decl = format!("__constant__ float {}[16] = {{", cb.c_name);
+            let at = src
+                .find(&decl)
+                .unwrap_or_else(|| panic!("{}: {} is not emitted", k.name, cb.c_name));
+            let body = &src[at + decl.len()..];
+            let body = &body[..body.find('}').expect("unterminated codebook")];
+            let got: Vec<f32> = body
+                .split(',')
+                .map(|t| {
+                    t.trim()
+                        .trim_end_matches('f')
+                        .parse::<f32>()
+                        .unwrap_or_else(|e| panic!("{}: {t:?}: {e}", k.name))
+                })
+                .collect();
+            assert_eq!(got.len(), 16, "{}: codebook is not 16 entries", k.name);
+            for (i, (g, w)) in got.iter().zip(cb.values.iter()).enumerate() {
+                // Bit comparison, not `==`: MXFP4's code 8 is negative
+                // zero, and `-0.0 == 0.0` would let it through.
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "{}: codebook entry {i}: emitted {g}, twin indexes {w}",
+                    k.name
+                );
+            }
+        }
+        assert!(seen >= 3, "the codebook kinds stopped declaring codebooks");
     }
 }

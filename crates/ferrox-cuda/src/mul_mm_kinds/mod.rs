@@ -8,15 +8,19 @@
 //!
 //! Split by family rather than one file per kind because the families
 //! are what actually share code: the legacy formats share a 32-element
-//! block and `nl == 2`, and the K-quants share a 256-element super-block
-//! and (for two of them) the 6-bit scale/min unpack.
+//! block and `nl == 2`, the K-quants share a 256-element super-block
+//! and (for two of them) the 6-bit scale/min unpack, and the codebook
+//! formats share the `__constant__` table seam that the affine kinds do
+//! not use at all.
 //!
 //! The table itself ([`crate::mul_mm::KINDS`]) stays in `mul_mm`, so
 //! there is exactly one list and a row added here without a row there
 //! compiles to dead code that clippy names.
 
+pub mod codebook;
 pub mod kquant;
 pub mod legacy;
 
-pub use kquant::{Q4_K, Q5_K, Q6_K};
+pub use codebook::{IQ4_NL, IQ4_XS, MXFP4};
+pub use kquant::{Q2_K, Q3_K, Q4_K, Q5_K, Q6_K};
 pub use legacy::{Q4_0, Q5_0, Q8_0};

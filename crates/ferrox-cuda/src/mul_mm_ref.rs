@@ -181,10 +181,116 @@ fn emulate_block(
     }
 }
 
+/// Weight fixtures every `mul_mm` test builds on, in ONE place.
+///
+/// Three tests need "a plausible quantized weight matrix for this
+/// kind": the dequant-twin comparison in [`crate::mul_mm`], the GEMM
+/// comparison below, and the `#[ignore]`d hardware test in
+/// [`crate::mul_mm_launch`]. Each used to carry its own builder, keyed
+/// by kind, and adding a format meant remembering all three -- with a
+/// `_ =>` arm in one of them silently pinning the wrong bytes for the
+/// next row. They share this module instead.
+///
+/// The bytes are deliberately arbitrary rather than the output of a
+/// real quantizer: `ferrox_quant` has no encoder for most of these
+/// formats, and a random nibble is a legal code in every one of them.
+/// Only the SCALE fields are constrained, and only to keep them finite
+/// -- a random `half` is Inf or NaN often enough to be the usual
+/// outcome, and a matrix of NaN proves nothing about an unpack.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use crate::mul_mm::MulMmKind;
+
+    /// Deterministic pseudo-random bytes, the generator shape
+    /// `gpu.rs`'s K-quant fixtures already use.
+    pub(crate) fn pseudo_bytes(seed: u32, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2654435761).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                (state >> 16) as u8
+            })
+            .collect()
+    }
+
+    /// Forces the f16 at `at` to a finite value while keeping its sign
+    /// and mantissa random.
+    ///
+    /// The exponent field goes to 11, so the scale lands near 2^-4 with
+    /// a random sign and a random fraction. Pinning the whole `half` to
+    /// one constant would make every block of the matrix identical in
+    /// its scale, which hides a kernel that reads the scale of the
+    /// wrong block.
+    fn finite_f16(block: &mut [u8], at: usize) {
+        let bits = u16::from(block[at]) | (u16::from(block[at + 1]) << 8);
+        let bits = (bits & 0x83FF) | (11 << 10);
+        block[at] = bits as u8;
+        block[at + 1] = (bits >> 8) as u8;
+    }
+
+    /// Constrains one block's scale fields for `kind`, leaving every
+    /// byte that carries quant data alone.
+    ///
+    /// **No catch-all arm.** A kind added to `KINDS` without a row here
+    /// panics with its own name the first time any of the three tests
+    /// touches it, rather than inheriting a guess. `IQ4_XS`'s per-group
+    /// 6-bit scales at bytes 2..8 are deliberately left random: they
+    /// are assembled from two places and that assembly is the part of
+    /// the format most likely to be transcribed wrong.
+    pub(crate) fn pin_finite_scales(kind: &MulMmKind, block: &mut [u8]) {
+        match kind.name {
+            // `half d` at the head, nothing else.
+            "Q8_0" | "Q4_0" | "Q5_0" | "IQ4_NL" | "IQ4_XS" => finite_f16(block, 0),
+            // `half d`, then `half dmin`.
+            "Q4_K" | "Q5_K" => {
+                finite_f16(block, 0);
+                finite_f16(block, 2);
+            }
+            // Q6_K keeps its `half d` at the END of the block.
+            "Q6_K" => finite_f16(block, 208),
+            // Q2_K puts its scales FIRST and both halves last.
+            "Q2_K" => {
+                finite_f16(block, 80);
+                finite_f16(block, 82);
+            }
+            // Q3_K has one `half d`, also at the end. Its twelve scale
+            // bytes at 96..108 stay random: they are a six-bit
+            // four-arm assembly and that assembly is the part of the
+            // format most likely to be transcribed wrong.
+            "Q3_K" => finite_f16(block, 108),
+            // One E8M0 byte, not an f16. 123..=130 is 2^-4 .. 2^3.
+            "MXFP4" => block[0] = 123 + (block[0] & 7),
+            other => panic!("{other}: no scale-pinning rule; add one beside the KINDS row"),
+        }
+    }
+
+    /// One block: random bytes with `kind`'s scale fields made finite.
+    pub(crate) fn block(kind: &MulMmKind, seed: u32) -> Vec<u8> {
+        let mut b = pseudo_bytes(seed, kind.block_bytes);
+        pin_finite_scales(kind, &mut b);
+        b
+    }
+
+    /// A whole `n_rows x n_cols` weight matrix in `kind`'s format.
+    pub(crate) fn weights(kind: &MulMmKind, n_rows: usize, n_cols: usize, seed: u32) -> Vec<u8> {
+        assert!(
+            n_cols.is_multiple_of(kind.block_elems),
+            "{}: {n_cols} columns is not a whole number of blocks",
+            kind.name
+        );
+        let blocks = (n_cols / kind.block_elems) * n_rows;
+        let mut out = Vec::with_capacity(blocks * kind.block_bytes);
+        for b in 0..blocks {
+            out.extend_from_slice(&block(kind, seed.wrapping_add(b as u32 * 7919)));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mul_mm::{f16_to_f32, kernel_src, kind_by_name, KINDS, Q4_0, Q8_0};
+    use crate::mul_mm::{f16_to_f32, kernel_src, KINDS, Q4_0, Q8_0};
 
     /// Deterministic pseudo-random bytes, the same generator shape
     /// `gpu.rs`'s K-quant fixtures already use.
@@ -427,6 +533,73 @@ mod tests {
         assert_close(&got, &want, 1e-5, "q4_0 partial tiles");
     }
 
+    /// Every kind in the table through the same GEMM body, against a
+    /// dequantize-then-dot built on `ferrox_quant`.
+    ///
+    /// This is the test that says the seam is a seam: nothing but the
+    /// table row changes between Q8_0 and IQ4_XS, including for the
+    /// codebook kinds, whose `dequant_src` indexes a `__constant__`
+    /// array where the affine kinds multiply and add.
+    ///
+    /// It iterates [`KINDS`] rather than naming rows, so a format added
+    /// to the table with no `ferrox_quant` dequant beside it fails here
+    /// instead of shipping unchecked. Shapes: exact tiles, then partial
+    /// on both axes (the out-of-range row clamp and the zero-filled
+    /// B-tile columns), then a narrow batch.
+    #[test]
+    fn every_kind_gemm_twin_matches_the_independent_reference() {
+        type Dequant = fn(&[u8]) -> Result<Vec<f32>, ferrox_quant::QuantError>;
+        let dequants: &[(&str, Dequant)] = &[
+            ("Q8_0", ferrox_quant::dequant_q8_0),
+            ("Q4_0", ferrox_quant::dequant_q4_0),
+            ("Q5_0", ferrox_quant::dequant_q5_0),
+            ("Q4_K", ferrox_quant::dequant_q4_k),
+            ("Q5_K", ferrox_quant::dequant_q5_k),
+            ("Q2_K", ferrox_quant::dequant_q2_k),
+            ("Q3_K", ferrox_quant::dequant_q3_k),
+            ("Q6_K", ferrox_quant::dequant_q6_k),
+            ("IQ4_NL", ferrox_quant::dequant_iq4_nl),
+            ("IQ4_XS", ferrox_quant::dequant_iq4_xs),
+            ("MXFP4", ferrox_quant::dequant_mxfp4_gguf),
+        ];
+
+        for k in KINDS {
+            let (_, dequant) = dequants
+                .iter()
+                .find(|(name, _)| *name == k.name)
+                .unwrap_or_else(|| panic!("{}: in KINDS with no ferrox_quant dequant", k.name));
+
+            for (n_rows, cols, batch) in [(BM * 2, 128usize, BN), (BM + 7, 96, BN + 9), (37, 64, 3)]
+            {
+                // Rounded UP to a whole super-block: `validate_shape`
+                // refuses anything else, and it is right to -- a
+                // 128-column Q4_K row is not a Q4_K row.
+                let n_cols = cols.next_multiple_of(k.block_elems);
+                let row_bytes = (n_cols / k.block_elems) * k.block_bytes;
+                let weights = fixtures::weights(k, n_rows, n_cols, 4242);
+                let x = activations(batch, n_cols);
+
+                let got =
+                    mul_mm_reference(k, &weights, &x, n_rows, n_cols, batch, row_bytes).unwrap();
+                let want = independent_gemm(
+                    |r| dequant(r).unwrap(),
+                    &weights,
+                    &x,
+                    n_rows,
+                    n_cols,
+                    batch,
+                    row_bytes,
+                );
+                assert_close(
+                    &got,
+                    &want,
+                    1e-5,
+                    &format!("{} {n_rows}x{n_cols}x{batch}", k.name),
+                );
+            }
+        }
+    }
+
     /// Sabotage check for the tests above: perturbing one weight byte
     /// must move the twin's output. A GEMM test that passes on data it
     /// never reads is not a test.
@@ -476,52 +649,6 @@ mod tests {
             "got {err:?}"
         );
         assert!(mul_mm_reference(&Q8_0, &[], &[], 0, 64, 1, 68).is_err());
-    }
-
-    /// Every row of the table has to describe a real GGUF format, and
-    /// the geometry the kernel is `#define`d with has to be that
-    /// format's actual geometry. A wrong `block_bytes` here would stride
-    /// the whole weight matrix incorrectly on a device and produce
-    /// plausible garbage.
-    #[test]
-    fn kind_table_geometry_matches_ferrox_quant() {
-        assert_eq!(Q8_0.block_bytes, ferrox_quant::Q8_0_BLOCK_BYTES);
-        assert_eq!(Q8_0.block_elems, ferrox_quant::Q8_0_BLOCK_ELEMS);
-        assert_eq!(Q4_0.block_bytes, ferrox_quant::Q4_0_BLOCK_BYTES);
-        assert_eq!(Q4_0.block_elems, ferrox_quant::Q4_0_BLOCK_ELEMS);
-        use crate::mul_mm::{Q4_K, Q5_0, Q5_K, Q6_K};
-        assert_eq!(Q5_0.block_bytes, ferrox_quant::Q5_0_BLOCK_BYTES);
-        assert_eq!(Q5_0.block_elems, ferrox_quant::Q5_0_BLOCK_ELEMS);
-        assert_eq!(Q4_K.block_bytes, ferrox_quant::Q4_K_BLOCK_BYTES);
-        assert_eq!(Q4_K.block_elems, ferrox_quant::Q4_K_BLOCK_ELEMS);
-        assert_eq!(Q5_K.block_bytes, ferrox_quant::Q5_K_BLOCK_BYTES);
-        assert_eq!(Q5_K.block_elems, ferrox_quant::Q5_K_BLOCK_ELEMS);
-        assert_eq!(Q6_K.block_bytes, ferrox_quant::Q6_K_BLOCK_BYTES);
-        assert_eq!(Q6_K.block_elems, ferrox_quant::Q6_K_BLOCK_ELEMS);
-        for k in KINDS {
-            assert_eq!(
-                k.block_elems,
-                k.nl() * SUB,
-                "{}: nl() must partition the super-block into {SUB}-element sub-blocks",
-                k.name
-            );
-            assert!(
-                BK.is_multiple_of(SUB),
-                "the K-tile must be a whole number of sub-blocks"
-            );
-            assert_eq!(kind_by_name(k.name).map(|f| f.name), Some(k.name));
-        }
-        // Q4_K, Q5_K and Q6_K resolve as of 2026-09-04, Q5_0 as of
-        // 2026-09-05. IQ4_XS does
-        // not, and the distinction is not an oversight: it is a
-        // codebook lookup rather than an affine dequant, so it does
-        // not fit `dequant_src`'s shape and needs its own row. A kind
-        // that resolves without a kernel would compute silently wrong
-        // numbers, which is the failure this line stands against.
-        assert!(
-            kind_by_name("IQ4_NL").is_none() && kind_by_name("IQ4_XS").is_none(),
-            "a kind with no mul_mm must not resolve"
-        );
     }
 
     /// The emitted translation unit has to define the entry point the
@@ -601,9 +728,11 @@ mod tests {
                 k.name
             );
         }
-        // Two kinds must not collide in the process-wide module cache.
-        assert_ne!(Q8_0.module_name, Q4_0.module_name);
-        assert_ne!(Q8_0.fn_name, Q4_0.fn_name);
+        // Module-cache and entry-point collisions are checked pairwise
+        // over the whole table by
+        // `mul_mm::dequant_twin_tests::declared_block_geometry_is_the_gguf_geometry`,
+        // which is where the table lives. Two named kinds here would
+        // have been a third structure agreeing with the other two.
     }
 
     /// A batch of one is a matvec, and the matvec kernels are the arm

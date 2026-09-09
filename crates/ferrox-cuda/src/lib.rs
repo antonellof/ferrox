@@ -16,6 +16,12 @@
 pub mod capability;
 pub mod coalesced_twin;
 
+/// The per-kind CUDA matvec (decode) kernel table. Always compiled,
+/// for the same reason [`mul_mm`] is: it is kernel text plus three
+/// strings per row, and `ferrox-core` derives its CUDA decode
+/// capability from it on builds that do not link `cudarc`.
+pub mod matvec_kinds;
+
 /// The `mul_mm` kernel source and its per-quant-kind dispatch table.
 /// Always compiled: it is CUDA C *text* plus a scalar twin, neither of
 /// which needs `cudarc`, so the default `cargo test -p ferrox-cuda` run

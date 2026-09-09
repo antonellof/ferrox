@@ -68,6 +68,12 @@ static inline float __int_as_float(int i) {
     return f;
 }
 
+// A `__constant__` array is device-global read-only storage; on the
+// host a plain namespace-scope array is the faithful stand-in. It is
+// deliberately NOT `static const`: the codebook kinds are the only
+// users, every one of them reads theirs, and `static const` would
+// invite `-Wunused-const-variable` on any kind that stopped.
+#define __constant__
 #define __global__
 #define __device__
 #define __forceinline__ inline

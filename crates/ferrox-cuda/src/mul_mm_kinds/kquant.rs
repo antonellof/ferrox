@@ -1,5 +1,6 @@
 //! The 256-element K-quant super-block formats the CUDA `mul_mm` GEMM
-//! consumes: Q4_K, Q5_K and Q6_K. Each is a [`MulMmKind`] row plus the
+//! consumes: Q2_K, Q3_K, Q4_K, Q5_K and Q6_K. Each is a [`MulMmKind`]
+//! row plus the
 //! Rust twin of its `dequant_src`, written statement for statement
 //! beside it.
 //!
@@ -82,6 +83,7 @@ __device__ __forceinline__ void ferrox_dequant_sub(
 }
 "#,
     dequant_twin: dequant_sub_q4_k,
+    codebook: None,
 };
 
 /// Scalar twin of [`Q4_K`]'s `dequant_src`.
@@ -148,6 +150,7 @@ __device__ __forceinline__ void ferrox_dequant_sub(
 }
 "#,
     dequant_twin: dequant_sub_q5_k,
+    codebook: None,
 };
 
 /// Scalar twin of [`Q5_K`]'s `dequant_src`.
@@ -236,6 +239,7 @@ __device__ __forceinline__ void ferrox_dequant_sub(
 }
 "#,
     dequant_twin: dequant_sub_q6_k,
+    codebook: None,
 };
 
 /// Scalar twin of [`Q6_K`]'s `dequant_src`.
@@ -291,5 +295,193 @@ fn dequant_sub_q6_k(xb: &[u8], il: usize, reg: &mut [f32; SUB]) {
         reg[4 * i + 1] = dl1 * (q & 0xFF00) as f32 - ml;
         reg[4 * i + 2] = dl2 * (q & 0x00FF_0000) as f32 - ml;
         reg[4 * i + 3] = dl3 * (q & 0xFF00_0000) as f32 - ml;
+    }
+}
+
+/// Q2_K: 16 scale bytes, 128 packed 2-bit quants (64 bytes), `half d`,
+/// `half dmin` -- 84 bytes for 256 elements, and the scales come FIRST
+/// while both halves come last, which is neither Q4_K's layout nor
+/// Q6_K's.
+///
+/// Each scale byte carries two 4-bit fields: the low nibble scales the
+/// quant, the high nibble scales the min that is subtracted. There is
+/// no 6-bit assembly here, so `ferrox_k_scale_min_just2` is not used.
+///
+/// `il` splits three ways, and the three are easy to confuse:
+/// `n = il / 8` picks the 128-element half (and with it the 32-byte
+/// `qs` group), `j = (il % 8) / 2` picks the 2-bit field within each
+/// byte (`shift = 2j`), and `half = il % 2` picks which 16 of the
+/// group's 32 bytes. The scale index is all three at once,
+/// `8n + 2j + half`, which is llama's `8*n + l/16` walked one
+/// sub-block at a time.
+///
+/// Transcribed from llama.cpp `ggml/src/ggml-cuda/dequantize.cuh:270`
+/// (`dequantize_q2_K`) and held against `ferrox_quant::dequant_q2_k`.
+pub const Q2_K: MulMmKind = MulMmKind {
+    name: "Q2_K",
+    module_name: "ferrox_mul_mm_q2_k",
+    fn_name: "q2_k_mul_mm",
+    block_bytes: 84,
+    block_elems: 256,
+    dequant_src: r#"
+__device__ __forceinline__ void ferrox_dequant_sub(
+    const unsigned char* xb, int il, float* reg
+) {
+    const unsigned char* scales = xb;
+    const unsigned char* qs = xb + 16;
+    const float d = ferrox_f16_to_f32(
+        (unsigned short)xb[80] | ((unsigned short)xb[81] << 8));
+    const float dmin = ferrox_f16_to_f32(
+        (unsigned short)xb[82] | ((unsigned short)xb[83] << 8));
+
+    const int n = il / 8;
+    const int j = (il % 8) / 2;
+    const int half = il % 2;
+    const int shift = 2 * j;
+    const int is = 8 * n + 2 * j + half;
+
+    const unsigned char sc = scales[is];
+    const float dl = d * (float)(sc & 0x0F);
+    const float ml = dmin * (float)(sc >> 4);
+    const unsigned char* q = qs + 32 * n + 16 * half;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        reg[i] = dl * (float)((q[i] >> shift) & 3) - ml;
+    }
+}
+"#,
+    dequant_twin: dequant_sub_q2_k,
+    codebook: None,
+};
+
+/// Scalar twin of [`Q2_K`]'s `dequant_src`.
+fn dequant_sub_q2_k(xb: &[u8], il: usize, reg: &mut [f32; SUB]) {
+    let scales = &xb[0..16];
+    let d = f16_to_f32(u16::from(xb[80]) | (u16::from(xb[81]) << 8));
+    let dmin = f16_to_f32(u16::from(xb[82]) | (u16::from(xb[83]) << 8));
+
+    let n = il / 8;
+    let j = (il % 8) / 2;
+    let half = il % 2;
+    let shift = 2 * j;
+    let is = 8 * n + 2 * j + half;
+
+    let sc = scales[is];
+    let dl = d * f32::from(sc & 0x0F);
+    let ml = dmin * f32::from(sc >> 4);
+    let base = 16 + 32 * n + 16 * half;
+    for (r, qv) in reg.iter_mut().zip(xb[base..base + 16].iter()) {
+        *r = dl * f32::from((qv >> shift) & 3) - ml;
+    }
+}
+
+/// Q3_K: 32 `hmask` bytes, 64 packed 2-bit quants, 12 scale bytes,
+/// `half d` -- 110 bytes for 256 elements.
+///
+/// Three bits per quant, and they are stored in two places: the low two
+/// in `qs`, the third as a BIT PLANE in `hmask`. The high bit is
+/// inverted relative to what a reader expects -- a SET `hmask` bit
+/// means bias 0 and a CLEAR one means bias 4, so a transcription that
+/// reads it the natural way is wrong on exactly the elements where the
+/// bit is set. `m` sweeps all eight bit positions across the whole
+/// super-block (`1 << (4n + j)`), not per 128-element half.
+///
+/// The six-bit scales are packed into twelve bytes by a DIFFERENT
+/// scheme from Q4_K's: `ferrox_q3_k_scale` below assembles one, in the
+/// four-arm form llama uses, and the result is biased by -32 rather
+/// than paired with a min.
+///
+/// `il` splits exactly as [`Q2_K`]'s does.
+///
+/// Transcribed from llama.cpp `ggml/src/ggml-cuda/dequantize.cuh:290`
+/// (`dequantize_q3_K`) and held against `ferrox_quant::dequant_q3_k`.
+pub const Q3_K: MulMmKind = MulMmKind {
+    name: "Q3_K",
+    module_name: "ferrox_mul_mm_q3_k",
+    fn_name: "q3_k_mul_mm",
+    block_bytes: 110,
+    block_elems: 256,
+    dequant_src: r#"
+__device__ __forceinline__ unsigned char ferrox_q3_k_scale(
+    const unsigned char* raw, int is
+) {
+    // llama's four-arm assembly of one 6-bit scale out of twelve
+    // bytes. The four cases differ in WHICH byte supplies the low
+    // nibble and which supplies the top two bits, so collapsing them
+    // reads plausible values from the wrong byte.
+    if (is < 4) {
+        return (unsigned char)((raw[is] & 0xF) | (((raw[is + 8] >> 0) & 3) << 4));
+    } else if (is < 8) {
+        return (unsigned char)((raw[is] & 0xF) | (((raw[is + 4] >> 2) & 3) << 4));
+    } else if (is < 12) {
+        return (unsigned char)((raw[is - 8] >> 4) | (((raw[is] >> 4) & 3) << 4));
+    } else {
+        return (unsigned char)((raw[is - 8] >> 4) | (((raw[is - 4] >> 6) & 3) << 4));
+    }
+}
+
+__device__ __forceinline__ void ferrox_dequant_sub(
+    const unsigned char* xb, int il, float* reg
+) {
+    const unsigned char* hmask = xb;
+    const unsigned char* qs = xb + 32;
+    const unsigned char* scales = xb + 96;
+    const float d_all = ferrox_f16_to_f32(
+        (unsigned short)xb[108] | ((unsigned short)xb[109] << 8));
+
+    const int n = il / 8;
+    const int j = (il % 8) / 2;
+    const int half = il % 2;
+    const int shift = 2 * j;
+    const int is = 8 * n + 2 * j + half;
+    const unsigned char m = (unsigned char)(1u << (4 * n + j));
+
+    const float dl = d_all * ((float)ferrox_q3_k_scale(scales, is) - 32.0f);
+    const unsigned char* q = qs + 32 * n + 16 * half;
+    const unsigned char* hm = hmask + 16 * half;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        const int raw = (int)((q[i] >> shift) & 3);
+        const int bias = (hm[i] & m) ? 0 : 4;
+        reg[i] = dl * (float)(raw - bias);
+    }
+}
+"#,
+    dequant_twin: dequant_sub_q3_k,
+    codebook: None,
+};
+
+/// Scalar twin of the `ferrox_q3_k_scale` in [`Q3_K`]'s `dequant_src`.
+fn q3_k_scale(raw: &[u8], is: usize) -> u8 {
+    if is < 4 {
+        (raw[is] & 0xF) | ((raw[is + 8] & 3) << 4)
+    } else if is < 8 {
+        (raw[is] & 0xF) | (((raw[is + 4] >> 2) & 3) << 4)
+    } else if is < 12 {
+        (raw[is - 8] >> 4) | (((raw[is] >> 4) & 3) << 4)
+    } else {
+        (raw[is - 8] >> 4) | (((raw[is - 4] >> 6) & 3) << 4)
+    }
+}
+
+/// Scalar twin of [`Q3_K`]'s `dequant_src`.
+fn dequant_sub_q3_k(xb: &[u8], il: usize, reg: &mut [f32; SUB]) {
+    let scales = &xb[96..108];
+    let d_all = f16_to_f32(u16::from(xb[108]) | (u16::from(xb[109]) << 8));
+
+    let n = il / 8;
+    let j = (il % 8) / 2;
+    let half = il % 2;
+    let shift = 2 * j;
+    let is = 8 * n + 2 * j + half;
+    let m = 1u8 << (4 * n + j);
+
+    let dl = d_all * (f32::from(q3_k_scale(scales, is)) - 32.0);
+    let qbase = 32 + 32 * n + 16 * half;
+    let hbase = 16 * half;
+    for i in 0..SUB {
+        let raw = i32::from((xb[qbase + i] >> shift) & 3);
+        let bias = if xb[hbase + i] & m != 0 { 0 } else { 4 };
+        reg[i] = dl * (raw - bias) as f32;
     }
 }

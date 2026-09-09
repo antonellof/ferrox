@@ -124,7 +124,7 @@ pub fn launch_mul_mm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mul_mm::{BM, Q4_0, Q5_0, Q8_0};
+    use crate::mul_mm::{BM, Q8_0};
     use crate::mul_mm_ref::mul_mm_reference;
 
     #[test]
@@ -145,25 +145,35 @@ mod tests {
     /// The one test that would close the gap this module leaves open.
     ///
     /// It compares the kernel against [`mul_mm_reference`] -- the same
-    /// scalar twin the host-side tests already hold to `ferrox_quant` --
-    /// on both an exact-tile and a partial-tile shape, for the three
-    /// 32-element kinds in the table. (The K-quants are covered by
-    /// `tools/mul_mm_host_check/run.sh`, which executes the same
-    /// emitted C on the host for every kind in `KINDS`.)
+    /// scalar twin the host-side tests already hold to `ferrox_quant`
+    /// -- on an exact-tile shape, a partial tile on both axes, and a
+    /// narrow batch, for EVERY kind in [`KINDS`].
+    ///
+    /// It used to name three kinds and pick their fixtures out of an
+    /// index-keyed `match`, so the kinds it did not name (the K-quants
+    /// then, the codebook formats now) were covered only by
+    /// `tools/mul_mm_host_check/run.sh` -- which executes the emitted C
+    /// on a host CPU and therefore cannot see anything NVRTC or a warp
+    /// scheduler would. The loop is over the table now, and the
+    /// fixtures come from [`crate::mul_mm_ref::fixtures`], so a kind
+    /// added to `KINDS` is on this list the moment it exists.
     ///
     /// Run it on a machine with a real device:
     ///   cargo test -p ferrox-cuda --features cuda -- --ignored
     #[test]
     #[ignore = "requires real CUDA hardware -- NEVER RUN: this kernel has never executed on a GPU. Run with --ignored on a CUDA-capable machine and record the result before any doc claims CUDA mul_mm works"]
     fn launch_mul_mm_matches_the_scalar_twin() {
-        for (kind, weights_of) in [(&Q8_0, 0usize), (&Q4_0, 1usize), (&Q5_0, 2usize)] {
-            for (n_rows, n_cols, batch) in [(BM * 2, 128, 32), (BM + 7, 96, 37), (33, 64, 3)] {
+        use crate::mul_mm::KINDS;
+
+        for kind in KINDS {
+            for (n_rows, cols, batch) in [(BM * 2, 128usize, 32), (BM + 7, 96, 37), (33, 64, 3)] {
+                // `validate_shape` refuses a column count that is not a
+                // whole super-block, so round up per kind rather than
+                // reusing one list of literals across formats whose
+                // block sizes differ by 8x.
+                let n_cols = cols.next_multiple_of(kind.block_elems);
                 let row_bytes = (n_cols / kind.block_elems) * kind.block_bytes;
-                let weights = match weights_of {
-                    0 => q8_0_weights(n_rows, n_cols),
-                    1 => q4_0_weights(n_rows, n_cols),
-                    _ => q5_0_weights(n_rows, n_cols),
-                };
+                let weights = crate::mul_mm_ref::fixtures::weights(kind, n_rows, n_cols, 4242);
                 let x: Vec<f32> = (0..batch * n_cols)
                     .map(|i| ((i as f32) * 0.019).cos())
                     .collect();
@@ -200,54 +210,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn q8_0_weights(n_rows: usize, n_cols: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        for r in 0..n_rows {
-            let row: Vec<f32> = (0..n_cols)
-                .map(|i| (((r * n_cols + i) as f32) * 0.037).sin())
-                .collect();
-            out.extend(ferrox_quant::quantize_q8_0(&row));
-        }
-        out
-    }
-
-    /// Q5_0 blocks: `half d`, a 4-byte `qh` bitplane, 16 packed
-    /// nibbles. `qh` is deliberately varied rather than zero -- a
-    /// kernel that dropped the fifth bit entirely would agree with the
-    /// twin on an all-zero `qh` fixture.
-    fn q5_0_weights(n_rows: usize, n_cols: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        let blocks = n_cols / 32;
-        let mut state = 6789u32;
-        for r in 0..n_rows {
-            for b in 0..blocks {
-                let scale = half::f16::from_f32(0.05 + ((r * blocks + b) % 13) as f32 * 0.01);
-                out.extend_from_slice(&scale.to_le_bytes());
-                for _ in 0..20 {
-                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
-                    out.push((state >> 16) as u8);
-                }
-            }
-        }
-        out
-    }
-
-    fn q4_0_weights(n_rows: usize, n_cols: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        let blocks = n_cols / 32;
-        let mut state = 12345u32;
-        for r in 0..n_rows {
-            for b in 0..blocks {
-                let scale = half::f16::from_f32(0.05 + ((r * blocks + b) % 13) as f32 * 0.01);
-                out.extend_from_slice(&scale.to_le_bytes());
-                for _ in 0..16 {
-                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
-                    out.push((state >> 16) as u8);
-                }
-            }
-        }
-        out
     }
 }
