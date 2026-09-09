@@ -10,22 +10,28 @@ Measured against llama.cpp on the same host and the same GGUF with
 `ferrox bench`. Gap = `llama / ferrox`, so anything under 1 means Ferrox
 is faster.
 
-- **Dense GQA**: TinyLlama, Llama 3.2, Mistral-7B, SmolLM2,
-  Qwen2.5/Qwen3, Gemma-3/4. Metal decode leads on several small models
-  (SmolLM2 **~0.67×**, Qwen2.5-0.5B **~0.70×**, Qwen3-0.6B **~0.71×**,
-  Gemma-3-1B **~0.88×**), and Llama-3.2-3B sits at **~0.96×**, ahead of
-  llama.cpp rather than behind it. Mistral-7B and Llama-3.2-1B Q4_K_M
-  land on 1.00×. Dense Metal prefill is closed: every dense `pp512` row
-  is 1.02–1.08×. **CPU decode is still behind everywhere (~1.17–2.44×),
-  and CPU prefill is behind on 6 of 8 rows.**
+- **Dense GQA**: TinyLlama, Llama 3.2, SmolLM2, Qwen2.5/Qwen3,
+  Gemma-2/3/4, Phi-4-mini. Re-measured on 2026-09-09 on a quiet M2 Pro:
+  **12 of 14 comparable Metal `tg128` rows are faster than llama.cpp**
+  (SmolLM2-135M **0.64×**, Qwen2.5-0.5B **0.65×**, Qwen3-0.6B **0.76×**,
+  Gemma-3-1B **0.80×**, TinyLlama **0.86×**, down to Llama-3.1-8B and
+  Phi-4-mini at **0.98×**). The two that are not: Llama-3.2-3B at 1.03×
+  and Gemma-2-2B at **1.11×**, which is the worst Metal row. Dense Metal
+  prefill spans **1.01× to 1.10×**. **CPU is a different story and is
+  behind on every row**: prefill 6.3× to 10.1× and decode 1.06× to
+  1.92× on x86, though the AVX2 GEMM tier that closes the prefill half
+  landed unmeasured.
 - **Phi-4**: CPU **and** Metal. Partial rotary (`n_rot < head_dim`) and
   LongRoPE `attn_factor` ride the Metal RoPE kernels as `rot_dim` and
   `mscale` uniforms, matching ggml's `rope_yarn` (the magnitude scale
-  reaches the rotated channels only). The published Metal speed rows
-  predate that fix and need measuring again before you quote them.
-- **MoE**: OLMoE-1B-7B, still behind on Metal decode (~1.41×). Metal
-  Concurrent plus fused encode groups, `MemRanges`, `mul_mv_id` and
-  prefill `mul_mm_id`. On CPU: int-dot and interleaved Q4_K.
+  reaches the rotated channels only). Now measured with that fix in
+  place: `pp512` 1.02×, `tg128` 0.98×.
+- **MoE**: OLMoE-1B-7B, and Metal decode is no longer the weak spot it
+  was. It read ~1.41× when this line was first written and reads
+  **0.96×** on the 2026-09-09 suite, so MoE decode is now faster than
+  llama.cpp rather than half again slower. Metal Concurrent plus fused
+  encode groups, `MemRanges`, `mul_mv_id` and prefill `mul_mm_id`. On
+  CPU: int-dot and interleaved Q4_K.
 - **MLA**: dense-lead and MoE-after-dense `deepseek2` / `mistral4`.
 - **Gemma-4**: dedicated engine (per-layer embeddings, shared KV,
   SWA/full), an SPM-style `gemma4` BPE tokenizer, and the `<|turn>` chat
@@ -77,7 +83,7 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 |---|---|
 | **CPU** | Dense and MoE. int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out), interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot, pool sized to performance cores |
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent with fused groups, `MemRanges`, `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
-| **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`), plus a batched `Q8_0`/`Q4_0` GEMM that **has never executed on a GPU** |
+| **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`), plus batched GEMMs for `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`, `IQ4_XS` and `MXFP4` that **have never executed on a GPU** |
 | **Vulkan** | `Q8_0` matvec only, no GEMM (`--features vulkan`). A beachhead, not a backend: see below |
 
 **Vulkan is one kernel, and calling it a backend would be generous.**
@@ -98,17 +104,20 @@ thread-by-thread scalar twin held against `ferrox-quant`'s independent
 dequantize-then-GEMM, and a host harness that compiles and *executes*
 the emitted CUDA C against a barrier shim
 (`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`) with zero
-mismatches on both kinds. Its hardware test is `#[ignore]`d with "NEVER
-RUN" as the reason, and NVRTC is not clang, so "it compiles here" is not
-"NVRTC accepts it". Below the width threshold a single token stays on
-the matvec kernels, which are the arm that *has* run on a GPU.
+mismatches across **11 kinds, 33 shapes and 75,042 compared positions**.
+Its hardware test is `#[ignore]`d, and NVRTC is not clang, so "it
+compiles here" is not "NVRTC accepts it". Below the width threshold a
+single token stays on the matvec kernels, which are the arm that *has*
+run on a GPU. That harness is worth no more than its own health: it had
+silently stopped compiling once already, which is why it now runs over
+every kind in the table rather than a hand-kept list.
 
-**CUDA compiles and runs, and nobody has benchmarked it.** Every number
-in this repo was taken on CPU or Apple Metal. GPU acceleration on
-Windows and Linux means CUDA, and the bar CUDA is held to is "must
-compile". There is no pinned benchmark host for it and no published
-timings. Treat a Windows or Linux install as **CPU-only in practice**
-until that changes. `/health` reports the same thing per capability,
+**CUDA is benchmarked and far behind.** It has receipts now, on an RTX
+3060: prefill 22.6× to 33.8× and decode 2.2× to 5.0× against llama.cpp
+on the same box. So a Windows or Linux install runs, and answers
+correctly, and should not be chosen for speed yet. The newest kernels
+in the table above are a further step back from that: they are verified
+on the host and have never run on a card at all. `/health` reports the same thing per capability,
 with a reason string, instead of quietly greying a control out.
 
 ## CLI
@@ -127,12 +136,17 @@ and the startup banner says so when the flag is being ignored.
 llama.cpp's method, agreeing with `llama-perplexity` to within a fifth
 of one standard error on five checkpoints. Where the two differ, the gap
 is monotone in the quant and has the sign the documented `vec_dot_type`
-difference predicts. `ferrox quantize` writes `Q8_0` byte-identically to
-`llama_model_quantize()`, plus `Q4_K_S` and `Q4_K_M` with `--pure`, and
-refuses every other target by name. Q4_K is not byte-identical and
-cannot be, because the C reference is compiled with FP contraction; it
-matches on perplexity instead. See
-[`CLI.md`](CLI.md).
+difference predicts. `ferrox quantize` writes **`Q8_0`, `Q4_K_S`,
+`Q4_K_M`, `Q5_K_M` and `Q6_K` byte-identically** to
+`llama_model_quantize()`, and refuses every other target by name.
+**The claim that Q4_K could never be byte-identical was wrong**, and it
+was wrong for an instructive reason: llama.cpp's `sumlx += w*x[i]*l`
+is contracted by its compiler into a single fused multiply-add, and
+Rust does not contract, so a strict transcription of the C was the
+defect. One unit in the last place flips a comparison and rewrites a
+whole super-block. With the fusion spelled out as `mul_add`, Q4_K went
+from 1.15% of super-blocks differing to zero, across all 147 tensors of
+a real model. See [`CLI.md`](CLI.md).
 
 The sampler flags carry llama.cpp's own defaults on `--temp` (0.8),
 `--top-k` (40), `--top-p` (0.95), `--min-p` (0.05) and `--repeat-last-n`
@@ -291,10 +305,11 @@ checked against the code rather than asserted. The gap is the roadmap.
 | NVIDIA RTX 30/40/50 | **Compiles, never measured.** CUDA has no in-tree benchmark receipt and no GPU in CI. |
 
 Two honest notes. Ferrox runs on Apple Metal, which that description
-does not cover, and Metal is where it is fastest: every dense `pp512`
-row is 0.98x to 1.10x against llama.cpp and 8 of 12 `tg128` rows are
-faster. And the single largest gap is not on this table: running a model
-that does not fit in memory works as policy and not as execution.
+does not cover, and Metal is where it is fastest: every `pp512` row is
+1.01x to 1.10x against llama.cpp and **12 of 14** comparable `tg128`
+rows are faster. And the single largest gap is not on this table:
+running a model that does not fit in memory works as policy and not as
+execution.
 
 ## Serving policy
 

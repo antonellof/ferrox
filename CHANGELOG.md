@@ -13,6 +13,118 @@ Entries name what changed and, where it matters, what was wrong
 before. A fix that closed a silent-wrong-answer class says so — those
 are the ones worth reading twice.
 
+## [0.18.0] - 2026-09-09
+
+### Added
+
+- **The four missing samplers**, so the chain is llama.cpp's full nine
+  steps in upstream's order: `dry`, `xtc`, `typ_p` and `top_n_sigma`
+  join `penalties`, `top_k`, `top_p`, `min_p` and `temperature`. Golden
+  values were read out of `libllama` rather than reasoned about. Every
+  new step is a no-op at its neutral value, so a default run is
+  unchanged. `mirostat` and `infill` remain refused by name, and the
+  reason mirostat is refused is written down: upstream *replaces* the
+  chain with it and it carries per-sequence state ferrox has nowhere to
+  put (#160).
+- **`ferrox gguf-split`**, a port of `llama-gguf-split`: split by tensor
+  count or by size, merge, `--dry-run`, the same shard names and the
+  same `split.*` metadata keys. Cross-checked against the real tool,
+  which produced 6 of 6 shards of identical size, and each tool merges
+  the other's output (#154).
+- **Three more architectures run with evidence**: `gemma`,
+  `hunyuan-dense` and `ernie4_5-moe` at step 1, each with a
+  libllama-golden fixture. Audited 23 to 26, unaudited refusals 34 to
+  31, and **the fixture-away class is now empty**: every row that needed
+  only evidence has it, so everything left needs code (#161).
+- **`ferrox quantize` writes Q5_K_M and Q6_K**, byte-identically (#162).
+- **CUDA gains Q2_K, Q3_K, IQ4_NL, IQ4_XS and MXFP4**, each with both a
+  matvec and a GEMM, since landing half of a kind is forbidden. Verified
+  on the host across 11 kinds, 33 shapes and 75,042 positions with zero
+  mismatches. **None has run on a GPU** (#157).
+- **AVX2 GEMMs for all five interleaved repack kinds on x86**, with one
+  per-workload dispatch rule shared by ten call sites. Verified by
+  execution on real AVX2 silicon, not emulation, and **not yet
+  benchmarked** (#159).
+
+### Fixed
+
+- **Q4_K quantization was not byte-identical, and the documented reason
+  it "could never be" was wrong.** llama.cpp's `sumlx += w*x[i]*l` is
+  contracted by its compiler into a single fused multiply-add; Rust does
+  not contract, so the strict transcription that shipped was the defect.
+  One unit in the last place flips a comparison and rewrites a whole
+  super-block, which is why 1.15% of super-blocks differed rather than a
+  rounding-sized fraction. Spelling the fusion as `mul_add` takes Q4_K,
+  Q5_K and Q6_K to **zero differing super-blocks across all 147 tensors**
+  of a real model (#162).
+- **The int-dot matvec repacked every weight matrix on every call.** It
+  passed a hand-written "uncacheable" identity where every other matvec
+  passed a real cache key, so the interleaved layout was rebuilt and
+  copied per token. It was 89% to 90% of decode work on Q8_0 and Q4_0
+  models. This also corrects the premise of #128: the cost is
+  proportional to gate and up projection bytes rather than fixed, and
+  fires only on those two formats (#155).
+- **`FERROX_CUDA=0` did not mean CPU.** The matvec launcher never
+  honoured the disable flag, on the strength of a comment claiming CUDA
+  needed no guard because launchers return an error with no device.
+  That is true of Metal and false of CUDA, where the binding panics, so
+  any quantized matvec on a CUDA build without a driver aborted the
+  process (#157).
+- **The CUDA host-check harness had silently stopped compiling** when
+  the `float4` inner loop landed, so it verified nothing while still
+  exiting green-adjacent. It now iterates the kind table rather than a
+  hand-kept list (#157).
+- **`ferrox gguf-split` was unreachable**: the CLI module existed but
+  was never registered, so the subcommand would have fallen through to
+  an implicit `ferrox run` and started generating text (#154).
+- Three pre-existing test races on a process-global override, which
+  passed only because the two halves of the int-dot tier used to move
+  together (#159).
+
+### Changed
+
+- **The CPU scheduler is chosen by work size**, not by
+  `FERROX_CPU_POOL`. One predicate decides per operation and the
+  environment variable is now an A/B override. The crossover constant is
+  **bracketed by the published measurements rather than swept**, and no
+  quiet-host before-and-after has been run, so this is not yet a
+  performance claim (#155).
+- **The repack cache has a derived byte budget with eviction.** The fix
+  above retains the packed copy, which cost +527 MB at 1.1B on Q8_0 and
+  would scale per expert on a mixture-of-experts model. The budget is
+  available memory minus a shared headroom constant minus committed
+  expert bytes, then a quarter share, so it spends the same pool as
+  `expert_store` rather than opening a second one. Zero disables the
+  cache and reproduces the previous behaviour exactly (#158).
+- **Metal encodes less per token**: 13% fewer dispatches and 9% fewer
+  barriers, by fusing RoPE for Q and K, folding the K and V cache append
+  into one grid, and deleting a barrier that guarded zero work on models
+  without QKV bias or QK-norm (#156).
+
+### Measured
+
+- **The Metal suite was re-measured on a quiet M2 Pro** and the stale
+  0.13.3 rows retired. Prefill spans **1.01× to 1.10×** and decode
+  **0.64× to 1.11×**, with **12 of 14 comparable decode rows faster than
+  llama.cpp**. MoE decode on OLMoE moved from ~1.41× to **0.96×**.
+  Gemma-2-2B at 1.11× is the worst row, confirming the 1.12× that the
+  concurrent-encode work predicted. Mistral-7B leaves the table because
+  `--fit-host` refuses it at ~10 GiB needed against 11.2 GiB free, and a
+  run from swap measures the swap (#163).
+
+### Retired hypotheses
+
+Both of these were the stated cause of an open issue, and both are now
+disproven by measurement rather than argument.
+
+- **Metal host cost is not dispatch count.** Removing 11.5% of encode
+  operations bought **2.3%** of host time, and barriers were already
+  hazard-driven rather than per-operation. What remains is per-dispatch
+  argument binding: roughly 2400 encoder calls per token against 418
+  dispatches and barriers combined (#149, #156).
+- **The CPU per-token cost is not fixed.** See the repack fix above
+  (#128, #155).
+
 ## [0.17.1] - 2026-09-04 
 
 ### Fixed
@@ -310,6 +422,7 @@ benchmark ledger.
 First tag. GGUF mmap loader, quantized CPU kernels, Metal backend,
 `ferrox` CLI and `ferrox-server`.
 
+[0.18.0]: https://github.com/antonellof/ferrox/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/antonellof/ferrox/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/antonellof/ferrox/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/antonellof/ferrox/compare/v0.15.3...v0.16.0

@@ -589,24 +589,39 @@ multimodal patch tables and audio codebooks. `token_embd.weight` and
 output head to Q6_K in other mixes is gated on the target not being
 Q8_0.
 
-`Q4_K_S` and `Q4_K_M` are also written, with `--pure`. Everything else
-(the remaining K-quants, the IQ tiers, MXFP4, imatrix) is refused by
-name rather than approximated. Tracked as
-[#70](https://github.com/antonellof/ferrox/issues/70).
+`Q4_K_S`, `Q4_K_M`, `Q5_K_M` and `Q6_K` are also written. Everything
+else (the IQ tiers, MXFP4, imatrix) is refused by name rather than
+approximated.
 
-**Q4_K is not byte-identical to llama.cpp's, and cannot be.** Compared
-tensor by tensor against `llama-quantize --pure`, 113 of 311 tensors
-match exactly and 198 differ in about 0.05% of their bytes. The cause is
-not the algorithm: `ggml-quants.c.o` carries 1957 FMA instructions
-because clang contracts `a*b+c` into a fused multiply-add by default for
-C, and Rust does not, so `quantize_row_q4_K_ref`'s exact output is a
-property of the compiler that built the reference. llama.cpp built with
-contraction off would not reproduce it either. Q8_0 IS byte-identical,
-because its arithmetic has no accumulated multiply-add to contract.
+**Q4_K is byte-identical too, and the claim that it could never be was
+wrong.** This document previously said the difference was a property of
+the compiler that built the reference: clang contracts `a*b+c` into a
+fused multiply-add for C and Rust does not, so a strict transcription
+could not match. The first half of that is true and the conclusion was
+not. The fix is to spell the contraction out. `sumlx += w*x[i]*l` in
+`ggml-quants.c` is **one** FMA, and writing it as `mul_add` in Rust
+reproduces it exactly; one unit in the last place flips
+`sumlx*sumlx > best*suml2` and rewrites an entire super-block, which is
+why 1.15% of super-blocks differed rather than a rounding-sized
+fraction.
 
-What is equal is the thing that matters. Perplexity of the two files, on
-the same corpus through the same engine: **25.1444** for ferrox's
-against **25.1805** for llama.cpp's, 2.4% of one standard error apart.
+Measured against `llama-quantize` b7650 over an F16 Llama-3.2-1B, whole
+model rather than a fixture:
+
+| Target | Tensors identical | Super-blocks differing |
+|---|---|---|
+| Q8_0 (control) | 147 / 147 | 0 |
+| Q4_K_M | 147 / 147 | 0 of 3,244,032 Q4_K, 0 of 1,583,104 Q6_K |
+| Q5_K_M | 147 / 147 | 0 of 3,244,032 Q5_K, 0 of 1,583,104 Q6_K |
+| Q6_K | 147 / 147 | 0 of 4,827,136 Q6_K |
+
+Two things that discipline needs. Goldens must come from the
+**installed** binary: a local release build of the same b7650 source
+disagrees on exactly these knife-edge blocks, and pinned the wrong
+bytes once. And the fixture must be able to fail: the original
+synthetic one stayed green with every `mul_add` removed, so it now
+carries eight real weight blocks, one per fusion site, of which nine of
+thirteen sites redden a golden.
 
 One refusal to know about: a tensor whose row width is not a multiple of
 256 stops the run. llama.cpp answers that case by changing the tensor's

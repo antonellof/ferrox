@@ -17,7 +17,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.17.1"
+version = "0.18.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/antonellof/ferrox"
@@ -57,19 +57,19 @@ minijinja = { version = "2.21", features = ["loop_controls", "json"] }
 libc = "0.2"
 
 # Internal crates — path for local builds, version for crates.io.
-ferrox-api = { version = "0.17.1", path = "crates/ferrox-api" }
-ferrox-gguf = { version = "0.17.1", path = "crates/ferrox-gguf" }
-ferrox-quant = { version = "0.17.1", path = "crates/ferrox-quant" }
-ferrox-safetensors = { version = "0.17.1", path = "crates/ferrox-safetensors" }
-ferrox-cuda = { version = "0.17.1", path = "crates/ferrox-cuda" }
-ferrox-metal = { version = "0.17.1", path = "crates/ferrox-metal" }
-ferrox-vulkan = { version = "0.17.1", path = "crates/ferrox-vulkan" }
-ferrox-core = { version = "0.17.1", path = "crates/ferrox-core" }
-ferrox-moe = { version = "0.17.1", path = "crates/ferrox-moe" }
-ferrox-models = { version = "0.17.1", path = "crates/ferrox-models" }
-ferrox-inference = { version = "0.17.1", path = "crates/ferrox-inference" }
+ferrox-api = { version = "0.18.0", path = "crates/ferrox-api" }
+ferrox-gguf = { version = "0.18.0", path = "crates/ferrox-gguf" }
+ferrox-quant = { version = "0.18.0", path = "crates/ferrox-quant" }
+ferrox-safetensors = { version = "0.18.0", path = "crates/ferrox-safetensors" }
+ferrox-cuda = { version = "0.18.0", path = "crates/ferrox-cuda" }
+ferrox-metal = { version = "0.18.0", path = "crates/ferrox-metal" }
+ferrox-vulkan = { version = "0.18.0", path = "crates/ferrox-vulkan" }
+ferrox-core = { version = "0.18.0", path = "crates/ferrox-core" }
+ferrox-moe = { version = "0.18.0", path = "crates/ferrox-moe" }
+ferrox-models = { version = "0.18.0", path = "crates/ferrox-models" }
+ferrox-inference = { version = "0.18.0", path = "crates/ferrox-inference" }
 # Only ferrox-cli depends on this, and only behind its optional `serve`
 # feature. The server's dependency set is a strict superset of the CLI's
 # (+98 crates, +6 MB), so an unconditional dependency would make
 # `cargo install ferrox-cli` compile an HTTP and TLS stack it never runs.
-ferrox-server = { version = "0.17.1", path = "crates/ferrox-server" }
+ferrox-server = { version = "0.18.0", path = "crates/ferrox-server" }
