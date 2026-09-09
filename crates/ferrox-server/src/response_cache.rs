@@ -195,10 +195,33 @@ pub struct SamplingKey {
     pub penalty_last_n: usize,
     pub presence_penalty_bits: u32,
     pub frequency_penalty_bits: u32,
+    pub typical_p_bits: u32,
+    pub top_n_sigma_bits: u32,
+    pub xtc_probability_bits: u32,
+    pub xtc_threshold_bits: u32,
+    /// DRY, as the configuration a caller SPELLED rather than as the
+    /// tokenised breaker map it resolved to. The map is a function of
+    /// that configuration and the model, and the model is already part
+    /// of [`CacheKey`], so hashing the strings keys the same answers
+    /// and costs a few bytes instead of a walk over the vocabulary.
+    pub dry: DryKey,
     /// The ORDER the chain ran in (llama.cpp's `samplers`). Two
     /// requests that differ only in it get different answers, so it is
     /// a key field like any other knob.
     pub sampler_order: ferrox_models::sampler_order::SamplerOrder,
+}
+
+/// The DRY half of [`SamplingKey`]. Its own struct because
+/// `DryParams` holds an `Arc` to a map that is neither `Hash` nor `Eq`,
+/// and because every field here is one a caller can change.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DryKey {
+    pub multiplier_bits: u32,
+    pub base_bits: u32,
+    pub allowed_length: i32,
+    pub penalty_last_n: i32,
+    pub total_context_size: usize,
+    pub sequence_breakers: Vec<String>,
 }
 
 /// The cache-key form of a resolved sampling configuration.
@@ -217,6 +240,11 @@ pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
         top_p,
         min_p,
         top_k,
+        typical_p,
+        top_n_sigma,
+        xtc_probability,
+        xtc_threshold,
+        dry,
         repetition_penalty,
         penalty_last_n,
         presence_penalty,
@@ -228,6 +256,18 @@ pub fn sampling_key(params: &SamplingParams) -> SamplingKey {
         top_p_bits: top_p.to_bits(),
         min_p_bits: min_p.to_bits(),
         top_k: *top_k,
+        typical_p_bits: typical_p.to_bits(),
+        top_n_sigma_bits: top_n_sigma.to_bits(),
+        xtc_probability_bits: xtc_probability.to_bits(),
+        xtc_threshold_bits: xtc_threshold.to_bits(),
+        dry: DryKey {
+            multiplier_bits: dry.multiplier().to_bits(),
+            base_bits: dry.base().to_bits(),
+            allowed_length: dry.allowed_length(),
+            penalty_last_n: dry.penalty_last_n(),
+            total_context_size: dry.total_context_size(),
+            sequence_breakers: dry.breakers().raw().to_vec(),
+        },
         repetition_penalty_bits: repetition_penalty.to_bits(),
         penalty_last_n: *penalty_last_n,
         presence_penalty_bits: presence_penalty.to_bits(),

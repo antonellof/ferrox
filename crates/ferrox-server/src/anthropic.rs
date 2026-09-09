@@ -644,6 +644,11 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
         min_p: None,
         top_k: None,
         repetition_penalty: None,
+        // Neither the Anthropic Messages wire nor the Responses wire
+        // carries llama.cpp's extra samplers, so they resolve to their
+        // neutral defaults and this chain is llama.cpp's default one
+        // doing nothing extra.
+        extra_samplers: Default::default(),
         // No seed on this wire, so the chat path's policy applies
         // unchanged: an unseeded sampled request draws fresh every time
         // rather than replaying one draw forever.
@@ -1398,7 +1403,8 @@ async fn messages_full(
     // The client's own list, kept apart from `params.stop`, which the
     // template adds its end-of-turn marker to. See `caller_stop`.
     let caller_stops = chat.stop_sequences();
-    let params = chat.generation_params_for_template(&template, active.name())?;
+    let params =
+        chat.generation_params_for_template(&template, active.name(), active.sampler_model())?;
 
     let (chunks, finish, usage) = crate::decode_task::buffered(
         crate::decode_task::DecodeHandles::take(&state, &active).map_err(anthropic_shape)?,
@@ -1456,7 +1462,8 @@ async fn messages_stream(
     let posture = OutputPosture::resolve(&served_model, &prompt);
     // See `messages_full`: the client's list, not the template's.
     let caller_stops = chat.stop_sequences();
-    let mut params = chat.generation_params_for_template(&template, &served_model)?;
+    let mut params =
+        chat.generation_params_for_template(&template, &served_model, active.sampler_model())?;
 
     // The same two-tier cancellation the chat stream has: the guard
     // rides with the generation task and deregisters however that task

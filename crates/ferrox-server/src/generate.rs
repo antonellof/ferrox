@@ -1155,8 +1155,19 @@ impl GenerationParams {
     /// reason its output parses, so a folded argmax under a grammar is
     /// unconstrained text served against a `response_format` the caller
     /// was told was honoured.
+    ///
+    /// The sampler arm is the third such thing, and it arrived with
+    /// llama.cpp's `xtc` and `typ_p`. Both of those can remove the
+    /// MAXIMUM from the candidate list, and `dry` can move which logit
+    /// the maximum is, so at `temperature <= 0` the answer is no longer
+    /// the argmax of the raw logits. A device that folded the argmax
+    /// away would hand the sampler one precomputed id with no
+    /// vocabulary left for XTC to remove anything from, and XTC would
+    /// silently not run. `SamplingParams::greedy_equals_argmax` is the
+    /// single predicate deciding that, shared with the sampler's own
+    /// greedy fast path and with `ferrox_cli::run`'s copy of this gate.
     pub(crate) fn needs_vocab_logits(&self) -> bool {
-        self.json_object || self.grammar.is_some()
+        self.json_object || self.grammar.is_some() || !self.sampling.greedy_equals_argmax()
     }
 }
 

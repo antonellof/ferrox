@@ -195,12 +195,16 @@ OpenAI-compatible HTTP API:
 - `POST /v1/responses`, the surface `codex` speaks, streaming and
   buffered. This server keeps no responses, so the two lookups by
   response id answer 404
-- Sampling matched to llama.cpp's own chain: `temperature`, `top_p`,
-  `top_k`, `min_p`, `repetition_penalty` over a 64-token penalty window,
-  presence and frequency penalties. Temperature runs **last**, after the
-  truncation filters, as llama.cpp orders it, and the repetition penalty
-  is applied once per candidate rather than once per occurrence. Both
-  routes read the same knobs through one `SamplingKnobs::resolve`
+- Sampling matched to llama.cpp's own chain, all nine steps of it in
+  upstream's order: `penalties`, `dry`, `top_n_sigma`, `top_k`,
+  `typ_p`, `top_p`, `min_p`, `xtc`, `temperature`
+  (`common/common.h:259-269`). Temperature runs **last**, after the
+  truncation filters, and the repetition penalty is applied once per
+  candidate rather than once per occurrence. DRY's sequence breakers are
+  tokenised against the loaded model's own vocabulary; a checkpoint with
+  none refuses DRY rather than running it breaker-less. `mirostat` and
+  `infill` are the two upstream samplers still refused, each by name.
+  Every route reads the same knobs through one `SamplingKnobs::resolve`
 - Grammar-constrained decoding, in every spelling: llama.cpp's own
   `grammar` field, OpenAI's `response_format: json_schema`, llama.cpp's
   bare `json_schema` field on `/completion`, and a forced `tool_choice`.

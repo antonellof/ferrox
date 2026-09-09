@@ -114,6 +114,33 @@ impl ActiveModel {
         }
     }
 
+    /// The model facts the sampler chain needs that a request body
+    /// cannot carry: the vocabulary DRY's sequence breakers are
+    /// tokenised against, and the context size `dry_penalty_last_n = -1`
+    /// resolves to.
+    ///
+    /// Taken off the PINNED `ActiveModel` rather than looked up again,
+    /// so a request cannot resolve its sampler against one checkpoint
+    /// and decode against the one `/admin/models/load` swapped in
+    /// afterwards.
+    pub(crate) fn sampler_model(&self) -> crate::sampling_knobs::SamplerModel<'_> {
+        let vocab = self
+            .generative_opt()
+            .filter(|m| m.has_real_vocabulary())
+            .map(|m| m.as_ref() as &dyn ferrox_models::dry::DryVocab);
+        crate::sampling_knobs::SamplerModel {
+            vocab,
+            // `usize::MAX` when this server could not price a ceiling:
+            // see `SamplerModel::context_size` for why that is the
+            // derived answer rather than a chosen constant.
+            context_size: self
+                .ceiling
+                .as_ref()
+                .and_then(|c| c.limit())
+                .unwrap_or(usize::MAX),
+        }
+    }
+
     /// The generation model when there is one, for the reporting
     /// surfaces (`/v1/models`, `/health`) that describe whatever is
     /// loaded rather than requiring a particular kind. They say less

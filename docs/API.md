@@ -61,6 +61,8 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `model`, `messages` | Supported |
 | `max_tokens` | Supported; **defaults to 32768**, not OpenAI's legacy 16. An explicit `0` is a 400 |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed`, `stop` | Supported |
+| `typical_p`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | Supported. llama.cpp's own spellings; absent means the sampler is off |
+| `samplers` | Supported. The chain order, as a list of names or a `;`-separated string. Defaults to llama.cpp's own default chain |
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
 | `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in eleven wire formats) |
@@ -977,8 +979,9 @@ from arriving as a number.
 `/v1/completions` honours `stop`, `max_tokens` (default 16, because the legacy
 floor is right *here*, where a caller completing a fragment usually
 wants a fragment back), `temperature`, `top_p`, `min_p`, `top_k`,
-`repetition_penalty`, `presence_penalty`, `frequency_penalty`, `seed`,
-`ignore_eos` and `grammar`.
+`typical_p`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, the five
+`dry_*` fields, `samplers`, `repetition_penalty`, `presence_penalty`,
+`frequency_penalty`, `seed`, `ignore_eos` and `grammar`.
 
 Four of those are recent. `top_k`, `repetition_penalty`,
 `presence_penalty` and `frequency_penalty` were undeclared on this
@@ -1037,9 +1040,26 @@ is a wire, not a second implementation.
 
 `prompt` (string, or `{"prompt_string": "…"}`) · `n_predict` ·
 `stream` · `stop` · `temperature` · `top_p` · `min_p` · `top_k` ·
+`typical_p` · `top_n_sigma` · `xtc_probability` · `xtc_threshold` ·
+`dry_multiplier` · `dry_base` · `dry_allowed_length` ·
+`dry_penalty_last_n` · `dry_sequence_breakers` ·
 `repeat_penalty` · `repeat_last_n` · `presence_penalty` ·
-`frequency_penalty` · `seed` (`-1` draws one) · `ignore_eos` ·
-`grammar` · `cache_prompt`.
+`frequency_penalty` · `samplers` · `seed` (`-1` draws one) ·
+`ignore_eos` · `grammar` · `cache_prompt`.
+
+The nine samplers of llama.cpp's default chain all run, in llama.cpp's
+order (`penalties, dry, top_n_sigma, top_k, typical_p, top_p, min_p,
+xtc, temperature`). An absent field resolves to the value that makes its
+sampler a no-op, so a request that names none of them is sampled exactly
+as it was before they existed.
+
+`dry_sequence_breakers` are STRINGS, tokenised against the loaded
+model's own vocabulary (llama.cpp's `get_overlapping_token_sequences`).
+A checkpoint with no real vocabulary — the synthetic-weight fallback —
+**refuses** `dry_multiplier` rather than running DRY with no breakers,
+because a breaker-less DRY looks like working DRY and penalises across
+every boundary the caller named. Send `dry_sequence_breakers: []` to ask
+for DRY with no breakers deliberately.
 
 `n_predict` keeps llama.cpp's meaning exactly, including the part that
 is easy to get wrong: **an absent `n_predict` is `-1`**, which means
@@ -1068,8 +1088,7 @@ because a stock client sends most of them explicitly and refusing
 `mirostat: 0` would be a false refusal. At any other value it is a 501
 naming the field:
 
-`dynatemp_range` · `typical_p` · `xtc_probability` · `mirostat` ·
-`dry_multiplier` · `samplers` (the sampler chain order is fixed) ·
+`dynatemp_range` · `mirostat` ·
 `n_probs` and `post_sampling_probs` (no per-token logprobs) ·
 `min_keep` · `return_tokens` (the decode loop hands this layer text,
 not ids) · `n_indent` · `n_keep` (ferrox refuses an oversized request
@@ -1089,10 +1108,9 @@ than ranked; upstream prefers `grammar` and drops the schema, which is
 a 200 whose answer need not match the schema the caller sent.
 
 Options that only *parameterise* a switched-off sampler (
-`mirostat_tau`, `mirostat_eta`, `dry_base`, `dry_allowed_length`,
-`dry_penalty_last_n`, `dry_sequence_breakers`, `xtc_threshold`,
-`dynatemp_exponent`) are deliberately not in that list: they do
-nothing while their switch is off, and their switch is. A field
+`mirostat_tau`, `mirostat_eta`, `dynatemp_exponent`) are deliberately
+not in that list: they do nothing while their switch is off, and their
+switch is. A field
 llama.cpp does not define either is ignored, exactly as upstream
 ignores it.
 

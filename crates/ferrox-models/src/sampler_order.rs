@@ -33,12 +33,14 @@
 //!
 //! # Partial support, stated
 //!
-//! ferrox implements five of llama.cpp's samplers. The rest are named
-//! in the table purely so that asking for one is a refusal that says
-//! WHICH sampler is missing, rather than an unknown-name error or, far
-//! worse, a chain quietly built without it. A caller who asked for
-//! `xtc` and was served a chain with no XTC in it got a different
-//! sampler than they requested and no way to tell.
+//! ferrox implements llama.cpp's whole default chain: `penalties`,
+//! `dry`, `top_n_sigma`, `top_k`, `typ_p`, `top_p`, `min_p`, `xtc` and
+//! `temperature`. `mirostat` and `infill` are named in the table purely
+//! so that asking for one is a refusal that says WHICH sampler is
+//! missing, rather than an unknown-name error or, far worse, a chain
+//! quietly built without it. A caller who asked for `mirostat` and was
+//! served a chain without it got a different sampler than they
+//! requested and no way to tell.
 
 use std::fmt;
 use std::str::FromStr;
@@ -111,9 +113,16 @@ sampler_names! {
 pub enum ChainStep {
     /// The repetition / presence / frequency penalties.
     Penalties,
+    /// The DRY sequence-repetition penalty; see [`crate::dry`].
+    Dry,
+    TopNSigma,
     TopK,
+    /// Locally typical sampling, llama.cpp's `typ_p`.
+    TypP,
     TopP,
     MinP,
+    /// "Exclude top choices", llama.cpp's `xtc`.
+    Xtc,
     Temperature,
 }
 
@@ -123,11 +132,31 @@ impl ChainStep {
     pub const fn name(self) -> SamplerName {
         match self {
             ChainStep::Penalties => SamplerName::Penalties,
+            ChainStep::Dry => SamplerName::Dry,
+            ChainStep::TopNSigma => SamplerName::TopNSigma,
             ChainStep::TopK => SamplerName::TopK,
+            ChainStep::TypP => SamplerName::TypP,
             ChainStep::TopP => SamplerName::TopP,
             ChainStep::MinP => SamplerName::MinP,
+            ChainStep::Xtc => SamplerName::Xtc,
             ChainStep::Temperature => SamplerName::Temperature,
         }
+    }
+
+    /// Every step this engine can run, DERIVED from the name table
+    /// rather than restated beside it.
+    ///
+    /// A hand-written list here would be a second structure that had to
+    /// agree with [`SamplerName::implemented`], which is the defect
+    /// shape this whole module is built to avoid. Derived, "is a step"
+    /// and "has a name that maps to it" are the same statement, and
+    /// `tests::every_step_the_name_table_yields_names_itself_back`
+    /// closes the loop in the other direction.
+    pub fn all() -> Vec<ChainStep> {
+        SamplerName::ALL
+            .iter()
+            .filter_map(|n| n.implemented().ok())
+            .collect()
     }
 }
 
@@ -143,29 +172,14 @@ impl SamplerName {
     pub const fn implemented(self) -> Result<ChainStep, &'static str> {
         match self {
             SamplerName::Penalties => Ok(ChainStep::Penalties),
+            SamplerName::Dry => Ok(ChainStep::Dry),
+            SamplerName::TopNSigma => Ok(ChainStep::TopNSigma),
             SamplerName::TopK => Ok(ChainStep::TopK),
+            SamplerName::TypP => Ok(ChainStep::TypP),
             SamplerName::TopP => Ok(ChainStep::TopP),
             SamplerName::MinP => Ok(ChainStep::MinP),
+            SamplerName::Xtc => Ok(ChainStep::Xtc),
             SamplerName::Temperature => Ok(ChainStep::Temperature),
-            SamplerName::Dry => Err(
-                "the DRY repetition sampler is not implemented: it needs the n-gram \
-                 breaker state llama.cpp keeps per sequence, which this engine has no \
-                 equivalent of",
-            ),
-            SamplerName::TypP => Err(
-                "locally typical sampling (`typ_p`) is not implemented: no filter in \
-                 this engine ranks candidates by their distance from the distribution's \
-                 entropy",
-            ),
-            SamplerName::Xtc => Err(
-                "the XTC sampler is not implemented: it removes the TOP candidates with \
-                 a probability, which is the only sampler here that would need its own \
-                 draw off the RNG stream",
-            ),
-            SamplerName::TopNSigma => Err(
-                "top-n-sigma truncation is not implemented: no filter here cuts on the \
-                 standard deviation of the logits",
-            ),
             SamplerName::Mirostat => Err(
                 "mirostat is not implemented. It is not a chain member upstream either \
                  (llama.cpp spells it `--mirostat` and it REPLACES the chain), so there \
@@ -270,19 +284,29 @@ pub struct SamplerOrder {
     len: usize,
 }
 
-/// ferrox's chain, which is llama.cpp's default chain restricted to the
-/// samplers ferrox has: penalties, top-k, top-p, min-p, and
-/// **temperature last**.
+/// llama.cpp's default chain, verbatim: `penalties, dry, top_n_sigma,
+/// top_k, typical_p, top_p, min_p, xtc, temperature`
+/// (`common/common.h:259-269`), with **temperature last**.
+///
+/// The four steps ferrox gained in `feat/sampler-parity` are all
+/// NO-OPS at their neutral defaults (`dry_multiplier 0.0`,
+/// `top_n_sigma -1.0`, `typical_p 1.0`, `xtc_probability 0.0`), so
+/// adding them to the default chain changes no run that did not
+/// configure them -- asserted bit-for-bit by
+/// `sampling::tests::the_default_order_is_the_chain_ferrox_already_ran`,
+/// which compares against the five-step chain ferrox used to run.
 ///
 /// This is the single definition of "the default". Changing it changes
-/// every run that did not pass `--samplers`, which
-/// `sampling::tests::the_default_order_is_the_chain_ferrox_already_ran`
-/// exists to catch.
-const DEFAULT_STEPS: [ChainStep; 5] = [
+/// every run that did not pass `--samplers`.
+const DEFAULT_STEPS: [ChainStep; 9] = [
     ChainStep::Penalties,
+    ChainStep::Dry,
+    ChainStep::TopNSigma,
     ChainStep::TopK,
+    ChainStep::TypP,
     ChainStep::TopP,
     ChainStep::MinP,
+    ChainStep::Xtc,
     ChainStep::Temperature,
 ];
 
@@ -426,19 +450,72 @@ impl std::hash::Hash for SamplerOrder {
 mod tests {
     use super::*;
 
-    /// The default chain is the one ferrox already ran, spelled out.
+    /// The default chain is llama.cpp's default chain, spelled out.
     ///
-    /// The distribution-level proof is
+    /// The distribution-level proof that adding the four new steps
+    /// changed nothing is
     /// `sampling::tests::the_default_order_is_the_chain_ferrox_already_ran`;
-    /// this is the cheap statement of the same fact, so a reordering of
-    /// `DEFAULT_STEPS` is visible in one line of diff.
+    /// this is the cheap statement of the order itself, so a reordering
+    /// of `DEFAULT_STEPS` is visible in one line of diff.
     #[test]
-    fn the_default_chain_is_penalties_top_k_top_p_min_p_then_temperature() {
+    fn the_default_chain_is_llama_cpps_default_chain() {
         assert_eq!(
             SamplerOrder::default().to_string(),
-            "penalties;top_k;top_p;min_p;temperature"
+            "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature"
         );
         assert!(SamplerOrder::default().has_penalties());
+    }
+
+    /// Every step the name table can produce names itself back, and
+    /// every step [`ChainStep::all`] lists is one the table produces.
+    ///
+    /// This is the closing half of the "one table" guarantee. The
+    /// compiler already forces [`ChainStep::name`] to cover every
+    /// variant and [`SamplerName::implemented`] to cover every name; what
+    /// neither forces is that a step given a name is a name that maps
+    /// BACK to it. A `ChainStep::Xtc => SamplerName::TopK` typo compiles,
+    /// and would make `xtc` build a chain running top-k twice.
+    #[test]
+    fn every_step_the_name_table_yields_names_itself_back() {
+        let steps = ChainStep::all();
+        assert!(!steps.is_empty());
+        for step in &steps {
+            assert_eq!(
+                step.name().implemented(),
+                Ok(*step),
+                "{step:?} is spelled `{}`, which maps to a different step",
+                step.name().as_str()
+            );
+        }
+        // And no two steps share a spelling, which would make the
+        // round-trip above pass while one step was unreachable.
+        let mut names: Vec<&str> = steps.iter().map(|s| s.name().as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "two steps share a name");
+    }
+
+    /// Every step this engine implements is in the DEFAULT chain, and in
+    /// llama.cpp's order.
+    ///
+    /// A step that were implemented, parseable and left out of the
+    /// default would run only for callers who named it explicitly --
+    /// which is llama.cpp's shape for `mirostat` and NOT for anything in
+    /// its default chain, so it would be a silent divergence from
+    /// upstream for every unconfigured run.
+    #[test]
+    fn the_default_chain_contains_every_step_this_engine_implements() {
+        let mut implemented = ChainStep::all();
+        let mut defaulted = SamplerOrder::default().steps().to_vec();
+        assert_eq!(
+            defaulted, implemented,
+            "the default chain and the implemented set must be the same steps \
+             in the same order"
+        );
+        implemented.sort_by_key(|s| s.name().as_str());
+        defaulted.sort_by_key(|s| s.name().as_str());
+        assert_eq!(defaulted, implemented);
     }
 
     /// Every name in the generated table parses back to itself, which is
@@ -509,12 +586,12 @@ mod tests {
     /// The samplers llama.cpp has and ferrox does not are refused BY
     /// NAME, with the reason, rather than dropped from the chain.
     ///
-    /// A caller who asked for `xtc` and was handed a chain without it
-    /// was given a different sampler and served a 200. This is the whole
-    /// reason those names are in the table at all.
+    /// A caller who asked for `mirostat` and was handed a chain without
+    /// it was given a different sampler and served a 200. This is the
+    /// whole reason those names are in the table at all.
     #[test]
     fn a_real_but_unimplemented_sampler_is_refused_with_its_reason() {
-        for name in ["dry", "xtc", "typ_p", "mirostat", "top_n_sigma", "infill"] {
+        for name in ["mirostat", "infill"] {
             let err = format!("top_k;{name};temperature")
                 .parse::<SamplerOrder>()
                 .expect_err(&format!("`{name}` must be refused, not skipped"));
@@ -548,16 +625,18 @@ mod tests {
     /// MESSAGE is asserted and not just the failure.
     #[test]
     fn an_unimplemented_sampler_names_itself_and_says_what_is_implemented() {
-        let err = "top_k;xtc".parse::<SamplerOrder>().expect_err("no xtc");
+        let err = "top_k;mirostat"
+            .parse::<SamplerOrder>()
+            .expect_err("no mirostat");
         assert_eq!(
             err,
             SamplerOrderError::Unimplemented {
-                name: "xtc",
-                reason: SamplerName::Xtc.implemented().unwrap_err(),
+                name: "mirostat",
+                reason: SamplerName::Mirostat.implemented().unwrap_err(),
             }
         );
         let message = err.to_string();
-        assert!(message.contains("`xtc`"), "{message}");
+        assert!(message.contains("`mirostat`"), "{message}");
         assert!(
             message.contains("top_k"),
             "must list what IS there: {message}"

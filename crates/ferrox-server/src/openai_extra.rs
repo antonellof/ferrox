@@ -215,6 +215,11 @@ pub(crate) struct CompletionsRequest {
     top_k: Option<usize>,
     #[serde(default)]
     repetition_penalty: Option<f32>,
+    /// llama.cpp's `typ_p`, `top_n_sigma`, `xtc_*` and `dry_*`, in ONE
+    /// struct shared with the other two routes that take them. See
+    /// `sampling_knobs::ExtraSamplerFields`.
+    #[serde(flatten)]
+    extra_samplers: crate::sampling_knobs::ExtraSamplerFields,
     #[serde(default)]
     presence_penalty: Option<f32>,
     #[serde(default)]
@@ -285,8 +290,8 @@ impl CompletionsRequest {
     /// chat route uses. See `crate::sampling_knobs`.
     /// Fallible because `samplers` is parsed here; see the chat route's
     /// twin.
-    fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
-        Ok(SamplingKnobs {
+    pub(crate) fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
+        let mut knobs = SamplingKnobs {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
@@ -301,7 +306,10 @@ impl CompletionsRequest {
                 self.samplers.as_ref(),
                 "/v1/completions",
             )?,
-        })
+            ..SamplingKnobs::default()
+        };
+        self.extra_samplers.apply(&mut knobs);
+        Ok(knobs)
     }
 
     fn stop_sequences(&self) -> Vec<String> {
@@ -484,7 +492,12 @@ pub async fn completions(
         // split that did not happen.
         reasoning: None,
         max_tokens: req.max_tokens,
-        sampling: req.sampling_knobs()?.resolve(),
+        sampling: req
+            .sampling_knobs()?
+            .resolve(active.sampler_model())
+            .map_err(|e| {
+                crate::unsupported_feature(&format!("`dry_multiplier` on /v1/completions: {e}"))
+            })?,
         seed: req.seed.unwrap_or(0),
         stop: req.stop_sequences(),
         json_object: false,
@@ -681,7 +694,8 @@ mod tests {
         }))
         .sampling_knobs()
         .expect("knobs")
-        .resolve();
+        .resolve(crate::sampling_knobs::SamplerModel::absent())
+        .expect("no dry");
 
         assert_eq!(resolved.temperature, 0.5);
         assert_eq!(resolved.top_p, 0.9);
@@ -717,14 +731,17 @@ mod tests {
         let completion = request(completion_body)
             .sampling_knobs()
             .expect("knobs")
-            .resolve();
+            .resolve(crate::sampling_knobs::SamplerModel::absent())
+            .expect("no dry");
 
         let mut chat_body = knobs;
         chat_body["model"] = serde_json::json!("m");
         chat_body["messages"] = serde_json::json!([{"role": "user", "content": "hi"}]);
         let chat: crate::ChatCompletionRequest =
             serde_json::from_value(chat_body).expect("chat request");
-        let chat = chat.sampling_params().expect("knobs");
+        let chat = chat
+            .sampling_params(crate::sampling_knobs::SamplerModel::absent())
+            .expect("knobs");
 
         assert_eq!(completion.temperature, chat.temperature);
         assert_eq!(completion.top_p, chat.top_p);
