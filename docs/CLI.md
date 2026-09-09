@@ -598,6 +598,70 @@ TYPE, to Q5_0 or F16, and ferrox has neither encoder; padding the row
 would shift every following row on decode. SmolLM2-135M cannot be Q4_K
 quantized here for that reason, its embedding being 576 wide.
 
+## Split and merge GGUF (`ferrox gguf-split`)
+
+llama.cpp's `llama-gguf-split`, same flags, same shard names, same
+metadata keys. Splitting is the default operation; `--merge` is the
+other direction.
+
+```bash
+# By tensor count (llama.cpp's default limit is 128)
+ferrox gguf-split --split-max-tensors 128 model.gguf out/model
+
+# By size. Units are DECIMAL, as in llama.cpp: 4G is 4,000,000,000
+ferrox gguf-split --split-max-size 4G model.gguf out/model
+
+# Metadata-only first shard, the layout most published checkpoints use
+ferrox gguf-split --split-max-size 4G --no-tensor-first-split model.gguf out/model
+
+# Plan only: shard count, tensors and bytes per shard, nothing written
+ferrox gguf-split --split-max-size 4G --dry-run model.gguf out/model
+
+# Back to one file. The input is the FIRST shard
+ferrox gguf-split --merge out/model-00001-of-00003.gguf model.gguf
+```
+
+Shards are named `<prefix>-NNNNN-of-MMMMM.gguf`, 1-based, and carry
+llama.cpp's three keys with llama.cpp's types: `split.no` (u16, 0-based),
+`split.count` (u16) and `split.tensors.count` (i32, the total across the
+whole set). The first shard holds the complete source metadata and the
+rest hold only those three, so a set written here is one `ferrox run -m
+out/model-00001-of-00003.gguf` away from running, and one llama.cpp
+reads too.
+
+Tensor bytes are copied straight from the source's mmap into the shard,
+never buffered, so a 400 GB checkpoint splits in the memory a header
+takes.
+
+Four things differ from llama.cpp's tool, all of them refusals it does
+not make:
+
+* Splitting a file that is **already a shard** stops. llama.cpp would
+  write a set whose `split.tensors.count` covered that one shard, which
+  no loader can reassemble.
+* A first tensor **larger than `--split-max-size`** is named, with both
+  numbers. llama.cpp prints "one of splits have 0 tensors" and exits.
+* `--merge` **refuses the `--split-*` options** instead of parsing and
+  ignoring them.
+* A missing shard names the file it wanted, at plan time, before the
+  output is opened.
+
+Two byte-level differences, both inherited from choices this crate
+already made: metadata keys are written sorted, and shards are padded
+with the alignment the source declares where llama.cpp's tool always
+pads with 32. A merge of a set this tool wrote reproduces the source
+byte for byte when the source itself carried the `split.*` keys a
+previous merge leaves behind; otherwise the merged file gains exactly
+those three keys and nothing else changes.
+
+Cross-checked against the installed `llama-gguf-split` (build 7650, 68b4d516c) on the
+21-tensor test fixture at `--split-max-tensors 4`. All **6 of 6** shards
+came out the identical SIZE, byte for byte, and differ only where the
+metadata keys are ordered: 54 bytes on each later shard (the three
+`split.*` keys) and 754 on the first (the whole header). Both directions
+work across the two tools: llama.cpp merges a set ferrox split, and
+ferrox merges a set llama.cpp split, each producing a 24,032-byte file.
+
 ## Hugging Face Hub (`download`, `pull`)
 
 Fetches a GGUF over HTTPS directly. No Python and no
