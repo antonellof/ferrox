@@ -14,23 +14,22 @@
 //!
 //! # The switch
 //!
-//! `FERROX_CPU_POOL`:
+//! Which of the two runs is decided **per operation, from its size**, by
+//! the one predicate in [`policy`]: [`backend`]. `FERROX_CPU_POOL` pins
+//! it either way (`spin` / `rayon`) and is an A/B override, not the
+//! decision. See [`policy::SPIN_MIN_OP_MACS`] for the crossover and what
+//! is and is not measured about it.
 //!
-//! - unset, `rayon`, `0`, `off` — **the default**: today's rayon
-//!   fork-join, expression for expression unchanged.
-//! - `spin`, `1`, `on`, `persistent` — the persistent pool.
-//!
-//! Read once, cached for the process. It defaults to rayon on purpose:
-//! nobody has measured the new path yet (an agent may not benchmark on a
-//! loaded host), so a before/after is one environment variable rather
-//! than two builds, and a revert is unsetting it.
+//! Every helper below asks [`backend`] and none of them decides
+//! anything itself, which is what stops the two arms of that choice from
+//! drifting apart across thirty call sites.
 //!
 //! # `min_len`, and where `MIN_TASK_MACS` went
 //!
 //! Every helper takes a `min_len`. On the rayon arm it is passed
 //! straight to `with_min_len`, which is what the call sites did by hand
-//! before, so the default path's task decomposition is bit-for-bit what
-//! it was.
+//! before, so the fork-join path's task decomposition is bit-for-bit
+//! what it was.
 //!
 //! On the spin arm it is **ignored**. `MIN_TASK_MACS` existed to stop
 //! rayon splitting a matvec into tasks too small to pay for their own
@@ -39,14 +38,18 @@
 //! pool width ([`task_count`]) the way `ggml_compute_forward_mul_mat`
 //! does. That is the deletion issue #27 asks for, and it is a deletion
 //! rather than a retune: no MAC threshold is consulted on this path at
-//! all. It survives on the rayon arm because the rayon arm is still the
-//! default and removing it there re-opens the measured 13-16x
-//! small-model regression documented on
+//! all. It survives on the rayon arm because the rayon arm still runs
+//! every operation below the crossover, and removing it there re-opens
+//! the measured 13-16x small-model regression documented on
 //! [`crate::weight_matrix::WeightMatrix::min_rows_per_task`].
 
 use rayon::prelude::*;
 
 use crate::cpu_pool::CpuPool;
+
+pub mod policy;
+
+pub use policy::{backend, macs_per_row, with_op_work};
 
 /// Which scheduler CPU parallel regions use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,24 +67,6 @@ pub enum Backend {
 /// the same order as llama.cpp's `4 * n_threads` chunk floor, with room
 /// for the uneven per-task cost that causal masking gives attention.
 const TASKS_PER_THREAD: usize = 8;
-
-/// The backend this process uses, from `FERROX_CPU_POOL`. Cached.
-pub fn backend() -> Backend {
-    use std::sync::OnceLock;
-    static BACKEND: OnceLock<Backend> = OnceLock::new();
-    *BACKEND.get_or_init(|| {
-        match std::env::var("FERROX_CPU_POOL")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("spin") | Some("persistent") | Some("1") | Some("on") | Some("true") => {
-                Backend::Spin
-            }
-            _ => Backend::Rayon,
-        }
-    })
-}
 
 /// The process-wide persistent pool, built on first use with
 /// [`crate::threads::resolve_cpu_threads`] workers -- the same width
@@ -460,15 +445,84 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// The env switch decides, and it decides once. Anything else and a
-    /// before/after measurement is measuring two different processes.
+    /// With nothing published and nothing pinned, the helpers fork with
+    /// rayon -- the behaviour every caller that has not opted into the
+    /// size rule keeps.
     #[test]
-    fn the_backend_is_read_from_one_env_var_and_defaults_to_rayon() {
-        // The process-wide cache means this can only assert the mapping
-        // when nothing has pinned it, which is the CI case.
-        if std::env::var_os("FERROX_CPU_POOL").is_none() {
+    fn an_unpublished_region_forks_with_rayon() {
+        if policy::pinned().is_none() {
             assert_eq!(backend(), Backend::Rayon);
         }
+    }
+
+    /// **Every rayon-versus-spin choice in this crate goes through one
+    /// predicate**, and this is what says so.
+    ///
+    /// The alternative is the shape this repo keeps shipping: a second
+    /// site that decides for itself and then drifts. `weight_matrix`
+    /// had four copies of one GPU-router eligibility test that tested
+    /// three conditions, two, and none.
+    ///
+    /// Two halves, because a helper can drift in two directions:
+    /// reaching the pool without asking, and asking the environment
+    /// instead of asking the predicate.
+    ///
+    /// Sabotage: inline `pool().run(..)` into a helper without its
+    /// `if backend() == Backend::Spin` guard, or read the environment
+    /// variable in a second place, and this goes red.
+    #[test]
+    fn every_scheduler_choice_in_this_crate_goes_through_the_one_predicate() {
+        // The needles are assembled rather than written out, because
+        // this file is one of the files being searched and a literal
+        // would count itself.
+        let call = format!("{}()", "backend");
+        let guard = format!("if {call} == Backend::Spin {{");
+        let dispatch = format!("match {call} {{");
+        let enters_pool = format!("if {}().run(", "pool");
+
+        let src = include_str!("par.rs");
+        let guarded = src.matches(&guard).count();
+        assert!(guarded >= 6, "expected one guard per region helper");
+        assert_eq!(
+            src.matches(&enters_pool).count(),
+            guarded,
+            "a helper reached the persistent pool without asking the predicate"
+        );
+        assert_eq!(
+            src.matches(&dispatch).count(),
+            3,
+            "num_threads, join2 and join3 dispatch on the predicate"
+        );
+
+        // And the environment is consulted in exactly one place, so the
+        // override cannot come to mean two things. The needle is the
+        // variable's name up to its closing quote, which is what keeps
+        // `FERROX_CPU_POOL_SPIN_US` (a different knob, in `cpu_pool`)
+        // out of the answer.
+        let needle = format!("FERROX_CPU_POOL{}", '"');
+        let mut readers = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("crate source is readable") {
+                let path = entry.expect("readable entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && std::fs::read_to_string(&path)
+                        .expect("source file is UTF-8")
+                        .lines()
+                        .any(|l| l.contains(&needle) && !l.trim_start().starts_with("//"))
+                {
+                    readers.push(path);
+                }
+            }
+        }
+        assert_eq!(
+            readers.len(),
+            1,
+            "`FERROX_CPU_POOL` must be read only by `par::policy::pinned`, found {readers:?}"
+        );
+        assert!(readers[0].ends_with("par/policy.rs"), "{readers:?}");
     }
 
     /// The spin arm's chunking is a function of pool width and item

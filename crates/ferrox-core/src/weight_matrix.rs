@@ -8,174 +8,24 @@
 //! dequant+dot kernels in ferrox-quant.
 
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use ferrox_gguf::GgmlType;
 
 use crate::tensor::Tensor;
 
 pub mod gpu_backend;
+mod repack_cache;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 use gpu_backend::BackendDispatch;
 use gpu_backend::{with_gpu_backend_caps, with_gpu_backends, BackendCaps, Cuda, Metal};
-
-/// Identity of the memory mapping a repacked buffer was built from.
-///
-/// The repack caches below key on a weight's **address**, and an address
-/// is only a stable identity for as long as the mapping that published
-/// it is alive. Unmap one file and map another and the kernel will hand
-/// the same address straight back -- a textbook ABA. The cache then
-/// serves one matrix another matrix's interleaved bytes, which panicked
-/// with an out-of-range slice when the two shapes differed and was
-/// SILENT, i.e. wrong output, when they matched.
-///
-/// Holding a [`std::sync::Weak`] is what closes it, and it closes both
-/// halves at once:
-///
-/// * while the `Weak` lives, the `Arc`'s control block cannot be
-///   recycled, so [`Self::id`] is a unique name for exactly one mapping
-///   for as long as the cache entry exists; and
-/// * `upgrade()` succeeding proves the mapping itself is still alive,
-///   which is what makes the address it published still mean what it
-///   meant when the entry was written.
-///
-/// A dead `Weak` is therefore a *stale entry*, not a hit, and is
-/// repacked and replaced. The `Weak` holds no mapping open, so nothing
-/// here keeps a file resident.
-#[derive(Clone)]
-pub struct MapId {
-    map: std::sync::Weak<memmap2::Mmap>,
-    id: usize,
-    offset: usize,
-}
-
-impl MapId {
-    /// True when `other` names the same, still-live mapping.
-    fn matches(&self, other: &MapId) -> bool {
-        self.id == other.id
-            && self.offset == other.offset
-            && self
-                .map
-                .upgrade()
-                .is_some_and(|m| Arc::as_ptr(&m) as usize == other.id)
-    }
-}
-
-/// `(mapping id, byte offset, rows, cols)`.
-///
-/// `cols` is in the key because two tensors of equal row count and
-/// unequal width are different matrices with different repacked lengths,
-/// and the old `(address, rows)` key called them the same one.
-type RepackKey = (usize, usize, usize, usize);
-
-/// Interleaved bytes, beside the mapping identity that makes the key
-/// meaningful. See [`MapId`].
-type RepackCache = Mutex<HashMap<RepackKey, (MapId, Arc<[u8]>)>>;
-
-/// The one lookup every format's repack shares.
-///
-/// `id` is `None` for bytes whose address may be recycled under us
-/// (owned buffers, and an expert store's leases -- see
-/// [`WeightBytes::map_id`]), and those always repack.
-fn get_or_repack(
-    cache: &'static RepackCache,
-    id: Option<MapId>,
-    rows: usize,
-    cols: usize,
-    repack: impl FnOnce() -> Vec<u8>,
-) -> Arc<[u8]> {
-    let Some(id) = id else {
-        return Arc::from(repack().into_boxed_slice());
-    };
-    let key = (id.id, id.offset, rows, cols);
-    {
-        let mut cache = cache.lock().unwrap();
-        match cache.get(&key) {
-            Some((entry, hit)) if entry.matches(&id) => return Arc::clone(hit),
-            // The mapping that published this address is gone, so the
-            // address has been handed to somebody else. Drop the entry
-            // rather than leaving a `Weak` pinning a dead control block.
-            Some(_) => {
-                cache.remove(&key);
-            }
-            None => {}
-        }
-    }
-    let arc: Arc<[u8]> = Arc::from(repack().into_boxed_slice());
-    let mut cache = cache.lock().unwrap();
-    // Another thread may have won the race; prefer the existing entry,
-    // but only if it is one this caller would have accepted above.
-    match cache.get(&key) {
-        Some((entry, hit)) if entry.matches(&id) => Arc::clone(hit),
-        _ => {
-            cache.insert(key, (id, Arc::clone(&arc)));
-            arc
-        }
-    }
-}
-
-/// Process-wide cache of interleaved Q4_K (`block_q4_Kx8`) bytes.
-fn q4k_repack_cache() -> &'static RepackCache {
-    static CACHE: OnceLock<RepackCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn get_or_repack_q4k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
-    get_or_repack(q4k_repack_cache(), id, rows, cols, || {
-        ferrox_quant::pack_q4_k_matrix_x8(data, rows, cols, ferrox_quant::q4_kx8_interleave())
-    })
-}
-
-/// Process-wide cache of interleaved Q5_K (`block_q5_Kx8`) bytes.
-fn q5k_repack_cache() -> &'static RepackCache {
-    static CACHE: OnceLock<RepackCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn get_or_repack_q5k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
-    get_or_repack(q5k_repack_cache(), id, rows, cols, || {
-        ferrox_quant::pack_q5_k_matrix_x8(data, rows, cols, ferrox_quant::q5_kx8_interleave())
-    })
-}
-
-/// Process-wide cache of interleaved Q6_K (`block_q6_Kx8`) bytes.
-fn q6k_repack_cache() -> &'static RepackCache {
-    static CACHE: OnceLock<RepackCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn get_or_repack_q6k(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
-    get_or_repack(q6k_repack_cache(), id, rows, cols, || {
-        ferrox_quant::pack_q6_k_matrix_x8(data, rows, cols, ferrox_quant::q6_kx8_interleave())
-    })
-}
-
-/// Process-wide cache of interleaved Q8_0 (`block_q8_0x4`) bytes.
-fn q8x4_repack_cache() -> &'static RepackCache {
-    static CACHE: OnceLock<RepackCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn get_or_repack_q8x4(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
-    get_or_repack(q8x4_repack_cache(), id, rows, cols, || {
-        ferrox_quant::pack_q8_0_matrix_x4(data, rows, cols, ferrox_quant::q8_0x4_interleave())
-    })
-}
-
-/// Process-wide cache of interleaved Q4_0 (`block_q4_0x4`) bytes.
-fn q4x4_repack_cache() -> &'static RepackCache {
-    static CACHE: OnceLock<RepackCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn get_or_repack_q4_0x4(data: &[u8], rows: usize, cols: usize, id: Option<MapId>) -> Arc<[u8]> {
-    get_or_repack(q4x4_repack_cache(), id, rows, cols, || {
-        ferrox_quant::pack_q4_0_matrix_x4(data, rows, cols, ferrox_quant::q4_0x4_interleave())
-    })
-}
+pub use repack_cache::MapId;
+use repack_cache::{
+    get_or_repack_q4_0x4, get_or_repack_q4k, get_or_repack_q5k, get_or_repack_q6k,
+    get_or_repack_q8x4,
+};
 
 /// Backing storage for a quantized weight matrix's raw bytes: either an
 /// owned buffer (synthetic/test weights, or any tensor that had to be
@@ -242,11 +92,7 @@ impl WeightBytes {
     /// nothing holds a handle that could witness the free.
     pub fn map_id(&self) -> Option<MapId> {
         match self {
-            WeightBytes::Mapped { mmap, range } => Some(MapId {
-                map: Arc::downgrade(mmap),
-                id: Arc::as_ptr(mmap) as usize,
-                offset: range.start,
-            }),
+            WeightBytes::Mapped { mmap, range } => Some(MapId::of(mmap, range.start)),
             WeightBytes::Owned(_) | WeightBytes::Shared { .. } => None,
         }
     }
@@ -479,15 +325,6 @@ pub fn active_backend() -> crate::kernel_registry::Backend {
     crate::kernel_registry::Backend::Cpu
 }
 
-thread_local! {
-    /// Elements dotted per output row of the matrix currently being
-    /// applied. Set by [`WeightMatrix::with_row_work`] on the calling
-    /// thread before a parallel region is opened, and read there -- it is
-    /// never consulted from a rayon worker, so it does not need to
-    /// propagate into the pool.
-    static ROW_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// Minimum multiply-accumulates a rayon task should carry before it is
 /// worth its own scheduling. Chosen by measurement, not derivation.
 ///
@@ -496,10 +333,11 @@ thread_local! {
 /// matvec into tasks too small to repay a fork-join; the persistent pool
 /// has no fork-join to repay, so it chunks by pool width alone (see the
 /// `MIN_TASK_MACS` section of [`crate::par`]). Issue #27 asks for this
-/// constant to be deleted rather than retuned, and on the new path it is:
-/// [`WeightMatrix::with_row_work`] does not publish anything there, so
-/// the branch below that reads it cannot be taken. It survives on the
-/// rayon path because that path is still the default and removing it
+/// constant to be deleted rather than retuned, and on the pool's path it
+/// is: [`WeightMatrix::min_rows_per_task`] returns before reading it
+/// whenever [`crate::par::backend`] picked the pool for this operation.
+/// It survives on the fork-join path, which is still every operation
+/// below [`crate::par::policy::SPIN_MIN_OP_MACS`], because removing it
 /// there re-opens the 13-16x small-model regression recorded on
 /// [`WeightMatrix::min_rows_per_task`].
 const MIN_TASK_MACS: usize = 1 << 16;
@@ -845,47 +683,28 @@ impl WeightMatrix {
     /// amortise their own scheduling, not of slow kernels (ferrox is
     /// *ahead* of llama at one thread on Mistral-7B).
     ///
-    /// [`Self::with_row_work`] supplies the elements-per-row so a task
-    /// can be required to carry at least [`MIN_TASK_MACS`]
+    /// [`crate::par::with_op_work`] supplies the elements-per-row so a
+    /// task can be required to carry at least [`MIN_TASK_MACS`]
     /// multiply-accumulates. Zero (unset) keeps the old row-only
     /// behaviour, so any call site that has not opted in is unchanged.
+    ///
+    /// Nothing here needs to ask which scheduler won this operation.
+    /// What this returns is a `min_len`, and `min_len` is read only by
+    /// the fork-join arm of [`crate::par`] -- the persistent pool's arm
+    /// chunks by width alone, which
+    /// `par::tests::the_spin_arm_chunks_by_pool_width_with_no_work_threshold`
+    /// asserts. A second `Backend::Spin` check here was written and
+    /// removed: deleting it changed no result, which is the definition
+    /// of a gate that cannot fire.
     fn min_rows_per_task(rows: usize) -> usize {
         let threads = crate::par::num_threads();
         let by_threads = (rows / (threads * 4)).max(8.min(rows.max(1)));
-        let per_row = ROW_WORK.with(|c| c.get());
+        let per_row = crate::par::macs_per_row();
         if per_row == 0 {
             return by_threads;
         }
         let need = MIN_TASK_MACS.div_ceil(per_row.max(1));
         by_threads.max(need.min(rows.max(1)))
-    }
-
-    /// Runs `f` with the per-row work (elements dotted per output row)
-    /// published for [`Self::min_rows_per_task`]. Restores the previous
-    /// value, so nesting is safe.
-    ///
-    /// Publishes **nothing** under [`crate::par::Backend::Spin`]: that is
-    /// the single place `MIN_TASK_MACS` is switched off, rather than a
-    /// second copy of the decision at each of the thirty-odd call sites
-    /// that ask for a `min_len`.
-    fn with_row_work<R>(per_row: usize, f: impl FnOnce() -> R) -> R {
-        let per_row = Self::row_work_for(crate::par::backend(), per_row);
-        let prev = ROW_WORK.with(|c| c.replace(per_row));
-        let out = f();
-        ROW_WORK.with(|c| c.set(prev));
-        out
-    }
-
-    /// What [`Self::with_row_work`] publishes, as a pure function of the
-    /// scheduler, so the claim "`MIN_TASK_MACS` is unreachable on the
-    /// persistent pool" is a test rather than a comment.
-    fn row_work_for(backend: crate::par::Backend, per_row: usize) -> usize {
-        match backend {
-            crate::par::Backend::Rayon => per_row,
-            // Zero means "no work-aware floor", which is exactly the
-            // branch `min_rows_per_task` returns early on.
-            crate::par::Backend::Spin => 0,
-        }
     }
 
     /// Run `body(g, t0, t1)` for every row-group `g` and activation-tile
@@ -1249,9 +1068,11 @@ impl WeightMatrix {
             self.cols(),
             "activation length must match matrix column count"
         );
-        // Decode: one activation, so a task's work is (rows in task) x cols.
-        // Publish `cols` so task sizing can be work-aware, not row-count-aware.
-        Self::with_row_work(x.len(), || self.apply_cpu_inner(x))
+        // Decode: one activation, so this operation is `rows x cols`
+        // MACs and a task's share of it is (rows in task) x cols.
+        // Publishing the shape is what lets both the scheduler choice
+        // and the task floor be work-aware rather than row-count-aware.
+        crate::par::with_op_work(self.rows(), x.len(), || self.apply_cpu_inner(x))
     }
 
     fn apply_cpu_inner(&self, x: &[f32]) -> Vec<f32> {
@@ -1278,12 +1099,7 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             let serial = Self::prefer_serial_matvec(*rows, *cols);
                             if n_groups > 0 {
-                                let packed = get_or_repack_q8x4(
-                                    data.as_slice(),
-                                    *rows,
-                                    *cols,
-                                    data.map_id(),
-                                );
+                                let packed = get_or_repack_q8x4(data, *rows, *cols);
                                 if serial {
                                     for (g, chunk) in out[..n_groups * ferrox_quant::Q8_0X4_NROWS]
                                         .chunks_mut(ferrox_quant::Q8_0X4_NROWS)
@@ -1361,12 +1177,7 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
                             let serial = Self::prefer_serial_matvec(*rows, *cols);
                             if n_groups > 0 {
-                                let packed = get_or_repack_q4_0x4(
-                                    data.as_slice(),
-                                    *rows,
-                                    *cols,
-                                    data.map_id(),
-                                );
+                                let packed = get_or_repack_q4_0x4(data, *rows, *cols);
                                 if serial {
                                     for (g, chunk) in out[..n_groups * ferrox_quant::Q4_0X4_NROWS]
                                         .chunks_mut(ferrox_quant::Q4_0X4_NROWS)
@@ -1444,8 +1255,7 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
-                                let packed =
-                                    get_or_repack_q4k(data.as_slice(), *rows, *cols, data.map_id());
+                                let packed = get_or_repack_q4k(data, *rows, *cols);
                                 crate::par::chunks_mut(
                                     &mut out[..n_groups * ferrox_quant::Q4_KX8_NROWS],
                                     ferrox_quant::Q4_KX8_NROWS,
@@ -1485,8 +1295,7 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q5_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
-                                let packed =
-                                    get_or_repack_q5k(data.as_slice(), *rows, *cols, data.map_id());
+                                let packed = get_or_repack_q5k(data, *rows, *cols);
                                 crate::par::chunks_mut(
                                     &mut out[..n_groups * ferrox_quant::Q5_KX8_NROWS],
                                     ferrox_quant::Q5_KX8_NROWS,
@@ -1526,8 +1335,7 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q6_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q6_kx8_interleave();
-                                let packed =
-                                    get_or_repack_q6k(data.as_slice(), *rows, *cols, data.map_id());
+                                let packed = get_or_repack_q6k(data, *rows, *cols);
                                 crate::par::chunks_mut(
                                     &mut out[..n_groups * ferrox_quant::Q6_KX8_NROWS],
                                     ferrox_quant::Q6_KX8_NROWS,
@@ -1591,7 +1399,18 @@ impl WeightMatrix {
     }
 
     /// INT_DOT matvec against a pre-quantized Q8_0 activation (shared gate/up).
+    ///
+    /// Publishes this operation's shape for exactly the same reason
+    /// [`Self::apply_cpu`] does, and it matters more here: the dense FFN
+    /// gate and up projections are the widest matvecs in a decode step,
+    /// so they are the ones the scheduler rule is deciding about.
     pub fn apply_cpu_q8(&self, act: &ferrox_quant::Q8Activations) -> Option<Vec<f32>> {
+        crate::par::with_op_work(self.rows(), self.cols(), || self.apply_cpu_q8_inner(act))
+    }
+
+    /// [`Self::apply_cpu_q8`] with the operation's shape already
+    /// published. Split only so the publish wraps every return path.
+    fn apply_cpu_q8_inner(&self, act: &ferrox_quant::Q8Activations) -> Option<Vec<f32>> {
         let WeightMatrix::Quantized {
             data,
             rows,
@@ -1610,13 +1429,13 @@ impl WeightMatrix {
         let row_bytes = self.block_bytes_per_row(*kind, *cols);
         let mut out = vec![0f32; *rows];
         let kind = *kind;
-        let data = data.as_slice();
+        let bytes = data.as_slice();
         // Q8_0×4 / Q4_0×4 interleaved GEMV — same paths as `apply_cpu` so
         // dense FFN gate+up hit the fast kernels, not per-row int dots.
         if matches!(kind, QuantKind::Q8_0) {
             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
             if n_groups > 0 {
-                let packed = get_or_repack_q8x4(data, *rows, *cols, /* uncacheable */ None);
+                let packed = get_or_repack_q8x4(data, *rows, *cols);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
                     ferrox_quant::gemv_q8_0x4_group(
@@ -1650,7 +1469,7 @@ impl WeightMatrix {
                         for (i, o) in tail.iter_mut().enumerate() {
                             let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
                             *o = ferrox_quant::dot_q8_0_q8(
-                                &data[r * row_bytes..(r + 1) * row_bytes],
+                                &bytes[r * row_bytes..(r + 1) * row_bytes],
                                 act,
                             );
                         }
@@ -1659,7 +1478,7 @@ impl WeightMatrix {
                         crate::par::items_mut(tail, min_len, |i, o| {
                             let r = n_groups * ferrox_quant::Q8_0X4_NROWS + i;
                             *o = ferrox_quant::dot_q8_0_q8(
-                                &data[r * row_bytes..(r + 1) * row_bytes],
+                                &bytes[r * row_bytes..(r + 1) * row_bytes],
                                 act,
                             );
                         });
@@ -1671,7 +1490,7 @@ impl WeightMatrix {
         if matches!(kind, QuantKind::Q4_0) {
             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
             if n_groups > 0 {
-                let packed = get_or_repack_q4_0x4(data, *rows, *cols, /* uncacheable */ None);
+                let packed = get_or_repack_q4_0x4(data, *rows, *cols);
                 let serial = Self::prefer_serial_matvec(*rows, *cols);
                 let body = |g: usize, chunk: &mut [f32]| {
                     ferrox_quant::gemv_q4_0x4_group(
@@ -1705,7 +1524,7 @@ impl WeightMatrix {
                         for (i, o) in tail.iter_mut().enumerate() {
                             let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
                             *o = ferrox_quant::dot_q4_0_q8(
-                                &data[r * row_bytes..(r + 1) * row_bytes],
+                                &bytes[r * row_bytes..(r + 1) * row_bytes],
                                 act,
                             );
                         }
@@ -1714,7 +1533,7 @@ impl WeightMatrix {
                         crate::par::items_mut(tail, min_len, |i, o| {
                             let r = n_groups * ferrox_quant::Q4_0X4_NROWS + i;
                             *o = ferrox_quant::dot_q4_0_q8(
-                                &data[r * row_bytes..(r + 1) * row_bytes],
+                                &bytes[r * row_bytes..(r + 1) * row_bytes],
                                 act,
                             );
                         });
@@ -1725,7 +1544,7 @@ impl WeightMatrix {
         }
         if Self::prefer_serial_matvec(*rows, *cols) {
             for (r, o) in out.iter_mut().enumerate() {
-                let row = &data[r * row_bytes..(r + 1) * row_bytes];
+                let row = &bytes[r * row_bytes..(r + 1) * row_bytes];
                 *o = match kind {
                     QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
                     QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
@@ -1735,7 +1554,7 @@ impl WeightMatrix {
             return Some(out);
         }
         crate::par::items_mut(&mut out, Self::min_rows_per_task(*rows), |r, o| {
-            let row = &data[r * row_bytes..(r + 1) * row_bytes];
+            let row = &bytes[r * row_bytes..(r + 1) * row_bytes];
             *o = match kind {
                 QuantKind::Q8_0 => ferrox_quant::dot_q8_0_q8(row, act),
                 QuantKind::Q4_0 => ferrox_quant::dot_q4_0_q8(row, act),
@@ -2114,8 +1933,7 @@ impl WeightMatrix {
                                 Self::q8_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q8_0X4_NROWS;
                             if n_groups > 0 {
-                                let packed =
-                                    get_or_repack_q8x4(data.as_slice(), *rows, cols, data.map_id());
+                                let packed = get_or_repack_q8x4(data, *rows, cols);
                                 let nrows_g = ferrox_quant::Q8_0X4_NROWS;
                                 let interleave = ferrox_quant::q8_0x4_interleave();
                                 if ferrox_quant::q8_0x4_gemm_uses_acts_x4(interleave) {
@@ -2244,12 +2062,7 @@ impl WeightMatrix {
                                 Self::q8_acts(shared, x_batch, batch_size, cols, &mut acts_owned);
                             let n_groups = *rows / ferrox_quant::Q4_0X4_NROWS;
                             if n_groups > 0 {
-                                let packed = get_or_repack_q4_0x4(
-                                    data.as_slice(),
-                                    *rows,
-                                    cols,
-                                    data.map_id(),
-                                );
+                                let packed = get_or_repack_q4_0x4(data, *rows, cols);
                                 let nrows_g = ferrox_quant::Q4_0X4_NROWS;
                                 let interleave = ferrox_quant::q4_0x4_interleave();
                                 if ferrox_quant::q4_0x4_gemm_uses_acts_x4(interleave) {
@@ -2374,8 +2187,7 @@ impl WeightMatrix {
                             let n_groups = *rows / ferrox_quant::Q4_KX8_NROWS;
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q4_kx8_interleave();
-                                let packed =
-                                    get_or_repack_q4k(data.as_slice(), *rows, cols, data.map_id());
+                                let packed = get_or_repack_q4k(data, *rows, cols);
                                 let nc = ferrox_quant::Q4_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul (llama.cpp
@@ -2486,8 +2298,7 @@ impl WeightMatrix {
                             };
                             if n_groups > 0 {
                                 let interleave = ferrox_quant::q5_kx8_interleave();
-                                let packed =
-                                    get_or_repack_q5k(data.as_slice(), *rows, cols, data.map_id());
+                                let packed = get_or_repack_q5k(data, *rows, cols);
                                 let nc = ferrox_quant::Q5_KX8_GEMM_NC;
                                 // On the i8mm path, interleave each quad of
                                 // activations once per matmul; the kernel
@@ -2601,8 +2412,7 @@ impl WeightMatrix {
                                 0
                             };
                             if n_groups > 0 {
-                                let packed =
-                                    get_or_repack_q6k(data.as_slice(), *rows, cols, data.map_id());
+                                let packed = get_or_repack_q6k(data, *rows, cols);
                                 // Quads of 4 (the i8mm tile shape), not
                                 // [`Q6_KX8_GEMM_NC`].
                                 let nc = ferrox_quant::Q8K_ACTS_X4_NC;
@@ -3480,30 +3290,33 @@ impl WeightMatrix {
 #[cfg(test)]
 mod tests {
 
-    /// Issue #27 asks for `MIN_TASK_MACS` to be deleted rather than
-    /// retuned. It is deleted from the persistent-pool path and kept on
-    /// the rayon path, which is only an honest answer if the pool path
-    /// genuinely cannot consult it -- so assert the gate, both ways,
-    /// without needing a process whose env var says `spin`.
+    /// The task floor is **work-aware**, which is the whole reason
+    /// [`crate::par::with_op_work`] exists: a row count alone cannot
+    /// tell a 64-wide matrix from a 256-wide one, and rayon splitting
+    /// the narrow one by rows alone is the measured 13-16x small-model
+    /// regression.
     ///
-    /// Sabotage: make `row_work_for` return `per_row` for both arms and
-    /// this goes red, because the MACs floor is then live on a path
-    /// whose whole premise is that scheduling is no longer expensive.
+    /// Both shapes here sit under [`crate::par::policy::SPIN_MIN_OP_MACS`]
+    /// so both are decided by the fork-join arm, which is the only arm
+    /// that reads a `min_len` at all.
+    ///
+    /// Sabotage: drop the `MIN_TASK_MACS` term from `min_rows_per_task`
+    /// and this goes red, because both shapes then collapse onto the
+    /// same row-count floor.
     #[test]
-    fn the_persistent_pool_path_never_publishes_a_macs_floor() {
-        use crate::par::Backend;
-        for per_row in [0usize, 1, 576, 4096, 1 << 20] {
-            assert_eq!(
-                WeightMatrix::row_work_for(Backend::Rayon, per_row),
-                per_row,
-                "the rayon arm keeps the measured mitigation"
-            );
-            assert_eq!(
-                WeightMatrix::row_work_for(Backend::Spin, per_row),
-                0,
-                "the persistent pool must reach `min_rows_per_task`'s                  early return, where MIN_TASK_MACS is not read"
-            );
+    fn the_task_floor_demands_more_rows_of_a_narrower_matrix() {
+        if crate::par::policy::pinned().is_some() {
+            return; // pinned: not the arm this floor belongs to
         }
+        let rows = 4096usize;
+        let narrow = crate::par::with_op_work(rows, 64, || WeightMatrix::min_rows_per_task(rows));
+        let wider = crate::par::with_op_work(rows, 256, || WeightMatrix::min_rows_per_task(rows));
+        assert_eq!(narrow, MIN_TASK_MACS.div_ceil(64));
+        assert!(
+            narrow > wider,
+            "a 64-wide row carries a quarter of a 256-wide row's work, so a \
+             task must hold four times as many of them: {narrow} vs {wider}"
+        );
     }
 
     /// The four dtypes the drifted copies were missing.
@@ -3638,12 +3451,12 @@ mod tests {
     /// The override is process-global, so the guard serializes on a
     /// mutex: two tests forcing opposite values concurrently would
     /// otherwise see each other's setting.
-    struct ForceIntDot {
+    pub(super) struct ForceIntDot {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl ForceIntDot {
-        fn new(on: bool) -> Self {
+        pub(super) fn new(on: bool) -> Self {
             static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
             INT_DOT_TEST_OVERRIDE.store(i8::from(on), std::sync::atomic::Ordering::Release);
@@ -4070,7 +3883,7 @@ mod tests {
     }
 
     /// Minimal f16 encode for small positive normals (test fixtures only).
-    fn f16_le(x: f32) -> [u8; 2] {
+    pub(super) fn f16_le(x: f32) -> [u8; 2] {
         let bits = x.to_bits();
         let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
         let mant = (bits >> 13) & 0x3ff;
@@ -4170,182 +3983,6 @@ mod tests {
             cols,
             kind,
         }
-    }
-
-    // -----------------------------------------------------------------
-    // Repack cache identity (see `MapId`)
-    //
-    // The bug these cover: the caches used to key on `(address, rows)`
-    // and gate on an `address_is_stable() -> bool`. Drop one mmap, make
-    // another, and the kernel hands the same address back, so the cache
-    // served the previous matrix's interleaved bytes -- an out-of-range
-    // panic when the shapes differed, silent wrong output when they
-    // matched.
-    //
-    // Address reuse is the OS's decision and cannot be demanded from a
-    // test, so these do not wait for it. They fabricate exactly what the
-    // cache would SEE in that moment -- a key that collides while the
-    // mapping behind it is gone, or while the width differs -- and
-    // assert the cache refuses to serve it.
-    // -----------------------------------------------------------------
-
-    /// Writes `bytes` to a temp file and maps it. The caller holds the
-    /// `Arc`, so when the mapping dies is explicit, which is the whole
-    /// subject of these tests.
-    fn mapped(tag: &str, bytes: &[u8]) -> (Arc<memmap2::Mmap>, WeightBytes) {
-        let path = std::env::temp_dir().join(format!(
-            "ferrox_repack_{tag}_{}_{:?}.bin",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::write(&path, bytes).expect("write fixture");
-        let file = std::fs::File::open(&path).expect("open fixture");
-        // SAFETY: the file was written and closed above, is named for
-        // this process and thread, and nothing mutates it while mapped.
-        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file).expect("map fixture") });
-        let _ = std::fs::remove_file(&path);
-        let view = WeightBytes::Mapped {
-            mmap: Arc::clone(&mmap),
-            range: 0..bytes.len(),
-        };
-        (mmap, view)
-    }
-
-    /// Q8_0 bytes with finite scales, `rows * cols/32` blocks.
-    fn q8_0_matrix_bytes(rows: usize, cols: usize, seed: u32) -> Vec<u8> {
-        let mut state = seed | 1;
-        let mut next = move || {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (state >> 24) as u8
-        };
-        let mut data = Vec::with_capacity(rows * (cols / 32) * 34);
-        for _ in 0..rows * (cols / 32) {
-            data.extend_from_slice(&f16_le(0.02 + f32::from(next()) * 0.0004));
-            for _ in 0..32 {
-                data.push(next());
-            }
-        }
-        data
-    }
-
-    /// A `MapId` is only an identity while its mapping is alive. This is
-    /// the check the old boolean could not express, and it is the one
-    /// thing standing between the cache and an ABA.
-    #[test]
-    fn map_id_stops_matching_once_its_mapping_is_dropped() {
-        let (mmap, view) = mapped("live", &q8_0_matrix_bytes(4, 32, 7));
-        let id = view.map_id().expect("Mapped bytes must have an identity");
-        let held = id.clone();
-        assert!(
-            held.matches(&id),
-            "a live mapping must match its own identity"
-        );
-
-        // Everything that could witness the mapping is gone: this is
-        // precisely the moment the address becomes reusable.
-        drop(view);
-        drop(mmap);
-        assert!(
-            !held.matches(&id),
-            "an identity whose mapping is dead must not match, or the \
-             cache will trust an address the kernel has already reissued"
-        );
-    }
-
-    /// A cache entry left behind by a dead mapping must be replaced, not
-    /// served. Fabricates the entry rather than waiting on the OS to
-    /// reissue an address; the entry is byte-for-byte what the old code
-    /// would have left there.
-    #[test]
-    fn stale_repack_entry_is_replaced_not_served() {
-        let (rows, cols) = (8usize, 64usize);
-        let bytes = q8_0_matrix_bytes(rows, cols, 11);
-        let (_mmap, view) = mapped("stale", &bytes);
-        let id = view.map_id().expect("Mapped bytes must have an identity");
-
-        // Some other matrix's packing, parked at the key this live
-        // matrix will look up, under an identity that can never upgrade.
-        let poison = vec![0xABu8; 16];
-        {
-            let mut cache = q8x4_repack_cache().lock().unwrap();
-            cache.insert(
-                (id.id, id.offset, rows, cols),
-                (
-                    MapId {
-                        map: std::sync::Weak::new(),
-                        id: id.id,
-                        offset: id.offset,
-                    },
-                    Arc::from(poison.clone().into_boxed_slice()),
-                ),
-            );
-        }
-
-        let got = get_or_repack_q8x4(view.as_slice(), rows, cols, Some(id.clone()));
-        let want = ferrox_quant::pack_q8_0_matrix_x4(
-            view.as_slice(),
-            rows,
-            cols,
-            ferrox_quant::q8_0x4_interleave(),
-        );
-        assert_ne!(&got[..], &poison[..], "served a dead mapping's bytes");
-        assert_eq!(&got[..], &want[..], "stale entry was not repacked");
-
-        // And the dead entry is gone rather than pinning a control block.
-        let cache = q8x4_repack_cache().lock().unwrap();
-        let (entry, _) = cache
-            .get(&(id.id, id.offset, rows, cols))
-            .expect("the live packing should now be cached");
-        assert!(
-            entry.matches(&id),
-            "the replacement entry must carry the LIVE identity"
-        );
-    }
-
-    /// Two widths at one address are two matrices. The old key was
-    /// `(address, rows)`, so a 576x576 and a 576x1536 collided and the
-    /// second was served the first's shorter buffer.
-    #[test]
-    fn repack_key_separates_two_widths_at_one_address() {
-        let rows = 8usize;
-        let narrow = q8_0_matrix_bytes(rows, 32, 3);
-        let wide = q8_0_matrix_bytes(rows, 64, 5);
-        let (_mmap, view) = mapped("widths", &narrow);
-        let id = view.map_id().expect("Mapped bytes must have an identity");
-
-        let il = ferrox_quant::q8_0x4_interleave();
-        let a = get_or_repack_q8x4(&narrow, rows, 32, Some(id.clone()));
-        let b = get_or_repack_q8x4(&wide, rows, 64, Some(id.clone()));
-        assert_eq!(
-            &a[..],
-            &ferrox_quant::pack_q8_0_matrix_x4(&narrow, rows, 32, il)[..]
-        );
-        assert_eq!(
-            &b[..],
-            &ferrox_quant::pack_q8_0_matrix_x4(&wide, rows, 64, il)[..],
-            "the wider matrix was served the narrower one's packing"
-        );
-        assert!(b.len() > a.len(), "widths must not share a cache entry");
-    }
-
-    /// Owned buffers and expert-store leases are never cacheable. The
-    /// lease is the interesting one: its allocation stays alive and keeps
-    /// its address while its CONTENTS are replaced by another expert's,
-    /// so no liveness check could rescue it.
-    #[test]
-    fn map_id_is_none_for_owned_and_shared_bytes() {
-        let owned = WeightBytes::Owned(q8_0_matrix_bytes(4, 32, 9));
-        assert!(owned.map_id().is_none(), "an owned Vec's address is reused");
-
-        let buf = Arc::new(q8_0_matrix_bytes(4, 32, 13));
-        let leased = WeightBytes::Shared {
-            buf,
-            range: 0..34 * 4,
-        };
-        assert!(
-            leased.map_id().is_none(),
-            "an expert lease keeps its address across a content swap"
-        );
     }
     /// One `apply_batch` vs per-row `apply` sweep, parameterized by shape
     /// so the shape tests below differ only in the numbers they pass.
