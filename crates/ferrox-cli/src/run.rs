@@ -142,6 +142,71 @@ pub struct InferArgs {
     #[arg(long = "repeat-penalty", default_value_t = 1.1)]
     pub repeat_penalty: f32,
 
+    /// Locally typical sampling, llama.cpp's `--typical` (`1.0` = off).
+    ///
+    /// Keeps the candidates whose surprisal is closest to the
+    /// distribution's entropy, from the middle outward, rather than the
+    /// most likely ones -- so it can drop the most likely token.
+    #[arg(long = "typical", visible_alias = "typical-p", default_value_t = 1.0)]
+    pub typical_p: f32,
+
+    /// Truncate at `n` standard deviations of the logits below the
+    /// maximum, llama.cpp's `--top-nsigma` (`-1.0` = off).
+    #[arg(
+        long = "top-nsigma",
+        visible_alias = "top-n-sigma",
+        default_value_t = -1.0
+    )]
+    pub top_n_sigma: f32,
+
+    /// The probability that XTC removes the top candidates on any one
+    /// token, llama.cpp's `--xtc-probability` (`0.0` = off).
+    #[arg(long = "xtc-probability", default_value_t = 0.0)]
+    pub xtc_probability: f32,
+
+    /// The probability a candidate must reach before XTC may remove it,
+    /// llama.cpp's `--xtc-threshold`. **Above 0.5 disables XTC**, which
+    /// is upstream's guard: above a half at most one candidate can clear
+    /// it and XTC never removes the last one.
+    #[arg(long = "xtc-threshold", default_value_t = 0.1)]
+    pub xtc_threshold: f32,
+
+    /// DRY sequence-repetition penalty multiplier, llama.cpp's
+    /// `--dry-multiplier` (`0.0` = off).
+    ///
+    /// Unlike `--repeat-penalty`, which looks at single tokens, DRY
+    /// penalises the token that would EXTEND a repeated sequence, by
+    /// `multiplier * base ^ (length - allowed-length)`.
+    #[arg(long = "dry-multiplier", default_value_t = 0.0)]
+    pub dry_multiplier: f32,
+
+    /// The base of DRY's exponential, llama.cpp's `--dry-base`. Below
+    /// 1.0 disables DRY.
+    #[arg(long = "dry-base", default_value_t = 1.75)]
+    pub dry_base: f32,
+
+    /// Repetitions this long or shorter are free, llama.cpp's
+    /// `--dry-allowed-length`.
+    #[arg(long = "dry-allowed-length", default_value_t = 2)]
+    pub dry_allowed_length: i32,
+
+    /// How many recent tokens DRY scans for repetitions, llama.cpp's
+    /// `--dry-penalty-last-n` (`0` = off, `-1` = the context size).
+    #[arg(long = "dry-penalty-last-n", default_value_t = -1)]
+    pub dry_penalty_last_n: i32,
+
+    /// A string DRY refuses to look past, llama.cpp's
+    /// `--dry-sequence-breaker`. Repeatable.
+    ///
+    /// Giving any breaker CLEARS llama.cpp's defaults (`\n`, `:`, `"`,
+    /// `*`), exactly as upstream's flag does (`common/arg.cpp:2119`),
+    /// and the literal `none` clears them without adding one. The
+    /// strings are tokenised against the loaded model's own vocabulary,
+    /// so a checkpoint with no real vocabulary refuses DRY rather than
+    /// running it with no breakers.
+    #[arg(long = "dry-sequence-breaker", value_name = "STRING")]
+    pub dry_sequence_breaker: Vec<String>,
+
     /// The order the sampler chain runs in, `;`-separated, llama.cpp's
     /// `--samplers`.
     ///
@@ -338,12 +403,20 @@ impl TokenStep {
     /// when nothing needs to look at the vocabulary first, and a grammar
     /// does. Read by the Metal greedy guard, which used to test the
     /// temperature alone.
+    ///
+    /// `sampling` is taken because the CHAIN can need the vocabulary
+    /// too: `xtc` and `typ_p` remove candidates the argmax may be one
+    /// of, and `dry` moves logits, so at `temperature <= 0` the answer
+    /// is not the argmax of what the device would fold.
+    /// `SamplingParams::greedy_equals_argmax` is the one predicate that
+    /// decides it, shared with the sampler's own greedy fast path and
+    /// with `ferrox_server::generate`'s copy of this gate.
     // Read only by the Metal greedy guard, so a CPU-only build has no
     // fold to refuse and this is genuinely dead there. Same shape and
     // same reason as `ferrox-models`'s `FoldedLmHead`.
     #[cfg_attr(not(feature = "metal"), allow(dead_code))]
-    pub fn needs_vocab_logits(&self) -> bool {
-        self.grammar.is_some()
+    pub fn needs_vocab_logits(&self, sampling: &ferrox_models::sampling::SamplingParams) -> bool {
+        self.grammar.is_some() || !sampling.greedy_equals_argmax()
     }
 
     /// `Ok(None)` means the grammar is SATISFIED and has no legal
@@ -427,6 +500,34 @@ impl InferArgs {
         Ok(None)
     }
 
+    /// The DRY configuration these flags spell, before its sequence
+    /// breakers are tokenised.
+    ///
+    /// llama.cpp's `--dry-sequence-breaker` CLEARS the defaults the
+    /// first time it is given (`common/arg.cpp:2119-2126`) and reads
+    /// the literal `none` as "no breakers at all". Both are reproduced
+    /// here, and `none` anywhere in the list clears it, because a caller
+    /// who wrote it meant it.
+    pub fn dry_request(&self) -> ferrox_models::dry::DryRequest {
+        let sequence_breakers = if self.dry_sequence_breaker.is_empty() {
+            ferrox_models::dry::DEFAULT_SEQUENCE_BREAKERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else if self.dry_sequence_breaker.iter().any(|s| s == "none") {
+            Vec::new()
+        } else {
+            self.dry_sequence_breaker.clone()
+        };
+        ferrox_models::dry::DryRequest {
+            multiplier: self.dry_multiplier,
+            base: self.dry_base,
+            allowed_length: self.dry_allowed_length,
+            penalty_last_n: self.dry_penalty_last_n,
+            sequence_breakers,
+        }
+    }
+
     /// The sampler these flags describe.
     ///
     /// One function rather than one copy per generation path. There were
@@ -435,18 +536,34 @@ impl InferArgs {
     /// repo's most expensive failure: adding `--min-p` meant editing
     /// four places, and a sampler added to three of them would be
     /// silently absent from the fourth with every test still green.
-    pub fn sampling(&self) -> SamplingParams {
-        SamplingParams {
+    ///
+    /// Fallible, and taking the vocabulary, because of DRY: its sequence
+    /// breakers are STRINGS that only mean something against a
+    /// particular tokenizer, so a checkpoint with no real vocabulary
+    /// must refuse `--dry-multiplier` rather than run DRY with no
+    /// breakers. `vocab` is `None` for exactly those checkpoints, and
+    /// `ctx_size` is what `--dry-penalty-last-n -1` resolves to.
+    pub fn sampling(
+        &self,
+        vocab: Option<&dyn ferrox_models::dry::DryVocab>,
+        ctx_size: usize,
+    ) -> anyhow::Result<SamplingParams> {
+        Ok(SamplingParams {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
             top_k: self.top_k,
+            typical_p: self.typical_p,
+            top_n_sigma: self.top_n_sigma,
+            xtc_probability: self.xtc_probability,
+            xtc_threshold: self.xtc_threshold,
+            dry: self.dry_request().resolve(vocab, ctx_size)?,
             repetition_penalty: self.repeat_penalty,
             penalty_last_n: self.repeat_last_n,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             sampler_order: self.samplers,
-        }
+        })
     }
 }
 
@@ -830,6 +947,35 @@ impl CliTokenizer {
             CliTokenizer::Spm(_) => "gguf-spm",
             CliTokenizer::Unigram(_) => "gguf-unigram",
         }
+    }
+
+    fn vocab_size(&self) -> usize {
+        match self {
+            CliTokenizer::Bpe(t) => t.vocab_size(),
+            CliTokenizer::Spm(t) => t.vocab_size(),
+            CliTokenizer::Unigram(t) => t.vocab_size(),
+        }
+    }
+}
+
+/// What the DRY sampler needs to tokenise its sequence breakers.
+///
+/// `ferrox-server` implements the same trait for its own tokenizer enum.
+/// Two implementations rather than one shared type because the two
+/// enums genuinely differ (the server carries a byte-level fallback the
+/// CLI does not), but they are held to ONE trait so the flag and the
+/// request field cannot mean different things.
+impl ferrox_models::dry::DryVocab for CliTokenizer {
+    fn n_tokens(&self) -> usize {
+        self.vocab_size()
+    }
+
+    fn detokenize(&self, token: usize) -> String {
+        self.decode(&[token])
+    }
+
+    fn tokenize(&self, text: &str) -> Vec<usize> {
+        self.encode(text)
     }
 }
 
@@ -1251,7 +1397,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = args.sampling();
+    let sampling = args.sampling(Some(&tokenizer), ctx_size)?;
     let seed = seed_from_args(args.seed);
     let sampler = Sampler::new(seed);
     let mut step = token_step(
@@ -1280,7 +1426,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         // for `json_object`, and the third instance of it. The rule is
         // the server's: the fold is sound only when NOTHING needs to
         // inspect the vocabulary before a token is chosen.
-        if sampling.temperature <= 0.0 && !step.needs_vocab_logits() {
+        if sampling.temperature <= 0.0 && !step.needs_vocab_logits(&sampling) {
             ferrox_models::set_metal_greedy_argmax(true);
             Some(Guard)
         } else {
@@ -1429,7 +1575,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = args.sampling();
+    let sampling = args.sampling(Some(&tokenizer), ctx_size)?;
     let sampler = Sampler::new(seed_from_args(args.seed));
     let mut step = token_step(
         &args,
@@ -1560,7 +1706,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = args.sampling();
+    let sampling = args.sampling(Some(&tokenizer), ctx_size)?;
     let sampler = Sampler::new(seed_from_args(args.seed));
     let mut step = token_step(
         &args,
@@ -1690,7 +1836,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
         (args.n_predict as usize).min(room)
     };
 
-    let sampling = args.sampling();
+    let sampling = args.sampling(Some(&tokenizer), ctx_size)?;
     let sampler = Sampler::new(seed_from_args(args.seed));
     let mut step = token_step(
         &args,
@@ -2053,11 +2199,14 @@ mod tests {
     /// same chain, so the two cannot drift apart.
     #[test]
     fn samplers_defaults_to_the_chain_ferrox_already_ran() {
-        let default = args(&["-m", "x.gguf"]).sampling().sampler_order;
+        let default = args(&["-m", "x.gguf"])
+            .sampling(None, 4096)
+            .expect("no dry, so no vocabulary is needed")
+            .sampler_order;
         assert_eq!(default, ferrox_models::SamplerOrder::default());
         assert_eq!(
             default.to_string(),
-            "penalties;top_k;top_p;min_p;temperature"
+            "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature"
         );
     }
 
@@ -2065,13 +2214,15 @@ mod tests {
     #[test]
     fn a_caller_supplied_order_reaches_the_sampler() {
         let order = args(&["-m", "x.gguf", "--samplers", "penalties;temperature;top_k"])
-            .sampling()
+            .sampling(None, 4096)
+            .expect("no dry")
             .sampler_order;
         assert_eq!(order.to_string(), "penalties;temperature;top_k");
         // llama.cpp's own aliases, so an upstream command line works.
         assert_eq!(
             args(&["-m", "x.gguf", "--samplers", "top-k;min-p;temp"])
-                .sampling()
+                .sampling(None, 4096)
+                .expect("no dry")
                 .sampler_order
                 .to_string(),
             "top_k;min_p;temperature"
@@ -2092,12 +2243,23 @@ mod tests {
             "-m",
             "x.gguf",
             "--samplers",
-            "dry;top_k;typ_p;top_p;min_p;xtc;temperature",
+            "penalties;mirostat;temperature",
         ])
-        .expect_err("upstream's default names samplers ferrox lacks")
+        .expect_err("mirostat is not a chain member here")
         .to_string();
-        assert!(err.contains("dry"), "{err}");
+        assert!(err.contains("mirostat"), "{err}");
         assert!(err.contains("not implemented"), "{err}");
+
+        // And llama.cpp's OWN default string now parses, which is the
+        // point of this change: pasting an upstream command line works.
+        Cli::try_parse_from([
+            "ferrox",
+            "-m",
+            "x.gguf",
+            "--samplers",
+            "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature",
+        ])
+        .expect("llama.cpp's default chain is ferrox's default chain");
 
         let unknown = Cli::try_parse_from(["ferrox", "-m", "x.gguf", "--samplers", "top_kk"])
             .expect_err("no such sampler")

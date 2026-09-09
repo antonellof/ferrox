@@ -43,10 +43,10 @@ use crate::{invalid_request, unsupported_feature, ApiError};
 ///
 /// ## Why a refusal and not a filtered chain
 ///
-/// ferrox implements five of upstream's samplers. Building the chain out
-/// of the names it recognises and dropping the rest would answer a
-/// request for `dry;top_k;typ_p;top_p;min_p;xtc;temperature` with a
-/// four-sampler chain, a 200, and no way for the caller to tell -- the
+/// ferrox implements llama.cpp's whole default chain but not `mirostat`
+/// or `infill`. Building the chain out of the names it recognises and
+/// dropping the rest would answer a request naming `mirostat` with a
+/// chain that has none, a 200, and no way for the caller to tell -- the
 /// same silence `logit_bias` is refused for.
 ///
 /// The status codes distinguish the two failures a caller can have:
@@ -221,7 +221,7 @@ mod tests {
     /// they did not ask for.
     #[test]
     fn a_sampler_ferrox_lacks_is_refused_by_name_as_not_implemented() {
-        for name in ["dry", "xtc", "typ_p", "mirostat", "top_n_sigma", "infill"] {
+        for name in ["mirostat", "infill"] {
             let body = serde_json::json!([name, "temperature"]);
             let (status, message) = parse_sampler_order(Some(&body), "/completion")
                 .expect_err("{name} must be refused, not skipped");
@@ -271,8 +271,25 @@ mod tests {
             (serde_json::json!(["top_k", "temperature"]), None),
             (serde_json::json!([]), None),
             (
-                serde_json::json!(["xtc", "temperature"]),
+                serde_json::json!(["mirostat", "temperature"]),
                 Some(StatusCode::NOT_IMPLEMENTED),
+            ),
+            // llama.cpp's own default chain, which every one of these
+            // routes must now accept: this list is the whole reason the
+            // four missing samplers were ported.
+            (
+                serde_json::json!([
+                    "penalties",
+                    "dry",
+                    "top_n_sigma",
+                    "top_k",
+                    "typ_p",
+                    "top_p",
+                    "min_p",
+                    "xtc",
+                    "temperature"
+                ]),
+                None,
             ),
             (
                 serde_json::json!(["top_kk", "temperature"]),

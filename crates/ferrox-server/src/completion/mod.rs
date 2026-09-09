@@ -146,18 +146,7 @@ const UNSUPPORTED: &[Unsupported] = &[
         0.0,
         "dynamic temperature sampling is not implemented",
     ),
-    off_at(
-        "typical_p",
-        1.0,
-        "locally typical sampling is not implemented",
-    ),
-    off_at("xtc_probability", 0.0, "the XTC sampler is not implemented"),
     off_at("mirostat", 0.0, "mirostat sampling is not implemented"),
-    off_at(
-        "dry_multiplier",
-        0.0,
-        "DRY repetition sampling is not implemented",
-    ),
     off_at(
         "n_probs",
         0.0,
@@ -268,6 +257,11 @@ pub(crate) struct CompletionRequest {
     min_p: Option<f32>,
     #[serde(default)]
     top_k: Option<usize>,
+    /// llama.cpp's `typ_p`, `top_n_sigma`, `xtc_*` and `dry_*`, in ONE
+    /// struct shared with the other two routes that take them. See
+    /// `sampling_knobs::ExtraSamplerFields`.
+    #[serde(flatten)]
+    extra_samplers: crate::sampling_knobs::ExtraSamplerFields,
     /// llama.cpp's spelling of `repetition_penalty`.
     #[serde(default)]
     repeat_penalty: Option<f32>,
@@ -368,7 +362,7 @@ impl CompletionRequest {
     /// and `repeat_last_n` are llama.cpp's spellings, everything else
     /// happens to agree. Resolution -- what an absent knob means -- is
     /// `SamplingKnobs::resolve`'s, shared with both OpenAI routes.
-    fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
+    pub(crate) fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
         let penalty_last_n = match self.repeat_last_n {
             None => None,
             Some(n) if n >= 0 => Some(n as usize),
@@ -381,7 +375,7 @@ impl CompletionRequest {
                 ))
             }
         };
-        Ok(SamplingKnobs {
+        let mut knobs = SamplingKnobs {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
@@ -394,7 +388,10 @@ impl CompletionRequest {
                 self.samplers.as_ref(),
                 ferrox_api::routes::COMPLETION,
             )?,
-        })
+            ..SamplingKnobs::default()
+        };
+        self.extra_samplers.apply(&mut knobs);
+        Ok(knobs)
     }
 
     /// `n_predict`, read as llama.cpp defines it.
@@ -536,7 +533,12 @@ pub(crate) async fn completion(
         // split that did not happen.
         reasoning: None,
         max_tokens: 0,
-        sampling: req.sampling_knobs()?.resolve(),
+        sampling: req
+            .sampling_knobs()?
+            .resolve(active.sampler_model())
+            .map_err(|e| {
+                crate::unsupported_feature(&format!("`dry_multiplier` on /completion: {e}"))
+            })?,
         seed: req.seed(),
         stop: req.stop.clone().unwrap_or_default(),
         json_object: false,
@@ -744,7 +746,8 @@ mod tests {
         }))
         .sampling_knobs()
         .expect("all supported")
-        .resolve();
+        .resolve(crate::sampling_knobs::SamplerModel::absent())
+        .expect("no dry");
         assert_eq!(knobs.temperature, 0.7);
         assert_eq!(knobs.top_p, 0.9);
         assert_eq!(knobs.min_p, 0.05);
@@ -762,8 +765,11 @@ mod tests {
         let mine = request(json!({"prompt": "hi"}))
             .sampling_knobs()
             .expect("nothing to refuse")
-            .resolve();
-        let shared = SamplingKnobs::default().resolve();
+            .resolve(crate::sampling_knobs::SamplerModel::absent())
+            .expect("no dry");
+        let shared = SamplingKnobs::default()
+            .resolve(crate::sampling_knobs::SamplerModel::absent())
+            .expect("no dry");
         assert_eq!(mine.temperature, shared.temperature);
         assert_eq!(mine.top_p, shared.top_p);
         assert_eq!(mine.min_p, shared.min_p);
@@ -939,10 +945,7 @@ mod tests {
     fn every_unsupported_option_is_refused_by_its_own_name() {
         let asking: &[(&str, Value)] = &[
             ("dynatemp_range", json!(0.5)),
-            ("typical_p", json!(0.95)),
-            ("xtc_probability", json!(0.5)),
             ("mirostat", json!(2)),
-            ("dry_multiplier", json!(0.8)),
             ("n_probs", json!(5)),
             ("post_sampling_probs", json!(true)),
             ("min_keep", json!(1)),
@@ -1062,7 +1065,8 @@ mod tests {
             request(json!({"prompt": "hi", "repeat_last_n": 0}))
                 .sampling_knobs()
                 .unwrap()
-                .resolve()
+                .resolve(crate::sampling_knobs::SamplerModel::absent())
+                .expect("no dry")
                 .penalty_last_n,
             0
         );

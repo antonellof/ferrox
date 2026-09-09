@@ -58,17 +58,11 @@ fn continuous_batching_composes_with_paged_kv() {
         let par = GenerationParams {
             reasoning: None,
             max_tokens: params[i].max_tokens,
-            sampling: SamplingParams {
-                temperature: params[i].sampling.temperature,
-                top_p: params[i].sampling.top_p,
-                min_p: params[i].sampling.min_p,
-                top_k: params[i].sampling.top_k,
-                repetition_penalty: params[i].sampling.repetition_penalty,
-                penalty_last_n: 64,
-                presence_penalty: params[i].sampling.presence_penalty,
-                frequency_penalty: params[i].sampling.frequency_penalty,
-                sampler_order: params[i].sampling.sampler_order,
-            },
+            // Cloned rather than field-by-field: a hand-written copy
+            // of `SamplingParams` is this repo's dominant defect at its
+            // smallest, and this one already omitted every sampler
+            // added after it was written.
+            sampling: params[i].sampling.clone(),
             seed: params[i].seed,
             stop: vec![],
             stop_token_ids: Vec::new(),
@@ -248,17 +242,11 @@ fn continuous_batch_matches_sequential_generate_token_ids() {
         let par = GenerationParams {
             reasoning: None,
             max_tokens: params[i].max_tokens,
-            sampling: SamplingParams {
-                temperature: params[i].sampling.temperature,
-                top_p: params[i].sampling.top_p,
-                min_p: params[i].sampling.min_p,
-                top_k: params[i].sampling.top_k,
-                repetition_penalty: params[i].sampling.repetition_penalty,
-                penalty_last_n: 64,
-                presence_penalty: params[i].sampling.presence_penalty,
-                frequency_penalty: params[i].sampling.frequency_penalty,
-                sampler_order: params[i].sampling.sampler_order,
-            },
+            // Cloned rather than field-by-field: a hand-written copy
+            // of `SamplingParams` is this repo's dominant defect at its
+            // smallest, and this one already omitted every sampler
+            // added after it was written.
+            sampling: params[i].sampling.clone(),
             seed: params[i].seed,
             stop: vec![],
             stop_token_ids: Vec::new(),

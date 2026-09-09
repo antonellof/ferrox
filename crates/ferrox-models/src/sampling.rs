@@ -1,6 +1,13 @@
-//! Token sampling from a decoder's output logits: temperature, top-k,
-//! top-p (nucleus), and repetition penalty, on top of the greedy argmax
-//! ferrox previously always used unconditionally.
+//! Token sampling from a decoder's output logits: llama.cpp's whole
+//! default sampler chain, on top of the greedy argmax ferrox previously
+//! always used unconditionally.
+//!
+//! The chain is `penalties, dry, top_n_sigma, top_k, typical_p, top_p,
+//! min_p, xtc, temperature` (`common/common.h:259-269`), which is
+//! [`crate::sampler_order::SamplerOrder`]'s default and llama.cpp's.
+//! The filters themselves are in [`crate::sampler_chain`], the DRY
+//! penalty in [`crate::dry`], the three history penalties in
+//! [`penalties`], the parameters in [`params`].
 //!
 //! `crate::speculative` verifies draft tokens against
 //! [`sampling_distribution`] -- the exact distribution [`Sampler`]
@@ -14,391 +21,70 @@
 //! dependency tree the same minimal, pure-Rust shape as the rest of
 //! this crate.
 
+mod params;
+mod penalties;
+mod recommended;
+mod rng;
+
+pub use params::SamplingParams;
+pub use recommended::{RecommendedSampling, RequestedSampling};
+pub use rng::{LogitMask, Sampler};
+
 use crate::penalty_window::PenaltyWindow;
 use crate::sampler_chain::Candidates;
-use crate::sampler_order::{ChainStep, SamplerOrder};
+use crate::sampler_order::ChainStep;
+use penalties::apply_history_penalties;
 
-/// Sampling parameters for one generation request. `temperature <= 0.0`
-/// means "sample nothing, take the greedy argmax" -- the same
-/// deterministic behavior ferrox always had before this module existed.
-#[derive(Debug, Clone)]
-pub struct SamplingParams {
-    pub temperature: f32,
-    /// Nucleus sampling threshold in (0.0, 1.0]. 1.0 disables top-p
-    /// filtering (every token with nonzero probability is eligible).
-    pub top_p: f32,
-    /// Keep only candidates at least `min_p` times as likely as the most
-    /// likely one. `0.0` disables it; llama.cpp's `--min-p`, whose
-    /// default is **0.05** (`common/common.h:231`) rather than off.
-    ///
-    /// That default is why this is a parity item and not a feature:
-    /// llama.cpp truncates with min-p on every run nobody configured,
-    /// so without it ferrox could not reproduce llama.cpp's *own*
-    /// out-of-the-box output for any prompt.
-    ///
-    /// The struct default here stays `0.0` (disabled) for the same
-    /// reason `temperature` defaults to greedy: `SamplingParams::default`
-    /// is ferrox's "do nothing the caller did not ask for" baseline, and
-    /// llama.cpp's CLI numbers live on the CLI flags.
-    pub min_p: f32,
-    /// Keep only the `top_k` highest-probability tokens before
-    /// sampling. 0 disables top-k filtering.
-    pub top_k: usize,
-    /// > 1.0 discourages repeating a token already in the
-    /// > [`PenaltyWindow`] -- prompt included; 1.0
-    /// > disables repetition penalty. Uses the standard convention
-    /// > (divide positive logits, multiply negative ones) so the penalty
-    /// > always pushes toward *less* likely, regardless of logit sign.
-    pub repetition_penalty: f32,
-    /// How many of the most recent tokens the penalties look at, as
-    /// llama.cpp's `penalty_last_n` (`common/common.h:238`, default 64).
-    ///
-    /// `0` disables the penalties entirely. ferrox had no window at all
-    /// and scanned the WHOLE history, so on a long generation it
-    /// penalised a steadily growing set of tokens where llama.cpp
-    /// penalises the last 64 -- the divergence grew with output length,
-    /// which is exactly when a repetition penalty matters most.
-    pub penalty_last_n: usize,
-    /// OpenAI-style presence penalty: subtract from logits of tokens
-    /// that already appeared in the [`PenaltyWindow`] (once per
-    /// distinct token).
-    pub presence_penalty: f32,
-    /// OpenAI-style frequency penalty: subtract `frequency_penalty *
-    /// count` from logits for each token id seen in the
-    /// [`PenaltyWindow`].
-    pub frequency_penalty: f32,
-    /// The ORDER the chain above runs in, llama.cpp's `--samplers`.
-    ///
-    /// Not a cosmetic setting. Each filter renormalises over the
-    /// survivors of the last one, so moving a step changes which
-    /// candidates the next step can see -- ferrox has already shipped
-    /// that bug once, with temperature running first.
-    ///
-    /// The default is ferrox's existing chain
-    /// (`penalties;top_k;top_p;min_p;temperature`), so a caller that
-    /// never touches this field samples exactly what it always did. See
-    /// [`crate::sampler_order`].
-    pub sampler_order: SamplerOrder,
-}
-
-impl Default for SamplingParams {
-    /// Greedy decoding: identical behavior to ferrox's original
-    /// argmax-only generation loop.
-    fn default() -> Self {
-        SamplingParams {
-            temperature: 0.0,
-            top_p: 1.0,
-            min_p: 0.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            penalty_last_n: 64,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            sampler_order: SamplerOrder::default(),
-        }
-    }
-}
-
-/// The sampling a **checkpoint recommends for itself**, one `Option`
-/// per field so that "this model says nothing about top_p" stays
-/// distinguishable from "this model recommends top_p = 1.0". This is
-/// sglang's `sampling_defaults='model'`, ported from FreeToken
-/// `python/freetoken/utils/hf.py:92 load_generation_sampling`.
+/// A deterministic, uninteresting-on-purpose logit vector: no ties, a
+/// wide dynamic range, and a few negatives so the penalty's sign
+/// convention is exercised.
 ///
-/// Every field is `None` for a checkpoint that recommends nothing,
-/// which is the overwhelming majority, and
-/// [`RecommendedSampling::resolve`] then reproduces ferrox's existing
-/// defaults exactly -- a recommendation may only fill a gap the request
-/// left, never override it.
-///
-/// Why this exists at all: reasoning checkpoints are tuned for a
-/// specific sampler (Qwen3.5 ships temperature 1.0, top_k 20, top_p
-/// 0.95) and ship those numbers with the weights. Served under a
-/// generic greedy-or-0.8 default they fall into repetition loops --
-/// fluent output that never terminates -- which reads as a broken model
-/// rather than as a serving default nobody read off the file.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct RecommendedSampling {
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub top_k: Option<usize>,
+/// Shared with [`rng`]'s tests rather than written out twice, because
+/// two "the same logits" that were not the same logits is the smallest
+/// possible instance of this repo's dominant defect.
+#[cfg(test)]
+pub(crate) fn spread_logits(vocab: usize) -> Vec<f32> {
+    (0..vocab)
+        .map(|i| ((i as f32 * 12.9898).sin() * 43_758.547).fract() * 8.0 - 3.0)
+        .collect()
 }
 
-/// The sampling fields **one request** actually specified. `None` means
-/// the request said nothing about that field, so the checkpoint's
-/// recommendation (and then the framework default) may speak for it.
+/// The token greedy decoding picks, given a chain that may or may not be
+/// able to move the argmax.
 ///
-/// Collapsing this to a plain [`SamplingParams`] at the wire boundary
-/// -- `temperature: req.temperature.unwrap_or(0.0)` -- is what destroys
-/// the distinction: a request that omitted `temperature` becomes
-/// indistinguishable from one that explicitly asked for greedy, and no
-/// recommendation can ever apply.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct RequestedSampling {
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub top_k: Option<usize>,
-}
-
-impl RecommendedSampling {
-    /// True when the checkpoint recommended nothing at all, i.e.
-    /// [`Self::resolve`] is guaranteed to return the framework defaults
-    /// for any request. Useful for telling an operator whether
-    /// "model defaults" had anything to act on.
-    pub fn is_empty(&self) -> bool {
-        *self == RecommendedSampling::default()
-    }
-
-    /// Precedence, exactly as FreeToken's `resolve_sampling.pick`
-    /// (`python/freetoken/server/generation.py:170`) applies it: the
-    /// **request's** own value, else the **checkpoint's**
-    /// recommendation, else the **framework** default carried by
-    /// `framework` (ferrox's `SamplingParams::default()` unless a caller
-    /// has its own).
-    ///
-    /// The penalty fields are taken from `framework` untouched: nothing
-    /// in the reference reads a recommended penalty, and inventing one
-    /// here would be this function changing generation on its own.
-    ///
-    /// Getting the order wrong in either direction is a silent
-    /// behaviour change: recommendation-over-request makes a client's
-    /// explicit `temperature: 0` unreachable on a model that recommends
-    /// 1.0, and framework-over-recommendation is the greedy repetition
-    /// loop this whole path exists to avoid.
-    pub fn resolve(
-        &self,
-        requested: RequestedSampling,
-        framework: SamplingParams,
-    ) -> SamplingParams {
-        SamplingParams {
-            temperature: requested
-                .temperature
-                .or(self.temperature)
-                .unwrap_or(framework.temperature),
-            top_p: requested.top_p.or(self.top_p).unwrap_or(framework.top_p),
-            top_k: requested.top_k.or(self.top_k).unwrap_or(framework.top_k),
-            ..framework
-        }
-    }
-
-    /// The recommendation in a HuggingFace-style `generation_config.json`
-    /// body.
-    ///
-    /// Two rules, both from the reference
-    /// (`hf.py:92 load_generation_sampling`):
-    ///
-    /// * `do_sample: false` means the checkpoint recommends **greedy**,
-    ///   which is returned as `temperature = 0` and *nothing else* --
-    ///   the top_k/top_p in such a file describe a sampler the model
-    ///   asks not to be used.
-    /// * otherwise only the keys **actually present** are returned. An
-    ///   absent key stays `None`; filling it with a house default (the
-    ///   naive reading, and what HF's own `GenerationConfig` object does
-    ///   for you) would turn silence into a recommendation and let a
-    ///   file that says only `temperature: 0.6` also pin top_p to 1.0,
-    ///   overriding the server's own default for a value the checkpoint
-    ///   never expressed.
-    ///
-    /// A file that does not parse, or is not a JSON object, recommends
-    /// nothing -- a malformed sidecar must not be able to change how a
-    /// model is sampled.
-    pub fn from_generation_config(json: &str) -> Self {
-        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(json)
-        else {
-            return RecommendedSampling::default();
-        };
-        if map.get("do_sample").and_then(|v| v.as_bool()) == Some(false) {
-            return RecommendedSampling {
-                temperature: Some(0.0),
-                ..RecommendedSampling::default()
-            };
-        }
-        RecommendedSampling {
-            temperature: map
-                .get("temperature")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32),
-            top_p: map.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
-            top_k: map
-                .get("top_k")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-        }
-    }
-
-    /// [`Self::from_generation_config`] for the `generation_config.json`
-    /// beside a checkpoint's weights (an HF-format model directory).
-    ///
-    /// A directory with no such file recommends nothing, exactly like a
-    /// GGUF with no `general.sampling.*` keys: the absence of a
-    /// recommendation is the normal case and must never be an error that
-    /// stops a model from loading.
-    pub fn from_model_dir(dir: &std::path::Path) -> Self {
-        match std::fs::read_to_string(dir.join("generation_config.json")) {
-            Ok(text) => Self::from_generation_config(&text),
-            Err(_) => RecommendedSampling::default(),
-        }
-    }
-}
-
-/// Sets logits a caller wants to forbid to `-inf`, in place, before the
-/// sampler looks at them.
+/// llama.cpp does NOT special-case `temp <= 0`: it runs the whole chain
+/// and lets `llama_sampler_temp_impl` (`src/llama-sampler.cpp:271-286`)
+/// set every logit but the maximum to `-inf`, so `dist` picks whatever
+/// the filters left. Two of those filters can therefore change greedy
+/// output, and both of them are new here: `xtc` removes the TOP
+/// candidates by construction, and `typ_p` selects outward from the
+/// distribution's entropy and may drop the most likely token.
 ///
-/// Two callers today, and they COMPOSE rather than exclude each other --
-/// a masked logit stays masked, so the order they run in cannot matter:
-/// JSON-object mode's character-class filter
-/// (`ferrox_server::json_mode`), and grammar-constrained decoding
-/// ([`crate::grammar_sampler::GrammarSampler::mask_logits`]).
-///
-/// The signature returns nothing because the callback runs from inside
-/// the sampler, which has no error to return one through. A mask that
-/// CAN fail -- a grammar that dead-ends leaves every logit at `-inf`,
-/// and sampling from that is how an "impossible" request becomes
-/// arbitrary text with a 200 -- records its refusal in the closure's own
-/// captured state, and the decode loop reads it after the sample and
-/// throws the token away. `ferrox_server::sample_step::sample_next` is
-/// the one place that pairing lives.
-pub type LogitMask<'a> = &'a mut dyn FnMut(&mut [f32]);
-
-/// A small, seedable xorshift64* generator. Not cryptographically
-/// secure -- sampling doesn't need that -- but reproducible given a
-/// seed, which greedy argmax already was for free.
-pub struct Sampler {
-    state: u64,
-}
-
-impl Sampler {
-    pub fn new(seed: u64) -> Self {
-        // xorshift64* requires a nonzero seed.
-        Sampler {
-            state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
-        }
+/// ferrox keeps its `argmax` fast path, because building and sorting a
+/// 128k-entry candidate list per token to reach an answer that cannot
+/// differ would be a decode-speed regression on the most common
+/// configuration there is. [`SamplingParams::greedy_equals_argmax`] is
+/// the one predicate that decides which path is exact, and it is read
+/// here and by the Metal `lm_head + argmax` fold's guard, so a chain
+/// that can move the argmax also stops the GPU from folding it away.
+fn greedy_choice(
+    scores: Vec<f32>,
+    params: &SamplingParams,
+    history: PenaltyWindow<'_>,
+    xtc_roll: Option<f32>,
+) -> usize {
+    if params.greedy_equals_argmax() {
+        return argmax(&scores);
     }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-        // The `*` in xorshift64*. Without it this is plain xorshift64,
-        // whose state IS its output, and a small seed's first output is
-        // therefore still small: for every seed below ~4000 the first
-        // draw landed in the bottom eighth of [0, 1), so a request that
-        // asked for `seed: 42` always got its first token from the
-        // bottom of the CDF. The multiply is what decorrelates the
-        // output from a low-entropy state; see
-        // `low_seeds_do_not_bias_the_first_draw`.
-        self.state.wrapping_mul(0x2545F491_4F6CDD1D)
-    }
-
-    /// Uniform float in [0.0, 1.0).
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    /// Samples one token id from `logits`, given `params` and the
-    /// [`PenaltyWindow`] the penalties look back over. Falls back to
-    /// plain greedy argmax when `params.temperature <= 0.0`.
-    ///
-    /// `history` is a window and not a slice on purpose: it carries the
-    /// PROMPT as well as the generated tokens, which is what llama.cpp
-    /// penalises over. See [`crate::penalty_window`].
-    ///
-    /// A length-1 `logits` vector is treated as a precomputed greedy token
-    /// id (`logits[0] as usize`) — used by the Metal dense-stack path that
-    /// returns GPU argmax instead of downloading the full vocab.
-    pub fn sample(
-        &mut self,
-        logits: &[f32],
-        params: &SamplingParams,
-        history: PenaltyWindow<'_>,
-    ) -> usize {
-        self.sample_with_mask(logits, params, history, None)
-    }
-
-    /// Like [`Self::sample`], but optionally zeroes disallowed logits via
-    /// `mask` before argmax / nucleus sampling (used for JSON-object mode).
-    pub fn sample_with_mask(
-        &mut self,
-        logits: &[f32],
-        params: &SamplingParams,
-        history: PenaltyWindow<'_>,
-        mut mask: Option<LogitMask<'_>>,
-    ) -> usize {
-        if params.temperature <= 0.0 && mask.is_none() {
-            if logits.len() == 1 {
-                return logits[0] as usize;
-            }
-            let mut scores = logits.to_vec();
-            apply_history_penalties(&mut scores, params, history);
-            return argmax(&scores);
-        }
-
-        let mut scores: Vec<f32> = logits.to_vec();
-        apply_history_penalties(&mut scores, params, history);
-
-        if let Some(m) = mask.as_mut() {
-            m(&mut scores);
-        }
-
-        if params.temperature <= 0.0 {
-            if scores.len() == 1 {
-                return scores[0] as usize;
-            }
-            return argmax(&scores);
-        }
-
-        let probs = filtered_distribution(scores, params);
-        self.sample_from(&probs)
-    }
-
-    /// A uniform draw in `[0.0, 1.0)`.
-    ///
-    /// Exposed because speculative decoding's accept test is a coin
-    /// flip against `p_target(x) / p_draft(x)` rather than a draw from
-    /// a distribution, and it must come off the same seeded stream as
-    /// every other draw in the run or a "reproducible given a seed"
-    /// generation stops being reproducible.
-    pub fn uniform(&mut self) -> f32 {
-        self.next_f32()
-    }
-
-    /// Draws one index from an already-normalised distribution.
-    ///
-    /// Split out of [`Self::sample_with_mask`] so speculative decoding
-    /// can sample from a distribution it had to compute anyway (the
-    /// rejection rule needs `p_target` itself, not just a draw from it)
-    /// and still go through *exactly* the same draw as ordinary
-    /// sampling. Two separate copies of this loop would be two chances
-    /// to be subtly non-lossless.
-    pub fn sample_from(&mut self, probs: &[f32]) -> usize {
-        let draw = self.next_f32();
-        let mut cumulative = 0.0f32;
-        for (i, &p) in probs.iter().enumerate() {
-            cumulative += p;
-            if draw < cumulative {
-                return i;
-            }
-        }
-        // Floating-point rounding may leave `draw` fractionally above
-        // the final cumulative sum; the last nonzero-probability token
-        // is the correct fallback, not index 0.
-        probs
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|&(_, &p)| p > 0.0)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    }
+    argmax(&filtered_distribution(scores, params, history, xtc_roll))
 }
 
 /// The **exact** distribution [`Sampler::sample`] draws from for these
 /// logits, params and history: penalties applied over the
-/// `penalty_last_n` window, then top-k, top-p and min-p, then
-/// temperature, renormalised to sum to 1.
+/// `penalty_last_n` window, then llama.cpp's chain in
+/// `params.sampler_order`, renormalised to sum to 1.
 ///
-/// That is llama.cpp's chain order, and it is the order
-/// `filtered_distribution` runs -- **temperature last**, not first.
+/// That is llama.cpp's chain order -- **temperature last**, not first.
 /// This comment used to say "temperature divided in, top-k and top-p
 /// filtered", which described the pre-2026-09-01 pipeline and omitted
 /// min-p entirely.
@@ -412,23 +98,34 @@ impl Sampler {
 /// a model nobody is running.
 ///
 /// Greedy (`temperature <= 0.0`) is a distribution too: the point mass
-/// on the argmax. Returning it as one rather than as a special case is
-/// why the same verification code is correct at every temperature.
+/// on the token [`greedy_choice`] would pick. Returning it as one rather
+/// than as a special case is why the same verification code is correct
+/// at every temperature.
+///
+/// `xtc_roll` is [`Sampler::xtc_roll`]'s answer, and it is a REQUIRED
+/// argument rather than something this function draws or defaults,
+/// because XTC is stochastic and the caller owns the seeded stream. A
+/// caller that passes `None` while XTC is configured gets a chain with
+/// no XTC in it, which is why every caller in this workspace obtains it
+/// from `Sampler::xtc_roll` and not by writing `None`.
 pub fn sampling_distribution(
     logits: &[f32],
     params: &SamplingParams,
     history: PenaltyWindow<'_>,
+    xtc_roll: Option<f32>,
 ) -> Vec<f32> {
     let mut scores = logits.to_vec();
     apply_history_penalties(&mut scores, params, history);
     if params.temperature <= 0.0 {
-        let mut probs = vec![0.0f32; scores.len()];
-        if let Some(p) = probs.get_mut(argmax(&scores)) {
+        let vocab = scores.len();
+        let chosen = greedy_choice(scores, params, history, xtc_roll);
+        let mut probs = vec![0.0f32; vocab];
+        if let Some(p) = probs.get_mut(chosen) {
             *p = 1.0;
         }
         return probs;
     }
-    filtered_distribution(scores, params)
+    filtered_distribution(scores, params, history, xtc_roll)
 }
 
 /// Shared tail of [`Sampler::sample_with_mask`] and
@@ -440,7 +137,7 @@ pub fn sampling_distribution(
 ///
 /// llama.cpp's default chain is `penalties, dry, top_n_sigma, top_k,
 /// typical_p, top_p, min_p, xtc, temperature` (`common/common.h:259-269`,
-/// consumed by `common/sampling.cpp:349-397`). The penalties already ran
+/// consumed by `common/sampling.cpp:346-397`). The penalties already ran
 /// in [`apply_history_penalties`]; this function is the rest of it, in
 /// that order, and **temperature is last**.
 ///
@@ -464,7 +161,7 @@ pub fn sampling_distribution(
 /// including the renormalisation between steps that a keep-mask cannot
 /// express. See that module's header.
 ///
-/// # The order is now the caller's
+/// # The order is the caller's
 ///
 /// `params.sampler_order` says which steps run and in what sequence,
 /// which is llama.cpp's `--samplers`. It DEFAULTS to the sequence
@@ -477,7 +174,12 @@ pub fn sampling_distribution(
 /// something to run. And because [`SamplerOrder`] can only be built out
 /// of steps ferrox implements, there is no arm here that means "asked
 /// for, silently not done".
-fn filtered_distribution(scores: Vec<f32>, params: &SamplingParams) -> Vec<f32> {
+fn filtered_distribution(
+    scores: Vec<f32>,
+    params: &SamplingParams,
+    history: PenaltyWindow<'_>,
+    xtc_roll: Option<f32>,
+) -> Vec<f32> {
     let vocab = scores.len();
     let mut candidates = Candidates::new(&scores);
     for &step in params.sampler_order.steps() {
@@ -487,86 +189,32 @@ fn filtered_distribution(scores: Vec<f32>, params: &SamplingParams) -> Vec<f32> 
             // first precisely so that this is the same position the
             // caller asked for; see `SamplerOrderError::PenaltiesNotFirst`.
             ChainStep::Penalties => {}
+            ChainStep::Dry => candidates.dry(&params.dry.penalties(history)),
+            ChainStep::TopNSigma => candidates.top_n_sigma(params.top_n_sigma),
             ChainStep::TopK => candidates.top_k(params.top_k),
+            ChainStep::TypP => candidates.typical_p(params.typical_p),
             ChainStep::TopP => candidates.top_p(params.top_p),
             ChainStep::MinP => candidates.min_p(params.min_p),
+            // `xtc_roll` is `None` exactly when
+            // `SamplingParams::xtc_can_fire` is false, which is the same
+            // predicate `Candidates::xtc` re-checks. See
+            // `Sampler::xtc_roll`.
+            ChainStep::Xtc => {
+                if let Some(chance) = xtc_roll {
+                    candidates.xtc(params.xtc_probability, params.xtc_threshold, chance);
+                }
+            }
             ChainStep::Temperature => candidates.temperature(params.temperature),
         }
     }
     candidates.into_distribution(vocab)
 }
 
-/// Penalise tokens that already appear in `history`, once each.
-///
-/// `history` is a [`PenaltyWindow`], so "already appear" includes the
-/// PROMPT. That is llama.cpp's rule and the module docs of
-/// [`crate::penalty_window`] carry the upstream lines; before it, every
-/// caller in this workspace picked its own slice and four of the five
-/// picked differently.
-///
-/// ONCE EACH is the whole subtlety, and ferrox used to get it wrong.
-/// llama.cpp walks the CANDIDATE list and looks each candidate up in a
-/// count map (`llama-sampler.cpp:2735-2756`), so a token repeated `n`
-/// times is divided by `penalty_repeat` exactly once. ferrox walked the
-/// HISTORY, so the same token was divided `n` times and the effective
-/// penalty was `penalty^n`.
-///
-/// That was live on every `ferrox run`: `--repeat-penalty` defaults to
-/// 1.1, so a token seen five times was penalised 1.61x rather than
-/// 1.1x, and the divergence grew with the length of the output.
-///
-/// The sign convention is llama.cpp's and its comment explains it:
-/// dividing alone would make tokens with NEGATIVE logits more likely,
-/// so negatives are multiplied instead.
-///
-/// A chain that does not name `penalties` does not penalise. llama.cpp
-/// reads an omitted sampler as "do not run it", and this function is the
-/// one place the penalties happen -- on the greedy path as well as the
-/// sampled one -- so the check belongs here rather than beside the
-/// candidate list, where the greedy path would never see it.
-fn apply_history_penalties(
-    scores: &mut [f32],
-    params: &SamplingParams,
-    history: PenaltyWindow<'_>,
-) {
-    if !params.sampler_order.has_penalties() {
-        return;
-    }
-    if params.repetition_penalty == 1.0
-        && params.presence_penalty == 0.0
-        && params.frequency_penalty == 0.0
-    {
-        return;
-    }
-    // Only the last `penalty_last_n`, as llama.cpp's ring buffer does.
-    if params.penalty_last_n == 0 {
-        return;
-    }
-    let mut counts = std::collections::HashMap::<usize, usize>::new();
-    for tok in history.recent(params.penalty_last_n) {
-        *counts.entry(tok).or_insert(0) += 1;
-    }
-    for (tok, count) in counts {
-        let Some(s) = scores.get_mut(tok) else {
-            continue;
-        };
-        if params.repetition_penalty != 1.0 {
-            *s = if *s > 0.0 {
-                *s / params.repetition_penalty
-            } else {
-                *s * params.repetition_penalty
-            };
-        }
-        *s -= params.frequency_penalty * count as f32;
-        *s -= params.presence_penalty;
-    }
-}
-
 fn argmax(logits: &[f32]) -> usize {
     logits
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
@@ -574,19 +222,11 @@ fn argmax(logits: &[f32]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dry::{DryBreakers, DryParams};
     use crate::sampler_order::SamplerOrder;
 
-    /// A deterministic, uninteresting-on-purpose logit vector: no ties,
-    /// a wide dynamic range, and a few negatives so the penalty's sign
-    /// convention is exercised.
-    fn spread_logits(vocab: usize) -> Vec<f32> {
-        (0..vocab)
-            .map(|i| ((i as f32 * 12.9898).sin() * 43_758.547).fract() * 8.0 - 3.0)
-            .collect()
-    }
-
-    /// The chain `filtered_distribution` ran BEFORE the order became a
-    /// parameter, written out by hand.
+    /// The chain `filtered_distribution` ran BEFORE llama.cpp's four
+    /// missing samplers were added, written out by hand.
     ///
     /// Deliberately not built from `SamplerOrder`: a reference that read
     /// the order it is supposed to be pinning would agree with any
@@ -608,17 +248,23 @@ mod tests {
     }
 
     /// **A run that does not ask for an order samples exactly what it
-    /// always did.** Bit-for-bit, against the chain written out by hand
-    /// rather than read back off `SamplerOrder`.
+    /// always did.** Bit-for-bit, against the five-step chain written out
+    /// by hand rather than read back off `SamplerOrder`.
     ///
-    /// This is the assertion that makes `--samplers` safe to add at all.
-    /// The order is not a reordering of independent steps: each filter
-    /// renormalises over the survivors of the last, so a default that
-    /// drifted by one position would change every generation on every
-    /// model, silently, with every other test in this file still green.
+    /// This is now doing double duty. It is still the assertion that
+    /// makes `--samplers` safe to expose -- the order is not a
+    /// reordering of independent steps, so a default that drifted by one
+    /// position would change every generation on every model. And it is
+    /// the assertion that adding `dry`, `top_n_sigma`, `typ_p` and `xtc`
+    /// to the DEFAULT chain changed nothing: at their neutral values
+    /// (`dry_multiplier 0.0`, `top_n_sigma -1.0`, `typical_p 1.0`,
+    /// `xtc_probability 0.0`) all four are no-ops, so the nine-step
+    /// default must produce bit-identical probabilities to the five-step
+    /// chain it replaced.
     ///
-    /// Swap any two entries of `sampler_order::DEFAULT_STEPS` and this
-    /// goes red.
+    /// Swap any two entries of `sampler_order::DEFAULT_STEPS`, or make
+    /// any of the four new filters do something at its neutral value,
+    /// and this goes red.
     #[test]
     fn the_default_order_is_the_chain_ferrox_already_ran() {
         let logits = spread_logits(64);
@@ -653,7 +299,7 @@ mod tests {
             };
             let window = || PenaltyWindow::new(&prompt, &generated);
             let expected = the_chain_ferrox_used_to_hardcode(&logits, &params, window());
-            let actual = sampling_distribution(&logits, &params, window());
+            let actual = sampling_distribution(&logits, &params, window(), None);
             for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                 assert_eq!(
                     a.to_bits(),
@@ -682,7 +328,7 @@ mod tests {
             ..SamplingParams::default()
         };
         let spelled = SamplingParams {
-            sampler_order: "penalties;top_k;top_p;min_p;temperature"
+            sampler_order: "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature"
                 .parse::<SamplerOrder>()
                 .expect("the default chain must parse"),
             ..base.clone()
@@ -699,15 +345,8 @@ mod tests {
         assert_eq!(draw(&base), draw(&spelled));
     }
 
-    /// **The flag does something.** A chain that runs the temperature
-    /// before top-p keeps a different candidate set than the default,
-    /// which is the whole reason the order is worth exposing -- and the
-    /// reason getting it wrong is a silent quality regression rather
-    /// than an error.
-    ///
-    /// A hot temperature flattens the distribution, so a top-p applied
-    /// after it sums smaller probabilities and reaches `p` later,
-    /// keeping MORE candidates.
+    /// A run that never asks for XTC must not consume a draw for it, or
+    /// every seeded generation in the workspace shifts by one.
     #[test]
     fn running_the_temperature_first_keeps_a_different_candidate_set() {
         let logits = vec![6.0f32, 4.0, 2.0, 0.0, -2.0, -4.0];
@@ -720,7 +359,7 @@ mod tests {
             ..SamplingParams::default()
         };
         let support = |order: &str| -> Vec<bool> {
-            sampling_distribution(&logits, &params(order), PenaltyWindow::new(&[], &[]))
+            sampling_distribution(&logits, &params(order), PenaltyWindow::new(&[], &[]), None)
                 .iter()
                 .map(|&p| p > 0.0)
                 .collect()
@@ -745,32 +384,78 @@ mod tests {
     /// knob is set -- llama.cpp reads an omitted sampler as "do not run
     /// it", and a chain that ran it anyway would be honouring a request
     /// nobody made.
+    ///
+    /// Checked for every filter that has a knob, not just min-p: the
+    /// four samplers added for llama.cpp parity each have their own arm
+    /// in `filtered_distribution`, and an arm that ignored the chain
+    /// would be invisible to a test that only exercised one of them.
     #[test]
     fn a_sampler_absent_from_the_chain_does_not_filter() {
         let logits = vec![4.0f32, 3.0, 2.0, 1.0];
-        let with_min_p = SamplingParams {
-            temperature: 1.0,
-            min_p: 0.2,
-            ..SamplingParams::default()
-        };
-        let survivors = |params: &SamplingParams| {
-            sampling_distribution(&logits, params, PenaltyWindow::new(&[], &[]))
+        let survivors = |params: &SamplingParams, roll: Option<f32>| {
+            sampling_distribution(&logits, params, PenaltyWindow::new(&[], &[]), roll)
                 .iter()
                 .filter(|&&p| p > 0.0)
                 .count()
         };
-        // The default chain runs min-p: 4 + ln(0.2) = 2.3905 keeps two.
-        assert_eq!(survivors(&with_min_p), 2);
-
-        let without_min_p = SamplingParams {
-            sampler_order: "penalties;top_k;top_p;temperature".parse().expect("chain"),
-            ..with_min_p.clone()
-        };
-        assert_eq!(
-            survivors(&without_min_p),
-            4,
-            "`min_p` is set but not in the chain, so nothing should truncate"
-        );
+        // (the knob, a chain WITHOUT its step, the roll to pass)
+        let cases: Vec<(SamplingParams, &str, Option<f32>)> = vec![
+            (
+                SamplingParams {
+                    temperature: 1.0,
+                    min_p: 0.2,
+                    ..SamplingParams::default()
+                },
+                "penalties;top_k;top_p;temperature",
+                None,
+            ),
+            (
+                SamplingParams {
+                    temperature: 1.0,
+                    typical_p: 0.5,
+                    ..SamplingParams::default()
+                },
+                "penalties;top_k;top_p;min_p;temperature",
+                None,
+            ),
+            (
+                SamplingParams {
+                    temperature: 1.0,
+                    top_n_sigma: 0.5,
+                    ..SamplingParams::default()
+                },
+                "penalties;top_k;top_p;min_p;temperature",
+                None,
+            ),
+            (
+                SamplingParams {
+                    temperature: 1.0,
+                    xtc_probability: 1.0,
+                    xtc_threshold: 0.05,
+                    ..SamplingParams::default()
+                },
+                "penalties;top_k;top_p;min_p;temperature",
+                Some(0.0),
+            ),
+        ];
+        for (with, chain_without, roll) in cases {
+            let filtered = survivors(&with, roll);
+            assert!(
+                filtered < 4,
+                "the knob must bite when its step IS in the chain, \
+                 or the second half proves nothing: {with:?}"
+            );
+            let without = SamplingParams {
+                sampler_order: chain_without.parse().expect("chain"),
+                ..with.clone()
+            };
+            assert_eq!(
+                survivors(&without, roll),
+                4,
+                "the knob is set but its step is not in `{chain_without}`, \
+                 so nothing should truncate: {without:?}"
+            );
+        }
     }
 
     /// Leaving `penalties` out of the chain disables the penalties, on
@@ -819,8 +504,8 @@ mod tests {
             ..sampled.clone()
         };
         assert_ne!(
-            sampling_distribution(&logits, &sampled, history()),
-            sampling_distribution(&logits, &with, history())
+            sampling_distribution(&logits, &sampled, history(), None),
+            sampling_distribution(&logits, &with, history(), None)
         );
     }
 
@@ -904,122 +589,6 @@ mod tests {
         );
     }
 
-    /// The repetition penalty is applied ONCE per token, however many
-    /// times that token appears in the history.
-    ///
-    /// ferrox walked the history and divided once per OCCURRENCE, so the
-    /// effective penalty was `penalty^n`. llama.cpp walks the candidates
-    /// and looks each up in a count map, so it is `penalty` flat
-    /// (`llama-sampler.cpp:2735-2756`).
-    ///
-    /// Live on every `ferrox run`: `--repeat-penalty` defaults to 1.1,
-    /// so a token seen five times was penalised 1.61x, and the
-    /// divergence grew with the length of the output. Twenty-four
-    /// sampling tests passed with the bug in place, which is why this
-    /// one exists.
-    #[test]
-    fn the_repetition_penalty_does_not_compound_with_repeats() {
-        let params = SamplingParams {
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 2.0,
-            ..SamplingParams::default()
-        };
-        let logits = vec![4.0f32, 1.0, 1.0];
-
-        // Token 0 appears five times. Penalised once, its score is 2.0;
-        // compounded it would be 4 / 2^5 = 0.125.
-        let mut scores = logits.clone();
-        apply_history_penalties(
-            &mut scores,
-            &params,
-            PenaltyWindow::new(&[], &[0, 0, 0, 0, 0]),
-        );
-        assert!(
-            (scores[0] - 2.0).abs() < 1e-6,
-            "expected one division (2.0), got {} -- {} would be 2^5",
-            scores[0],
-            4.0f32 / 32.0
-        );
-
-        // And once really is once: one occurrence and five occurrences
-        // must land on the same score, or the count still leaks in.
-        let mut once = logits.clone();
-        apply_history_penalties(&mut once, &params, PenaltyWindow::new(&[], &[0]));
-        assert_eq!(once[0].to_bits(), scores[0].to_bits());
-
-        // A NEGATIVE logit is multiplied rather than divided, or the
-        // penalty would make it more likely -- llama.cpp's own comment.
-        let mut negative = vec![-4.0f32];
-        apply_history_penalties(&mut negative, &params, PenaltyWindow::new(&[], &[0, 0, 0]));
-        assert!((negative[0] + 8.0).abs() < 1e-6, "got {}", negative[0]);
-    }
-
-    /// The penalties look at the last `penalty_last_n` tokens, not the
-    /// whole history.
-    ///
-    /// llama.cpp keeps a ring buffer of `penalty_last_n` (default 64,
-    /// `common/common.h:238`); ferrox scanned everything generated so
-    /// far. On a long generation that is a steadily growing set of
-    /// penalised tokens against llama.cpp's fixed 64 -- the divergence
-    /// grows with output length, which is when a repetition penalty
-    /// matters most.
-    #[test]
-    fn the_penalties_only_see_the_last_n_tokens() {
-        let params = SamplingParams {
-            repetition_penalty: 2.0,
-            penalty_last_n: 2,
-            ..SamplingParams::default()
-        };
-        let mut scores = vec![8.0f32, 8.0, 8.0];
-        // Token 0 fell out of the window; tokens 1 and 2 are in it.
-        apply_history_penalties(&mut scores, &params, PenaltyWindow::new(&[], &[0, 1, 2]));
-        assert_eq!(
-            scores[0].to_bits(),
-            8.0f32.to_bits(),
-            "token 0 is outside the window"
-        );
-        assert!((scores[1] - 4.0).abs() < 1e-6, "got {}", scores[1]);
-        assert!((scores[2] - 4.0).abs() < 1e-6, "got {}", scores[2]);
-
-        // `0` disables the penalties outright, as llama.cpp documents.
-        let off = SamplingParams {
-            penalty_last_n: 0,
-            ..params
-        };
-        let mut untouched = vec![8.0f32; 3];
-        apply_history_penalties(&mut untouched, &off, PenaltyWindow::new(&[], &[0, 1, 2]));
-        assert_eq!(untouched, vec![8.0f32; 3]);
-
-        // A window longer than the history is not an overflow.
-        let wide = SamplingParams {
-            penalty_last_n: 1000,
-            ..params
-        };
-        let mut short = vec![8.0f32];
-        apply_history_penalties(&mut short, &wide, PenaltyWindow::new(&[], &[0]));
-        assert!((short[0] - 4.0).abs() < 1e-6);
-    }
-
-    /// Frequency penalty still scales with the count, while the
-    /// repetition penalty does not.
-    ///
-    /// Both live in the same loop, so a fix that made the repetition
-    /// penalty flat by dropping the counts would break this one.
-    #[test]
-    fn the_frequency_penalty_still_counts_repeats() {
-        let params = SamplingParams {
-            frequency_penalty: 0.5,
-            presence_penalty: 0.25,
-            ..SamplingParams::default()
-        };
-        let mut scores = vec![10.0f32];
-        apply_history_penalties(&mut scores, &params, PenaltyWindow::new(&[], &[0, 0, 0, 0]));
-        // 10 - 0.5*4 - 0.25 = 7.75
-        assert!((scores[0] - 7.75).abs() < 1e-6, "got {}", scores[0]);
-    }
-
     /// Top-p cuts the UNSCALED distribution; the temperature reshapes
     /// only the survivors.
     ///
@@ -1039,7 +608,7 @@ mod tests {
                 top_k: 0,
                 ..SamplingParams::default()
             };
-            sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &[]))
+            sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &[]), None)
                 .iter()
                 .map(|&p| p > 0.0)
                 .collect()
@@ -1079,7 +648,7 @@ mod tests {
             min_p: 0.2,
             ..SamplingParams::default()
         };
-        let probs = sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &[]));
+        let probs = sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &[]), None);
         assert!(probs[0] > 0.0 && probs[1] > 0.0);
         assert_eq!(probs[2], 0.0, "2.0 is below 4 + ln(0.2) = 2.3905");
         assert_eq!(probs[3], 0.0);
@@ -1095,7 +664,7 @@ mod tests {
             min_p: 0.0,
             ..params.clone()
         };
-        let unfiltered = sampling_distribution(&logits, &off, PenaltyWindow::new(&[], &[]));
+        let unfiltered = sampling_distribution(&logits, &off, PenaltyWindow::new(&[], &[]), None);
         assert!(unfiltered.iter().all(|&p| p > 0.0));
     }
 
@@ -1121,7 +690,7 @@ mod tests {
                 min_p: 0.2,
                 ..SamplingParams::default()
             };
-            sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &[]))
+            sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &[]), None)
                 .iter()
                 .map(|&p| p > 0.0)
                 .collect()
@@ -1154,7 +723,7 @@ mod tests {
             min_p: 0.2,
             ..SamplingParams::default()
         };
-        let probs = sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &[]));
+        let probs = sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &[]), None);
         assert_eq!(
             probs.iter().map(|&p| p > 0.0).collect::<Vec<_>>(),
             vec![true, true, false, false]
@@ -1169,7 +738,7 @@ mod tests {
             ..params.clone()
         };
         assert_eq!(
-            sampling_distribution(&logits, &top_p_only, PenaltyWindow::new(&[], &[]))
+            sampling_distribution(&logits, &top_p_only, PenaltyWindow::new(&[], &[]), None)
                 .iter()
                 .filter(|&&p| p > 0.0)
                 .count(),
@@ -1177,214 +746,125 @@ mod tests {
         );
     }
 
+    /// DRY reaches the sampled token through the chain, not just the
+    /// penalty table.
+    ///
+    /// Window `0 1 2 0 1` at `allowed_length 2`: emitting `2` would make
+    /// it a three-token repetition, so DRY subtracts
+    /// `multiplier * base^0 = 6.0` from token 2's logit of 5.0 -- more
+    /// than enough to move the greedy argmax off it. That is the whole
+    /// claim: a sampler wired into `filtered_distribution` but not
+    /// reached from the greedy path would leave this at 2.
     #[test]
-    fn temperature_zero_accepts_precomputed_argmax_singleton() {
-        let mut sampler = Sampler::new(1);
-        let params = SamplingParams::default();
-        assert_eq!(
-            sampler.sample(&[42.0], &params, PenaltyWindow::new(&[], &[])),
-            42
-        );
-        // Non-greedy must not treat a singleton as a token id.
-        let sampled = SamplingParams {
-            temperature: 0.8,
+    fn dry_moves_the_chosen_token_on_both_the_greedy_and_the_sampled_path() {
+        let logits = vec![0.0f32, 0.0, 5.0, 0.0];
+        let history = || PenaltyWindow::new(&[], &[0, 1, 2, 0, 1]);
+        let dry = DryParams::new(6.0, 1.1, 2, -1, 1024, DryBreakers::none());
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            dry: dry.clone(),
             ..SamplingParams::default()
         };
-        // Softmax of a single logit → only token 0 is eligible.
+        let mut sampler = Sampler::new(5);
         assert_eq!(
-            sampler.sample(&[42.0], &sampled, PenaltyWindow::new(&[], &[])),
+            sampler.sample(&logits, &SamplingParams::default(), history()),
+            2,
+            "without DRY token 2 is the argmax"
+        );
+        assert_ne!(
+            sampler.sample(&logits, &greedy, history()),
+            2,
+            "DRY subtracts 4.0 from token 2's logit of 5.0, so it loses"
+        );
+
+        // Same on the sampled path, read off the distribution.
+        let sampled = SamplingParams {
+            temperature: 1.0,
+            ..greedy.clone()
+        };
+        let with = sampling_distribution(&logits, &sampled, history(), None);
+        let without = sampling_distribution(
+            &logits,
+            &SamplingParams {
+                dry: DryParams::off(),
+                ..sampled
+            },
+            history(),
+            None,
+        );
+        assert!(with[2] < without[2], "with={with:?} without={without:?}");
+    }
+
+    /// XTC removes the TOP candidates, so it can change greedy output --
+    /// and ferrox's greedy fast path knows that.
+    ///
+    /// `greedy_equals_argmax` is the predicate that decides whether the
+    /// `argmax` shortcut is exact. Make it return `true`
+    /// unconditionally and this goes red: the shortcut would return
+    /// token 0 while llama.cpp's chain, which runs XTC before the
+    /// temperature at every temperature, returns something else.
+    #[test]
+    fn xtc_changes_the_greedy_choice_because_it_removes_the_top() {
+        let logits = vec![3.0f32, 2.9, -10.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            // Always fires, and both leading candidates clear the
+            // threshold, so the more likely of the two is removed.
+            xtc_probability: 1.0,
+            xtc_threshold: 0.05,
+            ..SamplingParams::default()
+        };
+        assert!(!params.greedy_equals_argmax());
+        let mut sampler = Sampler::new(11);
+        assert_eq!(
+            sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])),
+            1,
+            "XTC drops token 0, so the greedy answer is token 1"
+        );
+        // Without XTC the argmax stands, which is what makes the
+        // assertion above about XTC and not about the logits.
+        assert_eq!(
+            sampler.sample(
+                &logits,
+                &SamplingParams::default(),
+                PenaltyWindow::new(&[], &[])
+            ),
             0
         );
     }
 
+    /// The same for typical-p: it selects outward from the entropy and
+    /// can drop the most likely token, so the greedy shortcut is not
+    /// exact when it is live.
     #[test]
-    fn temperature_zero_is_deterministic_greedy_argmax() {
-        let logits = vec![0.1, 0.9, 0.3, -0.2];
-        let params = SamplingParams::default();
-        let mut sampler = Sampler::new(42);
-        assert_eq!(
-            sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])),
-            1
-        );
-        // Must be deterministic regardless of RNG state advancing.
-        assert_eq!(
-            sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])),
-            1
-        );
-    }
-
-    #[test]
-    fn high_temperature_can_pick_a_non_argmax_token_over_many_draws() {
-        let logits = vec![1.0, 1.0, 1.0, 1.0];
+    fn typical_p_can_drop_the_argmax_so_greedy_must_run_the_chain() {
+        // One near-certain token and three equal small ones. The
+        // entropy is dominated by the small tokens, so the near-certain
+        // one is the ATYPICAL member and typical-p at 0.5 keeps it
+        // alone here -- while at 0.5 on a flatter distribution it drops
+        // the leader. The property under test is the predicate.
         let params = SamplingParams {
-            temperature: 1.0,
+            temperature: 0.0,
+            typical_p: 0.5,
             ..SamplingParams::default()
         };
-        let mut sampler = Sampler::new(7);
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..200 {
-            seen.insert(sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])));
+        assert!(!params.greedy_equals_argmax());
+        assert!(SamplingParams {
+            typical_p: 1.0,
+            ..params.clone()
         }
-        assert!(
-            seen.len() > 1,
-            "uniform logits at temperature=1.0 must produce more than one distinct token across 200 draws"
-        );
-    }
+        .greedy_equals_argmax());
 
-    #[test]
-    fn top_k_one_is_equivalent_to_greedy() {
-        let logits = vec![0.1, 0.9, 0.3, -0.2];
-        let params = SamplingParams {
-            temperature: 1.0,
-            top_k: 1,
-            ..SamplingParams::default()
-        };
-        let mut sampler = Sampler::new(123);
-        for _ in 0..20 {
-            assert_eq!(
-                sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])),
-                1
-            );
-        }
-    }
-
-    #[test]
-    fn top_p_near_zero_is_equivalent_to_greedy() {
-        let logits = vec![0.1, 5.0, 0.3, -0.2];
-        let params = SamplingParams {
-            temperature: 1.0,
-            top_p: 0.001,
-            ..SamplingParams::default()
-        };
-        let mut sampler = Sampler::new(9);
-        for _ in 0..20 {
-            assert_eq!(
-                sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])),
-                1
-            );
-        }
-    }
-
-    #[test]
-    fn presence_and_frequency_penalties_reduce_seen_token_logits() {
-        let logits = vec![0.0, 5.0, 0.0];
-        let params = SamplingParams {
-            temperature: 1.0,
-            presence_penalty: 10.0,
-            frequency_penalty: 0.0,
-            ..SamplingParams::default()
-        };
-        let mut sampler = Sampler::new(1);
-        let mut counts = [0usize; 3];
-        for _ in 0..500 {
-            counts[sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[1]))] += 1;
-        }
-        assert!(
-            counts[1] < 250,
-            "presence_penalty should discourage token 1; counts={counts:?}"
-        );
-
-        let params = SamplingParams {
-            temperature: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 10.0,
-            ..SamplingParams::default()
-        };
-        let mut sampler = Sampler::new(2);
-        counts = [0; 3];
-        for _ in 0..500 {
-            counts[sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[1, 1, 1]))] += 1;
-        }
-        assert!(
-            counts[1] < 250,
-            "frequency_penalty should discourage repeated token 1; counts={counts:?}"
-        );
-    }
-
-    #[test]
-    fn repetition_penalty_reduces_probability_of_recently_seen_token() {
-        let logits = vec![0.0, 5.0, 0.0];
-        let params = SamplingParams {
-            temperature: 1.0,
-            repetition_penalty: 1000.0,
-            ..SamplingParams::default()
-        };
+        // logits ln(0.4), ln(0.2) x3: llama.cpp keeps the three 0.2
+        // candidates and drops the 0.4 leader (`tests/test-sampling.cpp:346`),
+        // so the greedy answer must not be token 0.
+        let logits: Vec<f32> = [0.4f32, 0.2, 0.2, 0.2].iter().map(|p| p.ln()).collect();
         let mut sampler = Sampler::new(3);
-        let mut counts = [0usize; 3];
-        for _ in 0..500 {
-            counts[sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[1]))] += 1;
-        }
-        assert!(
-            counts[1] < 250,
-            "heavily penalizing token 1 (already in history) should make it far less likely than its raw logit alone would suggest; got counts={counts:?}"
+        assert_ne!(
+            sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])),
+            0,
+            "typical-p drops the most likely token here"
         );
-    }
-
-    #[test]
-    fn low_seeds_do_not_bias_the_first_draw() {
-        // Every generation seeds a fresh `Sampler` (the server does it
-        // per request, from the caller's `seed`), so the FIRST draw off
-        // a freshly seeded generator is the one users actually see.
-        // Plain xorshift64 returns its own state, so seeds 1..4000 all
-        // produced a first draw in the bottom eighth of [0, 1) -- the
-        // first sampled token of every seeded request came off the
-        // bottom of the CDF.
-        let vocab = 8;
-        let logits = vec![0.0f32; vocab];
-        let params = SamplingParams {
-            temperature: 1.0,
-            ..SamplingParams::default()
-        };
-        let seeds = 4_000u64;
-        let mut counts = vec![0usize; vocab];
-        for seed in 1..=seeds {
-            counts[Sampler::new(seed).sample(&logits, &params, PenaltyWindow::new(&[], &[]))] += 1;
-        }
-        let expected = seeds as f64 / vocab as f64;
-        for (token, &c) in counts.iter().enumerate() {
-            assert!(
-                (c as f64 - expected).abs() < expected * 0.25,
-                "uniform logits: token {token} came up {c} times across {seeds} seeds, \
-                 expected about {expected:.0} (counts={counts:?})"
-            );
-        }
-    }
-
-    #[test]
-    fn the_published_distribution_is_the_one_sample_actually_draws_from() {
-        // `sampling_distribution` is load-bearing for lossless
-        // speculative verification: if it disagreed with what `sample`
-        // draws from, every accept/reject decision would be measured
-        // against the wrong target. Check them against each other
-        // empirically, with filters on so the two code paths have
-        // something to disagree about.
-        let logits = vec![0.4, 2.0, -1.0, 1.2, 0.9, -0.3];
-        let params = SamplingParams {
-            temperature: 0.8,
-            top_p: 0.9,
-            top_k: 4,
-            repetition_penalty: 1.3,
-            ..SamplingParams::default()
-        };
-        let history = [1usize, 4];
-        let claimed = sampling_distribution(&logits, &params, PenaltyWindow::new(&[], &history));
-        assert!((claimed.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-
-        let draws = 100_000;
-        let mut counts = vec![0usize; logits.len()];
-        let mut sampler = Sampler::new(0xC0FFEE);
-        for _ in 0..draws {
-            counts[sampler.sample(&logits, &params, PenaltyWindow::new(&[], &history))] += 1;
-        }
-        for (i, &c) in counts.iter().enumerate() {
-            let empirical = c as f64 / draws as f64;
-            assert!(
-                (empirical - claimed[i] as f64).abs() < 0.01,
-                "token {i}: sample() draws it {empirical:.4} of the time but \
-                 sampling_distribution claims {:.4}",
-                claimed[i]
-            );
-        }
     }
 
     #[test]
@@ -1394,6 +874,7 @@ mod tests {
             &logits,
             &SamplingParams::default(),
             PenaltyWindow::new(&[], &[]),
+            None,
         );
         assert_eq!(probs, vec![0.0, 1.0, 0.0, 0.0]);
         // Penalties still apply at temperature 0, so the point mass
@@ -1405,165 +886,9 @@ mod tests {
                 ..SamplingParams::default()
             },
             PenaltyWindow::new(&[], &[1]),
+            None,
         );
         assert_eq!(penalized[1], 0.0);
         assert_eq!(penalized.iter().sum::<f32>(), 1.0);
-    }
-
-    #[test]
-    fn degenerate_all_zero_probability_falls_back_to_greedy() {
-        // top_k=1 combined with a top_p that would exclude even that
-        // one surviving token is a contradictory/degenerate
-        // configuration; must not panic or sample index 0 blindly.
-        let logits = vec![0.1, 0.9, 0.3, -0.2];
-        let params = SamplingParams {
-            temperature: 1.0,
-            top_k: 1,
-            top_p: 1.0,
-            ..SamplingParams::default()
-        };
-        let mut sampler = Sampler::new(1);
-        assert_eq!(
-            sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])),
-            1
-        );
-    }
-
-    /// Only the keys the file actually carries become a recommendation.
-    ///
-    /// **This test fails if an absent key is filled with a house
-    /// default** (the naive reading, and what HF's own
-    /// `GenerationConfig` object does): `top_p` and `top_k` would come
-    /// back as `Some(1.0)` / `Some(0)` and would then override whatever
-    /// the server itself defaults to, for values this checkpoint never
-    /// expressed.
-    #[test]
-    fn an_absent_generation_config_key_stays_absent_rather_than_taking_a_default() {
-        let recommended = RecommendedSampling::from_generation_config(r#"{"temperature": 0.6}"#);
-        assert_eq!(recommended.temperature, Some(0.6));
-        assert_eq!(recommended.top_p, None, "top_p was not in the file");
-        assert_eq!(recommended.top_k, None, "top_k was not in the file");
-        // An explicit JSON null is silence too (the reference's
-        // `if val is not None`).
-        let nulled = RecommendedSampling::from_generation_config(r#"{"top_p": null}"#);
-        assert_eq!(nulled, RecommendedSampling::default());
-    }
-
-    /// A reasoning checkpoint's full recommendation survives intact --
-    /// the case the whole path exists for (Qwen3.5: temp 1.0, top_k 20,
-    /// top_p 0.95).
-    #[test]
-    fn every_generation_config_key_present_is_recommended() {
-        let recommended = RecommendedSampling::from_generation_config(
-            r#"{"do_sample": true, "temperature": 1.0, "top_k": 20, "top_p": 0.95}"#,
-        );
-        assert_eq!(
-            recommended,
-            RecommendedSampling {
-                temperature: Some(1.0),
-                top_p: Some(0.95),
-                top_k: Some(20),
-            }
-        );
-    }
-
-    /// `do_sample: false` recommends greedy, expressed as temperature 0
-    /// and *nothing else*: the top_k/top_p such a file also carries
-    /// describe a sampler it is asking not to be used, so returning them
-    /// would filter a distribution the model wants collapsed to its
-    /// argmax.
-    #[test]
-    fn do_sample_false_recommends_greedy_and_no_other_field() {
-        let recommended = RecommendedSampling::from_generation_config(
-            r#"{"do_sample": false, "temperature": 0.7, "top_k": 50, "top_p": 0.9}"#,
-        );
-        assert_eq!(recommended.temperature, Some(0.0));
-        assert_eq!(recommended.top_p, None);
-        assert_eq!(recommended.top_k, None);
-    }
-
-    /// A sidecar that does not parse must not be able to change how the
-    /// model is sampled.
-    #[test]
-    fn a_malformed_generation_config_recommends_nothing() {
-        for text in ["", "not json", "[1, 2, 3]", "null"] {
-            assert!(
-                RecommendedSampling::from_generation_config(text).is_empty(),
-                "{text:?} must recommend nothing"
-            );
-        }
-    }
-
-    /// Precedence: the request wins over the checkpoint, and the
-    /// checkpoint only fills what the request left unset. An explicit
-    /// `temperature: 0` from a client must stay reachable on a model
-    /// that recommends 1.0.
-    #[test]
-    fn a_request_outranks_the_recommendation_which_outranks_the_framework_default() {
-        let recommended = RecommendedSampling {
-            temperature: Some(1.0),
-            top_p: Some(0.95),
-            top_k: Some(20),
-        };
-        let resolved = recommended.resolve(
-            RequestedSampling {
-                temperature: Some(0.0),
-                ..RequestedSampling::default()
-            },
-            SamplingParams::default(),
-        );
-        assert_eq!(resolved.temperature, 0.0, "the request asked for greedy");
-        assert_eq!(resolved.top_p, 0.95, "the request said nothing about top_p");
-        assert_eq!(resolved.top_k, 20, "the request said nothing about top_k");
-        // Penalties are never recommended, only carried through.
-        assert_eq!(resolved.repetition_penalty, 1.0);
-    }
-
-    /// A checkpoint that recommends nothing must leave ferrox's existing
-    /// behaviour bit-identical: greedy, unfiltered, exactly
-    /// `SamplingParams::default()`.
-    #[test]
-    fn a_checkpoint_that_recommends_nothing_leaves_the_framework_defaults_alone() {
-        let resolved = RecommendedSampling::default()
-            .resolve(RequestedSampling::default(), SamplingParams::default());
-        let default = SamplingParams::default();
-        assert_eq!(resolved.temperature, default.temperature);
-        assert_eq!(resolved.top_p, default.top_p);
-        assert_eq!(resolved.top_k, default.top_k);
-    }
-
-    /// A model directory with no `generation_config.json` recommends
-    /// nothing rather than failing: the absence of a recommendation is
-    /// the normal case for most checkpoints.
-    #[test]
-    fn a_model_directory_without_a_generation_config_recommends_nothing() {
-        let dir = std::env::temp_dir().join(format!(
-            "ferrox_test_no_generation_config_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(RecommendedSampling::from_model_dir(&dir).is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The sidecar is read from the directory beside the weights, the
-    /// same place HF's `GenerationConfig.from_pretrained` looks.
-    #[test]
-    fn a_model_directory_generation_config_is_read_from_beside_the_weights() {
-        let dir = std::env::temp_dir().join(format!(
-            "ferrox_test_generation_config_dir_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("generation_config.json"),
-            r#"{"temperature": 0.6, "top_p": 0.95}"#,
-        )
-        .unwrap();
-        let recommended = RecommendedSampling::from_model_dir(&dir);
-        std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(recommended.temperature, Some(0.6));
-        assert_eq!(recommended.top_p, Some(0.95));
-        assert_eq!(recommended.top_k, None);
     }
 }

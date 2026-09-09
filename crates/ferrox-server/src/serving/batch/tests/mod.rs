@@ -50,17 +50,10 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
     GenerationParams {
         reasoning: None,
         max_tokens,
-        sampling: SamplingParams {
-            temperature: 0.0,
-            top_p: 1.0,
-            min_p: 0.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            penalty_last_n: 64,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            sampler_order: ferrox_models::SamplerOrder::default(),
-        },
+        // `SamplingParams::default()` IS greedy with every filter
+        // off, so restating its fields here would be a second copy of
+        // the defaults that could drift from the first.
+        sampling: SamplingParams::default(),
         seed,
         stop: vec![],
         stop_token_ids: Vec::new(),

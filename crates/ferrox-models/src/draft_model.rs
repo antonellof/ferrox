@@ -253,10 +253,15 @@ impl Drafter for DraftModelSpeculator {
             // same sequence the target's would. The block used to clone
             // `history` per call to concatenate the two; the window
             // borrows both halves instead.
+            // The XTC roll comes off THIS drafter's own stream, so the
+            // distribution reported as `q` below is the one the token
+            // was actually drawn from even when XTC is configured.
+            let xtc_roll = self.rng.xtc_roll(&self.sampling);
             let probs = sampling_distribution(
                 &logits,
                 &self.sampling,
                 PenaltyWindow::new(history, &tokens),
+                xtc_roll,
             );
             let token = self.rng.sample_from(&probs);
 

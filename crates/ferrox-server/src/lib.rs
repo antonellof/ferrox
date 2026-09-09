@@ -821,6 +821,41 @@ impl Model {
             Model::Glm52(m) => Some(ferrox_models::Engine::vocab_size(&m.engine)),
         }
     }
+
+    /// True when this checkpoint carries a real vocabulary rather than
+    /// the byte-level fallback the synthetic-weight demo model uses.
+    ///
+    /// Read by the DRY sampler, whose sequence breakers are strings that
+    /// only mean something against a real tokenizer; see
+    /// [`ferrox_models::dry::DryVocabMissing`].
+    fn has_real_vocabulary(&self) -> bool {
+        match self {
+            Model::Gguf(m) => !matches!(*m.tokenizer, model::ServerTokenizer::Byte),
+            Model::Kimi(_) => true,
+            Model::Mla(m) => !matches!(m.tokenizer, model::ServerTokenizer::Byte),
+            Model::Gemma4(m) => !matches!(m.tokenizer, model::ServerTokenizer::Byte),
+            Model::Glm52(m) => !matches!(m.tokenizer, model::ServerTokenizer::Byte),
+        }
+    }
+}
+
+/// What the DRY sampler needs to tokenise its sequence breakers.
+///
+/// One trait, two implementations (`ferrox_cli`'s `CliTokenizer` has the
+/// other), so `--dry-sequence-breaker` and the `dry_sequence_breakers`
+/// request field cannot come to mean different things.
+impl ferrox_models::dry::DryVocab for Model {
+    fn n_tokens(&self) -> usize {
+        self.vocab_size().unwrap_or(0)
+    }
+
+    fn detokenize(&self, token: usize) -> String {
+        self.decode(&[token])
+    }
+
+    fn tokenize(&self, text: &str) -> Vec<usize> {
+        self.encode(text)
+    }
 }
 
 pub(crate) struct AppState {
@@ -1340,6 +1375,11 @@ struct ChatCompletionRequest {
     top_k: Option<usize>,
     #[serde(default)]
     repetition_penalty: Option<f32>,
+    /// llama.cpp's `typ_p`, `top_n_sigma`, `xtc_*` and `dry_*`, in ONE
+    /// struct shared with the other two routes that take them. See
+    /// `sampling_knobs::ExtraSamplerFields`.
+    #[serde(flatten)]
+    extra_samplers: crate::sampling_knobs::ExtraSamplerFields,
     #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
@@ -1498,7 +1538,7 @@ impl ChatCompletionRequest {
     /// sampler this engine does not have is a refusal, never a chain
     /// built without it.
     fn sampling_knobs(&self) -> Result<SamplingKnobs, ApiError> {
-        Ok(SamplingKnobs {
+        let mut knobs = SamplingKnobs {
             temperature: self.temperature,
             top_p: self.top_p,
             min_p: self.min_p,
@@ -1514,11 +1554,19 @@ impl ChatCompletionRequest {
                 self.samplers.as_ref(),
                 "/v1/chat/completions",
             )?,
-        })
+            ..SamplingKnobs::default()
+        };
+        self.extra_samplers.apply(&mut knobs);
+        Ok(knobs)
     }
 
-    fn sampling_params(&self) -> Result<SamplingParams, ApiError> {
-        Ok(self.sampling_knobs()?.resolve())
+    fn sampling_params(
+        &self,
+        model: crate::sampling_knobs::SamplerModel<'_>,
+    ) -> Result<SamplingParams, ApiError> {
+        self.sampling_knobs()?.resolve(model).map_err(|e| {
+            unsupported_feature(&format!("`dry_multiplier` on /v1/chat/completions: {e}"))
+        })
     }
 
     fn stop_sequences(&self) -> Vec<String> {
@@ -1849,7 +1897,10 @@ impl ChatCompletionRequest {
     /// grammar, or a `response_format` this server cannot honour, is a
     /// refusal rather than a request served without the constraint it
     /// asked for.
-    fn generation_params(&self) -> Result<GenerationParams, ApiError> {
+    fn generation_params(
+        &self,
+        model: crate::sampling_knobs::SamplerModel<'_>,
+    ) -> Result<GenerationParams, ApiError> {
         Ok(GenerationParams {
             // Set by `generation_params_for_template`, which is the only
             // caller that knows the SERVED model name. Left `None` here
@@ -1857,7 +1908,7 @@ impl ChatCompletionRequest {
             // rather than claiming the model did not think.
             reasoning: None,
             max_tokens: self.max_tokens,
-            sampling: self.sampling_params()?,
+            sampling: self.sampling_params(model)?,
             seed: self.resolved_seed(),
             stop: self.effective_stop_sequences(),
             // Resolved by `run_generation_emit`, the layer that holds a
@@ -1890,8 +1941,9 @@ impl ChatCompletionRequest {
         &self,
         template: &chat_template::PromptTemplate,
         served_model: &str,
+        model: crate::sampling_knobs::SamplerModel<'_>,
     ) -> Result<GenerationParams, ApiError> {
-        let mut params = self.generation_params()?;
+        let mut params = self.generation_params(model)?;
         // The served model, not the request's `model` field -- see this
         // function's doc. Same name `OutputPosture::resolve` reads the
         // answer back with, so the count and the split cannot disagree
@@ -3190,7 +3242,8 @@ async fn chat_completions_full(
     // completion (#35). It also means an unparseable grammar is a 400
     // for the second caller too, rather than a 200 carrying prose
     // generated under no grammar at all.
-    let params = req.generation_params_for_template(&template, active.name())?;
+    let params =
+        req.generation_params_for_template(&template, active.name(), active.sampler_model())?;
     let key = req.is_cacheable().then(|| req.cache_key(&prompt, &params));
 
     let (completion, cache_status) = if let Some(cached) = key
@@ -3318,7 +3371,8 @@ async fn chat_completions_stream(
     let batcher = active.batcher.clone();
     let ceiling = active.ceiling.clone();
     let metal_private_decode_gate = state.metal_private_decode_gate.clone();
-    let mut params = req.generation_params_for_template(&template, active.name())?;
+    let mut params =
+        req.generation_params_for_template(&template, active.name(), active.sampler_model())?;
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
@@ -8263,7 +8317,11 @@ mod tests {
         let template = chat_template::PromptTemplate::plain();
 
         let thinks = req
-            .generation_params_for_template(&template, "Qwen3-8B")
+            .generation_params_for_template(
+                &template,
+                "Qwen3-8B",
+                crate::sampling_knobs::SamplerModel::absent(),
+            )
             .expect("params");
         assert!(
             thinks.reasoning.is_some(),
@@ -8271,7 +8329,11 @@ mod tests {
         );
 
         let plain = req
-            .generation_params_for_template(&template, "Llama-3.2-1B-Instruct")
+            .generation_params_for_template(
+                &template,
+                "Llama-3.2-1B-Instruct",
+                crate::sampling_knobs::SamplerModel::absent(),
+            )
             .expect("params");
         assert!(
             plain.reasoning.is_none(),
@@ -8296,7 +8358,7 @@ mod tests {
         req.validate_supported_fields()
             .expect("a valid grammar is a valid request");
         let params = req
-            .generation_params()
+            .generation_params(crate::sampling_knobs::SamplerModel::absent())
             .expect("a valid grammar compiles at params time too");
         assert!(
             params.grammar.is_some(),
@@ -8312,7 +8374,11 @@ mod tests {
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
         }));
-        assert!(plain.generation_params().unwrap().grammar.is_none());
+        assert!(plain
+            .generation_params(crate::sampling_knobs::SamplerModel::absent())
+            .unwrap()
+            .grammar
+            .is_none());
     }
 
     fn tool_request(tool_choice: serde_json::Value) -> ChatCompletionRequest {
@@ -8337,7 +8403,11 @@ mod tests {
             req.validate_supported_fields()
                 .unwrap_or_else(|e| panic!("{choice} is a valid request: {e:?}"));
             let params = req
-                .generation_params_for_template(&graded_template(), "Qwen3-8B")
+                .generation_params_for_template(
+                    &graded_template(),
+                    "Qwen3-8B",
+                    crate::sampling_knobs::SamplerModel::absent(),
+                )
                 .unwrap_or_else(|e| panic!("{choice} compiles: {e:?}"));
             let grammar = params
                 .grammar
@@ -8373,7 +8443,11 @@ mod tests {
         for choice in [serde_json::json!("auto"), serde_json::json!("none")] {
             let req = tool_request(choice.clone());
             req.validate_supported_fields().expect("still supported");
-            let params = match req.generation_params_for_template(&graded_template(), "Qwen3-8B") {
+            let params = match req.generation_params_for_template(
+                &graded_template(),
+                "Qwen3-8B",
+                crate::sampling_knobs::SamplerModel::absent(),
+            ) {
                 Ok(p) => p,
                 Err((status, _)) => panic!("{choice} has no constraint to compile: {status}"),
             };
@@ -8430,11 +8504,14 @@ mod tests {
         // three `tool_grammar::wire::shape` still refuses, and it says
         // which of them and why.
         let req = tool_request(serde_json::json!("required"));
-        let (status, Json(body)) =
-            match req.generation_params_for_template(&graded_template(), "Gemma4-27B") {
-                Err(e) => e,
-                Ok(_) => panic!("a gemma4 call's arguments are not an object rule"),
-            };
+        let (status, Json(body)) = match req.generation_params_for_template(
+            &graded_template(),
+            "Gemma4-27B",
+            crate::sampling_knobs::SamplerModel::absent(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a gemma4 call's arguments are not an object rule"),
+        };
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert!(
             body["error"]["message"]
@@ -8459,7 +8536,11 @@ mod tests {
             .expect_err("this does not parse");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "grammar");
-        assert!(req.generation_params().is_err(), "and again at params time");
+        assert!(
+            req.generation_params(crate::sampling_knobs::SamplerModel::absent())
+                .is_err(),
+            "and again at params time"
+        );
     }
 
     /// `response_format: json_schema` used to be a 501 naming the
@@ -8480,7 +8561,9 @@ mod tests {
         }));
         req.validate_supported_fields()
             .expect("a boolean schema converts");
-        let params = req.generation_params().expect("and compiles");
+        let params = req
+            .generation_params(crate::sampling_knobs::SamplerModel::absent())
+            .expect("and compiles");
         let grammar = params.grammar.expect("the schema is the grammar");
         let mut g = (*grammar).clone();
         g.accept_token(0, b"true").expect("a boolean is accepted");
@@ -8515,7 +8598,11 @@ mod tests {
                 .contains("minimum"),
             "the refusal must name the keyword: {body}"
         );
-        assert!(req.generation_params().is_err(), "and again at params time");
+        assert!(
+            req.generation_params(crate::sampling_knobs::SamplerModel::absent())
+                .is_err(),
+            "and again at params time"
+        );
     }
 
     /// A forced `tool_choice` and a `response_format` schema are two
@@ -8567,14 +8654,23 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "min_p": 0.07,
         }));
-        assert_eq!(asked.sampling_params().expect("knobs").min_p, 0.07);
+        assert_eq!(
+            asked
+                .sampling_params(crate::sampling_knobs::SamplerModel::absent())
+                .expect("knobs")
+                .min_p,
+            0.07
+        );
 
         let silent = chat_request(serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
         }));
         assert_eq!(
-            silent.sampling_params().expect("knobs").min_p,
+            silent
+                .sampling_params(crate::sampling_knobs::SamplerModel::absent())
+                .expect("knobs")
+                .min_p,
             0.0,
             "an unset min_p must be off, not llama.cpp's CLI default"
         );
@@ -8597,7 +8693,9 @@ mod tests {
         });
         let key_for = |body: serde_json::Value| {
             let req = chat_request(body);
-            let params = req.generation_params().expect("params");
+            let params = req
+                .generation_params(crate::sampling_knobs::SamplerModel::absent())
+                .expect("params");
             req.cache_key("prompt", &params)
         };
         let baseline = key_for(base.clone());
@@ -8642,7 +8740,9 @@ mod tests {
         });
         let key_for = |body: serde_json::Value| {
             let req = chat_request(body);
-            let params = req.generation_params().expect("params");
+            let params = req
+                .generation_params(crate::sampling_knobs::SamplerModel::absent())
+                .expect("params");
             req.cache_key("prompt", &params)
         };
         let baseline = key_for(base.clone());

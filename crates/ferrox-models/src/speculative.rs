@@ -582,10 +582,12 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
         // about every push, which is exactly the shape this fix exists
         // to remove.
         let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
+        let xtc_roll = rng.xtc_roll(&options.sampling);
         let probs = sampling_distribution(
             last,
             &options.sampling,
             PenaltyWindow::new(seen_prompt, seen_generated),
+            xtc_roll,
         );
         rng.sample_from(&probs)
     };
@@ -637,10 +639,12 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
         let mut replacement: Option<usize> = None;
         for (i, (&token, dist)) in draft.tokens().iter().zip(draft.dists()).enumerate() {
             let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
+            let xtc_roll = rng.xtc_roll(&options.sampling);
             let target = sampling_distribution(
                 &batch_logits[i],
                 &options.sampling,
                 PenaltyWindow::new(seen_prompt, seen_generated),
+                xtc_roll,
             );
             match accept_or_resample(&target, dist, token, &mut rng) {
                 None => {
@@ -687,10 +691,12 @@ pub fn speculative_decode_observed<D: Drafter + ?Sized>(
             // token that makes a fully-accepted block worth `k + 1`.
             None => {
                 let (seen_prompt, seen_generated) = history.split_at(prompt_tokens.len());
+                let xtc_roll = rng.xtc_roll(&options.sampling);
                 let probs = sampling_distribution(
                     &batch_logits[accepted],
                     &options.sampling,
                     PenaltyWindow::new(seen_prompt, seen_generated),
+                    xtc_roll,
                 );
                 rng.sample_from(&probs)
             }
@@ -984,7 +990,16 @@ mod tests {
             // `history` is already prompt-then-generated, and the
             // window only ever reads the tail of the two halves
             // together, so the whole sequence goes in the first one.
-            let probs = sampling_distribution(logits, params, PenaltyWindow::new(history, &[]));
+            // This helper enumerates the exact marginal over every
+            // continuation, so it must not depend on a random draw:
+            // `None` is correct here and only here, because the params
+            // it is called with never enable XTC.
+            debug_assert!(
+                !params.xtc_can_fire(),
+                "the exact marginal is not defined under XTC"
+            );
+            let probs =
+                sampling_distribution(logits, params, PenaltyWindow::new(history, &[]), None);
             for (token, &p) in probs.iter().enumerate() {
                 if p <= 0.0 {
                     continue;

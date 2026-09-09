@@ -72,6 +72,15 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--frequency-penalty` | Penalise a token in proportion to how often it has appeared. `0.0` = off |
 | `--hf-file` | Exact filename inside `--hf-repo`, llama.cpp's `-hff`. Skips quant resolution entirely |
 | `--repeat-last-n` | How many recent tokens the repetition / presence / frequency penalties consider. `0` = penalties off. Default `64`, llama.cpp's (`common/common.h:238`) |
+| `--typical` / `--typical-p` | Locally typical sampling. Keeps the candidates nearest the distribution's entropy, so it can drop the MOST likely token. `1.0` = off, llama.cpp's default (`common/common.h:230`) |
+| `--top-nsigma` / `--top-n-sigma` | Mask every candidate more than `n` standard deviations of the logits below the maximum. `-1.0` = off, llama.cpp's default. `0.0` is a no-op, not greedy |
+| `--xtc-probability` | Chance that XTC removes the top candidates on a token. `0.0` = off, llama.cpp's default |
+| `--xtc-threshold` | Probability a candidate must reach before XTC may remove it. Default `0.1`; **above `0.5` disables XTC**, as upstream |
+| `--dry-multiplier` | DRY sequence-repetition penalty. `0.0` = off, llama.cpp's default |
+| `--dry-base` | Base of DRY's exponential. Default `1.75`; below `1.0` disables DRY |
+| `--dry-allowed-length` | Repetitions this long or shorter are free. Default `2` |
+| `--dry-penalty-last-n` | How many recent tokens DRY scans. `0` = off, `-1` = the context size (default) |
+| `--dry-sequence-breaker` | Repeatable. A string DRY refuses to look past. Giving any CLEARS llama.cpp's defaults (`\n`, `:`, `"`, `*`), and the literal `none` clears them outright |
 | `-s` / `--seed` | `-1` = time-based |
 | `--samplers` / `--sampler-seq` | Order the chain runs in, semicolon-separated. A sampler ferrox lacks is refused by name, see below |
 | `--grammar` | Constrain generation to a GBNF grammar, llama.cpp's `--grammar` |
@@ -107,14 +116,18 @@ per token, which is why a model that fits at its full context on Metal
 can need `--ctx-size auto` on CPU. `ferrox inspect-plan` prices both.
 
 `--samplers` (llama.cpp's, also `--sampler-seq`) chooses the ORDER, as a
-semicolon-separated list: `--samplers "penalties;top_k;top_p;min_p;temperature"`
-is the default spelled out. llama.cpp's aliases parse, so `top-k`,
-`nucleus`, `temp` and `typical` all work.
+semicolon-separated list. The default is llama.cpp's own default chain,
+spelled out:
+`--samplers "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature"`.
+llama.cpp's aliases parse, so `top-k`, `nucleus`, `temp` and `typical`
+all work, and an upstream command line pastes in unchanged.
 
 A sampler ferrox does not implement is **refused by name with the
-reason**, never skipped: `dry`, `typ_p`, `xtc` and `top_n_sigma` are
-real llama.cpp samplers, and a caller who asked for one and silently got
-a chain without it was handed a different sampler than the one they
+reason**, never skipped. That is now only `mirostat` and `infill`:
+`mirostat` REPLACES the chain upstream rather than joining it, so there
+is no position in this order that would honour it, and `infill` needs
+the model's FIM tokens. A caller who asked for one and silently got a
+chain without it was handed a different sampler than the one they
 requested.
 
 Order is not cosmetic, which is why it is worth exposing and why getting
@@ -125,9 +138,12 @@ temperature ran first, and top-p then summed probabilities temperature
 had already reshaped.
 
 **The sampler chain is llama.cpp's, in llama.cpp's order.** Penalties,
-then top-k, then top-p, then min-p, and **temperature last**
-(`common/common.h:259-269`; ferrox
-`crates/ferrox-models/src/sampling.rs`'s `filtered_distribution`).
+DRY, top-n-sigma, top-k, typical-p, top-p, min-p, XTC, and
+**temperature last** (`common/common.h:259-269`; ferrox
+`crates/ferrox-models/src/sampling.rs`'s `filtered_distribution`). Every
+one of those nine runs by default, and the four with no OpenAI
+equivalent sit at neutral values that make them exact no-ops, so a
+command line that does not name them samples what it always did.
 Ferrox used to divide by the temperature first and filter afterwards,
 which keeps a different candidate set for the same flags: top-p selects
 the smallest set summing to `p`, and temperature changes the

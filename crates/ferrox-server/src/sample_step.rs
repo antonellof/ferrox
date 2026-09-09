@@ -530,6 +530,31 @@ mod tests {
             r#"root ::= "cd""#,
             "c",
         )));
+
+        // And the third thing that needs the vocabulary: a SAMPLER that
+        // can move the argmax. `xtc` removes the top candidates, `typ_p`
+        // can drop the most likely one, and `dry` changes which logit is
+        // the maximum -- so a folded argmax at temperature 0 would be the
+        // answer to a chain the caller did not configure.
+        for live in [
+            ferrox_models::SamplingParams {
+                xtc_probability: 1.0,
+                xtc_threshold: 0.1,
+                ..ferrox_models::SamplingParams::default()
+            },
+            ferrox_models::SamplingParams {
+                typical_p: 0.5,
+                ..ferrox_models::SamplingParams::default()
+            },
+        ] {
+            let mut p = params(false, 0.0);
+            p.sampling = live;
+            assert!(
+                !greedy_gpu_fold_allowed(&p),
+                "a chain that can move the argmax must stop the fold: {:?}",
+                p.sampling
+            );
+        }
     }
 
     /// A grammar that waits for a trigger, with the trigger MANDATORY --
