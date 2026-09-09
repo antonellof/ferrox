@@ -1073,7 +1073,7 @@ pub(crate) fn load_decoder_streaming_if_needed(
         match ferrox_core::host_memory::plan_for(
             weights,
             available,
-            /* headroom = */ 4 * 1024 * 1024 * 1024,
+            ferrox_core::host_memory::FIT_HEADROOM_BYTES,
             /* floor = */ 2 * 1024 * 1024 * 1024,
         ) {
             ferrox_core::host_memory::FitPlan::Resident => None,

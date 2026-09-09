@@ -115,6 +115,24 @@ struct Inner {
     clock: u64,
 }
 
+/// Bytes every live [`ExpertStore`] in this process has committed to
+/// holding expert weights.
+///
+/// This module is the SINGLE holder of the expert byte budget, because
+/// on unified memory two budgets are the same RAM counted twice. That
+/// rule only bites when something *else* also wants to retain weight
+/// bytes, and something else now does: `weight_matrix::repack_cache`
+/// keeps interleaved copies of matrices it has packed. This gauge is
+/// how that cache subtracts rather than restates -- see
+/// [`crate::host_memory::derived_copy_budget`].
+static COMMITTED_EXPERT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes currently committed to expert caches across the process. See
+/// [`COMMITTED_EXPERT_BYTES`].
+pub fn committed_expert_bytes() -> u64 {
+    COMMITTED_EXPERT_BYTES.load(Ordering::Relaxed)
+}
+
 /// The bounded cache. See the module docs for the design contract.
 pub struct ExpertStore<S: ExpertSource> {
     source: S,
@@ -127,8 +145,15 @@ pub struct ExpertStore<S: ExpertSource> {
     bytes_read: AtomicU64,
 }
 
+impl<S: ExpertSource> Drop for ExpertStore<S> {
+    fn drop(&mut self) {
+        COMMITTED_EXPERT_BYTES.fetch_sub(self.budget_bytes as u64, Ordering::Relaxed);
+    }
+}
+
 impl<S: ExpertSource> ExpertStore<S> {
     pub fn new(source: S, budget_bytes: usize) -> Self {
+        COMMITTED_EXPERT_BYTES.fetch_add(budget_bytes as u64, Ordering::Relaxed);
         ExpertStore {
             source,
             budget_bytes,
@@ -356,6 +381,40 @@ mod tests {
             },
             budget,
         )
+    }
+
+    /// The process-wide gauge tracks every live store's budget and
+    /// releases it on drop.
+    ///
+    /// It exists so `weight_matrix::repack_cache` can SUBTRACT the
+    /// expert budget from the same pool rather than declare a second
+    /// one: on unified memory an expert byte and a repacked byte are
+    /// the same RAM, and this module is the single holder of the expert
+    /// half. A gauge that did not fall on drop would starve the repack
+    /// cache for the rest of the process.
+    ///
+    /// The gauge is process-wide and the harness runs these tests in
+    /// parallel, so this asserts against a SENTINEL budget larger than
+    /// every other budget in this module put together rather than
+    /// against an exact total another test could move under it.
+    ///
+    /// Sabotage: delete the `fetch_add` in `new` or the `Drop` impl and
+    /// this goes red.
+    #[test]
+    fn the_committed_gauge_rises_with_a_store_and_falls_when_it_drops() {
+        const SENTINEL: usize = 1 << 40;
+        {
+            let _held = store(64, SENTINEL);
+            assert!(
+                committed_expert_bytes() >= SENTINEL as u64,
+                "a live store must have committed its budget"
+            );
+        }
+        assert!(
+            committed_expert_bytes() < SENTINEL as u64,
+            "a dropped store must return its budget to the pool, or the \
+             repack cache is starved of it for the rest of the process"
+        );
     }
 
     #[test]
