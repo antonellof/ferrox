@@ -260,16 +260,84 @@ the pool per operation.
 measured on both aarch64 and x86 rather than guessed. `spin` stops
 being a user-visible knob.
 
-### 4. Find the 60 ms (#128)
+### 4. Find the 60 ms (#128)  [NAMED 2026-09-10: rayon's cold submit]
 
-Flat in thread count and model size, so it is not fork-join and not
-arithmetic. At 8B it is 27% of the token; at 135M it is 93%.
+**The premise of this step was wrong twice, and both corrections are
+recorded because each one cost work.**
 
-It also caps speculative decoding, which runs a small model as the
-drafter and pays the constant on every draft token.
+The first framing, "a fixed ~60 ms per token, flat in model size", was
+corrected by #155: the cost was proportional to gate and up projection
+BYTES and fired only on Q8_0 and Q4_0, because the int-dot matvec
+repacked the whole weight matrix on every call. That was 89% to 90% of
+decode and it is fixed.
 
-**Exit:** the constant named and removed, and 135M decode within 2x of
-llama.cpp on a quiet host.
+The second framing, in a comment on #128, measured 5.48 us per
+fork-join region, multiplied by ~210 regions per token, got 6.7% of the
+token, and concluded scheduling could not be what remained. **The
+arithmetic was right and the denominator was stale.** It was taken
+against a 17.23 ms token, i.e. WITH the repack bug still inflating the
+work. Once #155 removed that work the token fell to about 5 ms and the
+same fixed dispatch became a much larger share of it.
+
+#### What it actually is
+
+`rayon::join` and the `par_iter` bridges both funnel into
+`Registry::in_worker`, which has two arms with very different costs.
+From a rayon worker: run one half inline, post the other for stealing,
+wait on a `SpinLatch`, no syscall. From any other thread: inject the
+job and block on a `LockLatch`, which is a pthread mutex and condvar.
+Every forward pass was driven from a thread rayon did not own, so it
+paid the second arm once per region, roughly five per layer.
+
+Sampled with `sample` on an M2 Pro over SmolLM2-135M Q8_0 `tg128`,
+CPU-only, `-t 6`:
+
+| | share of the driving thread's wall time |
+|---|---|
+| `__psynch_cvwait` under rayon's `LockLatch` | **74%** |
+| attention (`causal_gqa_attention_softcap`) | 10% |
+| the one matvec that ran inline (`o_proj`) | 5% |
+
+Across all twelve threads in that process, the NEON `q8_0x4` matvec
+kernel held 6.6% of the samples and `__psynch_cvwait` 63.7%. During the
+74% the driving thread spent asleep, the six workers it was waiting for
+held about an eighth as many kernel samples between them: most of the
+wait was the round trip, not the work.
+
+#### The fix, and what it measured
+
+`ferrox_core::par::on_workers` wraps a whole forward pass in one
+`rayon::scope`, so the step runs on a worker and every nested region
+takes the hot arm. `~150` cold entries per token become **one**.
+`decoder/entry.rs` is the one place every public `Decoder::forward_*`
+does this, and `par::cold_regions` is a per-thread operation counter so
+the property is a test rather than a stopwatch.
+
+Interleaved `main, branch, main, branch` on the M2 Pro, CPU only, which
+is NOT a benchmark host, so these are ratios and not ledger rows:
+
+| model | decode | prefill |
+|---|---|---|
+| SmolLM2-135M Q8_0 | **+29%** (4 of 4 rounds) | flat |
+| Llama-3.2-3B Q4_K_M | **+9%** (4 of 4 rounds) | flat |
+| Llama-3.1-8B Q4_K_M | +3%, swap-bound on this host | not run |
+
+Against `llama-bench` on the same host and file, best-of-3 at `tg64`,
+the gap moved from about 1.9x to about 1.5x. The host was too noisy for
+that number to be worth more than its order of magnitude; the
+main-versus-branch ratio is the reliable half.
+
+Metal and CUDA are deliberately NOT promoted. Moving the step off the
+main thread changes Metal's output (`Llama-3.2-3B Q4_K_M --ngl 99`,
+greedy, diverges around the tenth token, deterministically on both
+sides), because the Metal stack carries thread-local state across a
+step. `on_workers` asks `weight_matrix::active_backend` first, and with
+that gate the Metal answer is byte-identical to `main` over three runs.
+
+**Exit:** 135M decode within 2x of llama.cpp on a QUIET host. Still
+owed: the numbers above are from a laptop, so the ledger row in
+`benchmarks/RESULTS.md` has not moved and must be re-measured on the
+rented aarch64 box it was taken on.
 
 ### 5. x86 CPU  [DONE for decode, 2026-09-04]
 

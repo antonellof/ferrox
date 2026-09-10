@@ -576,10 +576,22 @@ pub fn for_each_chunk_init<S, I, F>(
     crate::par::chunks_mut_init(chunks, chunk_len, 1, init, |state, i, c| f(state, i, c));
 }
 
-/// Builds the global rayon pool with an explicit width and an explicit
-/// QoS, so neither depends on which thread first touched rayon. Safe to
-/// call more than once and from either binary; a pool that already
-/// exists is left alone.
+/// Stack each rayon worker gets.
+///
+/// Rust's default for a spawned thread is 2 MiB, and that was fine while
+/// workers only ever ran one matvec chunk. Since
+/// [`crate::par::on_workers`] a WHOLE forward pass runs on a worker: the
+/// decoder's layer loop, its Metal and CUDA arms, and every scratch
+/// buffer any of them puts on the stack. The thread that used to run
+/// that body is the process's main thread, which gets 8 MiB on macOS and
+/// Linux, so this matches it rather than quietly halving the headroom of
+/// code that never had to think about it.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Builds the global rayon pool with an explicit width, an explicit QoS
+/// and an explicit stack, so none of the three depends on which thread
+/// first touched rayon. Safe to call more than once and from either
+/// binary; a pool that already exists is left alone.
 ///
 /// Returns the thread count the pool was built with, or `None` if the
 /// global pool already existed.
@@ -587,6 +599,7 @@ pub fn init_cpu_pool() -> Option<usize> {
     let threads = resolve_cpu_threads();
     let built = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        .stack_size(WORKER_STACK_BYTES)
         .start_handler(move |_idx| set_user_interactive_qos())
         .build_global()
         .is_ok();
