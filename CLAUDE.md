@@ -12,21 +12,23 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-10. **28** architectures run with
+Honest position, re-audited 2026-09-10. **30** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 29 unaudited refusals are now TRIAGED, and the refusal says which of
-three things is missing: **0 are a fixture away**, 1 needs one named
-match arm, 24 need new code, 4 are unknown with the question stated.
-Five one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
-2026-09-03, and `gemma`, `hunyuan-dense` and `ernie4_5-moe` on
-2026-09-09, each with a libllama-golden fixture, which is what moved 46
-to 41 to 34 to 31. The fixture-away class being EMPTY is the honest
-headline: every row that only needed evidence has it, so what is left
-needs code.
+The 25 unaudited refusals are now TRIAGED, and the refusal says which of
+three things is missing: **0 are a fixture away, 0 are one match arm
+away**, 24 need new code, 1 is unknown with the question stated. Five
+one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
+2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
+and `olmo2`, `exaone4`, `chatglm` and `qwen` on 2026-09-10, each with a
+libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
+to 28; moving the three alias rows off the generic path took it to 25.
+BOTH cheap classes being EMPTY is the honest headline: nothing still
+refusing is one fixture or one arm away, so what is left needs a
+different graph.
 
 **And on 2026-09-10 the NEW CODE column moved for the first time**, 26
 to 24, which is what took 31 to 29. `olmo2` and `exaone4` closed
@@ -42,9 +44,19 @@ RoPE at all -- and `olmo` (OLMo-1) is a THIRD shape, pre-norm with a
 non-parametric LayerNorm, still needing code.
 
 Building those fixtures keeps finding defects worth more than the
-admissions. `plamo3` could never have loaded a real checkpoint, because
-it is the only architecture upstream whose post-norms use the
-two-argument `LLM_TN` overload and ferrox asked for the wrong spelling;
+admissions. The last three UNKNOWN rows -- `mistral`, `mixtral`, `yi` --
+closed on 2026-09-10 by turning out NOT TO BE ARCHITECTURES: libllama
+refuses all three strings (`unknown model architecture: 'mistral'`,
+measured), every real checkpoint of all three declares `llama`, and the
+rows had been sitting on the generic path with NEOX RoPE while `llama`
+is NORM -- a wrong-pairs rotation that `rope_layout_matches_llama_cpp`
+could not see, because a name absent from llama.cpp's table is a
+`continue` there. `chatglm`'s arm was predicted to close `qwen` too and
+closed it only halfway: the fused `attn_qkv.bias` really is shared, but
+`qwen.cpp:33-35` also halves every FFN matrix, which cost no logits and
+made `expert_ffn_dim` twice the real width. `plamo3` could never have
+loaded a real checkpoint, because it is the only architecture upstream
+whose post-norms use the two-argument `LLM_TN` overload and ferrox asked for the wrong spelling;
 a gate refused every file carrying `attention.sliding_window_pattern` as
 unimplemented while the feature was already implemented, which made the
 loader's own read of that key unreachable; llama.cpp's own

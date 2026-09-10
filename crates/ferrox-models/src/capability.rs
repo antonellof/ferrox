@@ -403,6 +403,30 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // the `baichuan` precedent. NOT the audited `exaone` row, which is
     // EXAONE 3.x and a plain pre-norm llama.
     "exaone4",
+    // tests/one_match_arm_graphs.rs: the FUSED-`attn_qkv.bias` pair.
+    // `create_tensor_qkv` (llama-model.cpp:2886-2900) creates the bias
+    // beside a fused `wqkv`, and `build_qkv` (llama-graph.cpp:1605-1609)
+    // adds it to the fused projection before splitting. ferrox split the
+    // fused WEIGHT and then looked for the bias only under the split
+    // `attn_q.bias` names, so it was dropped and all three projections
+    // ran unbiased. Both halves now come out of one decision in
+    // `qkv_fused`, sliced by the same spans.
+    //
+    // `chatglm` (chatglm.cpp:25-52,58-161) was the LAST ONE MATCH ARM
+    // row anywhere in this file. It also pins the two things that made
+    // it look fixture-away and are not: PARTIAL RoPE
+    // (conversion/chatglm.py:151 writes `rope_dimension_count` as
+    // `head_dim * 0.5`) and the fused gate+up SwiGLU
+    // (chatglm.cpp:48,128-133), which is phi3's call shape.
+    "chatglm",
+    // `qwen` is Qwen-1 (`QWenLMHeadModel`), not qwen2/qwen3. Its
+    // `attn_qkv.bias` is REQUIRED (qwen.cpp:28, flag `0`), which is
+    // stronger than chatglm's optional one, and it needed a SECOND arm
+    // the chatglm verdict did not name: qwen.cpp:33-35 sizes every FFN
+    // matrix at `n_ff / 2`, because Qwen-1's `intermediate_size` counts
+    // gate and up together. See `FFN_LENGTH_COUNTS_GATE_AND_UP` in
+    // loader.rs.
+    "qwen",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -580,35 +604,19 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // ferrox-only alias row; no llama.cpp GGUF spells it this way, but
     // it must not carry a different verdict from `granitemoe`.
     ("granite-moe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
-    (
-        "chatglm",
-        TriageClass::OneMatchArm,
-        "the FUSED `attn_qkv.bias`, which is the same arm `qwen` is refused by name for. \
-         This row said FIXTURE-AWAY until an attempt to build the fixture read the \
-         converter: `src/models/chatglm.cpp:42` calls create_tensor_qkv, which prefers a fused \
-         `wqkv` and then creates `wqkv_b` beside it (llama-model.cpp:2890-2892), and \
-         `build_qkv` adds that bias to the fused projection before splitting \
-         (llama-graph.cpp:1607-1610). Every real chatglm checkpoint carries it: ChatGLM2/3 \
-         set `add_qkv_bias: true`, and gguf-py maps \
-         `encoder.layers.{bid}.self_attention.query_key_value` \
-         (tensor_mapping.py:246) to `blk.N.attn_qkv`, so the file holds \
-         `blk.N.attn_qkv.weight` AND `blk.N.attn_qkv.bias`. \
-         `load_qkv_projections` (loader.rs) splits the fused WEIGHT but reads bias only \
-         under the split `attn_q.bias` / `attn_k.bias` / `attn_v.bias` names, so the bias \
-         is dropped and all three projections run unbiased -- the identical sentence this \
-         file already writes for `qwen` and `starcoder`, on an architecture that was not \
-         on that list. Splitting `attn_qkv.bias` by the same row ranges the weight split \
-         already computes closes chatglm and qwen together, and it is one function. \
-         Everything else really is generic and really was read: the FUSED gate+up SwiGLU \
-         (:48, :128-133, `LLM_FFN_SWIGLU, LLM_FFN_SEQ`) is the audited phi3 call shape \
-         (phi3.cpp:52, :144-149) and `load_dense_expert` already takes it; the graph \
-         (:75-145) is a sequential residual with `1/sqrt(n_embd_head)` (:108), NORM RoPE \
-         (llama-model.cpp:2593), no QK-norm, no post-norms and no window; and chatglm is \
-         PARTIAL-rope -- :59-61 asserts only that the K and V head dims agree, NOT that \
-         n_embd_head == n_rot, and `conversion/chatglm.py:151` writes \
-         rope_dimension_count as `head_dim * partial_rotary_factor` (0.5) -- which \
-         `ModelConfig::rope_dim` already implements",
-    ),
+    // `chatglm` was HERE, ONE MATCH ARM on the fused `attn_qkv.bias`.
+    // The arm landed (`crate::qkv_fused`, which now resolves the
+    // projections and their biases from ONE decision about which
+    // spelling the file uses) and is evidenced against libllama in
+    // `tests/one_match_arm_graphs.rs`, so the row is in
+    // AUDITED_GENERIC_GQA and carries no verdict.
+    //
+    // Its verdict said implementing the arm "closes chatglm and qwen
+    // together". It did not, and that is the finding: `qwen` needs the
+    // same bias AND a second, unrelated arm the verdict did not name --
+    // `qwen.cpp:33-35` sizes every FFN matrix `n_ff/2`, because
+    // Qwen-1's `intermediate_size` counts gate and up together. `qwen`
+    // stays refused, with that added to its reason.
     (
         "deci",
         TriageClass::NewCode,
@@ -681,27 +689,45 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
 ];
 
 /// Shared by the three ferrox-only alias rows `mistral`, `mixtral` and
-/// `yi`, and the reason they are UNKNOWN rather than fixture-away.
+/// `yi`: the reason none of them is an architecture at all.
 ///
-/// The temptation is to call them "llama with a different name" and mark
-/// them fixture-away. That would be a guess about a file nobody has
-/// seen, and the RoPE hazard below is exactly why it would be an
-/// expensive one.
+/// These were UNKNOWN, and the open question was "what would settle
+/// it?" -- a real GGUF whose `general.architecture` is literally one of
+/// the three. **The investigation that settled it (2026-09-10) did not
+/// find one, and found the reason no such file exists.** Three
+/// measurements, not readings:
+///
+///   1. `grep '"mistral' src/llama-arch.cpp` returns `mistral3` and
+///      `mistral4` and nothing else; `mixtral` and `yi` return nothing.
+///      Neither is in gguf-py's `MODEL_ARCH_NAMES` either.
+///   2. A GGUF written with `general.architecture = "mistral"` (and
+///      `mixtral`, and `yi`) is REFUSED by libllama with
+///      `llama_model_load: error loading model: unknown model
+///      architecture: 'mistral'`. So no golden reference for these rows
+///      can ever exist, at the evidence standard every audited row in
+///      this file meets.
+///   3. The two real checkpoints in `models/` --
+///      `Mistral-7B-Instruct-v0.2-Q4_K_M.gguf` and
+///      `Yi-1.5-6B-Chat-Q4_K_M.gguf` -- both declare
+///      `general.architecture = llama`, which is audited and runs.
+///
+/// So the rows are refused as strings rather than triaged as
+/// architectures, and the refusal says the actionable thing: your file
+/// is spelled `llama`. Leaving them on the generic path would have kept
+/// a live hazard: the catalog gave all three NEOX RoPE while `llama`,
+/// the graph they really are, is in `llama_model_rope_type`'s NORM
+/// group (llama-model.cpp, the `case LLM_ARCH_LLAMA:` arm), so a file
+/// spelling `mistral` would have been rotated on the wrong pairs of
+/// every Q/K head -- the exact defect behind the Llama-3.1-8B
+/// wrong-logits bug -- and `rope_layout_matches_llama_cpp` cannot see
+/// it, because its lookup miss on a ferrox-only name is a `continue`.
+///
+/// `phi4` is the same shape and is deliberately NOT changed here: it is
+/// still `GenericGqa` + UNKNOWN, because unlike these three it names a
+/// concrete, checkable hypothesis (phi3's fused-QKV graph) that a real
+/// file would confirm or refute. These three name none.
 const NO_UPSTREAM_ARCH: &str =
-    "there is no llama.cpp graph to diff against: none of `mistral`, `mixtral` or `yi` \
-     appears in LLM_ARCH_NAMES (src/llama-arch.cpp) or in gguf-py's MODEL_ARCH_NAMES, and \
-     every real Mistral, Mixtral and Yi checkpoint converts to `llama` (llama.cpp's own \
-     conversion scripts emit MODEL_ARCH.LLAMA for all three; only `mistral3` and `mistral4` \
-     exist as their own strings). So these are ferrox-only rows that no llama.cpp-produced \
-     file can carry. THE HAZARD, and why this is not marked fixture-away: the catalog gives \
-     all three NEOX RoPE, while `llama` -- the string these models really ship under, and \
-     the graph they really are -- is in `llama_model_rope_type`'s NORM group \
-     (llama-model.cpp, the `case LLM_ARCH_LLAMA:` arm). A file spelling `mistral` would \
-     therefore be rotated on the wrong pairs of every Q/K head, which is the exact defect \
-     that caused the Llama-3.1-8B wrong-logits bug. It is latent only because the row \
-     refuses. WHAT WOULD SETTLE IT: a real GGUF whose general.architecture is literally one \
-     of these three. Absent one, the honest options are to delete the rows or to move them \
-     to NORM to match the graph they claim to be";
+    "this is not a GGUF architecture. `mistral`, `mixtral` and `yi` appear in neither      LLM_ARCH_NAMES (src/llama-arch.cpp lists `mistral3` and `mistral4` and nothing else      under that prefix) nor gguf-py's MODEL_ARCH_NAMES, and libllama REFUSES a file      declaring one of them: `unknown model architecture: 'mistral'` -- measured, on a      synthetic llama-shaped file written under each of the three strings. Every real      Mistral, Mixtral and Yi checkpoint converts to `llama` instead, which ferrox audits      and runs: the two in this repo's own models/ directory      (Mistral-7B-Instruct-v0.2-Q4_K_M.gguf, Yi-1.5-6B-Chat-Q4_K_M.gguf) both declare      `general.architecture = llama`. IF YOUR FILE REALLY SPELLS THIS, it came from a      converter neither engine has read, so its RoPE variant, its norm placement and its      FFN shape are all undetermined and ferrox will not guess -- re-convert it with      llama.cpp's convert_hf_to_gguf.py and it will load as `llama`. These rows used to sit      on the generic path with NEOX RoPE, while `llama` is in llama_model_rope_type's NORM      group, so such a file would have been rotated on the wrong pairs of every Q/K head";
 
 /// Shared by `arcee` and `plm`: an ungated ReLU-squared MLP.
 ///
@@ -873,9 +899,12 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          parameterisable from the gpt-oss clamp\" -- the clamp is, the per-layer n_rot is \
          not",
     ),
-    ("mistral", TriageClass::Unknown, NO_UPSTREAM_ARCH),
-    ("mixtral", TriageClass::Unknown, NO_UPSTREAM_ARCH),
-    ("yi", TriageClass::Unknown, NO_UPSTREAM_ARCH),
+    // `mistral`, `mixtral` and `yi` were HERE, UNKNOWN on
+    // NO_UPSTREAM_ARCH. The question that verdict asked -- "is there a
+    // real GGUF spelling one of these?" -- was answered NO, with a
+    // measurement: libllama refuses all three strings outright. They
+    // are refused as strings now, not triaged as architectures. See
+    // NO_UPSTREAM_ARCH.
     (
         "grok",
         TriageClass::NewCode,
@@ -947,7 +976,8 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          `wqkv` as `n_embd x (2*n_head_kv(i) + n_head(i)) * n_embd_head_k` (:34), and the \
          graph re-derives those widths for every layer (:67-69). ferrox's ModelConfig \
          carries n_heads, n_kv_heads and expert_ffn_dim as SCALARS, and \
-         `load_qkv_projections` splits a fused QKV at offsets computed from those scalars, \
+         `qkv_fused::load_fused_or_split_qkv` splits a fused QKV at offsets computed from \
+         those scalars, \
          so there is nowhere to put this. It fails closed, but NOT with this message: \
          conversion/openelm.py:57-59 writes head_count, head_count_kv and \
          feed_forward_length as ARRAYS, and `GgufValue::as_u64` returns None for an array \
@@ -993,6 +1023,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // libllama-golden fixture (`tests/one_match_arm_graphs.rs`) and
         // any other step is refused by name (`crate::moe_interleave`).
         v.push(gqa_norm("ernie4_5-moe"));
+        // `chatglm` was the LAST ONE MATCH ARM row anywhere in this
+        // file. Its arm -- the fused `attn_qkv.bias` -- landed in
+        // `crate::qkv_fused` and has a libllama-golden fixture
+        // (`tests/one_match_arm_graphs.rs`), so the class is empty now.
+        v.push(gqa_norm("chatglm"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1049,6 +1084,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // these two rows.
             "olmo2",
             "exaone4",
+            // Was a `DedicatedOnly` bias refusal, not an unaudited row:
+            // its only dropped bias was the FUSED `attn_qkv.bias`, which
+            // `crate::qkv_fused` applies now. Qwen-1 only; qwen2 and
+            // later store the split spelling and were already audited.
+            "qwen",
         ] {
             v.push(gqa_neox(n));
         }
@@ -1149,10 +1189,16 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         //   the marker of a real LayerNorm. The generic decoder only has
         //   `rms_norm(x, w, eps)` -- no mean subtraction and no bias --
         //   so it computes a different normalisation at every layer.
-        // - `attn_qkv.bias` is the *fused* spelling.
-        //   `load_qkv_projections` splits a fused `attn_qkv.weight` but
-        //   looks for the bias only under the split `attn_q.bias` names,
-        //   finds nothing, and runs unbiased.
+        // - `attn_qkv.bias` is the *fused* spelling, and it IS applied
+        //   now: `qkv_fused::load_fused_or_split_qkv` resolves the
+        //   projections and their biases from one decision about which
+        //   spelling the file uses, and slices the fused bias by the
+        //   same spans as the fused weight. Until 2026-09-10 it did not,
+        //   and that is what refused `qwen` and `chatglm`; both are
+        //   audited now. `tests/attn_bias.rs`'s
+        //   `GENERIC_DECODER_APPLIES` carries the name, so a row whose
+        //   ONLY missing bias is this one no longer counts as dropped.
+        //   `starcoder` and `bloom` still require five more each.
         //
         // Every one of these loads clean and answers fluently, which is
         // why they are refused here rather than left to a tensor gate.
@@ -1179,11 +1225,10 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             (
                 "starcoder",
                 Norm,
-                "required bias tensors with no slot in the generic decoder: the \
-                 *fused* `attn_qkv.bias` (src/models/starcoder.cpp:40), which \
-                 `load_qkv_projections` never looks for because it reads bias only \
-                 under the split `attn_q.bias` names; `attn_output.bias`, \
-                 `ffn_down.bias`, `ffn_up.bias` (:43,49,52); and the LayerNorm \
+                "required bias tensors with no slot in the generic decoder. NOT the \
+                 *fused* `attn_qkv.bias` (src/models/starcoder.cpp:40) any more -- \
+                 `qkv_fused` applies that one now -- but `attn_output.bias`, \
+                 `ffn_down.bias`, `ffn_up.bias` (:43,49,52) and the LayerNorm \
                  biases `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` \
                  (:24,37,46). It also adds a learned `position_embd` to the \
                  embeddings (:75) that the generic decoder has no slot for",
@@ -1227,16 +1272,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 "required LayerNorm biases `output_norm.bias` and `attn_norm.bias` \
                  (src/models/stablelm.cpp:20,28); the generic decoder is \
                  RMSNorm-only and drops both",
-            ),
-            (
-                "qwen",
-                Neox,
-                "a required *fused* `attn_qkv.bias` (src/models/qwen.cpp:28). \
-                 `load_qkv_projections` splits the fused `attn_qkv.weight` but reads \
-                 bias only under the split `attn_q.bias` / `attn_k.bias` / \
-                 `attn_v.bias` names, so Qwen-1's QKV bias is silently dropped and \
-                 every Q, K and V projection runs unbiased. Qwen-2 and later store \
-                 the split spelling and stay generic",
             ),
         ] {
             v.push(prof(
@@ -1556,6 +1591,16 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             },
             WholeVector,
         ));
+        // The three ferrox-only alias rows. Refused as STRINGS, not
+        // triaged as architectures: libllama refuses all three outright
+        // and every real checkpoint of all three declares `llama`. See
+        // `NO_UPSTREAM_ARCH` for the three measurements. Note the
+        // `dedicated` helper gives them NORM RoPE, which is at least the
+        // layout of the graph they claim to be; they had NEOX while
+        // sitting on the generic path.
+        for n in ["mistral", "mixtral", "yi"] {
+            v.push(dedicated(n, NO_UPSTREAM_ARCH));
+        }
         v.push(dedicated(
             "glm-dsa",
             "use ferrox_models::glm52_decoder / glm52_gguf_loader (DSA), not the generic GQA Decoder",
@@ -2412,7 +2457,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 29,
+            seen == 25,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2420,12 +2465,16 @@ mod audit_tests {
              with libllama-golden fixtures, 41 until seven FIXTURE-AWAY rows -- \
              internlm2, xverse, ernie4_5, baichuan, exaone, bailingmoe2, plamo3 -- got \
              theirs (tests/fixture_away_graphs.rs), 34 until `gemma`, `hunyuan-dense` \
-             and `ernie4_5-moe` got theirs, and 31 until `olmo2` and `exaone4` -- the \
+             and `ernie4_5-moe` got theirs, 31 until `olmo2` and `exaone4` -- the \
              POST-NORM-ONLY pair, ONE topology and one implementation \
-             (`crate::pre_norm`) -- got theirs \
-             (tests/post_norm_only_graphs.rs). `gemma` was the LAST fixture-away row, so \
-             that class is empty and everything left needs code. Those two are the first \
-             NEW CODE rows to close"
+             (`crate::pre_norm`) -- got theirs (tests/post_norm_only_graphs.rs), 29 until \
+             `chatglm` -- the LAST ONE MATCH ARM row -- got its fused-QKV-bias arm and \
+             its fixture, and 28 until `mistral`, `mixtral` and `yi` turned out not to be \
+             architectures at all (libllama refuses all three strings) and moved to \
+             DedicatedOnly. `gemma` was the last fixture-away row and `chatglm` the last \
+             one-match-arm row, so BOTH classes are empty: what is left is 24 NEW CODE \
+             and one UNKNOWN (`phi4`). `olmo2` and `exaone4` were the first NEW CODE rows \
+             to close"
         );
     }
 
@@ -2433,33 +2482,38 @@ mod audit_tests {
     /// classes must not read the same, which is the defect being fixed.
     #[test]
     fn the_refusal_detail_distinguishes_the_classes() {
-        // `chatglm`, not `ernie4_5-moe`: that one was ONE MATCH ARM here
-        // until its arm landed as a refusal and its step-1 fixture was
-        // measured against libllama, so it is audited now and renders no
-        // detail at all. There is deliberately no FIXTURE-AWAY sample:
-        // `gemma` was the last row in that class and
-        // `every_unaudited_row_is_triaged_and_the_distribution_is_pinned`
-        // now pins it at zero. Everything left needs code.
-        let arm = unaudited_refusal_detail("chatglm");
+        // TWO of the four classes have no rows left. `gemma` was the
+        // last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM
+        // one, and both are audited now, so neither renders a detail at
+        // all -- `every_triage_verdict_cites_the_llama_cpp_line...`
+        // pins the count that says so. The two live classes are sampled
+        // from the catalog; the two empty ones are sampled from
+        // `headline()` below, because a class with no rows still has to
+        // render distinctly the day something lands in it again.
+        //
         // `olmo`, not `olmo2`: OLMo-2 is audited now (its topology is
         // `crate::pre_norm`), and OLMo-1 is a THIRD residual shape --
         // non-parametric LayerNorm BEFORE both sublayers -- not the
         // post-norm-only one, so it stays NEW CODE and is the sample.
         let new_code = unaudited_refusal_detail("olmo");
+        // `phi4` is the only UNKNOWN row left: `mistral`, `mixtral` and
+        // `yi` used to be the other three and are refused as strings
+        // now (see `NO_UPSTREAM_ARCH`).
+        let unknown = unaudited_refusal_detail("phi4");
         // TRIAGE_PENDING is empty now that all 47 are read, so the
         // untriaged branch is exercised through a name the catalog does
         // not carry. The branch has to keep working: it is what a NEW
         // architecture added to the catalog would render until somebody
         // reads it.
         let untriaged = unaudited_refusal_detail("an-arch-nobody-has-read");
-        assert!(arm.contains("ONE MATCH ARM"), "{arm}");
         assert!(new_code.contains("NEW CODE"), "{new_code}");
+        assert!(unknown.contains("UNKNOWN"), "{unknown}");
         assert!(
             untriaged.contains("not done for `an-arch-nobody-has-read` yet"),
             "{untriaged}"
         );
-        for a in [&arm, &new_code, &untriaged] {
-            for b in [&arm, &new_code, &untriaged] {
+        for a in [&new_code, &unknown, &untriaged] {
+            for b in [&new_code, &unknown, &untriaged] {
                 if !std::ptr::eq(a, b) {
                     assert_ne!(a, b, "two refusal details are identical");
                 }
@@ -2468,8 +2522,21 @@ mod audit_tests {
         // The blocker itself, not only the class label, has to be in the
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
-        assert!(arm.contains("attn_qkv.bias"), "{arm}");
         assert!(new_code.contains("olmo.cpp:27-35"), "{new_code}");
+        assert!(unknown.contains("LLM_ARCH_NAMES"), "{unknown}");
+        // The two empty classes still have to be distinguishable.
+        let labels = [
+            TriageClass::FixtureAway,
+            TriageClass::OneMatchArm,
+            TriageClass::NewCode,
+            TriageClass::Unknown,
+        ];
+        for (i, a) in labels.iter().enumerate() {
+            for b in &labels[i + 1..] {
+                assert_ne!(a.label(), b.label());
+                assert_ne!(a.headline(), b.headline());
+            }
+        }
     }
 
     /// An architecture nobody has checked is not audited, which is the
@@ -2500,24 +2567,21 @@ mod tests {
                 rope: RopeLayout::Neox
             })
         );
-        assert_eq!(
-            resolve_architecture("mistral"),
-            Some(ArchPath::GenericGqa {
-                rope: RopeLayout::Neox
-            })
-        );
-        assert_eq!(
-            resolve_architecture("yi"),
-            Some(ArchPath::GenericGqa {
-                rope: RopeLayout::Neox
-            })
-        );
-        assert_eq!(
-            resolve_architecture("mixtral"),
-            Some(ArchPath::GenericGqa {
-                rope: RopeLayout::Neox
-            })
-        );
+        // `mistral`, `mixtral` and `yi` are NOT here any more. They are
+        // resolved, but refused: no converter writes those strings and
+        // libllama refuses them outright, so they are alias rows that
+        // exist to say "your file is spelled `llama`", not families
+        // that load. Pinned by
+        // `the_alias_rows_are_refused_as_strings_no_converter_writes`.
+        for alias in ["mistral", "mixtral", "yi"] {
+            assert!(
+                matches!(
+                    resolve_architecture(alias),
+                    Some(ArchPath::DedicatedOnly { .. })
+                ),
+                "`{alias}` must be refused, not routed to the generic decoder"
+            );
+        }
         assert_eq!(
             resolve_architecture("phi3"),
             Some(ArchPath::GenericGqa {

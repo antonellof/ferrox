@@ -20,7 +20,11 @@
 //! What ferrox has a slot for is a short list:
 //!
 //! - `AttnWeights::{q_bias, k_bias, v_bias}` — the split
-//!   `blk.N.attn_{q,k,v}.bias` spelling, and only that spelling.
+//!   `blk.N.attn_{q,k,v}.bias` spelling, AND the fused
+//!   `blk.N.attn_qkv.bias`, which `qkv_fused` slices into the same
+//!   three fields by the same spans that split the fused weight. The
+//!   fused spelling was unread until 2026-09-10, which is why `qwen`
+//!   and `chatglm` were refused; both are audited now.
 //! - `GptOssLayer::{o_bias, router_bias}` — gpt-oss's
 //!   `blk.N.attn_output.bias` and `blk.N.ffn_gate_inp.bias`, on the
 //!   gpt-oss path only.
@@ -32,10 +36,16 @@
 
 use ferrox_models::capability::{resolve_profile, ArchPath};
 
-/// The split QKV biases, the only required biases the generic decoder
-/// applies. Anything else in a row means that architecture must not
-/// reach the generic path.
-const GENERIC_DECODER_APPLIES: &[&str] = &["attn_q.bias", "attn_k.bias", "attn_v.bias"];
+/// The QKV biases, in both spellings -- the only required biases the
+/// generic decoder applies. Anything else in a row means that
+/// architecture must not reach the generic path.
+///
+/// `attn_qkv.bias` joined this list with `qkv_fused`, and
+/// `the_fused_qkv_bias_entry_is_backed_by_real_code` below is what
+/// stops it from being a name in a table that no loader reads -- the
+/// exact shape of the defect it was added to fix.
+const GENERIC_DECODER_APPLIES: &[&str] =
+    &["attn_q.bias", "attn_k.bias", "attn_v.bias", "attn_qkv.bias"];
 
 /// `(gguf arch, required bias tensors, citation)`.
 ///
@@ -234,6 +244,41 @@ const GPT_OSS_EXEMPTION: &str = "gpt-oss";
 /// If `GptOssLayer` ever loses either field the exemption below becomes
 /// a lie, and the model quietly runs its attention output and its
 /// router unbiased. Referencing both fields makes that a compile error.
+/// `attn_qkv.bias`'s place in [`GENERIC_DECODER_APPLIES`] has to be
+/// backed by a loader that reads it, not by this table saying so.
+///
+/// A name in a coverage list that no code honours is worse than no
+/// entry: it stops `an_architecture_whose_required_bias_ferrox_drops...`
+/// from refusing the row, so the architecture reaches the generic
+/// decoder and runs unbiased -- which is exactly what happened to
+/// `qwen` and `chatglm` for as long as the loader read only the split
+/// spelling. The chatglm fixture carries the fused spelling and NOTHING
+/// else, so all three biases here can only have come from splitting it.
+#[test]
+fn the_fused_qkv_bias_entry_is_backed_by_real_code() {
+    assert!(GENERIC_DECODER_APPLIES.contains(&"attn_qkv.bias"));
+    let path = format!(
+        "{}/tests/fixtures/chatglm_tiny.gguf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let file = ferrox_gguf::GgufFile::open(&path).expect("fixture opens");
+    assert!(
+        file.find_tensor("blk.0.attn_qkv.bias").is_some()
+            && file.find_tensor("blk.0.attn_q.bias").is_none(),
+        "the fixture must carry ONLY the fused spelling, or this proves nothing"
+    );
+    let config = ferrox_models::ModelConfig::from_gguf(&file).expect("config parses");
+    let d = ferrox_models::Decoder::from_gguf(&path, config).expect("fixture loads");
+    for (i, layer) in d.layers.iter().enumerate() {
+        assert!(
+            layer.attn.q_bias.is_some()
+                && layer.attn.k_bias.is_some()
+                && layer.attn.v_bias.is_some(),
+            "layer {i}: the fused attn_qkv.bias was not applied"
+        );
+    }
+}
+
 #[test]
 fn the_gpt_oss_exemption_is_backed_by_real_fields() {
     let _o_bias: fn(&ferrox_models::decoder::GptOssLayer) -> &Vec<f32> = |l| &l.o_bias;
@@ -256,6 +301,13 @@ fn the_gpt_oss_exemption_is_backed_by_real_fields() {
 /// only `rms_norm(x, w, eps)`, no mean subtraction and no bias, so it
 /// was computing a different normalisation at every layer of every one
 /// of them.
+///
+/// EIGHT of the nine are still refused. `qwen` left, because its only
+/// dropped bias was the fused `attn_qkv.bias` and `qkv_fused` applies
+/// that now; it is audited against libllama in
+/// `tests/one_match_arm_graphs.rs`. That is what this test is for -- a
+/// row leaves it by the blocker being implemented, not by the row being
+/// edited.
 #[test]
 fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path() {
     let mut admitted = Vec::new();
@@ -297,7 +349,6 @@ fn the_bias_refusals_name_the_bias() {
         "jais2",
         "nemotron",
         "orion",
-        "qwen",
         "stablelm",
         "starcoder",
         "starcoder2",

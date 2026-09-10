@@ -174,6 +174,29 @@ const DEDICATED_OWNS_ITS_BEHAVIOUR: &[(&str, &str)] = &[
 // unaudited and refuses first.
 const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "olmoe", "qwen2moe"];
 
+/// Architectures whose `{arch}.feed_forward_length` counts the gate and
+/// the up projection TOGETHER, so each FFN matrix is half as wide as the
+/// key says.
+///
+/// Qwen-1 (`QWenLMHeadModel`, GGUF string `qwen` -- not `qwen2` and not
+/// `qwen3`) is the only one. HF's `QWenMLP` sets
+/// `ff_dim_in = config.intermediate_size // 2` and builds `w1` and `w2`
+/// at that width; `conversion/qwen.py`'s `QwenModel` inherits the base
+/// `set_gguf_parameters`, which writes `intermediate_size` through
+/// unchanged (`conversion/base.py:1206`); and `src/models/qwen.cpp:33-35`
+/// therefore creates `ffn_gate`, `ffn_up` and `ffn_down` at `n_ff / 2`.
+///
+/// **This costs no logits and is still worth fixing.** ferrox loads the
+/// dense FFN by tensor NAME and uses each matrix's own shape, so the
+/// forward pass was always right; what was wrong was `expert_ffn_dim`,
+/// which is what every memory estimate and `ferrox inspect-plan` row
+/// prices the FFN from. That is this repo's dominant bug shape --
+/// `ModelConfig` and the weights disagreeing about one number with
+/// nothing comparing them -- so
+/// `the_declared_ffn_width_matches_the_matrices_that_load`
+/// (tests/one_match_arm_graphs.rs) now compares them.
+const FFN_LENGTH_COUNTS_GATE_AND_UP: &[&str] = &["qwen"];
+
 /// Architectures that store their **pre-FFN** norm under the tensor name
 /// `blk.N.post_attention_norm.weight` and carry no `blk.N.ffn_norm`.
 ///
@@ -509,7 +532,16 @@ impl ModelConfig {
         // is optional. llama.cpp `qwen2moe.cpp` uses
         // `n_ff_exp = n_ff_exp ? n_ff_exp : n_ff / n_expert_used` (1408 for
         // Qwen1.5-MoE); the shared expert keeps the full `n_ff` (5632).
-        let feed_forward_length = metadata_u64_any(file, &[key("feed_forward_length")]);
+        let feed_forward_length = metadata_u64_any(file, &[key("feed_forward_length")])
+            // Qwen-1 declares gate and up as one number; see
+            // `FFN_LENGTH_COUNTS_GATE_AND_UP`.
+            .map(|ff| {
+                if FFN_LENGTH_COUNTS_GATE_AND_UP.contains(&arch.as_str()) {
+                    ff / 2
+                } else {
+                    ff
+                }
+            });
         let expert_ffn_dim = metadata_u64_any(file, &[key("expert_feed_forward_length")])
             .or_else(|| {
                 feed_forward_length.map(|ff| {
@@ -1332,7 +1364,11 @@ pub(crate) fn load_norm_vec_either_spelling(
 /// byte range. Mapped sources stay zero-copy (sub-range of the same
 /// mmap); other backings get an owned copy. Returns `None` for non-
 /// quantized matrices (F32 / MXFP4) -- callers fall back to dequant.
-fn slice_quantized_rows(m: &WeightMatrix, start: usize, n: usize) -> Option<WeightMatrix> {
+pub(crate) fn slice_quantized_rows(
+    m: &WeightMatrix,
+    start: usize,
+    n: usize,
+) -> Option<WeightMatrix> {
     let WeightMatrix::Quantized {
         data,
         rows,
@@ -1361,77 +1397,6 @@ fn slice_quantized_rows(m: &WeightMatrix, start: usize, n: usize) -> Option<Weig
         cols: *cols,
         kind: *kind,
     })
-}
-
-/// Loads Q/K/V projections: prefers split `attn_{q,k,v}.weight`, falls
-/// back to fused `attn_qkv.weight` (Phi-3 / some Qwen GGUFs) by
-/// slicing quantized rows (zero-copy for mmapped GGUFs; dequant only
-/// for non-quantized storage). Mirrors llama.cpp `create_tensor_qkv`.
-fn load_qkv_projections(
-    file: &impl TensorSource,
-    layer: usize,
-    config: &ModelConfig,
-) -> Result<(WeightMatrix, WeightMatrix, WeightMatrix), LoadError> {
-    let q_name = format!("blk.{layer}.attn_q.weight");
-    let k_name = format!("blk.{layer}.attn_k.weight");
-    let v_name = format!("blk.{layer}.attn_v.weight");
-    let fused_name = format!("blk.{layer}.attn_qkv.weight");
-
-    if file.find_tensor(&q_name).is_some() {
-        return Ok((
-            load_weight_matrix(file, &q_name)?,
-            load_weight_matrix(file, &k_name)?,
-            load_weight_matrix(file, &v_name)?,
-        ));
-    }
-    if file.find_tensor(&fused_name).is_none() {
-        return Err(LoadError::Gguf(GgufError::TensorNotFound(q_name)));
-    }
-
-    let fused = load_weight_matrix(file, &fused_name)?;
-    let q_rows = config.n_heads * config.head_dim;
-    let kv_rows = config.n_kv_heads * config.head_dim;
-    let expected = q_rows + 2 * kv_rows;
-    if fused.rows() != expected {
-        // Phi-3 sometimes stores Q as full n_embd (== q_rows when MHA).
-        return Err(LoadError::UnsupportedFeature(
-            config.name.to_string(),
-            format!(
-                "{fused_name} has {} rows; expected q+k+v = {} \
-                 (n_heads*head_dim + 2*n_kv_heads*head_dim)",
-                fused.rows(),
-                expected
-            ),
-        ));
-    }
-    let cols = fused.cols();
-    // Quantized fused tensor: split by row ranges without dequantizing,
-    // keeping Q/K/V on the quantized (Metal-capable) matvec path.
-    if let (Some(q), Some(k), Some(v)) = (
-        slice_quantized_rows(&fused, 0, q_rows),
-        slice_quantized_rows(&fused, q_rows, kv_rows),
-        slice_quantized_rows(&fused, q_rows + kv_rows, kv_rows),
-    ) {
-        return Ok((q, k, v));
-    }
-    // Non-quantized storage: dequant once and split.
-    let mut full = Vec::with_capacity(fused.rows() * cols);
-    for r in 0..fused.rows() {
-        full.extend_from_slice(&fused.dequant_row(r));
-    }
-    let q = WeightMatrix::F32(Tensor::new(
-        full[..q_rows * cols].to_vec(),
-        vec![q_rows, cols],
-    ));
-    let k = WeightMatrix::F32(Tensor::new(
-        full[q_rows * cols..(q_rows + kv_rows) * cols].to_vec(),
-        vec![kv_rows, cols],
-    ));
-    let v = WeightMatrix::F32(Tensor::new(
-        full[(q_rows + kv_rows) * cols..].to_vec(),
-        vec![kv_rows, cols],
-    ));
-    Ok((q, k, v))
 }
 
 /// Dense-layer FFN tensors: standard gate/up/down, or Phi-3 fused
@@ -2126,7 +2091,18 @@ impl Decoder {
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut refined_qk_norm = config.qk_norm_style;
         for l in 0..config.n_layers {
-            let (q_proj, k_proj, v_proj) = load_qkv_projections(&file, l, &config)?;
+            // Q/K/V and their biases come out of ONE decision about
+            // which spelling this layer uses -- see `qkv_fused`. They
+            // used to be resolved independently, and a checkpoint that
+            // fused both (ChatGLM, Qwen-1) had its bias dropped.
+            let crate::qkv_fused::QkvProjections {
+                q: q_proj,
+                k: k_proj,
+                v: v_proj,
+                q_bias,
+                k_bias,
+                v_bias,
+            } = crate::qkv_fused::load_fused_or_split_qkv(&file, l, &config)?;
             let q_norm = load_f32_vec_optional(&file, &format!("blk.{l}.attn_q_norm.weight"))?;
             let k_norm = load_f32_vec_optional(&file, &format!("blk.{l}.attn_k_norm.weight"))?;
             // Refine WholeVector vs PerHead from the first observed norm length.
@@ -2169,10 +2145,12 @@ impl Decoder {
                 k_norm,
                 // Qwen2/Qwen2-MoE-family real QKV bias (`attn_{q,k,v}.bias`,
                 // real config `qkv_bias`, `o_proj` has none) -- see
-                // `AttnWeights::q_bias`'s doc comment.
-                q_bias: load_f32_vec_optional(&file, &format!("blk.{l}.attn_q.bias"))?,
-                k_bias: load_f32_vec_optional(&file, &format!("blk.{l}.attn_k.bias"))?,
-                v_bias: load_f32_vec_optional(&file, &format!("blk.{l}.attn_v.bias"))?,
+                // `AttnWeights::q_bias`'s doc comment. Resolved above,
+                // alongside the projections they belong to, because a
+                // file that fuses the weight fuses the bias too.
+                q_bias,
+                k_bias,
+                v_bias,
                 // gpt-oss ships `post_attention_norm` but applies it in
                 // Gemma's *other* slot: llama.cpp's openai-moe graph
                 // norms `ffn_inp` with it after the attention residual,
