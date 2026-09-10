@@ -109,22 +109,31 @@ Metal hardware tests without a real GPU.
 ## How to write code here
 
 **Keep files small, modules narrow, and the binary light.** This is not
-style preference, it is the repo's most expensive lesson. Measured
-2026-09-01, and every one of these GREW since the last measurement:
+style preference, it is the repo's most expensive lesson.
 
-| File | Lines |
-|---|---|
-| `ferrox-server/src/lib.rs` | 9628 |
-| `ferrox-metal/src/attn.rs` | 9331 |
-| `ferrox-metal/src/gpu.rs` | 8935 |
-| `ferrox-quant/src/lib.rs` | 8239 |
-| `ferrox-models/src/decoder.rs` | 6752 |
+Re-measured 2026-09-10, against the 2026-09-03 numbers:
 
-Re-measured 2026-09-03. Every one of these grew again, and
-`ferrox-metal/src/attn.rs` grew most (8860 to 9331). `decoder.rs` has
-started creeping back up (6702 to 6752) after its one shrink. The rule
-is written down two paragraphs below and is being broken while it is
-written.
+| File | Was | Now | |
+|---|---|---|---|
+| `ferrox-server/src/lib.rs` | 9628 | **9775** | grew |
+| `ferrox-metal/src/gpu.rs` | 8935 | **9018** | grew |
+| `ferrox-metal/src/attn.rs` | 9331 | **8715** | shrank |
+| `ferrox-quant/src/lib.rs` | 8239 | **8242** | flat |
+| `ferrox-models/src/decoder.rs` | 6752 | **6780** | grew |
+
+**One of five shrank, and the rule still lost on balance.** `attn.rs`
+gave up 616 lines only because a change was made to it and the split
+came first, which is the rule working as written. `lib.rs` gained 147
+adding four sampler steps to three routes, and `decoder.rs` crept up
+again. Nothing shrinks on its own.
+
+What did work is not in that table, because the files left it:
+`ferrox-quant/src/repack.rs` was 6446 lines and is now a directory of
+ten; `ferrox-models/src/sampling.rs` went 1569 to 894 with four
+submodules beside it; `ferrox-cuda/src/mul_mm.rs` is 865 with its kinds
+in two directories. Each of those splits happened because somebody was
+about to add to the file and split it first. That is the whole
+mechanism, and it is the only one that has ever worked here.
 
 Those files are why llama.cpp has 140 architectures and ferrox has 26
 proven. Adding a model means editing a 6750-line file, so nobody adds
