@@ -67,7 +67,7 @@ pub(super) fn elements_root(
     };
     // Every value ends at this tag, so it is also the one string a value
     // may not contain.
-    let text = text_excluding(builder, "arg-text", param.close)?;
+    let text = text_excluding(builder, "arg-text", &[param.close])?;
 
     let mut alternatives = Vec::with_capacity(tools.len());
     for tool in tools {
