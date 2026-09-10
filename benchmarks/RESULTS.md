@@ -51,6 +51,19 @@ with a work-size rule so the scheduler is chosen per operation, and
 that change and have not been re-measured**, so they still describe the
 old flag ([#27](https://github.com/antonellof/ferrox/issues/27)).
 
+**The 8.2x on the 135M row is known to be stale, and is left because
+nothing has re-measured that host.** Two fixes landed after it. #155
+removed a per-matvec repack that fired only on Q8_0 and Q4_0, which is
+what that row is, and was 89% to 90% of decode work.
+[#167](https://github.com/antonellof/ferrox/pull/167) then collapsed
+about 150 cold rayon entries per token into one, worth +29% at 135M as
+an interleaved within-process ratio. On an M2 Pro after both, 135M reads
+roughly **1.9x** rather than 8.2x. That figure is a different machine
+from the A725 in this table and is not a replacement for it: this row
+needs a quiet Cortex-A725 to be re-stated honestly, and until then the
+number above should be read as an upper bound on a gap that is known to
+have shrunk.
+
 **CUDA now has receipts** and is in the generated table below, on an
 RTX 3060, so it is no longer described here. Decode reads 2.2× to 5.0×
 and prefill 22.6× to 33.8×. The one thing receipts cannot show is a
@@ -124,7 +137,7 @@ pipelining encode against execution; fusion is a GPU-side lever worth
 | [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, 1.11× worst row | kernels already beat llama.cpp's whole token, and the cost is host-side. [#156](https://github.com/antonellof/ferrox/pull/156) removed 13% of dispatches and 9% of barriers for **2.3%** of host time, so the count is not the lever and the hypothesis that it was is retired. Barriers were already hazard-driven. What is left is per-dispatch argument binding: ~2400 encoder calls per token against 418 dispatches and barriers |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, 6.3× to 10.1× | was a missing kernel tier. [#159](https://github.com/antonellof/ferrox/pull/159) added AVX2 GEMMs for all five interleaved kinds and a per-workload dispatch rule, verified by execution on real AVX2 but **not yet benchmarked**, so this gap number still describes the code before it |
 | [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | the size rule landed in [#155](https://github.com/antonellof/ferrox/pull/155); the crossover constant is bracketed by the published numbers, not swept, and no before/after on a quiet host has been run. `MIN_TASK_MACS` is still there, which the issue asks to delete |
-| [#128](https://github.com/antonellof/ferrox/issues/128) | CPU fixed per-token cost | **82–87% of the main thread is `__psynch_cvwait`**, parked on rayon's condvar, at 1 and 6 threads alike. ferrox dispatches a parallel region per matmul; llama.cpp's threads all run the graph. Neither pool fixes it |
+| [#128](https://github.com/antonellof/ferrox/issues/128) | CPU decode dispatch, **closed** | The condvar wait was real and the cause was rayon's two-armed `join`: from a non-worker thread it injects and blocks on a mutex, ~150 times per token. [#167](https://github.com/antonellof/ferrox/pull/167) runs a whole forward in one `rayon::scope`. Note the trap: #128 had computed scheduling at 6.7% of a token and ruled it out, against a **stale denominator** taken before #155 removed the repack that inflated the token to 17 ms. At ~5 ms the same fixed cost is a much larger share |
 
 ## Method
 
