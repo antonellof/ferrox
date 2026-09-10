@@ -21,6 +21,7 @@
 //! dependency tree the same minimal, pure-Rust shape as the rest of
 //! this crate.
 
+mod greedy_equivalence;
 mod params;
 mod penalties;
 mod recommended;
@@ -63,17 +64,21 @@ pub(crate) fn spread_logits(vocab: usize) -> Vec<f32> {
 /// ferrox keeps its `argmax` fast path, because building and sorting a
 /// 128k-entry candidate list per token to reach an answer that cannot
 /// differ would be a decode-speed regression on the most common
-/// configuration there is. [`SamplingParams::greedy_equals_argmax`] is
-/// the one predicate that decides which path is exact, and it is read
-/// here and by the Metal `lm_head + argmax` fold's guard, so a chain
-/// that can move the argmax also stops the GPU from folding it away.
+/// configuration there is. [`SamplingParams::chain_keeps_the_argmax`]
+/// decides which path is exact.
+///
+/// That predicate and NOT [`SamplingParams::greedy_equals_raw_argmax`],
+/// which is the Metal `lm_head + argmax` fold's question: `scores` here
+/// has already been through [`apply_history_penalties`], and a device
+/// argmax over raw logits has not. Reading one predicate for both was
+/// GitHub issue #170 -- see [`greedy_equivalence`].
 fn greedy_choice(
     scores: Vec<f32>,
     params: &SamplingParams,
     history: PenaltyWindow<'_>,
     xtc_roll: Option<f32>,
 ) -> usize {
-    if params.greedy_equals_argmax() {
+    if params.chain_keeps_the_argmax() {
         return argmax(&scores);
     }
     argmax(&filtered_distribution(scores, params, history, xtc_roll))
@@ -798,8 +803,8 @@ mod tests {
     /// XTC removes the TOP candidates, so it can change greedy output --
     /// and ferrox's greedy fast path knows that.
     ///
-    /// `greedy_equals_argmax` is the predicate that decides whether the
-    /// `argmax` shortcut is exact. Make it return `true`
+    /// `chain_keeps_the_argmax` is the predicate that decides whether
+    /// the `argmax` shortcut is exact. Make it return `true`
     /// unconditionally and this goes red: the shortcut would return
     /// token 0 while llama.cpp's chain, which runs XTC before the
     /// temperature at every temperature, returns something else.
@@ -814,7 +819,7 @@ mod tests {
             xtc_threshold: 0.05,
             ..SamplingParams::default()
         };
-        assert!(!params.greedy_equals_argmax());
+        assert!(!params.chain_keeps_the_argmax());
         let mut sampler = Sampler::new(11);
         assert_eq!(
             sampler.sample(&logits, &params, PenaltyWindow::new(&[], &[])),
@@ -848,12 +853,12 @@ mod tests {
             typical_p: 0.5,
             ..SamplingParams::default()
         };
-        assert!(!params.greedy_equals_argmax());
+        assert!(!params.chain_keeps_the_argmax());
         assert!(SamplingParams {
             typical_p: 1.0,
             ..params.clone()
         }
-        .greedy_equals_argmax());
+        .chain_keeps_the_argmax());
 
         // logits ln(0.4), ln(0.2) x3: llama.cpp keeps the three 0.2
         // candidates and drops the 0.4 leader (`tests/test-sampling.cpp:346`),

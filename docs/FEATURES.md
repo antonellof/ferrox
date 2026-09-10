@@ -157,6 +157,18 @@ token-identical. `-e`/`--escape` is on by default as it is there, and a
 *partial* `-ngl N` is refused rather than silently offloading every
 layer.
 
+That non-default default has a **Metal decode cost**, and it is
+deliberate. At `--temp 0` the Metal stack can fold
+`final_norm + lm_head + argmax` into its own command buffer and hand
+back one token id instead of `vocab_size` floats. A device argmax over
+raw logits cannot apply the penalties, so the fold is now refused
+whenever any of `--repeat-penalty`, `--presence-penalty` or
+`--frequency-penalty` is live -- which, at `--repeat-penalty 1.1`, is
+every plain greedy run. It used to fire anyway and return a token the
+host sampler would not have chosen (GitHub issue #170).
+`--repeat-penalty 1.0` or `--repeat-last-n 0` gets the fold back and
+is also what makes a run token-identical to llama.cpp's defaults.
+
 `ferrox bench -m model.gguf` works like `llama-bench`: the same `pp512`
 and `tg128` workloads, reported as a median with a population stddev.
 Add `--compare` to run `llama-bench` alongside it and print the gap.

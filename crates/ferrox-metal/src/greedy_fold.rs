@@ -36,24 +36,33 @@
 //! So the resident-activation hand-off (`crate::resident_act`) is
 //! value-neutral and this flag is the whole of the difference.
 //!
-//! # Why the two paths do not agree, which is the deeper defect
+//! # Why the two paths did not agree, which was the deeper defect
 //!
-//! They should. Both compute `lm_head` with the same
+//! They should not differ at all. Both compute `lm_head` with the same
 //! `MatvecLaunch` through the same `encode_matvec`, over an activation
-//! that is bit-identical either way. What differs is what happens AFTER
+//! that is bit-identical either way. What differed is what happens AFTER
 //! the logits: the folded path takes a device argmax of the RAW logits,
 //! and the unfolded path hands the vocabulary to the host sampler, which
 //! applies the repetition penalties first.
 //!
 //! `--repeat-penalty` defaults to 1.1 in this project (llama.cpp's is
 //! 1.0), so on a default `--temp 0` run the penalty is live and the fold
-//! drops it. Re-run the same comparison with `--repeat-penalty 1.0` and
-//! the two paths agree exactly. The gate that permits the fold,
-//! `SamplingParams::greedy_equals_argmax`, tests XTC, typical-p and DRY
-//! and does NOT test the penalties: two structures that must agree about
-//! when an argmax is the answer, with nothing enforcing it. That gate
-//! lives in `ferrox-models` and is tracked separately; this module can
-//! only say which flag selects which path.
+//! dropped it. The gate that permits the fold,
+//! `SamplingParams::greedy_equals_argmax`, tested XTC, typical-p and DRY
+//! and did NOT test the penalties: two structures that must agree about
+//! when an argmax is the answer, with nothing enforcing it.
+//!
+//! Fixed in `ferrox-models` (GitHub issue #170), where that gate lives.
+//! It is now two predicates rather than one -- `chain_keeps_the_argmax`
+//! for a host that has already penalised, `greedy_equals_raw_argmax` for
+//! a device that has not -- built from an exhaustive classification of
+//! every chain step and every `SamplingParams` field. The consequence
+//! for THIS module is worth stating plainly, because it moves Metal
+//! decode numbers: **at the CLI's default `--repeat-penalty 1.1` the
+//! fold no longer fires**. `--repeat-penalty 1.0` or `--repeat-last-n 0`
+//! gets it back, and so would a fold that masked the penalty window on
+//! the device. This module can still only say which flag selects which
+//! path.
 //!
 //! # What is fixed here and what is not
 //!
