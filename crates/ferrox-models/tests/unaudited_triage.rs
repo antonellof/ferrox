@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 22,
+        n, 21,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -78,13 +78,17 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          `hunyuan-dense` and `ernie4_5-moe` were admitted with theirs, 31 until \
          `olmo2` and `exaone4` were -- the first two NEW CODE rows to close, and they \
          closed TOGETHER because they are one topology with one implementation \
-         (`ferrox_models::pre_norm`, `tests/post_norm_only_graphs.rs`) -- 29 until \
+         (`ferrox_models::norm`, `tests/post_norm_only_graphs.rs`) -- 29 until \
          `chatglm` was admitted with the fused-QKV-bias arm and its fixture, 28 until \
          `mistral`, `mixtral` and `yi` were found not to be architectures at all and \
          moved to DedicatedOnly, and 25 until `granite`, `granitemoe` and the \
          `granite-moe` alias closed together on ONE implementation of their four scalar \
-         multipliers (`tests/granite_family_graphs.rs`) -- rows closing is the count \
-         going DOWN \
+         multipliers (`tests/granite_family_graphs.rs`), and 22 until `olmo` closed on \
+         the non-parametric LayerNorm (`ferrox_models::norm`, `tests/olmo_graphs.rs`) -- \
+         the FIRST NEW CODE row to close alone, and it closed alone because its cause \
+         really is unshared: every `build_norm` call in llama.cpp's 140 graphs was \
+         scanned for a null weight and all three hits are `olmo.cpp` -- rows closing is \
+         the count going DOWN \
          for the best reason. Either an architecture was audited or reclassified (good -- \
          update the count and the docs) or one was added (check it was triaged)"
     );
@@ -142,7 +146,7 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
         // `olmo2` and `exaone4` used to head this group -- no attn_norm
         // and no ffn_norm at all, Q/K/V off the raw residual. That
         // blocker was real and it is now IMPLEMENTED, once, for both
-        // (`ferrox_models::pre_norm`), so neither carries a verdict any
+        // (`ferrox_models::norm`), so neither carries a verdict any
         // more, and `the_post_norm_group_is_three_topologies_and_only_two_of_them_closed` below
         // is now about which of the three shapes each of the group is.
         //
@@ -200,13 +204,13 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
 /// * `olmo2` and `exaone4` have NEITHER pre-norm and read the raw
 ///   residual at both sublayers (`olmo2.cpp:45-52,92,169`,
 ///   `exaone4.cpp:60-67,118,159`). That is one topology across the two,
-///   `ferrox_models::pre_norm` is the one implementation, and
+///   `ferrox_models::norm` is the one implementation, and
 ///   `tests/post_norm_only_graphs.rs` is the evidence for both.
 /// * `olmo` (OLMo-1) is the third: it norms BEFORE both sublayers, so
 ///   it is pre-norm like llama, and what it lacks is the norm FUNCTION
 ///   -- non-parametric LayerNorm, all three `build_norm` calls with a
 ///   NULL weight (`olmo.cpp:65-67,104-106,128-130`). It still refuses,
-///   and `pre_norm` is no help to it.
+///   and `norm` is no help to it.
 ///
 /// Pinning the split stops the grouping being restored from the prose,
 /// and it now also pins that closing two of the three did NOT sweep the
@@ -241,19 +245,30 @@ fn the_post_norm_group_is_three_topologies_and_only_two_of_them_closed() {
         "a third name here is a third llama.cpp graph somebody read"
     );
 
-    // olmo (OLMo-1): a different shape, still refused, and its verdict
-    // has to say so rather than pointing at the pair next door.
-    let olmo = unaudited_triage("olmo").expect("olmo verdict");
-    assert_eq!(olmo.class, TriageClass::NewCode);
-    assert!(!is_audited_generic("olmo"));
+    // olmo (OLMo-1) is the THIRD topology and it closed too, on a
+    // different variant of the same enum -- pre-norm, with a
+    // non-parametric LayerNorm at all three sites
+    // (`tests/olmo_graphs.rs`). What still has to hold is that it is
+    // NOT on the post-norm-only list: a decoder that read OLMo-1 that
+    // way would drop both its norms and answer fluently.
+    assert!(is_audited_generic("olmo"));
+    assert!(
+        unaudited_triage("olmo").is_none(),
+        "`olmo` is audited and must carry no verdict"
+    );
     assert!(
         !ferrox_models::capability::is_post_norm_only("olmo"),
         "OLMo-1 norms before both sublayers; it is not post-norm-only"
     );
     assert!(
-        olmo.blocker.contains("NOT the post-norm-only topology"),
-        "olmo's verdict must say which shape it is NOT: {}",
-        olmo.blocker
+        ferrox_models::capability::uses_non_parametric_layer_norm("olmo"),
+        "OLMo-1's norm has no parameters, which is the whole row"
+    );
+    assert_eq!(
+        ferrox_models::capability::NON_PARAMETRIC_LAYER_NORM,
+        &["olmo"],
+        "a second name here would be a second llama.cpp graph with a null-weight \
+         `LLM_NORM`, and the scan over all 140 found none"
     );
 }
 
@@ -324,7 +339,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 22);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 21);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -517,7 +532,10 @@ fn batch_three_verdicts_are_pinned_to_what_was_read() {
         // architectures. See
         // `the_alias_rows_are_refused_as_strings_no_converter_writes`.
         ("deci", TriageClass::NewCode, "PER LAYER"),
-        ("olmo", TriageClass::NewCode, "NO norm weights at all"),
+        // `olmo` was HERE, NEW CODE on "NO norm weights at all". It is
+        // audited now (`tests/olmo_graphs.rs`) and carries no verdict;
+        // `the_post_norm_group_is_three_topologies...` above is where
+        // the claim about it lives.
     ];
     for (arch, class, evidence) in cases {
         let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
@@ -812,18 +830,22 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 21, 1),
+        (0, 0, 20, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
          refusing today is one fixture or one arm away and EVERY remaining row is NEW \
          CODE. That column went 26 to 24 when `olmo2` and `exaone4` closed together -- \
-         one topology, one implementation -- and 24 to 21 when `granite`, `granitemoe` \
+         one topology, one implementation -- 24 to 21 when `granite`, `granitemoe` \
          and the `granite-moe` alias closed on ONE implementation of their four scalar \
-         multipliers. Each closure took several rows at once because each found ONE cause \
-         behind several refusals, which is the only way this column has ever moved. The \
+         multipliers, and 21 to 20 when `olmo` closed on the non-parametric LayerNorm. \
+         The first two closures took several rows at once because each found ONE cause \
+         behind several refusals; `olmo` is the first that did not, and the reason is \
+         recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
+         graphs was scanned for a null weight and all three hits are `olmo.cpp`, so \
+         there was no second row to take. The \
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 22);
+    assert_eq!(fixture + arm + new_code + unknown, 21);
 }

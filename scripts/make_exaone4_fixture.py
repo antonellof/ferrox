@@ -17,7 +17,7 @@ branch's OUTPUT before the residual add (:152-155, :166-169).
     out     = ffn_inp + ffn_post_norm(ffn(ffn_inp))
 
 Identical to `olmo2.cpp:92,160-165,169,177-182`. The two rows share ONE
-implementation in ferrox (`crates/ferrox-models/src/pre_norm.rs`), and
+implementation in ferrox (`crates/ferrox-models/src/norm.rs`), and
 this fixture and `olmo2_tiny.gguf` are what prove they are the same
 graph rather than two that look alike.
 

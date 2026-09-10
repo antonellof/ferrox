@@ -753,9 +753,21 @@ impl ModelConfig {
             embedding: metadata_f32_any(file, &[key("embedding_scale")]),
             attention: metadata_f32_any(file, &[key("attention.scale")]),
         };
-        let multipliers =
-            crate::scalar_multipliers::resolve(multiplier_support, declared, head_dim)
-                .map_err(|e| LoadError::UnsupportedFeature(arch.clone(), e.message(&arch)))?;
+        let multipliers = crate::scalar_multipliers::resolve(
+            multiplier_support,
+            declared,
+            // `n_layer` and `n_embd` are here for MiniCPM's defaults
+            // (`minicpm.cpp:6-7`), which are computed from the model's
+            // own shape rather than declared: an older MiniCPM export
+            // carries none of the three keys and is still scaled by all
+            // three.
+            crate::scalar_multipliers::MultiplierDims {
+                head_dim,
+                n_layer: n_layers,
+                n_embd: hidden_dim,
+            },
+        )
+        .map_err(|e| LoadError::UnsupportedFeature(arch.clone(), e.message(&arch)))?;
 
         // Gemma: embeddings are scaled by sqrt(hidden_dim) at input.
         // That is ARITHMETIC, not a key -- llama.cpp's Gemma graphs read
@@ -805,6 +817,18 @@ impl ModelConfig {
             &arch,
             file.metadata(&key("rope.scaling.finetuned"))
                 .and_then(GgufValue::as_bool),
+        ) {
+            return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
+        }
+
+        // OLMo-1 clamps Q, K and V by `{arch}.attention.clamp_kqv`
+        // inside the shared `build_qkv`. ferrox clamps no projection
+        // anywhere, so a file declaring a positive clamp stops here
+        // rather than running unclamped. See `crate::clamp_kqv`, which
+        // also records that the OLMo converter really writes this key.
+        if let Some(reason) = crate::clamp_kqv::clamped_refusal(
+            &arch,
+            metadata_f32_any(file, &[key("attention.clamp_kqv")]),
         ) {
             return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
         }
@@ -2107,7 +2131,7 @@ impl Decoder {
         let post_attn_norm_is_pre_ffn_norm = pre_ffn_norm_is_post_attention_norm(&arch);
         // The post-norm-only residual topology: no `attn_norm` and no
         // `ffn_norm` tensors, both sublayers reading the raw residual.
-        // `crate::pre_norm` holds the graph and the two llama.cpp files
+        // `crate::norm` holds the graph and the two llama.cpp files
         // it was read from.
         //
         // The two lists cannot overlap: for gpt-oss / seed_oss
@@ -2117,6 +2141,14 @@ impl Decoder {
         // rather than asserted here, so it fails in CI instead of only
         // on a debug load of a file nobody has.
         let post_norm_only = crate::capability::is_post_norm_only(&arch);
+        // The THIRD shape: pre-norm like llama, but with a
+        // non-parametric LayerNorm and no norm tensor anywhere in the
+        // file. `olmo` and nothing else -- see
+        // `capability::NON_PARAMETRIC_LAYER_NORM`, which says how that
+        // was measured. Resolved once here and read at all three norm
+        // sites, so the pre-attention, pre-FFN and final norms cannot
+        // come to disagree about which function this model uses.
+        let no_param_layer_norm = crate::capability::uses_non_parametric_layer_norm(&arch);
         let mut gpt_oss_layers: Vec<crate::decoder::GptOssLayer> = Vec::new();
 
         // One store for the whole model (keys are (layer, expert)),
@@ -2173,14 +2205,19 @@ impl Decoder {
                 k_proj,
                 v_proj,
                 o_proj: load_weight_matrix(&file, &format!("blk.{l}.attn_output.weight"))?,
-                // `olmo2` and `exaone4` have no `attn_norm` tensor at
-                // all and project Q/K/V off the raw residual; every
-                // other architecture on this path norms first. See
-                // `capability::POST_NORM_ONLY_ARCHITECTURES`.
+                // Three shapes, and the file's tensor list is what
+                // separates them. `olmo2` / `exaone4` have no
+                // `attn_norm` and project Q/K/V off the raw residual
+                // (`capability::POST_NORM_ONLY_ARCHITECTURES`); `olmo`
+                // norms first but has no weight to norm WITH
+                // (`capability::NON_PARAMETRIC_LAYER_NORM`); everything
+                // else on this path carries `blk.N.attn_norm.weight`.
                 norm_weight: if post_norm_only {
-                    crate::pre_norm::PreNorm::None
+                    crate::norm::NormOp::None
+                } else if no_param_layer_norm {
+                    crate::norm::NormOp::LayerNormNoParams
                 } else {
-                    crate::pre_norm::PreNorm::Rms(load_f32_vec(
+                    crate::norm::NormOp::Rms(load_f32_vec(
                         &file,
                         &format!("blk.{l}.attn_norm.weight"),
                     )?)
@@ -2413,7 +2450,12 @@ impl Decoder {
                     // No `ffn_norm` tensor: the FFN reads the raw
                     // post-attention residual (olmo2.cpp:169,
                     // exaone4.cpp:159).
-                    crate::pre_norm::PreNorm::None
+                    crate::norm::NormOp::None
+                } else if no_param_layer_norm {
+                    // `olmo.cpp:104-106`: the same non-parametric
+                    // LayerNorm as the attention slot, on the
+                    // post-attention residual.
+                    crate::norm::NormOp::LayerNormNoParams
                 } else if post_attn_norm_is_pre_ffn_norm {
                     // Same two spellings as above, and the same helper,
                     // so the pre-FFN-norm slot cannot drift away from
@@ -2421,7 +2463,7 @@ impl Decoder {
                     // called. gpt-oss and seed_oss both write `.weight`
                     // today; sharing the rule is what stops that being
                     // a thing to rediscover.
-                    crate::pre_norm::PreNorm::Rms(
+                    crate::norm::NormOp::Rms(
                         load_norm_vec_either_spelling(
                             &file,
                             &format!("blk.{l}.post_attention_norm"),
@@ -2433,7 +2475,7 @@ impl Decoder {
                         })?,
                     )
                 } else {
-                    crate::pre_norm::PreNorm::Rms(load_f32_vec(
+                    crate::norm::NormOp::Rms(load_f32_vec(
                         &file,
                         &format!("blk.{l}.ffn_norm.weight"),
                     )?)
@@ -2450,7 +2492,14 @@ impl Decoder {
             layers.push(LayerWeights { attn, moe });
         }
 
-        let final_norm = load_f32_vec(&file, "output_norm.weight")?;
+        // `olmo.cpp:15-36` creates no `output_norm` at all and
+        // `:128-130` norms the final hidden state with a null weight, so
+        // asking for the tensor would refuse every real OLMo-1 file.
+        let final_norm = if no_param_layer_norm {
+            crate::norm::NormOp::LayerNormNoParams
+        } else {
+            crate::norm::NormOp::Rms(load_f32_vec(&file, "output_norm.weight")?)
+        };
         // Many small Llama/Gemma-family GGUFs tie the lm-head to
         // `token_embd.weight` and omit `output.weight` (llama.cpp
         // `llama_model_loader` falls back the same way). Prefer the
@@ -4421,34 +4470,54 @@ mod tests {
         }
     }
 
-    /// The two norm-slot lists cannot name the same architecture.
+    /// The three norm-slot lists cannot name the same architecture.
     ///
     /// `PRE_FFN_NORM_IS_POST_ATTENTION_NORM` says "this file's
     /// `post_attention_norm` IS the pre-FFN norm";
     /// `capability::POST_NORM_ONLY_ARCHITECTURES` says "this
-    /// architecture has no pre-FFN norm at all". A name on both would be
-    /// read two ways by two branches of the same `if`, and the second
-    /// branch would win silently. Two lists that must agree about one
-    /// thing, with something enforcing it -- which is the only shape of
-    /// fix that has ever held here.
+    /// architecture has no pre-FFN norm at all";
+    /// `capability::NON_PARAMETRIC_LAYER_NORM` says "this architecture
+    /// norms at every site with no weight to norm with". They are three
+    /// branches of the same `if` in the loader, so a name on two of them
+    /// would be read two ways and the earlier branch would win silently.
+    /// Three lists that must agree about one thing, with something
+    /// enforcing it -- which is the only shape of fix that has ever held
+    /// here.
+    ///
+    /// Written as an all-pairs loop rather than three hand-written
+    /// directions, because the previous version checked two and the
+    /// third list would have slipped past it in either direction.
     #[test]
-    fn the_two_norm_slot_lists_cannot_name_the_same_architecture() {
-        for name in PRE_FFN_NORM_IS_POST_ATTENTION_NORM {
-            assert!(
-                !crate::capability::is_post_norm_only(name),
-                "`{name}` claims both that post_attention_norm is its pre-FFN norm and \
-                 that it has no pre-FFN norm"
-            );
+    fn the_three_norm_slot_lists_cannot_name_the_same_architecture() {
+        let lists: [(&str, &[&str]); 3] = [
+            (
+                "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
+                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+            ),
+            (
+                "POST_NORM_ONLY_ARCHITECTURES",
+                crate::capability::POST_NORM_ONLY_ARCHITECTURES,
+            ),
+            (
+                "NON_PARAMETRIC_LAYER_NORM",
+                crate::capability::NON_PARAMETRIC_LAYER_NORM,
+            ),
+        ];
+        for (i, (a_name, a)) in lists.iter().enumerate() {
+            for (b_name, b) in lists.iter().skip(i + 1) {
+                for name in a.iter() {
+                    assert!(
+                        !b.contains(name),
+                        "`{name}` is on both `{a_name}` and `{b_name}`; the loader's norm-slot \
+                         `if` would read it two ways and the first branch would win silently"
+                    );
+                }
+            }
         }
-        // And the converse, so a name added to either list is checked
-        // from whichever side it was added on.
-        for name in crate::capability::POST_NORM_ONLY_ARCHITECTURES {
-            assert!(
-                !pre_ffn_norm_is_post_attention_norm(name),
-                "`{name}` has no pre-FFN norm, so it cannot keep one in the \
-                 post_attention_norm slot"
-            );
-        }
+        // Non-empty, so the loop above cannot pass by having nothing to
+        // compare. `olmo` was added to the third list and this is what
+        // says the third list exists at all.
+        assert!(!crate::capability::NON_PARAMETRIC_LAYER_NORM.is_empty());
     }
 
     /// EXAONE-4 32B is the `baichuan` shape on a different

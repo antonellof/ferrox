@@ -12,8 +12,8 @@
 //!
 //! **They are one topology, not two that look alike**, and the claim is
 //! a line-by-line reading of both graphs rather than a family
-//! resemblance -- `crate::pre_norm`'s module docs carry the table. So
-//! there is ONE implementation, `PreNorm`, and this suite is what
+//! resemblance -- `crate::norm`'s module docs carry the table. So
+//! there is ONE implementation, `NormOp`, and this suite is what
 //! proves the shared body is right for both rows rather than right for
 //! one and plausible for the other.
 //!
@@ -96,7 +96,7 @@ use common::{
     GRAPH_PROMPT,
 };
 use ferrox_models::capability::QkNormStyle;
-use ferrox_models::pre_norm::PreNorm;
+use ferrox_models::norm::NormOp;
 use ferrox_models::{Decoder, ModelConfig, RopeLayout};
 
 /// Both rows, named once so no test below can quietly cover one and
@@ -242,12 +242,12 @@ fn neither_row_has_a_pre_attention_norm_or_a_pre_ffn_norm() {
         for (il, layer) in d.layers.iter().enumerate() {
             assert_eq!(
                 layer.attn.norm_weight,
-                PreNorm::None,
+                NormOp::None,
                 "{name} blk.{il}: Q/K/V must be projected off the raw residual"
             );
             assert_eq!(
                 layer.moe.norm_weight,
-                PreNorm::None,
+                NormOp::None,
                 "{name} blk.{il}: the FFN must read the raw post-attention residual"
             );
             // And both post-norms ARE there, non-zero, because they are
@@ -275,7 +275,7 @@ fn neither_row_has_a_pre_attention_norm_or_a_pre_ffn_norm() {
 /// pre-norms, load a vector of ones". An RMSNorm with unit weights is
 /// not the identity -- it still divides by the RMS of the residual --
 /// and this test measures how far from the truth that lands. Without
-/// it, `PreNorm::None` and `PreNorm::Rms(vec![1.0; n])` would be
+/// it, `NormOp::None` and `NormOp::Rms(vec![1.0; n])` would be
 /// indistinguishable to this suite and the enum would be decoration.
 #[test]
 fn restoring_an_all_ones_pre_norm_in_either_slot_diverges_from_llama_cpp() {
@@ -285,9 +285,9 @@ fn restoring_an_all_ones_pre_norm_in_either_slot_diverges_from_llama_cpp() {
             let hidden = d.config.hidden_dim;
             for layer in d.layers.iter_mut() {
                 if slot == "attn" {
-                    layer.attn.norm_weight = PreNorm::Rms(vec![1.0; hidden]);
+                    layer.attn.norm_weight = NormOp::Rms(vec![1.0; hidden]);
                 } else {
-                    layer.moe.norm_weight = PreNorm::Rms(vec![1.0; hidden]);
+                    layer.moe.norm_weight = NormOp::Rms(vec![1.0; hidden]);
                 }
             }
             let mut kv = graph_caches(&d);
@@ -512,8 +512,13 @@ fn both_rows_are_admitted_to_the_audited_generic_path() {
         &ROWS[..]
     );
     // `olmo` is OLMo-1 and a different shape: pre-norm, with a
-    // non-parametric LayerNorm. It must NOT be on this list and must
-    // still refuse.
+    // non-parametric LayerNorm. It is audited now too
+    // (`tests/olmo_graphs.rs`), on a different variant of the same enum,
+    // and what still has to hold is that it is not on THIS list -- a
+    // decoder that read OLMo-1 as post-norm-only would drop both its
+    // norms and answer fluently.
     assert!(!ferrox_models::capability::is_post_norm_only("olmo"));
-    assert!(!ferrox_models::capability::is_audited_generic("olmo"));
+    assert!(ferrox_models::capability::uses_non_parametric_layer_norm(
+        "olmo"
+    ));
 }

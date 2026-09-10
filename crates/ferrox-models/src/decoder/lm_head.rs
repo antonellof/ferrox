@@ -101,11 +101,25 @@ pub(crate) struct FoldedLmHead<L> {
 #[cfg(any(feature = "metal", test))]
 impl<L> FoldedLmHead<L> {
     /// `Some` only when the stack is allowed to run lm_head on device:
-    /// greedy argmax is active for this thread AND the output head has a
+    /// greedy argmax is active for this thread, the model's FINAL NORM
+    /// is an RMSNorm the stack can bake in, AND the output head has a
     /// Metal launch. Any other combination keeps lm_head on the host,
     /// where `Decoder::logits_from_normed` applies the cap.
-    pub(crate) fn permit(greedy_argmax: bool, launch: Option<L>) -> Option<Self> {
-        if !greedy_argmax {
+    ///
+    /// The final norm is a condition here rather than at the two call
+    /// sites because what folds is `final_norm + lm_head + argmax`, one
+    /// operation: `launch_moe_decode_stack` asserts outright that an
+    /// on-device lm_head requires a final norm, and the dense stack's
+    /// `final_norm_w` is derived from the same `NormOp`. `olmo` is the
+    /// architecture that makes this reachable -- `olmo.cpp:128-130`
+    /// norms with a null weight, so there is nothing to hand the kernel
+    /// and the whole fold has to stay on the host.
+    pub(crate) fn permit(
+        greedy_argmax: bool,
+        final_norm: &crate::norm::NormOp,
+        launch: Option<L>,
+    ) -> Option<Self> {
+        if !greedy_argmax || final_norm.rms_weights().is_none() {
             return None;
         }
         launch.map(|launch| FoldedLmHead { launch })
@@ -221,18 +235,24 @@ mod tests {
         );
     }
 
+    /// An RMSNorm final norm, for the tests that are about the other
+    /// two conditions.
+    fn rms() -> crate::norm::NormOp {
+        crate::norm::NormOp::Rms(vec![1.0; 4])
+    }
+
     /// Invariant 2's constructor. Folding lm_head into the stack when
     /// greedy argmax is NOT active would return a full vocabulary that
     /// bypasses `logits_from_normed` and therefore the cap.
     #[test]
     fn lm_head_folds_into_the_stack_only_under_greedy_argmax() {
         assert!(
-            FoldedLmHead::permit(false, Some(())).is_none(),
+            FoldedLmHead::permit(false, &rms(), Some(())).is_none(),
             "without greedy argmax the stack would return uncapped logits"
         );
-        assert!(FoldedLmHead::permit(true, None::<u32>).is_none());
-        let folded =
-            FoldedLmHead::permit(true, Some(7u32)).expect("greedy + launch permits folding");
+        assert!(FoldedLmHead::permit(true, &rms(), None::<u32>).is_none());
+        let folded = FoldedLmHead::permit(true, &rms(), Some(7u32))
+            .expect("greedy + launch permits folding");
         assert_eq!(
             *folded.launch(),
             7,
@@ -248,7 +268,7 @@ mod tests {
     /// instead of an id, Gemma-2's 30.0 cap must still apply.
     #[test]
     fn a_folded_stack_returning_logits_gets_them_softcapped() {
-        let folded = FoldedLmHead::permit(true, Some(())).unwrap();
+        let folded = FoldedLmHead::permit(true, &rms(), Some(())).unwrap();
         let vocab = 4;
         let raw = vec![100.0f32, -100.0, 31.0, 0.25];
         let got = folded.interpret(raw.clone(), vocab, Some(30.0), None);
@@ -272,11 +292,38 @@ mod tests {
     /// would emit token 29.
     #[test]
     fn a_folded_stack_returning_an_argmax_id_is_passed_through_untouched() {
-        let folded = FoldedLmHead::permit(true, Some(())).unwrap();
+        let folded = FoldedLmHead::permit(true, &rms(), Some(())).unwrap();
         assert_eq!(
             folded.interpret(vec![100.0], 32_000, Some(30.0), None),
             vec![100.0],
             "a 1-element argmax id must not be softcapped"
+        );
+    }
+
+    /// A model whose FINAL NORM has no RMS weights cannot fold, however
+    /// greedy the caller is and whatever launch the head has.
+    ///
+    /// What folds is `final_norm + lm_head + argmax`, one operation:
+    /// `launch_moe_decode_stack` asserts that an on-device lm_head
+    /// requires a final norm, and the dense stack derives `final_norm_w`
+    /// from the same `NormOp`. Before `olmo` no architecture could reach
+    /// either non-RMS variant here, so both call sites wrote
+    /// `Some(&self.final_norm)` and the MoE one hardcoded
+    /// `final_norm_done_in_stack = true`.
+    #[test]
+    fn a_non_rms_final_norm_cannot_fold_however_greedy_the_caller_is() {
+        for norm in [
+            crate::norm::NormOp::LayerNormNoParams,
+            crate::norm::NormOp::None,
+        ] {
+            assert!(
+                FoldedLmHead::permit(true, &norm, Some(())).is_none(),
+                "{norm:?}: the stack has no weights to bake the final norm from"
+            );
+        }
+        assert!(
+            FoldedLmHead::permit(true, &rms(), Some(())).is_some(),
+            "an RMSNorm final norm still folds, or this test proves nothing"
         );
     }
 }

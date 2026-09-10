@@ -414,7 +414,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // ignores it.
     "bailingmoe2",
     // tests/post_norm_only_graphs.rs: the POST-NORM-ONLY family, two
-    // architectures and ONE implementation (`crate::pre_norm::PreNorm`).
+    // architectures and ONE implementation (`crate::norm::NormOp`).
     // Neither has an `attn_norm` or an `ffn_norm` tensor; both read the
     // raw residual at both sublayers and norm each branch's output
     // before its residual add. Same evidence standard as the rows
@@ -462,6 +462,49 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // gate and up together. See `FFN_LENGTH_COUNTS_GATE_AND_UP` in
     // loader.rs.
     "qwen",
+    // tests/minicpm_graphs.rs: MiniCPM, which was never an unaudited
+    // row -- it was refused BY NAME, because the thing it does is
+    // invisible in the file. `models.h:1594-1601` is
+    // `using graph = llama_model_granite::graph`, so it is the Granite
+    // graph object verbatim; what `minicpm.cpp:5-7` adds is DEFAULTS,
+    // assigning an embedding multiplier of 12.0, a residual multiplier
+    // of `1.4/sqrt(n_layer)` and a logit multiplier of `256/n_embd`
+    // before `:12-14` lets the file override them. A MiniCPM export
+    // carrying none of the three keys is still scaled by all three, so
+    // `unsupported_scaling_keys` -- a key-PRESENCE gate -- can see
+    // nothing to refuse. `scalar_multipliers::MultiplierDefaults` is
+    // that hook, and the fixture that evidences it declares NO key at
+    // all, which is the only fixture shape that can tell the hook from
+    // its absence. A second fixture declares all three and pins that
+    // the file still wins.
+    //
+    // It is Granite's arithmetic minus one column: `minicpm.cpp:3-24`
+    // never reads `{arch}.attention.scale`, so that key stays refused
+    // for this row by the derived list.
+    "minicpm",
+    // tests/olmo_graphs.rs: OLMo-1, the THIRD norm shape and the reason
+    // `crate::norm::NormOp` has three variants rather than two. It is
+    // pre-norm like `llama` -- `olmo.cpp:65-67` before attention,
+    // :104-106 before the FFN -- so it is NOT the post-norm-only
+    // topology `olmo2` and `exaone4` share. What differs is the norm
+    // FUNCTION: all three sites are
+    // `build_norm(x, NULL, NULL, LLM_NORM, il)`, a non-parametric
+    // LayerNorm, and `olmo.cpp:15-36` creates no norm tensor at all --
+    // no `attn_norm`, no `ffn_norm`, no `output_norm`.
+    //
+    // Its lm_head is TIED with a fallback (:21-25) and its RoPE is NORM
+    // (llama-model.cpp:2585). The one thing it needs that ferrox does
+    // not have is a CLAMP: `olmo.cpp:5` reads
+    // `{arch}.attention.clamp_kqv`, `llama-graph.cpp:1611-1652` applies
+    // it to Q, K and V inside `build_qkv`, and
+    // `conversion/olmo.py:23-25` really writes it for the checkpoints
+    // whose HF config has a `clip_qkv` (OLMo-7B-Twin-2T, OLMo-1.7-7B;
+    // the original OLMo-7B has none). A file declaring a positive clamp
+    // is refused by name (`crate::clamp_kqv`) with a fixture that
+    // carries the key, the `baichuan`-13B precedent: an architecture
+    // admitted for the checkpoints it really covers, not for all of
+    // them.
+    "olmo",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -488,7 +531,7 @@ pub fn is_audited_generic(arch: &str) -> bool {
 /// (:60-67) and the same four lines (:118, :159, :152-155, :166-169).
 ///
 /// Both are refused unless [`AUDITED_GENERIC_GQA`] names them, and
-/// `crate::pre_norm::PreNorm` is the one implementation they share.
+/// `crate::norm::NormOp` is the one implementation they share.
 /// Adding a third name here means having read a third `*.cpp`: this
 /// list decides whether `loader.rs` demands `blk.N.attn_norm.weight`
 /// from a file, so a wrong entry is a load that fails or a norm that
@@ -499,6 +542,45 @@ pub const POST_NORM_ONLY_ARCHITECTURES: &[&str] = &["olmo2", "exaone4"];
 /// See [`POST_NORM_ONLY_ARCHITECTURES`].
 pub fn is_post_norm_only(arch: &str) -> bool {
     POST_NORM_ONLY_ARCHITECTURES.contains(&arch)
+}
+
+/// Architectures that normalise with a **non-parametric LayerNorm** --
+/// subtract the mean, divide by the standard deviation, no learned
+/// weight and no bias -- at every norm site.
+///
+/// `olmo` (OLMo-1), and llama.cpp has no second one. `olmo.cpp:27-35`
+/// creates Q/K/V, `attn_output` and gate/up/down and NOT ONE norm
+/// tensor, and its graph is `build_norm(x, NULL, NULL, LLM_NORM, il)`
+/// at :65-67 (pre-attention), :104-106 (pre-FFN) and :128-130 (final).
+///
+/// It is pre-norm like `llama`, so this is orthogonal to
+/// [`POST_NORM_ONLY_ARCHITECTURES`]: the difference is the norm
+/// FUNCTION, not the residual wiring, and a name cannot be on both
+/// lists (`loader.rs`'s
+/// `the_three_norm_slot_lists_cannot_name_the_same_architecture`).
+///
+/// **This list will not grow, and that is a measured claim rather than
+/// an expectation.** Every `build_norm` call in all of llama.cpp's
+/// `src/models/*.cpp` graphs was scanned for a null weight argument:
+/// three calls pass one to `LLM_NORM`, and all three are `olmo.cpp`.
+/// `talkie.cpp` passes a null weight to `LLM_NORM_RMS` at five sites,
+/// which is a non-parametric RMSNorm -- a different function, and a row
+/// this list does not serve.
+///
+/// The LayerNorm *function* is shared, and that is a different list
+/// that does not exist yet: `dbrx` (unaudited, NEW CODE) and the
+/// `nemotron` / `orion` / `stablelm` / `codeshell` / `jais2` /
+/// `starcoder` / `starcoder2` / `phimoe` bias group all normalise with
+/// `LLM_NORM` and a learned weight, most of them with a bias too. None
+/// of them is closed by this variant, because a `LayerNorm(weight,
+/// bias)` with no caller would be a variant that rots -- see
+/// `crate::norm::NormOp`.
+pub const NON_PARAMETRIC_LAYER_NORM: &[&str] = &["olmo"];
+
+/// Does this architecture normalise without any learned parameters?
+/// See [`NON_PARAMETRIC_LAYER_NORM`].
+pub fn uses_non_parametric_layer_norm(arch: &str) -> bool {
+    NON_PARAMETRIC_LAYER_NORM.contains(&arch)
 }
 
 /// How the generic `Decoder` / `ModelConfig::from_gguf` path treats a
@@ -670,22 +752,14 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          expert_ffn_dim as SCALARS and its decoder runs the same block on every layer, so \
          there is nowhere to put any of the three. Same class as `openelm`, one step worse",
     ),
-    (
-        "olmo",
-        TriageClass::NewCode,
-        "OLMo-1 has NO norm weights at all. src/models/olmo.cpp:27-35 creates Q/K/V, \
-         attn_output and gate/up/down and not one norm tensor, and the graph calls \
-         `build_norm(x, NULL, NULL, LLM_NORM, il)` at all three sites (:65-67, :104-106, \
-         :128-130) -- non-parametric LayerNorm: subtract the mean, divide by the standard \
-         deviation, no learned weight and no bias. ferrox has only `rms_norm(x, w, eps)` \
-         and requires `blk.N.attn_norm.weight`, so it is both a different function and a \
-         missing tensor. It also reads an optional {arch}.attention.clamp_kqv (:5) that \
-         nothing here applies. Note this is OLMo-1, and it is NOT the post-norm-only \
-         topology `olmo2` and `exaone4` share: OLMo-1 norms BEFORE both sublayers \
-         (:65-67 before attention, :104-106 before the FFN), so it is pre-norm like \
-         llama and the difference is the norm FUNCTION, not the residual shape. Three \
-         shapes, not two, and `crate::pre_norm` is no help here",
-    ),
+    // `olmo` was HERE, NEW CODE on the non-parametric LayerNorm, and is
+    // audited now: `crate::norm::NormOp::LayerNormNoParams` implements
+    // the function and `tests/olmo_graphs.rs` carries the fixture. Its
+    // verdict called the clamp "an optional key nothing here applies";
+    // that half stayed a REFUSAL rather than an implementation, because
+    // `llama-graph.cpp:1611-1652` really does clamp Q, K and V and
+    // `conversion/olmo.py:23-25` really does write the key. See
+    // `crate::clamp_kqv`.
     (
         "arctic",
         TriageClass::NewCode,
@@ -1064,6 +1138,15 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         for n in ["granite", "granitemoe", "granite-moe"] {
             v.push(gqa_norm(n));
         }
+        // OLMo-1 was NEW CODE in `NORM_ROPE_TRIAGED` on its
+        // non-parametric LayerNorm, which `crate::norm::NormOp` now
+        // implements (`tests/olmo_graphs.rs`). NORM RoPE:
+        // `llama_model_rope_type` puts LLM_ARCH_OLMO in the
+        // consecutive-pairs group (llama-model.cpp:2585), which is also
+        // why `conversion/olmo.py:33-36` permutes q_proj and k_proj the
+        // way `LlamaModel` does. A file declaring a positive
+        // `olmo.attention.clamp_kqv` is refused by name in `loader.rs`.
+        v.push(gqa_norm("olmo"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1110,7 +1193,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "bailingmoe2",
             "plamo3",
             // Were NEW CODE in `NEOX_ROPE_TRIAGED` and are audited now.
-            // One residual topology, `crate::pre_norm`, shared by both:
+            // One residual topology, `crate::norm`, shared by both:
             // no pre-attention norm and no pre-FFN norm, each branch's
             // OUTPUT normed before its residual add. The evidence is
             // `tests/post_norm_only_graphs.rs`, one libllama-golden
@@ -1428,27 +1511,25 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 WholeVector,
             ));
         }
-        // MiniCPM is the case `unsupported_scaling_keys` cannot catch:
-        // `src/models/minicpm.cpp:4-14` *hardcodes* an embedding
+        // MiniCPM was the case `unsupported_scaling_keys` cannot catch:
+        // `src/models/minicpm.cpp:5-7` *hardcodes* an embedding
         // multiplier of 12.0, a residual multiplier of
         // `1.4/sqrt(n_layer)` and a logit multiplier of `256/n_embd`,
-        // and only then lets the GGUF override them. An older MiniCPM
-        // export carrying none of the three keys is still scaled by all
-        // three, so a key-presence gate sees nothing and the generic
-        // decoder computes an unscaled graph.
-        v.push(prof(
-            "minicpm",
-            TextGeneration,
-            StandardGqa,
-            KvGqa,
-            Norm,
-            ArchPath::DedicatedOnly {
-                reason: "unconditional embedding/residual/logit multipliers that llama.cpp \
-                         applies even when the GGUF omits every key; not applied by the \
-                         generic decoder",
-            },
-            WholeVector,
-        ));
+        // and only then (`:12-14`) lets the GGUF override them. An older
+        // MiniCPM export carrying none of the three keys is still scaled
+        // by all three, so a key-presence gate sees nothing.
+        //
+        // It is generic now, on the same evidence every other row here
+        // has: `scalar_multipliers::MultiplierDefaults` applies the
+        // three, and `tests/minicpm_graphs.rs` drives a fixture that
+        // declares NONE of them against llama.cpp's own logits. Its RoPE
+        // is NORM (`llama_model_rope_type`, llama-model.cpp:2580, the
+        // consecutive-pairs group), and it is deliberately NOT in
+        // `rope_finetuned::ROPE_GATED_ON_FINETUNED`: it runs Granite's
+        // graph, whose RoPE is gated on `hparams.rope_finetuned`, but
+        // `minicpm.cpp:17` pins that true with no key read at all, so
+        // the switch Granite exposes is unreachable here.
+        v.push(gqa_norm("minicpm"));
         v.push(prof(
             "phi3",
             TextGeneration,
@@ -2500,7 +2581,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 22,
+            seen == 21,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2510,13 +2591,19 @@ mod audit_tests {
              theirs (tests/fixture_away_graphs.rs), 34 until `gemma`, `hunyuan-dense` \
              and `ernie4_5-moe` got theirs, 31 until `olmo2` and `exaone4` -- the \
              POST-NORM-ONLY pair, ONE topology and one implementation \
-             (`crate::pre_norm`) -- got theirs (tests/post_norm_only_graphs.rs), 29 until \
+             (`crate::norm`) -- got theirs (tests/post_norm_only_graphs.rs), 29 until \
              `chatglm` -- the LAST ONE MATCH ARM row -- got its fused-QKV-bias arm and \
              its fixture, 28 until `mistral`, `mixtral` and `yi` turned out not to be \
              architectures at all (libllama refuses all three strings) and moved to \
              DedicatedOnly, and 25 until the three Granite rows -- granite, granitemoe \
              and the granite-moe alias -- closed together on ONE implementation of their \
-             four scalar multipliers (tests/granite_family_graphs.rs). `gemma` was the \
+             four scalar multipliers (tests/granite_family_graphs.rs), and 22 until \
+             `olmo` closed on the non-parametric LayerNorm (`crate::norm`, \
+             tests/olmo_graphs.rs). `olmo` is the FIRST NEW CODE row to close on its own, \
+             and it says something the other closures do not: its cause is not shared. \
+             Every `build_norm` call in llama.cpp's 140 graphs was scanned for a null \
+             weight and all three hits are `olmo.cpp`, so this variant was never going to \
+             take a second row with it -- see `NON_PARAMETRIC_LAYER_NORM`. `gemma` was the \
              last fixture-away row and `chatglm` the last one-match-arm row, so BOTH \
              classes are empty: what is left is 21 NEW CODE and one UNKNOWN (`phi4`). \
              The NEW CODE rows that have closed are `olmo2`, `exaone4` and the three \
@@ -2538,11 +2625,14 @@ mod audit_tests {
         // `headline()` below, because a class with no rows still has to
         // render distinctly the day something lands in it again.
         //
-        // `olmo`, not `olmo2`: OLMo-2 is audited now (its topology is
-        // `crate::pre_norm`), and OLMo-1 is a THIRD residual shape --
-        // non-parametric LayerNorm BEFORE both sublayers -- not the
-        // post-norm-only one, so it stays NEW CODE and is the sample.
-        let new_code = unaudited_refusal_detail("olmo");
+        // `dbrx`, which used to be `olmo`. Both are LayerNorm rows and
+        // that is why the sample moved: `olmo`'s norm is
+        // NON-PARAMETRIC and is implemented now
+        // (`crate::norm::NormOp::LayerNormNoParams`), while `dbrx`'s has
+        // a learned weight, no `ffn_norm` at all, and a REQUIRED
+        // `attention.clamp_kqv` -- three blockers, none of which the
+        // `olmo` work reached.
+        let new_code = unaudited_refusal_detail("dbrx");
         // `phi4` is the only UNKNOWN row left: `mistral`, `mixtral` and
         // `yi` used to be the other three and are refused as strings
         // now (see `NO_UPSTREAM_ARCH`).
@@ -2569,7 +2659,7 @@ mod audit_tests {
         // The blocker itself, not only the class label, has to be in the
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
-        assert!(new_code.contains("olmo.cpp:27-35"), "{new_code}");
+        assert!(new_code.contains("dbrx.cpp:4"), "{new_code}");
         assert!(unknown.contains("LLM_ARCH_NAMES"), "{unknown}");
         // The two empty classes still have to be distinguishable.
         let labels = [
@@ -2764,11 +2854,18 @@ mod tests {
         assert!(!unsupported_feature_keys("llama").is_empty());
     }
 
-    /// Parallel attention+FFN residual is not a tensor and, for MiniCPM,
-    /// not even a metadata key -- llama.cpp hardcodes MiniCPM's three
-    /// multipliers. Neither the tensor-consumption gate nor
-    /// `unsupported_scaling_keys` can see the difference, so these
+    /// Parallel attention+FFN residual is not a tensor and not a
+    /// metadata key either, so neither the tensor-consumption gate nor
+    /// `unsupported_scaling_keys` can see the difference: these
     /// architectures must not be admitted to the generic decoder at all.
+    ///
+    /// `minicpm` used to be on this list and is NOT a residual-topology
+    /// row -- it runs Granite's graph verbatim
+    /// (`models.h:1594-1601`). It was here because its three hardcoded
+    /// multipliers are invisible to a key-presence gate the same way a
+    /// parallel residual is, which made the list's name wrong about one
+    /// of its own members. `scalar_multipliers::MultiplierDefaults`
+    /// applies them now and `tests/minicpm_graphs.rs` is the evidence.
     #[test]
     fn architectures_with_a_different_residual_topology_are_refused() {
         for arch in [
@@ -2779,7 +2876,6 @@ mod tests {
             "gptneox",
             "phi2",
             "plamo",
-            "minicpm",
         ] {
             match resolve_architecture(arch) {
                 Some(ArchPath::DedicatedOnly { reason }) => {

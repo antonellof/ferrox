@@ -54,10 +54,31 @@ is faster.
   ONE residual topology rather than two: neither has an `attn_norm` or
   an `ffn_norm` tensor, both sublayers read the raw residual, and each
   branch's output is normed before its residual add
-  (`ferrox_models::pre_norm`). Two sub-cases stay refused by name -- an
+  (`ferrox_models::norm`). Two sub-cases stay refused by name -- an
   `olmo2` carrying both a sliding window and a RoPE scaling (Olmo-3),
   and EXAONE-4 32B, whose full-attention layers get no RoPE at all.
-  `olmo` (OLMo-1) is a third shape and still refuses.
+- **OLMo-1**, the third norm shape and a third variant of that same
+  enum. It is pre-norm like llama, but `olmo.cpp:65-67,104-106,128-130`
+  normalise with a null weight and a null bias -- a non-parametric
+  LayerNorm, mean subtracted and standard deviation divided out -- and
+  the file carries no norm tensor of any kind, not even an
+  `output_norm`. `Decoder::final_norm` became a `NormOp` with it,
+  because the fused Metal stacks that fold `final_norm + lm_head +
+  argmax` had `Some(&self.final_norm)` written into them
+  unconditionally. **A file declaring a positive
+  `olmo.attention.clamp_kqv` still stops**: llama.cpp clamps Q, K and V
+  by it (`llama-graph.cpp:1611-1652`) and ferrox clamps no projection
+  anywhere, so OLMo-7B loads and OLMo-1.7-7B, whose `clip_qkv` is 8.0,
+  does not.
+- **MiniCPM**, which was refused by NAME rather than as unaudited,
+  because what it does is invisible in the file: `minicpm.cpp:5-7`
+  assigns an embedding multiplier of 12.0, a residual multiplier of
+  `1.4/sqrt(n_layer)` and a logit multiplier of `256/n_embd` and only
+  then lets the GGUF override them, so an export declaring nothing is
+  still scaled three ways. It runs Granite's graph verbatim
+  (`models.h:1594-1601`), so this is a DEFAULTS field on the table
+  below rather than a second implementation. It reads no
+  `attention.scale`, and a file declaring one is still refused.
 - **ChatGLM and Qwen-1**, both audited against libllama on 2026-09-10
   and both closed by the same arm: the *fused* `blk.N.attn_qkv.bias`.
   ferrox split a fused `attn_qkv.weight` and then looked for the bias
@@ -93,9 +114,7 @@ is faster.
 - **Every other architecture's scalar multipliers still stop the load**,
   from a list derived from that same table rather than restated beside
   it. A checkpoint that declares one with a value that changes the maths
-  stops with an error naming the key. `minicpm` stops outright, because
-  llama.cpp applies its three multipliers even when the file carries no
-  key at all; a Granite file declaring
+  stops with an error naming the key. A Granite file declaring
   `rope.scaling.finetuned = false` stops too, because llama.cpp then
   runs it with no rotation at all and there is no way to express that
   here.
