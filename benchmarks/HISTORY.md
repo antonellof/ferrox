@@ -167,6 +167,26 @@ Four traps, each of which put a wrong number in this file before:
   fusion removing 5% of dispatches was worth ~1.4% of wall against a
   ~1.1% noise floor. "No difference" measured nothing either way.
 
+- **`ferrox bench` does not use the Metal greedy argmax fold, so the
+  fold's eligibility does not move these rows.** Worth stating because
+  [#172](https://github.com/antonellof/ferrox/pull/172) stopped the fold
+  firing in `ferrox run`'s default configuration, which looks like it
+  should have changed the `tg` numbers and did not. The bench path asks
+  the engine for full logits and argmaxes them on the host
+  (`bench_guard::greedy_pick`), because a row that cannot show which
+  token it produced cannot show it computed anything. The fold is opt-in
+  through `set_metal_greedy_argmax`, and its thread-local setting
+  defaults to unset. It has **two** non-test callers, `ferrox-cli`'s
+  `run.rs` and `ferrox-server`'s `generate.rs`, and neither is in the
+  bench path. An earlier version of this note said only `ferrox run`
+  calls it, which was wrong: the conclusion survives because what matters
+  is that no caller is on the bench path, not how many callers exist.
+  The two also differ in what the fix changed for them, which is worth
+  knowing: `ferrox run` defaults `--repeat-penalty` to 1.1 so its greedy
+  Metal path stops folding, while the server defaults
+  `repetition_penalty` to 1.0 so its greedy requests still fold unless a
+  client sends a penalty.
+
 Do not compare this file to a pre-0.13 version: those receipts had no
 warmup, so their prefill numbers include cold mmap page faults.
 
