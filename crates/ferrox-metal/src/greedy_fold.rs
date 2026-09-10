@@ -82,10 +82,19 @@
 //! explicitly is the only sound answer, and the carrying has to be done
 //! by whoever moves the work.
 //!
-//! That is why `ferrox_core::par::on_workers` still declines to promote
-//! a decode step under a GPU backend. Relaxing that gate is a separate,
-//! measurable change, and it should pass [`greedy_fold_setting`] through
-//! [`adopt_greedy_fold`] when it does.
+//! # Who does the carrying
+//!
+//! `ferrox_core::par::carry`, which is the one thing in the workspace
+//! that moves a forward pass between threads. It captures with
+//! [`greedy_fold_setting`] on the submitting thread and installs with
+//! [`adopt_greedy_fold`] on the worker, for the length of the job, and
+//! its `Carry` struct is destructured exhaustively so a second setting
+//! added here and not carried there does not compile.
+//!
+//! With that in place `on_workers` no longer declines to promote under
+//! Metal. CUDA and Vulkan still decline, for want of hardware to check
+//! them on rather than for a known defect; the verdict per backend and
+//! its evidence live on `par::carry::promotable`.
 
 use std::cell::Cell;
 
