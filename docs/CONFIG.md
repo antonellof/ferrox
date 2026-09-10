@@ -135,9 +135,12 @@ Held by `cargo test -p ferrox-models --features metal --test
 paged_metal_parity -- --ignored`, which greedy-decodes the same prompt
 twice in one process, once through each cache, on a dense model, an MoE
 model and a sliding-window model. It runs one model per process on
-purpose: two checkpoints loaded into a single process do not answer the
-same as either alone on Metal, which is a separate bug and not one this
-check should be at the mercy of.
+purpose: two checkpoints in one process used not to answer the same as
+either alone on Metal, because the resident-buffer caches keyed on a
+host address a dropped model's allocator had already handed on. That
+was GitHub issue #180 and is fixed; `model_swap_isolation` is the check
+that holds it, and the per-process isolation here stays because this
+suite should not be at the mercy of it either way.
 
 `FERROX_PREFIX_CACHE_ENTRIES` had the same bug and no refusal in front
 of it. A stored snapshot is the host rows, so on Metal it was all zeros,
@@ -223,7 +226,7 @@ tests that read them skip instead.
 
 | Variable | Purpose |
 |---|---|
-| `FERROX_TEST_MODELS_DIR` | Root the real-GGUF sweeps scan (default `models`). Read by `bos_policy`, `chat_template_real_gguf` and `paged_metal_parity` -- a git worktree has no `models/` of its own, which is what this is for. Unrelated to `FERROX_MODEL_DIR`, which is server config |
+| `FERROX_TEST_MODELS_DIR` | Root the real-GGUF sweeps scan (default `models`). Read by `bos_policy`, `chat_template_real_gguf`, `paged_metal_parity` and `model_swap_isolation` -- a git worktree has no `models/` of its own, which is what this is for. Unrelated to `FERROX_MODEL_DIR`, which is server config |
 | `FERROX_TEST_GEMMA2_GGUF` | Gemma-2 GGUF for the Metal quality gate |
 | `FERROX_TEST_QWEN2MOE_GGUF` | Qwen2-MoE GGUF for the "capital of France" check |
 | `FERROX_TEST_SMOLLM2_GGUF` | SmolLM2 GGUF for the same check on Metal |

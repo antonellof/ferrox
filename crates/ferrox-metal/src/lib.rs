@@ -27,6 +27,9 @@ pub mod decode_dense;
 pub mod resident_act;
 
 #[cfg(feature = "metal")]
+mod resident_cache;
+
+#[cfg(feature = "metal")]
 pub mod greedy_fold;
 
 #[cfg(feature = "metal")]

@@ -53,6 +53,7 @@
 
 use crate::dispatch::dispatch_counted;
 use crate::moe_ids::IdsBinding;
+use crate::resident_cache::{get_or_build, HostKey, Resident};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -5208,9 +5209,10 @@ pub(crate) fn warm_mul_mm_sg_pipeline(
     ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)
 }
 
-/// Process-wide cache of quantized weight `MTLBuffer`s, keyed by the
-/// host slice's base pointer and length. Stable for mmap-backed and
-/// owned `WeightBytes` after load (weights are not mutated in place).
+/// Process-wide cache of quantized weight `MTLBuffer`s, looked up by
+/// the host slice's base pointer and length and served only when the
+/// entry can still prove it holds those bytes -- see
+/// [`crate::resident_cache`] for why a lookup key is not an identity.
 pub(crate) struct ResidentWeightBuffer {
     pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Byte offset of the weight bytes within `buffer`. Non-zero only on
@@ -5266,78 +5268,46 @@ fn weight_fingerprint(weights: &[u8]) -> u64 {
 unsafe impl Send for ResidentWeightBuffer {}
 unsafe impl Sync for ResidentWeightBuffer {}
 
-type WeightCacheKey = (usize, usize);
-type WeightCacheMap = HashMap<WeightCacheKey, Arc<ResidentWeightBuffer>>;
+impl Resident for ResidentWeightBuffer {
+    /// One proof per way this entry can have been built.
+    ///
+    /// A `BytesNoCopy` alias holds an `Arc<ResidentMmapFile>`, and that
+    /// keepalive is what makes its address an identity: the mapping
+    /// cannot be unmapped while the entry lives, so the kernel cannot
+    /// reissue the range to a second file. There is also nothing to
+    /// compare, because the device bytes ARE the host bytes.
+    ///
+    /// A copied entry owns its bytes, and the host allocation behind
+    /// the address can be freed and reissued, so it carries a
+    /// fingerprint of what it was built from. Sampled rather than
+    /// exhaustive: the copy path is what an expert-streaming lease
+    /// takes, where comparing a whole matrix per matvec would cost what
+    /// the upload it skips costs. That is a weaker proof than
+    /// [`ResidentF32Buffer`]'s, and saying so is the honest version.
+    fn still_holds(&self, host: &[u8]) -> bool {
+        self.mmap_backed || self.fingerprint == weight_fingerprint(host)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.nbytes
+    }
+}
+
+type WeightCacheMap = HashMap<HostKey, Arc<ResidentWeightBuffer>>;
 
 static WEIGHT_CACHE: Mutex<Option<WeightCacheMap>> = Mutex::new(None);
 
 thread_local! {
-    static TL_WEIGHT_CACHE: RefCell<HashMap<(usize, usize), Arc<ResidentWeightBuffer>>> =
-        RefCell::new(HashMap::new());
-}
-
-fn weight_cache_budget_bytes() -> usize {
-    match std::env::var("FERROX_METAL_WEIGHT_CACHE_BYTES") {
-        Ok(v) => v.parse().unwrap_or(usize::MAX),
-        // Default: effectively unlimited on unified memory; callers can
-        // cap with FERROX_METAL_WEIGHT_CACHE_BYTES for smaller machines.
-        Err(_) => usize::MAX,
-    }
+    static TL_WEIGHT_CACHE: RefCell<WeightCacheMap> = RefCell::new(HashMap::new());
 }
 
 pub(crate) fn resident_weight_buffer(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     weights: &[u8],
 ) -> Result<Arc<ResidentWeightBuffer>, MetalError> {
-    let key = (weights.as_ptr() as usize, weights.len());
-    // The fingerprint guards against an address being freed and reused
-    // by different bytes. That cannot happen to a registered mmap: the
-    // cached entry holds an `Arc<ResidentMmapFile>` keeping the mapping
-    // alive, so the range stays valid and unchanged for as long as the
-    // entry does. Every real GGUF weight takes that path, and computing
-    // the fingerprint touches 64 pages -- per weight, per call, on the
-    // hot side of the cache lookup. So compute it lazily, only for the
-    // owned/unregistered slices that can actually alias.
-    let fingerprint_of = |c: &ResidentWeightBuffer| -> bool {
-        c.mmap_backed || c.fingerprint == weight_fingerprint(weights)
-    };
-    if let Some(cached) = TL_WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        if fingerprint_of(&cached) {
-            return Ok(cached);
-        }
-        // Address reused by different bytes: drop the stale alias and
-        // fall through to rebuild.
-        TL_WEIGHT_CACHE.with(|c| {
-            c.borrow_mut().remove(&key);
-        });
-    }
-    let cached = {
-        let mut guard = WEIGHT_CACHE.lock().unwrap();
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(cached) = cache.get(&key).filter(|c| fingerprint_of(c)) {
-            cached.clone()
-        } else {
-            let budget = weight_cache_budget_bytes();
-            let used: usize = cache.values().map(|b| b.nbytes).sum();
-            if used.saturating_add(weights.len()) > budget {
-                // Drop everything and retry with a clean slate for this matrix.
-                // Better than silently re-uploading forever under a tight budget.
-                cache.clear();
-                TL_WEIGHT_CACHE.with(|c| c.borrow_mut().clear());
-            }
-            if weights.len() > budget {
-                // Matrix alone exceeds budget: one-shot upload, do not cache.
-                return Ok(Arc::new(build_resident_weight_buffer(device, weights)?));
-            }
-            let cached = Arc::new(build_resident_weight_buffer(device, weights)?);
-            cache.insert(key, cached.clone());
-            cached
-        }
-    };
-    TL_WEIGHT_CACHE.with(|c| {
-        c.borrow_mut().insert(key, cached.clone());
-    });
-    Ok(cached)
+    get_or_build(&WEIGHT_CACHE, &TL_WEIGHT_CACHE, weights, || {
+        build_resident_weight_buffer(device, weights)
+    })
 }
 
 /// VM page size used for `BytesNoCopy` alignment. Apple Silicon uses
@@ -5483,77 +5453,74 @@ pub(crate) struct ResidentF32Buffer {
     nbytes: usize,
 }
 
+impl Resident for ResidentF32Buffer {
+    /// An exhaustive compare, because this entry can prove nothing
+    /// else: it always copies, so it neither aliases the host bytes nor
+    /// keeps their allocation alive, and what it caches are the RMSNorm
+    /// gammas and RoPE frequency factors owned by a `Decoder` that
+    /// `/admin/models/load` drops.
+    ///
+    /// Exact rather than sampled, and affordable for the same reason it
+    /// is needed: these are `hidden_dim` floats, single-digit KB, so
+    /// the compare costs a fraction of the upload it avoids. That
+    /// leaves no residual probability of serving one model's norms to
+    /// another (GitHub issue #180).
+    fn still_holds(&self, host: &[u8]) -> bool {
+        if self.nbytes != host.len() {
+            return false;
+        }
+        // SAFETY: `buffer` is a `StorageModeShared` buffer this process
+        // allocated with exactly `nbytes` bytes and only ever reads on
+        // the GPU, so its contents pointer is valid and readable for
+        // that length for as long as this entry lives.
+        let device = unsafe {
+            std::slice::from_raw_parts(self.buffer.contents().as_ptr() as *const u8, self.nbytes)
+        };
+        device == host
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.nbytes
+    }
+}
+
 // SAFETY: same justification as `SharedMetal` -- `MTLBuffer` created
 // once and only read by compute kernels is safe to share across threads
 // that each build their own command buffer/encoder.
 unsafe impl Send for ResidentF32Buffer {}
 unsafe impl Sync for ResidentF32Buffer {}
 
-type F32CacheKey = (usize, usize);
-type F32CacheMap = HashMap<F32CacheKey, Arc<ResidentF32Buffer>>;
+type F32CacheMap = HashMap<HostKey, Arc<ResidentF32Buffer>>;
 
 static F32_CACHE: Mutex<Option<F32CacheMap>> = Mutex::new(None);
 
 thread_local! {
-    static TL_F32_CACHE: RefCell<HashMap<(usize, usize), Arc<ResidentF32Buffer>>> =
-        RefCell::new(HashMap::new());
+    static TL_F32_CACHE: RefCell<F32CacheMap> = RefCell::new(HashMap::new());
 }
 
 pub(crate) fn resident_f32_buffer(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     data: &[f32],
 ) -> Result<Arc<ResidentF32Buffer>, MetalError> {
-    let key = (data.as_ptr() as usize, data.len());
-    if let Some(cached) = TL_F32_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        return Ok(cached);
-    }
     let nbytes = std::mem::size_of_val(data);
-    let cached = {
-        let mut guard = F32_CACHE.lock().unwrap();
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(cached) = cache.get(&key) {
-            cached.clone()
-        } else {
-            let budget = weight_cache_budget_bytes();
-            let used: usize = cache.values().map(|b| b.nbytes).sum();
-            if used.saturating_add(nbytes) > budget {
-                // Drop everything and retry with a clean slate for this matrix.
-                // Better than silently re-uploading forever under a tight budget.
-                cache.clear();
-                TL_F32_CACHE.with(|c| c.borrow_mut().clear());
-            }
-            if nbytes > budget {
-                // Matrix alone exceeds budget: one-shot upload, do not cache.
-                let mut data_owned = data.to_vec();
-                let buffer = unsafe {
-                    device.newBufferWithBytes_length_options(
-                        NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
-                        nbytes,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                }
-                .ok_or(MetalError::BufferAllocFailed)?;
-                return Ok(Arc::new(ResidentF32Buffer { buffer, nbytes }));
-            }
-
-            let mut data_owned = data.to_vec();
-            let buffer = unsafe {
-                device.newBufferWithBytes_length_options(
-                    NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
-                    nbytes,
-                    MTLResourceOptions::StorageModeShared,
-                )
-            }
-            .ok_or(MetalError::BufferAllocFailed)?;
-            let cached = Arc::new(ResidentF32Buffer { buffer, nbytes });
-            cache.insert(key, cached.clone());
-            cached
+    // SAFETY: an initialised `[f32]` is `nbytes` initialised bytes, and
+    // `u8` has no alignment requirement. Read-only, and the borrow of
+    // `data` outlives the view.
+    let host = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, nbytes) };
+    get_or_build(&F32_CACHE, &TL_F32_CACHE, host, || {
+        let mut data_owned = data.to_vec();
+        // SAFETY: `data_owned` holds `nbytes` initialised bytes and is
+        // alive across the call, which copies them into the buffer.
+        let buffer = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(data_owned.as_mut_ptr() as *mut _).unwrap(),
+                nbytes,
+                MTLResourceOptions::StorageModeShared,
+            )
         }
-    };
-    TL_F32_CACHE.with(|c| {
-        c.borrow_mut().insert(key, cached.clone());
-    });
-    Ok(cached)
+        .ok_or(MetalError::BufferAllocFailed)?;
+        Ok(ResidentF32Buffer { buffer, nbytes })
+    })
 }
 
 /// One quantized matvec to encode into a fused Metal command buffer

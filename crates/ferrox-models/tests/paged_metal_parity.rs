@@ -22,13 +22,15 @@
 
 #![cfg(feature = "metal")]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ferrox_core::cache::{KvCache, PagedKvCache, SharedPagedKv};
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::config::ModelConfig;
 use ferrox_models::decoder::Decoder;
-use ferrox_models::tokenizer::{GgufBpeTokenizer, GgufSpmTokenizer};
+
+mod common;
+use common::{argmax, model_dir, prompt_tokens};
 
 const PROMPT: &str = "The capital of France is";
 /// Long enough that prefill runs the batched Metal kernels rather than
@@ -46,74 +48,6 @@ const MODELS: &[&str] = &[
     "olmoe-1b-7b-0924-q4_0.gguf",
     "gemma-2-2b-it-Q4_K_M.gguf",
 ];
-
-fn model_dir() -> PathBuf {
-    // `FERROX_TEST_MODELS_DIR` because a git worktree has no `models/` of its
-    // own, and this check is worth running from one.
-    if let Ok(d) = std::env::var("FERROX_TEST_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
-}
-
-fn argmax(logits: &[f32]) -> usize {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i)
-        .unwrap()
-}
-
-/// Repeat until exactly `want` tokens, keeping at most one leading BOS
-/// -- the same stretch `ferrox verify --prompt-tokens` performs, down
-/// to only treating the first token as BOS when it really is one. A
-/// checkpoint without BOS otherwise loses its first word, which makes
-/// this run a different prompt from the one `verify` reports on.
-fn stretch(mut tokens: Vec<usize>, want: usize, bos: Option<usize>) -> Vec<usize> {
-    if tokens.len() >= want {
-        tokens.truncate(want);
-        return tokens;
-    }
-    let leading_bos = (bos.is_some() && tokens.first().copied() == bos).then(|| tokens[0]);
-    let body: Vec<usize> = tokens[leading_bos.iter().count()..].to_vec();
-    tokens.truncate(leading_bos.iter().count());
-    while tokens.len() < want {
-        let take = (want - tokens.len()).min(body.len());
-        tokens.extend_from_slice(&body[..take]);
-    }
-    tokens
-}
-
-fn tokenize(file: &ShardedGguf) -> Vec<usize> {
-    let raw: Vec<usize> = match file.metadata_str("tokenizer.ggml.model") {
-        Some("gpt2" | "gemma4") => GgufBpeTokenizer::from_gguf(file)
-            .expect("bpe tokenizer")
-            .encode(PROMPT)
-            .into_iter()
-            .map(|i| i as usize)
-            .collect(),
-        Some("llama") => GgufSpmTokenizer::from_gguf(file)
-            .expect("spm tokenizer")
-            .encode(PROMPT)
-            .into_iter()
-            .map(|i| i as usize)
-            .collect(),
-        other => panic!("paged parity does not cover tokenizer {other:?}"),
-    };
-    let mut tokens = raw;
-    let bos = file
-        .metadata_u64("tokenizer.ggml.bos_token_id")
-        .map(|v| v as usize);
-    if ferrox_models::tokenizer::should_add_bos_token(file) {
-        if let Some(b) = bos {
-            if tokens.first() != Some(&b) {
-                tokens.insert(0, b);
-            }
-        }
-    }
-    stretch(tokens, PROMPT_TOKENS, bos)
-}
 
 fn greedy_contiguous(decoder: &Decoder, prompt: &[usize], eos: Option<usize>) -> Vec<usize> {
     let mut caches: Vec<KvCache> = (0..decoder.layers.len())
@@ -187,13 +121,17 @@ fn paged_kv_answers_exactly_what_contiguous_kv_answers_on_metal() {
 
 /// One model per process, run as children of this one.
 ///
-/// Not fussiness: two checkpoints loaded into a single process do NOT
+/// Not fussiness: two checkpoints loaded into a single process did NOT
 /// come out the same as either alone on Metal. Loading Llama-3.2-1B and
 /// then OLMoE in one run produced three different OLMoE continuations
 /// across three runs, none of them the stable answer OLMoE gives on its
 /// own, while paged and contiguous agreed with each other every time.
-/// That is process-global Metal state surviving a dropped `Decoder` --
-/// a separate bug, and one this check must not be at the mercy of.
+/// That was process-global Metal state surviving a dropped `Decoder`:
+/// resident-buffer caches keyed on a host address the dropped model's
+/// allocator had already handed to the next one (GitHub issue #180),
+/// now fixed and held by `model_swap_isolation`. The isolation stays,
+/// because what this suite measures should not depend on that fix
+/// holding.
 ///
 /// The re-invocation is the shape `ferrox verify` already uses for the
 /// same reason: some state is per process, so isolate per process.
@@ -233,7 +171,7 @@ fn check_one(path: &Path) {
     let eos = file
         .metadata_u64("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize);
-    let prompt = tokenize(&file);
+    let prompt = prompt_tokens(&file, PROMPT, PROMPT_TOKENS);
     let decoder = Decoder::from_gguf(path, config).expect("decoder");
 
     let want = greedy_contiguous(&decoder, &prompt, eos);

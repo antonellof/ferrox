@@ -176,3 +176,91 @@ pub fn worst_vs(got: &[f32], golden: &[f32]) -> f32 {
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max)
 }
+
+// ---------------------------------------------------------------------
+// Real-checkpoint sweeps
+//
+// Shared by `paged_metal_parity` and `model_swap_isolation`, which both
+// greedy-decode one prompt on a real GGUF and compare the token ids two
+// runs produce. Each had grown its own copy of the tokenize/stretch
+// pair, and a prompt or a BOS rule that drifted between them would have
+// made one suite quietly measure something else.
+// ---------------------------------------------------------------------
+
+/// Root the real-GGUF suites scan.
+///
+/// `FERROX_TEST_MODELS_DIR` because a git worktree has no `models/` of
+/// its own, and these checks are worth running from one.
+pub fn model_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("FERROX_TEST_MODELS_DIR") {
+        return PathBuf::from(d);
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+}
+
+/// The greedy pick, which is what makes two runs comparable at all.
+pub fn argmax(logits: &[f32]) -> usize {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .map(|(i, _)| i)
+        .unwrap()
+}
+
+/// Repeat until exactly `want` tokens, keeping at most one leading BOS
+/// -- the same stretch `ferrox verify --prompt-tokens` performs, down
+/// to only treating the first token as BOS when it really is one. A
+/// checkpoint without BOS otherwise loses its first word, which makes a
+/// suite run a different prompt from the one `verify` reports on.
+fn stretch(mut tokens: Vec<usize>, want: usize, bos: Option<usize>) -> Vec<usize> {
+    if tokens.len() >= want {
+        tokens.truncate(want);
+        return tokens;
+    }
+    let leading_bos = (bos.is_some() && tokens.first().copied() == bos).then(|| tokens[0]);
+    let body: Vec<usize> = tokens[leading_bos.iter().count()..].to_vec();
+    tokens.truncate(leading_bos.iter().count());
+    while tokens.len() < want {
+        let take = (want - tokens.len()).min(body.len());
+        tokens.extend_from_slice(&body[..take]);
+    }
+    tokens
+}
+
+/// `prompt` under this checkpoint's own tokenizer, with its BOS policy
+/// applied, stretched to exactly `want` tokens.
+///
+/// Panics rather than skipping for a tokenizer family it does not
+/// cover: a suite that silently ran a different prompt would report a
+/// pass it had not earned.
+pub fn prompt_tokens(file: &ferrox_gguf::ShardedGguf, prompt: &str, want: usize) -> Vec<usize> {
+    use ferrox_models::tokenizer::{GgufBpeTokenizer, GgufSpmTokenizer};
+    let raw: Vec<usize> = match file.metadata_str("tokenizer.ggml.model") {
+        Some("gpt2" | "gemma4") => GgufBpeTokenizer::from_gguf(file)
+            .expect("bpe tokenizer")
+            .encode(prompt)
+            .into_iter()
+            .map(|i| i as usize)
+            .collect(),
+        Some("llama") => GgufSpmTokenizer::from_gguf(file)
+            .expect("spm tokenizer")
+            .encode(prompt)
+            .into_iter()
+            .map(|i| i as usize)
+            .collect(),
+        other => panic!("this suite does not cover tokenizer {other:?}"),
+    };
+    let bos = file
+        .metadata_u64("tokenizer.ggml.bos_token_id")
+        .map(|v| v as usize);
+    let mut tokens = raw;
+    if ferrox_models::tokenizer::should_add_bos_token(file) {
+        if let Some(b) = bos {
+            if tokens.first() != Some(&b) {
+                tokens.insert(0, b);
+            }
+        }
+    }
+    stretch(tokens, want, bos)
+}
