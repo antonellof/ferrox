@@ -132,7 +132,7 @@ function TaskCard({
                 ? "ok"
                 : task.status === "cancelled"
                   ? "neutral"
-                  : "accent"
+                  : "strong"
           }
         >
           {task.status}
@@ -148,7 +148,7 @@ function TaskCard({
         )}
       </div>
       {terminal ? null : <Progress fraction={fraction} label={task.label} />}
-      <p className="font-mono text-[0.6875rem] text-faint">
+      <p className="font-mono text-2xs text-faint">
         {facts.join("  ·  ")}
       </p>
     </li>
@@ -409,7 +409,7 @@ export function ModelsScreen() {
 
         <CardFooter>
           Pick which of these answers in the model menu at the top of{" "}
-          <Link to="/ui/chat" className="text-accent underline">
+          <Link to="/ui/chat" className="link">
             Chat
           </Link>
           . A swap loads the checkpoint for every client of this server; an

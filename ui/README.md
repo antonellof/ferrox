@@ -109,6 +109,34 @@ src/
   screens/{models,activity,connect}.tsx
 ```
 
+## The look, in four rules
+
+They are written at the top of `src/index.css`, because a rule nobody can
+quote is a rule that drifts. Three of them are asserted by
+`lib/theme.test.ts` rather than promised.
+
+- **Colour.** There is **no brand hue**. The neutral ramp is zero-chroma
+  and the only chromatic tokens in the app are `ok`, `warn` and `err`, so
+  chroma means exactly one thing: a state. The test fails if any other
+  token grows chroma, or if a semantic one loses it.
+- **Emphasis**, since no hue carries it. Four levers, loudest first: a
+  solid **ink** fill (`--ink`, near-black in light and near-white in
+  dark) for the one primary action in a view; **weight** for a selected
+  row or a label; **surface** behind a hairline for grouping; and the
+  **contrast** ramp `fg` / `muted` / `faint` for rank inside a block.
+- **Type.** One six-step scale — `2xs` 11, `xs` 12, `sm` 14, `base` 15,
+  `lg` 17, `xl` 20, plus `code` 13 — and no arbitrary sizes in
+  components.
+- **Elevation.** Borders separate; shadows only float. One shadow token,
+  `--shadow-pop`, for popovers and the mobile drawer.
+
+The mark is a body-centred cubic cell, which is the structure of α-iron.
+Its geometry lives in `lib/logo-geometry.ts` and is drawn twice — by
+`components/logo.tsx` in `currentColor`, and by `public/favicon.svg`,
+which needs a colour of its own because a favicon cannot inherit one.
+`lib/logo-geometry.test.ts` reads the favicon off disk and holds the two
+to the same path strings.
+
 ## Where you land, and what it opens
 
 **The URL says which conversation you are in.** `/ui/chat` is a new

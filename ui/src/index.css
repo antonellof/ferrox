@@ -3,70 +3,112 @@
 
 /* Ferrox Studio theme.
  *
- * The discipline the previous hand-written stylesheet had is kept: every
- * colour is declared exactly once on `:root`, and the dark theme is one
- * `prefers-color-scheme` block that redefines the SAME names and nothing
- * else. No component below hard-codes a colour, so the two themes cannot
- * drift apart — adding a token to one and forgetting the other is a
- * missing-variable error, not a silently wrong shade.
- *
- * The accent is ferrox's burnt orange, carried over unchanged from the
- * old stylesheet and from the favicon. No new brand was invented here.
+ * Every colour is declared exactly once on `:root`, and the dark theme is
+ * one `prefers-color-scheme` block that redefines the SAME names and
+ * nothing else. No component below hard-codes a colour, so the two themes
+ * cannot drift apart. `lib/theme.test.ts` asserts that: the two blocks
+ * must define the same key set, every `--color-*` must point at a token
+ * that exists, and the neutral ramp must be provably hueless.
  *
  * No web fonts: the binary carries the UI, and a font file is 40-100 KB
- * of it. The system stack is also the only stack that needs no network
- * at all, which is the point of a locally-served studio.
+ * of it. The system stack is also the only stack that needs no network at
+ * all, which is the point of a locally-served studio.
+ *
+ * Four rules the rest of the app is built on. They are written down
+ * because a rule nobody can quote is a rule that drifts:
+ *
+ *   COLOUR. There is no brand hue. The neutral ramp is zero-chroma and
+ *     the ONLY chromatic tokens in the file are `ok`, `warn` and `err`.
+ *     That is deliberate: chroma now means one thing, "something is
+ *     wrong or something finished", so a red badge cannot be mistaken
+ *     for decoration. Nothing may add a fourth hue without answering
+ *     what state it names.
+ *
+ *   EMPHASIS, since no hue carries it. Four levers, in order of volume:
+ *     INK (`--ink`, a solid near-black fill in light and near-white in
+ *     dark) for the one primary action in a view; WEIGHT (500 for a
+ *     selected row or a label, 600 for a title, never bold) for "you are
+ *     here"; SURFACE (raised / inset / sunken behind a hairline) for
+ *     grouping and selection; CONTRAST (`fg` / `muted` / `faint`) for
+ *     rank inside a block. `--ink` IS `--fg`; the separate name exists so
+ *     that "this is the loudest thing on the screen" is a decision a
+ *     component states rather than one it borrows from a text colour.
+ *
+ *   TYPE. One scale, six steps, no arbitrary sizes in components.
+ *     2xs 11 · xs 12 · sm 14 (the UI default) · base 15 (prose) ·
+ *     lg 17 (titles) · xl 20. Plus `code` 13 for monospace blocks.
+ *     Before this, `text-[0.6875rem]` appeared 23 times in the app — one
+ *     magic number restated 23 times, which is this repo's dominant
+ *     defect shape wearing a stylesheet.
+ *
+ *   ELEVATION. Borders separate; shadows only FLOAT. A hairline is the
+ *     boundary between two surfaces that both sit on the page — cards,
+ *     tables, inputs, the sidebar — and it never gets a shadow. Exactly
+ *     one shadow token exists, `--shadow-pop`, for things genuinely
+ *     above the page: popovers and the mobile drawer.
  */
 
 :root {
-  --bg: oklch(0.976 0.001 286);
+  /* The neutral ramp. Zero chroma, by rule and by test. */
+  --bg: oklch(0.985 0 0);
   --bg-raised: oklch(1 0 0);
-  --bg-sunken: oklch(0.949 0.002 286);
-  --bg-inset: oklch(0.962 0.003 286);
-  --border: oklch(0.898 0.003 286);
-  --border-strong: oklch(0.808 0.005 286);
-  --fg: oklch(0.187 0.004 286);
-  --fg-muted: oklch(0.492 0.006 286);
-  --fg-faint: oklch(0.634 0.007 286);
-  --accent: oklch(0.518 0.164 39.5);
-  --accent-hover: oklch(0.463 0.155 39.5);
-  --accent-fg: oklch(1 0 0);
-  --accent-soft: oklch(0.958 0.019 47);
-  --accent-ring: oklch(0.518 0.164 39.5 / 0.45);
-  --ok: oklch(0.556 0.121 154);
+  --bg-sunken: oklch(0.971 0 0);
+  --bg-inset: oklch(0.949 0 0);
+  --border: oklch(0.909 0 0);
+  --border-strong: oklch(0.833 0 0);
+  --fg: oklch(0.205 0 0);
+  --fg-muted: oklch(0.478 0 0);
+  --fg-faint: oklch(0.598 0 0);
+
+  /* Ink — emphasis as a fill rather than as a hue. */
+  --ink: oklch(0.205 0 0);
+  --ink-hover: oklch(0.318 0 0);
+  --on-ink: oklch(1 0 0);
+
+  /* Selection, and the one soft neutral a "chosen" row sits on. */
+  --select: oklch(0.884 0 0);
+
+  /* The only chroma in this file. Each one names a STATE. */
+  --ok: oklch(0.546 0.124 154);
   --ok-soft: oklch(0.955 0.03 154);
-  --warn: oklch(0.586 0.124 74);
+  --warn: oklch(0.566 0.124 74);
   --warn-soft: oklch(0.958 0.045 85);
   --err: oklch(0.535 0.183 26);
   --err-soft: oklch(0.955 0.028 20);
+
   --shadow-color: 0 0 0;
-  --shadow-strength: 0.055;
+  --shadow-strength: 0.07;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: oklch(0.176 0.003 286);
-    --bg-raised: oklch(0.219 0.004 286);
-    --bg-sunken: oklch(0.145 0.003 286);
-    --bg-inset: oklch(0.253 0.005 286);
-    --border: oklch(0.296 0.006 286);
-    --border-strong: oklch(0.402 0.008 286);
-    --fg: oklch(0.937 0.003 286);
-    --fg-muted: oklch(0.714 0.008 286);
-    --fg-faint: oklch(0.564 0.009 286);
-    --accent: oklch(0.712 0.163 46);
-    --accent-hover: oklch(0.769 0.147 50);
-    --accent-fg: oklch(0.176 0.03 40);
-    --accent-soft: oklch(0.276 0.045 42);
-    --accent-ring: oklch(0.712 0.163 46 / 0.5);
+    --bg: oklch(0.178 0 0);
+    --bg-raised: oklch(0.216 0 0);
+    --bg-sunken: oklch(0.152 0 0);
+    --bg-inset: oklch(0.262 0 0);
+    --border: oklch(0.301 0 0);
+    --border-strong: oklch(0.408 0 0);
+    --fg: oklch(0.962 0 0);
+    --fg-muted: oklch(0.719 0 0);
+    --fg-faint: oklch(0.586 0 0);
+
+    /* Ink inverts with the page: the loudest fill is always the one
+     * furthest from the background, which in the dark is white. */
+    --ink: oklch(0.962 0 0);
+    --ink-hover: oklch(0.865 0 0);
+    --on-ink: oklch(0.178 0 0);
+
+    --select: oklch(0.345 0 0);
+
     --ok: oklch(0.762 0.143 158);
-    --ok-soft: oklch(0.27 0.045 158);
+    --ok-soft: oklch(0.276 0.045 158);
     --warn: oklch(0.79 0.132 79);
-    --warn-soft: oklch(0.29 0.045 79);
-    --err: oklch(0.699 0.163 21);
-    --err-soft: oklch(0.29 0.06 21);
+    --warn-soft: oklch(0.293 0.045 79);
+    --err: oklch(0.712 0.163 21);
+    --err-soft: oklch(0.293 0.06 21);
+
     --shadow-color: 0 0 0;
-    --shadow-strength: 0.4;
+    --shadow-strength: 0.45;
   }
 }
 
@@ -83,10 +125,10 @@
   --color-fg: var(--fg);
   --color-muted: var(--fg-muted);
   --color-faint: var(--fg-faint);
-  --color-accent: var(--accent);
-  --color-accent-hover: var(--accent-hover);
-  --color-accent-fg: var(--accent-fg);
-  --color-accent-soft: var(--accent-soft);
+  --color-ink: var(--ink);
+  --color-ink-hover: var(--ink-hover);
+  --color-on-ink: var(--on-ink);
+  --color-select: var(--select);
   --color-ok: var(--ok);
   --color-ok-soft: var(--ok-soft);
   --color-warn: var(--warn);
@@ -98,14 +140,34 @@
     system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
     sans-serif;
   --font-mono:
-    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-    "Liberation Mono", monospace;
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
 
-  --radius-card: 0.75rem;
+  /* The type scale, stated once. `2xs` and `code` are the two steps this
+   * app was writing as arbitrary values; `base` and `lg` are pulled in
+   * from Tailwind's defaults because a 16px body and an 18px card title
+   * read as a marketing page, not as a tool. */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-code: 0.8125rem;
+  --text-code--line-height: 1.35rem;
+  --text-base: 0.9375rem;
+  --text-base--line-height: 1.55;
+  --text-lg: 1.0625rem;
+  --text-lg--line-height: 1.4;
+  --text-xl: 1.25rem;
+  --text-xl--line-height: 1.35;
 
-  --shadow-panel:
-    0 1px 2px rgb(var(--shadow-color) / var(--shadow-strength)),
-    0 8px 24px -12px rgb(var(--shadow-color) / var(--shadow-strength));
+  /* One radius, four derived steps, so "rounded like the rest of it" is
+   * a decision made once. sm 6 · md 8 · lg 10 · xl 14 · 2xl 20. */
+  --radius: 0.625rem;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 10px);
+
+  /* The only shadow. Things that float, and nothing else. */
   --shadow-pop:
     0 4px 8px -4px rgb(var(--shadow-color) / var(--shadow-strength)),
     0 16px 40px -16px rgb(var(--shadow-color) / var(--shadow-strength));
@@ -125,20 +187,21 @@
     color: var(--fg);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
-    font-size: 0.9375rem;
-    line-height: 1.55;
+    text-rendering: optimizeLegibility;
+    font-size: var(--text-sm);
+    line-height: 1.5;
   }
 
-  /* Keyboard focus stays visible everywhere; the accent ring is the one
-   * signal a keyboard-only user has for where they are. */
+  /* Keyboard focus stays visible everywhere. With no accent hue the ring
+   * is ink, which is the highest-contrast outline either theme has. */
   :focus-visible {
-    outline: 2px solid var(--accent);
+    outline: 2px solid var(--ink);
     outline-offset: 2px;
-    border-radius: 0.375rem;
+    border-radius: var(--radius-sm);
   }
 
   ::selection {
-    background: var(--accent-soft);
+    background: var(--select);
     color: var(--fg);
   }
 
@@ -148,28 +211,40 @@
     scrollbar-width: thin;
     scrollbar-color: var(--border-strong) transparent;
   }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 4px;
+  }
 }
 
 @layer components {
   /* Prose for rendered model output. Scoped to `.aui-md` so it can never
    * leak into the chrome around it. */
   .aui-md {
-    @apply text-[0.9375rem] leading-relaxed;
+    @apply text-base leading-relaxed;
   }
   .aui-md > * + * {
     @apply mt-3;
   }
   .aui-md h1 {
-    @apply mt-5 text-xl font-semibold tracking-tight;
+    @apply mt-5 text-lg font-semibold tracking-tight;
   }
   .aui-md h2 {
-    @apply mt-5 text-lg font-semibold tracking-tight;
+    @apply mt-5 text-base font-semibold tracking-tight;
   }
   .aui-md h3,
   .aui-md h4,
   .aui-md h5,
   .aui-md h6 {
-    @apply mt-4 text-base font-semibold;
+    @apply mt-4 text-sm font-semibold;
   }
   .aui-md ul {
     @apply list-disc space-y-1 pl-5;
@@ -181,8 +256,14 @@
   .aui-md li > ol {
     @apply mt-1;
   }
+  /* A link has no hue to be recognised by, so the underline carries it:
+   * always present, thickened on hover rather than switched on. One rule
+   * for prose links and for the inline links in the chrome — the two used
+   * to be an accent colour each and would now be two copies of a
+   * five-utility string that has to stay in step. */
+  .link,
   .aui-md a {
-    @apply text-accent underline decoration-accent/40 underline-offset-2 hover:decoration-accent;
+    @apply font-medium text-fg underline decoration-line-strong decoration-2 underline-offset-2 hover:decoration-fg;
   }
   .aui-md blockquote {
     @apply border-l-2 border-line-strong pl-3 text-muted italic;
@@ -201,7 +282,7 @@
     @apply bg-sunken font-medium;
   }
   .aui-md :not(pre) > code {
-    @apply rounded bg-inset px-1 py-0.5 font-mono text-[0.85em];
+    @apply rounded-sm bg-inset px-1 py-0.5 font-mono text-[0.85em];
   }
   /* A fenced block renders as `<CodeHeader/>` followed by `<pre>` — two
    * siblings, not a wrapper — so the card outline is drawn by joining
@@ -211,7 +292,7 @@
     @apply mt-3 rounded-t-lg border border-b-0 border-line;
   }
   .aui-md pre {
-    @apply overflow-x-auto rounded-lg border border-line bg-sunken p-3 font-mono text-[0.8125rem] leading-relaxed;
+    @apply overflow-x-auto rounded-lg border border-line bg-sunken p-3 font-mono text-code;
   }
   .aui-md .aui-code-header + pre {
     @apply mt-0 rounded-t-none border-t-0;

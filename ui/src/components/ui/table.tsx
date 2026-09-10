@@ -1,7 +1,15 @@
 import type * as React from "react";
 import { cn } from "@/lib/utils";
 
-/** Wide tables scroll inside their own box; the page never scrolls sideways. */
+/**
+ * Wide tables scroll inside their own box; the page never scrolls sideways.
+ *
+ * Every cell below is `whitespace-nowrap`, and that is what makes this box
+ * work at all. A `w-full` table with auto layout does not overflow when it
+ * is too wide — it WRAPS, so at 430px `708.7 MB` broke across two lines
+ * and every row in the inventory was 57px instead of 35px, with nothing to
+ * scroll. Let the cells refuse to wrap and the overflow lands here.
+ */
 export function TableScroll({
   className,
   ...props
@@ -32,7 +40,7 @@ export function Th({
     <th
       scope="col"
       className={cn(
-        "sticky top-0 z-10 border-b border-line bg-raised px-3 py-2 text-left text-[0.6875rem] font-semibold tracking-wide text-faint uppercase",
+        "sticky top-0 z-10 border-b border-line bg-raised px-3 py-2 text-left text-2xs font-semibold tracking-wide whitespace-nowrap text-faint uppercase",
         numeric && "text-right tabular-nums",
         className,
       )}
@@ -50,9 +58,9 @@ export function Td({
   return (
     <td
       className={cn(
-        "border-b border-line/70 px-3 py-2 align-middle",
+        "border-b border-line/70 px-3 py-2 align-middle whitespace-nowrap",
         numeric && "text-right tabular-nums",
-        mono && "font-mono text-[0.8125rem]",
+        mono && "font-mono text-code",
         className,
       )}
       {...props}

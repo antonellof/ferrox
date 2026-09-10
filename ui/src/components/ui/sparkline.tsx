@@ -51,25 +51,25 @@ export function Sparkline({
       preserveAspectRatio="none"
       role="img"
       aria-label={`${label}: ${points.length} samples, ${min.toFixed(1)} to ${max.toFixed(1)}`}
-      className={cn("h-8 w-full overflow-visible", className)}
+      className={cn("h-8 w-full overflow-visible text-fg", className)}
     >
       <defs>
         <linearGradient id={id} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.25" />
-          <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
+          <stop offset="0%" stopColor="currentColor" stopOpacity="0.25" />
+          <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
         </linearGradient>
       </defs>
       <path d={area} fill={`url(#${id})`} />
       <path
         d={path}
         fill="none"
-        stroke="var(--accent)"
+        stroke="currentColor"
         strokeWidth="1.5"
         strokeLinejoin="round"
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
       />
-      <circle cx={last[0]} cy={last[1]} r="2" fill="var(--accent)" />
+      <circle cx={last[0]} cy={last[1]} r="2" fill="currentColor" />
     </svg>
   );
 }

@@ -10,16 +10,17 @@ import {
 } from "@assistant-ui/react";
 import {
   ArrowDown,
+  ArrowUp,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
   Copy,
-  CornerDownLeft,
   Pencil,
   RefreshCw,
   Square,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { FerroxMark } from "@/components/logo";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/screens/chat/markdown";
 import { ReasoningPart } from "@/screens/chat/reasoning";
@@ -58,14 +59,14 @@ function StatLine() {
   const pieces = [outcome, stats.line].filter(Boolean);
   if (!pieces.length) {
     return stats.requestId ? (
-      <p className="mt-2 font-mono text-[0.6875rem] text-faint">
+      <p className="mt-2 font-mono text-2xs text-faint">
         {stats.requestId}
       </p>
     ) : null;
   }
   return (
     <p
-      className="mt-2 font-mono text-[0.6875rem] leading-relaxed text-faint"
+      className="mt-2 font-mono text-2xs leading-relaxed text-faint"
       title="Reported by the server in the final SSE chunk's usage block. The browser holds no stopwatch."
     >
       {pieces.join("  ·  ")}
@@ -84,7 +85,7 @@ function BranchPicker({ className }: { className?: string }) {
           <ChevronLeft />
         </Button>
       </BranchPickerPrimitive.Previous>
-      <span className="font-mono text-[0.6875rem]">
+      <span className="font-mono text-2xs">
         <BranchPickerPrimitive.Number /> / <BranchPickerPrimitive.Count />
       </span>
       <BranchPickerPrimitive.Next asChild>
@@ -98,7 +99,10 @@ function BranchPicker({ className }: { className?: string }) {
 
 const UserMessage: FC = () => (
   <MessagePrimitive.Root className="group flex w-full flex-col items-end gap-1">
-    <div className="max-w-[min(44rem,88%)] rounded-2xl rounded-br-md bg-accent px-3.5 py-2 text-accent-fg">
+    {/* A raised neutral, not a filled block. A solid bubble in the one
+        emphasis colour the app has would turn a long conversation into a
+        stripe; the tail and the alignment already say who is speaking. */}
+    <div className="max-w-[min(44rem,88%)] rounded-2xl rounded-br-md border border-line bg-inset px-3.5 py-2 text-fg">
       <MessagePrimitive.Parts />
     </div>
     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
@@ -138,11 +142,8 @@ const EditComposer: FC = () => (
 const AssistantMessage: FC = () => (
   <MessagePrimitive.Root className="group flex w-full flex-col gap-1">
     <div className="flex gap-3">
-      <span
-        aria-hidden
-        className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md border border-line bg-inset text-[0.625rem] font-bold text-accent"
-      >
-        Fe
+      <span className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md border border-line bg-inset text-muted">
+        <FerroxMark className="size-3.5" />
       </span>
       <div className="min-w-0 flex-1">
         <div className="min-w-0">
@@ -194,12 +195,7 @@ function Empty({ disabledReason }: { disabledReason: string | null }) {
   return (
     <ThreadPrimitive.Empty>
       <div className="flex flex-col items-center gap-5 px-4 py-14 text-center">
-        <span
-          aria-hidden
-          className="grid size-12 place-items-center rounded-2xl bg-accent text-lg font-bold text-accent-fg shadow-panel"
-        >
-          Fe
-        </span>
+        <FerroxMark className="size-11 text-fg" />
         <div className="space-y-1.5">
           <p className="text-base font-semibold tracking-tight">
             Talk to your local model
@@ -242,7 +238,7 @@ function Composer({ disabledReason }: { disabledReason: string | null }) {
   return (
     <ComposerPrimitive.Root
       className={cn(
-        "flex w-full items-end gap-2 rounded-2xl border border-line bg-raised p-2 shadow-panel transition-colors focus-within:border-accent",
+        "flex w-full items-end gap-2 rounded-2xl border border-line bg-raised p-2 transition-colors focus-within:border-line-strong",
         disabledReason && "opacity-70",
       )}
     >
@@ -260,19 +256,30 @@ function Composer({ disabledReason }: { disabledReason: string | null }) {
         // adapter POSTs /v1/cancel with the request_id the server named
         // on the first chunk. It cancels on the server, not just here.
         <ComposerPrimitive.Cancel asChild>
-          <Button variant="default" size="icon" aria-label="Stop generating">
-            <Square className="fill-current" />
+          <Button variant="default" size="round" aria-label="Stop generating">
+            {/* A square is optically larger than a circle of the same
+                box, so the stop glyph is drawn smaller than the arrow
+                rather than at the size class's default. */}
+            <Square className="size-3 fill-current" />
           </Button>
         </ComposerPrimitive.Cancel>
       ) : (
         <ComposerPrimitive.Send asChild>
           <Button
             variant="primary"
-            size="icon"
+            size="round"
             aria-label="Send"
             disabled={!!disabledReason}
           >
-            <CornerDownLeft />
+            {/* An up arrow, not the ↵ corner-arrow that was here. The
+                corner glyph hangs its mass down and to the left, so in a
+                circle it is off-centre on BOTH axes and can only be
+                fixed by a nudge nobody can check. This one is symmetric
+                left-to-right, so the horizontal centre is free; the head
+                puts more ink in the top half than the shaft puts in the
+                bottom, so the perceived centre sits high and the glyph
+                is dropped half a pixel to bring it back. */}
+            <ArrowUp className="translate-y-[0.5px]" />
           </Button>
         </ComposerPrimitive.Send>
       )}

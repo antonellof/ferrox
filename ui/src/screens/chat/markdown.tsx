@@ -26,7 +26,7 @@ import { CopyButton } from "@/components/ui/copy-button";
 function CodeHeader({ language, code }: CodeHeaderProps) {
   return (
     <div className="aui-code-header flex items-center gap-2 bg-inset px-3 py-1.5">
-      <span className="font-mono text-[0.6875rem] tracking-wide text-faint uppercase">
+      <span className="font-mono text-2xs tracking-wide text-faint uppercase">
         {language || "text"}
       </span>
       <span className="flex-1" />

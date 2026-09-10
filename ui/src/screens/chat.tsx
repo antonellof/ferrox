@@ -159,7 +159,7 @@ function ModelSwitcher({
     <Popover.Root onOpenChange={(open) => open && refresh()}>
       <Popover.Trigger asChild>
         <Button variant="default" size="sm" className="max-w-[16rem]">
-          <span className="truncate font-mono text-[0.6875rem]">
+          <span className="truncate font-mono text-2xs">
             {active ?? "no model loaded"}
           </span>
           <ChevronDown className="text-faint" />
@@ -170,7 +170,7 @@ function ModelSwitcher({
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] rounded-xl border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           {unsupported ? (
             <p className="p-2 text-xs text-faint">
@@ -182,7 +182,7 @@ function ModelSwitcher({
           ) : !inventory.models.length ? (
             <p className="p-2 text-xs text-faint">
               No checkpoints found.{" "}
-              <Link to="/ui/models" className="text-accent underline">
+              <Link to="/ui/models" className="link">
                 Download one
               </Link>
               .
@@ -200,7 +200,7 @@ function ModelSwitcher({
                       className={cn(
                         "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors",
                         isActive
-                          ? "bg-accent-soft text-accent"
+                          ? "bg-inset font-medium text-fg"
                           : "hover:bg-inset disabled:opacity-50",
                       )}
                     >
@@ -215,7 +215,7 @@ function ModelSwitcher({
                         <span className="block truncate font-mono text-xs">
                           {entry.id}
                         </span>
-                        <span className="block truncate text-[0.6875rem] text-faint">
+                        <span className="block truncate text-2xs text-faint">
                           {[entry.quant, entry.arch, fmtBytes(entry.size_bytes)]
                             .filter(Boolean)
                             .join(" · ")}
@@ -228,11 +228,11 @@ function ModelSwitcher({
             </ul>
           )}
           {error ? (
-            <p className="mt-1 rounded-lg bg-err-soft px-2 py-1.5 text-[0.6875rem] text-err">
+            <p className="mt-1 rounded-lg bg-err-soft px-2 py-1.5 text-2xs text-err">
               {error}
             </p>
           ) : null}
-          <p className="mt-1 border-t border-line px-2 pt-1.5 text-[0.6875rem] text-faint">
+          <p className="mt-1 border-t border-line px-2 pt-1.5 text-2xs text-faint">
             Loading a checkpoint swaps it for every client of this server. A
             request already in flight finishes on the weights it started on.
           </p>
@@ -265,7 +265,7 @@ function SamplingPanel({
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] space-y-3 rounded-card border border-line bg-raised p-3 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] space-y-3 rounded-xl border border-line bg-raised p-3 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           <div className="grid grid-cols-3 gap-2">
             <Field label="temperature">
@@ -340,7 +340,7 @@ function ConversationPicker({ transcript }: { transcript: Transcript }) {
       <Popover.Trigger asChild>
         <Button variant="default" size="sm" className="max-w-[14rem]">
           <MessagesSquare className="text-faint" />
-          <span className="truncate text-[0.6875rem]">
+          <span className="truncate text-2xs">
             {current ? conversationLabel(current) : "New conversation"}
           </span>
           <ChevronDown className="text-faint" />
@@ -351,7 +351,7 @@ function ConversationPicker({ transcript }: { transcript: Transcript }) {
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-xl border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           {!summaries.length ? (
             <p className="p-2 text-xs text-faint">
@@ -370,14 +370,14 @@ function ConversationPicker({ transcript }: { transcript: Transcript }) {
                       className={cn(
                         "min-w-0 flex-1 rounded-lg px-2 py-1.5 text-left transition-colors",
                         isActive
-                          ? "bg-accent-soft text-accent"
+                          ? "bg-inset font-medium text-fg"
                           : "hover:bg-inset",
                       )}
                     >
                       <span className="block truncate text-xs">
                         {conversationLabel(entry)}
                       </span>
-                      <span className="block truncate text-[0.6875rem] text-faint">
+                      <span className="block truncate text-2xs text-faint">
                         {[
                           `${entry.message_count} message${entry.message_count === 1 ? "" : "s"}`,
                           entry.model,
@@ -399,7 +399,7 @@ function ConversationPicker({ transcript }: { transcript: Transcript }) {
               })}
             </ul>
           )}
-          <p className="mt-1 border-t border-line px-2 pt-1.5 text-[0.6875rem] text-faint">
+          <p className="mt-1 border-t border-line px-2 pt-1.5 text-2xs text-faint">
             Stored on the server, not in this browser. Deleting one deletes it
             for every client of this server, and nothing is ever deleted to
             make room.
@@ -441,7 +441,7 @@ function ChatInner({
           <Badge tone="err">synthetic weights</Badge>
         ) : null}
         {transcript.saving ? (
-          <span className="text-[0.6875rem] text-faint">saving…</span>
+          <span className="text-2xs text-faint">saving…</span>
         ) : null}
         <span className="flex-1" />
         {transcript.mode === "server" ? (
@@ -520,7 +520,7 @@ function ChatInner({
         <Thread
           disabledReason={disabledReason}
           footer={
-            <p className="text-center text-[0.6875rem] text-faint">
+            <p className="text-center text-2xs text-faint">
               {transcript.mode === "server"
                 ? "Transcript is stored on the server, branches included, and survives this browser."
                 : transcript.mode === "local"

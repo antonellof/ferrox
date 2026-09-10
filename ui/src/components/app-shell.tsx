@@ -3,24 +3,9 @@ import { NavLink, Outlet } from "react-router";
 import { PanelLeft, X } from "lucide-react";
 import { SCREENS } from "@/lib/screens";
 import { HealthPill } from "@/components/health-pill";
+import { FerroxWordmark } from "@/components/logo";
 import { useHealth } from "@/lib/use-health";
 import { cn } from "@/lib/utils";
-
-function Brand() {
-  return (
-    <div className="flex items-center gap-2.5">
-      <span
-        aria-hidden
-        className="grid size-7 shrink-0 place-items-center rounded-[0.4375rem] bg-accent text-[0.8125rem] font-bold text-accent-fg"
-      >
-        Fe
-      </span>
-      <span className="text-sm font-semibold tracking-tight">
-        Ferrox Studio
-      </span>
-    </div>
-  );
-}
 
 function Nav({ onNavigate }: { onNavigate?: () => void }) {
   return (
@@ -30,12 +15,15 @@ function Nav({ onNavigate }: { onNavigate?: () => void }) {
           key={to}
           to={to}
           onClick={onNavigate}
+          // Where you are is not news: you clicked it. A neutral fill
+          // plus a weight bump says it without making the loudest thing
+          // on a screen where nothing is wrong be "which tab am I on".
           className={({ isActive }) =>
             cn(
               "group flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors",
               isActive
-                ? "bg-accent-soft font-medium text-accent"
-                : "text-muted hover:bg-inset hover:text-fg",
+                ? "bg-inset font-medium text-fg"
+                : "text-muted hover:bg-inset/60 hover:text-fg",
             )
           }
         >
@@ -44,11 +32,11 @@ function Nav({ onNavigate }: { onNavigate?: () => void }) {
               <Icon
                 className={cn(
                   "size-4 shrink-0",
-                  isActive ? "text-accent" : "text-faint group-hover:text-muted",
+                  isActive ? "text-fg" : "text-faint group-hover:text-muted",
                 )}
               />
               <span className="min-w-0 flex-1 truncate">{label}</span>
-              <span className="hidden text-[0.6875rem] text-faint lg:group-hover:inline">
+              <span className="hidden text-2xs text-faint lg:group-hover:inline">
                 {blurb}
               </span>
             </>
@@ -66,7 +54,7 @@ export function AppShell() {
   const sidebar = (
     <div className="flex h-full flex-col gap-4 p-3">
       <div className="flex items-center justify-between px-1 pt-1">
-        <Brand />
+        <FerroxWordmark />
         <button
           type="button"
           onClick={() => setDrawer(false)}
@@ -122,7 +110,7 @@ export function AppShell() {
           >
             <PanelLeft className="size-4" />
           </button>
-          <Brand />
+          <FerroxWordmark />
         </header>
 
         <main id="main" tabIndex={-1} className="min-h-0 flex-1 overflow-hidden">

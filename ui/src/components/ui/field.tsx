@@ -3,7 +3,7 @@ import * as LabelPrimitive from "@radix-ui/react-label";
 import { cn } from "@/lib/utils";
 
 const control =
-  "w-full rounded-lg border border-line bg-raised px-2.5 py-1.5 text-sm text-fg placeholder:text-faint transition-colors hover:border-line-strong focus:border-accent focus:outline-none focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-1 disabled:opacity-50";
+  "w-full rounded-lg border border-line bg-raised px-2.5 py-1.5 text-sm text-fg placeholder:text-faint transition-colors hover:border-line-strong focus:border-ink focus:outline-none focus-visible:outline-2 focus-visible:outline-ink focus-visible:outline-offset-1 disabled:opacity-50";
 
 export function Input({ className, ...props }: React.ComponentProps<"input">) {
   return <input className={cn(control, "h-9", className)} {...props} />;
@@ -49,7 +49,7 @@ export function Field({
     <div className={cn("flex min-w-0 flex-col gap-1.5", className)}>
       <Label htmlFor={htmlFor}>{label}</Label>
       {children}
-      {hint ? <p className="text-[0.6875rem] text-faint">{hint}</p> : null}
+      {hint ? <p className="text-2xs text-faint">{hint}</p> : null}
     </div>
   );
 }
