@@ -40,10 +40,24 @@ import {
 } from "@/components/ui/card";
 import { EmptyState, Notice, Skeleton } from "@/components/ui/feedback";
 import { Sparkline } from "@/components/ui/sparkline";
+import { StatTile, StatValue } from "@/components/ui/stat";
 import { Table, TableScroll, Td, Tr } from "@/components/ui/table";
-import { Page, PageHeader } from "@/components/page";
-import { ApiError, getJson, routes, type Stats, type StatsRow } from "@/lib/api";
-import { fmtClock, fmtDuration, fmtInt, fmtMs, fmtNum, isNum } from "@/lib/format";
+import { Page, PageHeader, SectionLabel } from "@/components/page";
+import {
+  ApiError,
+  getJson,
+  routes,
+  type Stats,
+  type StatsRow,
+} from "@/lib/api";
+import {
+  fmtClock,
+  fmtDuration,
+  fmtInt,
+  fmtMs,
+  fmtNum,
+  isNum,
+} from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const POLL_MS = 2000;
@@ -58,17 +72,14 @@ function Counter({
   hint?: string;
 }) {
   return (
-    <div
-      className="rounded-lg border border-line bg-inset/40 px-3 py-2"
-      title={hint}
-    >
-      <p className="text-[0.6875rem] tracking-wide text-faint uppercase">
-        {label}
-      </p>
-      <p className="mt-0.5 font-mono text-lg tabular-nums">{value}</p>
-    </div>
+    <StatTile label={label} hint={hint}>
+      <StatValue>{value}</StatValue>
+    </StatTile>
   );
 }
+
+/** The one grid the counters and the trend lines share. */
+const TILES = "grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5";
 
 const column = createColumnHelper<StatsRow>();
 
@@ -284,19 +295,17 @@ export function ActivityScreen() {
 
       {stale ? <Notice tone="err">Stale: {stale}</Notice> : null}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Server counters</CardTitle>
-        </CardHeader>
-        <CardBody>
+      <section>
+        <SectionLabel>Server counters</SectionLabel>
+        <div>
           {!stats ? (
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+            <div className={TILES}>
               {Array.from({ length: 9 }, (_, i) => (
-                <Skeleton key={i} className="h-14" />
+                <Skeleton key={i} className="h-16" />
               ))}
             </div>
           ) : (
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+            <div className={TILES}>
               <Counter
                 label="uptime"
                 value={fmtDuration(stats.uptime_seconds)}
@@ -327,7 +336,9 @@ export function ActivityScreen() {
               />
               <Counter
                 label="queued"
-                value={isNum(stats.queue_depth) ? fmtInt(stats.queue_depth) : "—"}
+                value={
+                  isNum(stats.queue_depth) ? fmtInt(stats.queue_depth) : "—"
+                }
                 hint="Requests waiting for a decode slot in the continuous-batching scheduler. “—” means there is no queue to measure: without batching every request gets its own thread and nothing waits in front of anything."
               />
               <Counter
@@ -350,31 +361,34 @@ export function ActivityScreen() {
               />
             </div>
           )}
-        </CardBody>
-      </Card>
+        </div>
+      </section>
 
       {trend.length >= 2 ? (
-        <div className="grid gap-3 sm:grid-cols-3">
-          {(
-            [
-              ["TTFT (ms)", trend.map((r) => (isNum(r.ttft_ms) ? r.ttft_ms : null))],
+        <section>
+          <SectionLabel>
+            Trend over the last {trend.length} requests
+          </SectionLabel>
+          <div className="grid gap-3 sm:grid-cols-3">
+            {(
               [
-                "decode (ms)",
-                trend.map((r) => (isNum(r.decode_ms) ? r.decode_ms : null)),
-              ],
-              ["decode tok/s", trend.map(decodeRate)],
-            ] as const
-          ).map(([label, values]) => (
-            <Card key={label}>
-              <CardBody className="space-y-2 p-3">
-                <p className="text-[0.6875rem] tracking-wide text-faint uppercase">
-                  {label}
-                </p>
+                [
+                  "TTFT (ms)",
+                  trend.map((r) => (isNum(r.ttft_ms) ? r.ttft_ms : null)),
+                ],
+                [
+                  "decode (ms)",
+                  trend.map((r) => (isNum(r.decode_ms) ? r.decode_ms : null)),
+                ],
+                ["decode tok/s", trend.map(decodeRate)],
+              ] as const
+            ).map(([label, values]) => (
+              <StatTile key={label} label={label}>
                 <Sparkline label={label} values={[...values]} />
-              </CardBody>
-            </Card>
-          ))}
-        </div>
+              </StatTile>
+            ))}
+          </div>
+        </section>
       ) : null}
 
       <Card>
@@ -391,8 +405,8 @@ export function ActivityScreen() {
           </CardBody>
         ) : !recent.length ? (
           <EmptyState icon={Inbox} title="No requests yet">
-            Send a message on the Chat screen, or point an editor at this
-            server — external traffic lands here too.
+            Send a message on the Chat screen, or point an editor at this server
+            — external traffic lands here too.
           </EmptyState>
         ) : (
           <TableScroll className="max-h-[32rem] overflow-y-auto">
@@ -403,8 +417,7 @@ export function ActivityScreen() {
                     {group.headers.map((header) => {
                       const numeric = (
                         header.column.columnDef.meta as
-                          | { numeric?: boolean }
-                          | undefined
+                          { numeric?: boolean } | undefined
                       )?.numeric;
                       const sorted = header.column.getIsSorted();
                       const Icon =
@@ -417,13 +430,13 @@ export function ActivityScreen() {
                         <th
                           key={header.id}
                           scope="col"
-                          className="sticky top-0 z-10 border-b border-line bg-raised p-0 text-left"
+                          className="sticky top-0 z-10 border-b border-line bg-raised p-0 text-left first:[&>button]:pl-4 last:[&>button]:pr-4"
                         >
                           <button
                             type="button"
                             onClick={header.column.getToggleSortingHandler()}
                             className={cn(
-                              "flex w-full items-center gap-1 px-3 py-2 text-[0.6875rem] font-semibold tracking-wide text-faint uppercase hover:text-fg",
+                              "flex w-full items-center gap-1 px-3 py-2 text-2xs font-medium tracking-wide text-faint uppercase transition-colors hover:text-fg",
                               numeric && "justify-end",
                             )}
                           >
@@ -453,8 +466,7 @@ export function ActivityScreen() {
                         numeric={
                           (
                             cell.column.columnDef.meta as
-                              | { numeric?: boolean }
-                              | undefined
+                              { numeric?: boolean } | undefined
                           )?.numeric
                         }
                       >

@@ -91,7 +91,10 @@ copyleft dependency is not a lockfile detail.
 src/
   main.tsx              router: /, /ui and /ui/<screen> all resolve here
   index.css             design tokens + Tailwind theme (one light block,
-                        one prefers-color-scheme block, nothing else)
+                        one prefers-color-scheme block, nothing else),
+                        and the three rules — type scale, spacing
+                        rhythm, elevation — that every component obeys.
+                        Read its header before changing anything visual.
   lib/api.ts            the ONLY place that talks HTTP
   lib/api.test.ts       stream recovery, against a stubbed fetch
   lib/format.ts         "unknown" is an em dash, never a zero

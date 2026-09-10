@@ -1,13 +1,14 @@
 import type * as React from "react";
 import { cn } from "@/lib/utils";
 
+// A card is a hairline and a surface, never a shadow. See the ELEVATION
+// rule in `index.css`: what floats gets `shadow-pop`, and a card does
+// not float — it sits on the page beside its neighbours.
+
 export function Card({ className, ...props }: React.ComponentProps<"section">) {
   return (
     <section
-      className={cn(
-        "rounded-card border border-line bg-raised shadow-panel",
-        className,
-      )}
+      className={cn("rounded-lg border border-line bg-raised", className)}
       {...props}
     />
   );
@@ -41,13 +42,14 @@ export function CardDescription({
   className,
   ...props
 }: React.ComponentProps<"p">) {
-  return <p className={cn("text-xs text-faint", className)} {...props} />;
+  return <p className={cn("text-xs text-muted", className)} {...props} />;
 }
 
 export function CardBody({ className, ...props }: React.ComponentProps<"div">) {
   return <div className={cn("p-4", className)} {...props} />;
 }
 
+/** The quiet strip under a card that explains what the card just showed. */
 export function CardFooter({
   className,
   ...props
@@ -55,7 +57,7 @@ export function CardFooter({
   return (
     <footer
       className={cn(
-        "border-t border-line px-4 py-2.5 text-xs text-faint",
+        "rounded-b-lg border-t border-line bg-sunken/70 px-4 py-3 text-xs leading-relaxed text-faint",
         className,
       )}
       {...props}

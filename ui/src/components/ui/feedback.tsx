@@ -4,13 +4,13 @@ import { AlertTriangle, CircleAlert, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const noticeVariants = cva(
-  "flex items-start gap-2.5 rounded-lg border px-3 py-2.5 text-sm",
+  "flex items-start gap-2.5 rounded-md border px-3 py-2.5 text-sm leading-relaxed",
   {
     variants: {
       tone: {
-        info: "border-line bg-inset text-muted",
-        warn: "border-warn/35 bg-warn-soft text-warn",
-        err: "border-err/35 bg-err-soft text-err",
+        info: "border-line bg-inset/60 text-muted",
+        warn: "border-warn/30 bg-warn-soft text-warn",
+        err: "border-err/30 bg-err-soft text-err",
       },
     },
     defaultVariants: { tone: "info" },
@@ -32,7 +32,7 @@ export function Notice({
       className={cn(noticeVariants({ tone }), className)}
       {...props}
     >
-      <Icon className="mt-0.5 size-4 shrink-0" aria-hidden />
+      <Icon className="mt-0.5 size-4 shrink-0 opacity-80" aria-hidden />
       <div className="min-w-0 flex-1">{children}</div>
     </div>
   );
@@ -65,17 +65,19 @@ export function EmptyState({
   return (
     <div
       className={cn(
-        "flex flex-col items-center justify-center gap-3 px-6 py-12 text-center",
+        "flex flex-col items-center justify-center gap-3 px-6 py-14 text-center",
         className,
       )}
     >
-      <span className="grid size-11 place-items-center rounded-xl border border-line bg-inset text-faint">
-        <Icon className="size-5" />
+      <span className="grid size-9 place-items-center rounded-lg border border-line bg-sunken text-faint">
+        <Icon className="size-4" />
       </span>
       <div className="space-y-1">
         <p className="text-sm font-medium text-fg">{title}</p>
         {children ? (
-          <div className="mx-auto max-w-md text-xs text-faint">{children}</div>
+          <div className="mx-auto max-w-md text-xs leading-relaxed text-faint">
+            {children}
+          </div>
         ) : null}
       </div>
       {action}

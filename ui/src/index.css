@@ -10,63 +10,91 @@
  * drift apart — adding a token to one and forgetting the other is a
  * missing-variable error, not a silently wrong shade.
  *
- * The accent is ferrox's burnt orange, carried over unchanged from the
- * old stylesheet and from the favicon. No new brand was invented here.
+ * The accent is ferrox's burnt orange, and it is now EXACTLY the
+ * favicon's `#c2410c` rather than a near-miss of it. No new brand was
+ * invented here.
  *
  * No web fonts: the binary carries the UI, and a font file is 40-100 KB
  * of it. The system stack is also the only stack that needs no network
  * at all, which is the point of a locally-served studio.
+ *
+ * Three rules the rest of the app is built on. They are written down
+ * because a rule nobody can quote is a rule that drifts:
+ *
+ *   TYPE. One scale, six steps, no arbitrary sizes in components.
+ *     2xs 11 · xs 12 · sm 14 (the UI default) · base 15 (prose) ·
+ *     lg 17 (titles) · xl 20. Plus `code` 13 for monospace blocks.
+ *     Weight does the emphasis: 400 body, 500 labels and active rows,
+ *     600 titles. Nothing is bold. `tracking-tight` on titles only.
+ *     Before this, `text-[0.6875rem]` appeared 22 times in the app —
+ *     one magic number restated 22 times, which is this repo's dominant
+ *     defect shape wearing a stylesheet.
+ *
+ *   RHYTHM. Chrome (sidebar, popovers, toolbars) runs on 8px: `p-2`,
+ *     `gap-1`. Content runs on 16/24: `p-4`, `gap-4`, `md:p-6 md:gap-6`.
+ *     Card gutters are 16 and the table columns inside them line up with
+ *     that gutter rather than starting 4px in.
+ *
+ *   ELEVATION. Borders separate; shadows only FLOAT. A hairline is the
+ *     boundary between two surfaces that both sit on the page — cards,
+ *     tables, inputs, the sidebar — and it never gets a shadow. Exactly
+ *     one shadow token survives, `--shadow-pop`, and it is only for
+ *     things that are genuinely above the page: popovers and the mobile
+ *     drawer. That is why the light theme separates a white card from an
+ *     off-white page with a border, and the dark theme lifts the card
+ *     ABOVE the page instead: a border-only card needs the border to be
+ *     visible, and a fill reads better in the dark.
  */
 
 :root {
-  --bg: oklch(0.976 0.001 286);
+  /* Neutrals are zero-chroma. The old ramp carried a 286° blue tint that
+   * fought the orange accent everywhere the two met. */
+  --bg: oklch(0.985 0 0);
   --bg-raised: oklch(1 0 0);
-  --bg-sunken: oklch(0.949 0.002 286);
-  --bg-inset: oklch(0.962 0.003 286);
-  --border: oklch(0.898 0.003 286);
-  --border-strong: oklch(0.808 0.005 286);
-  --fg: oklch(0.187 0.004 286);
-  --fg-muted: oklch(0.492 0.006 286);
-  --fg-faint: oklch(0.634 0.007 286);
-  --accent: oklch(0.518 0.164 39.5);
-  --accent-hover: oklch(0.463 0.155 39.5);
+  --bg-sunken: oklch(0.971 0 0);
+  --bg-inset: oklch(0.952 0 0);
+  --border: oklch(0.912 0 0);
+  --border-strong: oklch(0.836 0 0);
+  --fg: oklch(0.205 0 0);
+  --fg-muted: oklch(0.481 0 0);
+  --fg-faint: oklch(0.595 0 0);
+  --accent: oklch(0.547 0.17 41);
+  --accent-hover: oklch(0.487 0.158 41);
   --accent-fg: oklch(1 0 0);
-  --accent-soft: oklch(0.958 0.019 47);
-  --accent-ring: oklch(0.518 0.164 39.5 / 0.45);
-  --ok: oklch(0.556 0.121 154);
+  --accent-soft: oklch(0.951 0.024 55);
+  --ok: oklch(0.546 0.124 154);
   --ok-soft: oklch(0.955 0.03 154);
-  --warn: oklch(0.586 0.124 74);
+  --warn: oklch(0.566 0.124 74);
   --warn-soft: oklch(0.958 0.045 85);
   --err: oklch(0.535 0.183 26);
   --err-soft: oklch(0.955 0.028 20);
   --shadow-color: 0 0 0;
-  --shadow-strength: 0.055;
+  --shadow-strength: 0.07;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: oklch(0.176 0.003 286);
-    --bg-raised: oklch(0.219 0.004 286);
-    --bg-sunken: oklch(0.145 0.003 286);
-    --bg-inset: oklch(0.253 0.005 286);
-    --border: oklch(0.296 0.006 286);
-    --border-strong: oklch(0.402 0.008 286);
-    --fg: oklch(0.937 0.003 286);
-    --fg-muted: oklch(0.714 0.008 286);
-    --fg-faint: oklch(0.564 0.009 286);
-    --accent: oklch(0.712 0.163 46);
-    --accent-hover: oklch(0.769 0.147 50);
-    --accent-fg: oklch(0.176 0.03 40);
-    --accent-soft: oklch(0.276 0.045 42);
-    --accent-ring: oklch(0.712 0.163 46 / 0.5);
+    --bg: oklch(0.178 0 0);
+    --bg-raised: oklch(0.213 0 0);
+    --bg-sunken: oklch(0.152 0 0);
+    --bg-inset: oklch(0.262 0 0);
+    --border: oklch(0.297 0 0);
+    --border-strong: oklch(0.401 0 0);
+    --fg: oklch(0.963 0 0);
+    --fg-muted: oklch(0.719 0 0);
+    --fg-faint: oklch(0.593 0 0);
+    --accent: oklch(0.723 0.161 48);
+    --accent-hover: oklch(0.782 0.142 52);
+    --accent-fg: oklch(0.181 0.028 41);
+    --accent-soft: oklch(0.283 0.048 43);
     --ok: oklch(0.762 0.143 158);
-    --ok-soft: oklch(0.27 0.045 158);
+    --ok-soft: oklch(0.276 0.045 158);
     --warn: oklch(0.79 0.132 79);
-    --warn-soft: oklch(0.29 0.045 79);
-    --err: oklch(0.699 0.163 21);
-    --err-soft: oklch(0.29 0.06 21);
+    --warn-soft: oklch(0.293 0.045 79);
+    --err: oklch(0.712 0.163 21);
+    --err-soft: oklch(0.293 0.06 21);
     --shadow-color: 0 0 0;
-    --shadow-strength: 0.4;
+    --shadow-strength: 0.45;
   }
 }
 
@@ -98,14 +126,34 @@
     system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
     sans-serif;
   --font-mono:
-    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-    "Liberation Mono", monospace;
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
 
-  --radius-card: 0.75rem;
+  /* The type scale, stated once. `2xs` and `code` are the two steps this
+   * app was writing as arbitrary values; `base` and `lg` are pulled in
+   * from Tailwind's defaults because a 16px body and an 18px card title
+   * read as a marketing page, not as a tool. */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-code: 0.8125rem;
+  --text-code--line-height: 1.35rem;
+  --text-base: 0.9375rem;
+  --text-base--line-height: 1.55;
+  --text-lg: 1.0625rem;
+  --text-lg--line-height: 1.4;
+  --text-xl: 1.25rem;
+  --text-xl--line-height: 1.35;
 
-  --shadow-panel:
-    0 1px 2px rgb(var(--shadow-color) / var(--shadow-strength)),
-    0 8px 24px -12px rgb(var(--shadow-color) / var(--shadow-strength));
+  /* One radius, four derived steps, so "rounded like the rest of it" is
+   * a decision made once. sm 6 · md 8 · lg 10 · xl 14 · 2xl 20. */
+  --radius: 0.625rem;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 10px);
+
+  /* The only shadow. Things that float, and nothing else. */
   --shadow-pop:
     0 4px 8px -4px rgb(var(--shadow-color) / var(--shadow-strength)),
     0 16px 40px -16px rgb(var(--shadow-color) / var(--shadow-strength));
@@ -125,8 +173,9 @@
     color: var(--fg);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
-    font-size: 0.9375rem;
-    line-height: 1.55;
+    text-rendering: optimizeLegibility;
+    font-size: var(--text-sm);
+    line-height: 1.5;
   }
 
   /* Keyboard focus stays visible everywhere; the accent ring is the one
@@ -134,7 +183,7 @@
   :focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-    border-radius: 0.375rem;
+    border-radius: var(--radius-sm);
   }
 
   ::selection {
@@ -148,28 +197,40 @@
     scrollbar-width: thin;
     scrollbar-color: var(--border-strong) transparent;
   }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 4px;
+  }
 }
 
 @layer components {
   /* Prose for rendered model output. Scoped to `.aui-md` so it can never
    * leak into the chrome around it. */
   .aui-md {
-    @apply text-[0.9375rem] leading-relaxed;
+    @apply text-base leading-relaxed;
   }
   .aui-md > * + * {
     @apply mt-3;
   }
   .aui-md h1 {
-    @apply mt-5 text-xl font-semibold tracking-tight;
+    @apply mt-5 text-lg font-semibold tracking-tight;
   }
   .aui-md h2 {
-    @apply mt-5 text-lg font-semibold tracking-tight;
+    @apply mt-5 text-base font-semibold tracking-tight;
   }
   .aui-md h3,
   .aui-md h4,
   .aui-md h5,
   .aui-md h6 {
-    @apply mt-4 text-base font-semibold;
+    @apply mt-4 text-sm font-semibold;
   }
   .aui-md ul {
     @apply list-disc space-y-1 pl-5;
@@ -201,7 +262,7 @@
     @apply bg-sunken font-medium;
   }
   .aui-md :not(pre) > code {
-    @apply rounded bg-inset px-1 py-0.5 font-mono text-[0.85em];
+    @apply rounded-sm bg-inset px-1 py-0.5 font-mono text-[0.85em];
   }
   /* A fenced block renders as `<CodeHeader/>` followed by `<pre>` — two
    * siblings, not a wrapper — so the card outline is drawn by joining
@@ -211,7 +272,7 @@
     @apply mt-3 rounded-t-lg border border-b-0 border-line;
   }
   .aui-md pre {
-    @apply overflow-x-auto rounded-lg border border-line bg-sunken p-3 font-mono text-[0.8125rem] leading-relaxed;
+    @apply overflow-x-auto rounded-lg border border-line bg-sunken p-3 font-mono text-code;
   }
   .aui-md .aui-code-header + pre {
     @apply mt-0 rounded-t-none border-t-0;

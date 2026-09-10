@@ -48,7 +48,13 @@ function visual({ health, error }: HealthState): Visual {
   }
 }
 
-export function HealthPill({ state, className }: { state: HealthState; className?: string }) {
+export function HealthPill({
+  state,
+  className,
+}: {
+  state: HealthState;
+  className?: string;
+}) {
   const v = visual(state);
   const health = state.health;
 
@@ -56,7 +62,7 @@ export function HealthPill({ state, className }: { state: HealthState; className
     <Popover.Root>
       <Popover.Trigger
         className={cn(
-          "group flex w-full items-center gap-2 rounded-lg border border-line bg-raised px-2.5 py-2 text-left text-xs transition-colors hover:border-line-strong hover:bg-inset",
+          "group flex w-full items-center gap-2 rounded-md border border-line bg-raised px-2 py-1.5 text-left text-xs transition-colors hover:border-line-strong hover:bg-inset",
           className,
         )}
         title="Backend status — open for capability detail"
@@ -72,7 +78,10 @@ export function HealthPill({ state, className }: { state: HealthState; className
           ) : null}
           <span className={cn("size-2 rounded-full", v.dot)} />
         </span>
-        <span className="min-w-0 flex-1 truncate font-medium" aria-live="polite">
+        <span
+          className="min-w-0 flex-1 truncate font-medium"
+          aria-live="polite"
+        >
           {v.label}
         </span>
         <ChevronDown className="size-3.5 shrink-0 text-faint transition-transform group-data-[state=open]:rotate-180" />
@@ -84,7 +93,7 @@ export function HealthPill({ state, className }: { state: HealthState; className
           align="start"
           sideOffset={8}
           collisionPadding={12}
-          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-3 text-xs shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-lg border border-line bg-raised p-3 text-xs leading-relaxed shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           {health ? (
             <div className="space-y-3">
@@ -97,8 +106,7 @@ export function HealthPill({ state, className }: { state: HealthState; className
                 ) : null}
                 {health.model ? (
                   <p className="text-muted">
-                    model{" "}
-                    <span className="font-mono">{health.model.id}</span>
+                    model <span className="font-mono">{health.model.id}</span>
                     {health.model.tokenizer
                       ? ` · tokenizer ${health.model.tokenizer}`
                       : ""}
@@ -150,7 +158,8 @@ export function HealthPill({ state, className }: { state: HealthState; className
             </div>
           ) : (
             <p className="text-muted">
-              The server did not answer <code className="font-mono">/health</code>
+              The server did not answer{" "}
+              <code className="font-mono">/health</code>
               {state.error ? `: ${state.error.message}` : "."}
             </p>
           )}

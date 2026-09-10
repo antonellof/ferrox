@@ -23,6 +23,12 @@ export function Table({ className, ...props }: React.ComponentProps<"table">) {
   );
 }
 
+/* A table inside a card shares the card's 16px gutter: the first column
+ * lines up with the card title above it and the last with its right
+ * edge. Cells are px-3 between those, which is where the density comes
+ * from — dense but breathing, rather than dense and cramped. */
+const gutter = "px-3 first:pl-4 last:pr-4";
+
 export function Th({
   className,
   numeric,
@@ -32,7 +38,10 @@ export function Th({
     <th
       scope="col"
       className={cn(
-        "sticky top-0 z-10 border-b border-line bg-raised px-3 py-2 text-left text-[0.6875rem] font-semibold tracking-wide text-faint uppercase",
+        // A wrapped header doubles the height of every row under it, so
+        // a narrow window scrolls the table instead of reflowing it.
+        "sticky top-0 z-10 border-b border-line bg-raised py-2 text-left text-2xs font-medium tracking-wide whitespace-nowrap text-faint uppercase",
+        gutter,
         numeric && "text-right tabular-nums",
         className,
       )}
@@ -50,9 +59,14 @@ export function Td({
   return (
     <td
       className={cn(
-        "border-b border-line/70 px-3 py-2 align-middle",
+        // `w-full` plus auto layout means a table too wide for its box
+        // WRAPS its cells rather than overflowing — "1.04 GB" breaking
+        // across two lines and doubling every row. Nowrap makes it
+        // overflow instead, which is what `TableScroll` is for.
+        "border-b border-line py-2 align-middle whitespace-nowrap",
+        gutter,
         numeric && "text-right tabular-nums",
-        mono && "font-mono text-[0.8125rem]",
+        mono && "font-mono text-code",
         className,
       )}
       {...props}
@@ -63,7 +77,10 @@ export function Td({
 export function Tr({ className, ...props }: React.ComponentProps<"tr">) {
   return (
     <tr
-      className={cn("transition-colors hover:bg-inset/60", className)}
+      className={cn(
+        "transition-colors last:[&>td]:border-b-0 hover:bg-inset/50",
+        className,
+      )}
       {...props}
     />
   );

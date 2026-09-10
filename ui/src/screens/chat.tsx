@@ -15,13 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Field, Input, Textarea } from "@/components/ui/field";
 import { Notice } from "@/components/ui/feedback";
 import { Badge } from "@/components/ui/badge";
-import {
-  ApiError,
-  getJson,
-  postJson,
-  routes,
-  type Inventory,
-} from "@/lib/api";
+import { ApiError, getJson, postJson, routes, type Inventory } from "@/lib/api";
 import type { HealthState } from "@/lib/use-health";
 import { fmtBytes } from "@/lib/format";
 import { useLatest } from "@/lib/use-latest";
@@ -32,10 +26,7 @@ import {
   useFerroxRuntime,
   type Sampling,
 } from "@/screens/chat/runtime";
-import {
-  useTranscript,
-  type Transcript,
-} from "@/screens/chat/persistence";
+import { useTranscript, type Transcript } from "@/screens/chat/persistence";
 import { conversationLabel } from "@/lib/conversations";
 
 const SETTINGS_KEY = "ferrox.studio.sampling.v1";
@@ -156,7 +147,7 @@ function ModelSwitcher({
     <Popover.Root onOpenChange={(open) => open && refresh()}>
       <Popover.Trigger asChild>
         <Button variant="default" size="sm" className="max-w-[16rem]">
-          <span className="truncate font-mono text-[0.6875rem]">
+          <span className="truncate font-mono text-2xs">
             {active ?? "no model loaded"}
           </span>
           <ChevronDown className="text-faint" />
@@ -167,7 +158,7 @@ function ModelSwitcher({
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] rounded-lg border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           {unsupported ? (
             <p className="p-2 text-xs text-faint">
@@ -195,10 +186,12 @@ function ModelSwitcher({
                       disabled={isActive || !!busy}
                       onClick={() => swap(entry.id)}
                       className={cn(
-                        "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors",
+                        "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors",
+                        // The check icon already says which one is
+                        // selected; the fill only has to say "this row".
                         isActive
-                          ? "bg-accent-soft text-accent"
-                          : "hover:bg-inset disabled:opacity-50",
+                          ? "bg-inset font-medium text-fg"
+                          : "hover:bg-inset/60 disabled:opacity-50",
                       )}
                     >
                       {busy === entry.id ? (
@@ -212,7 +205,7 @@ function ModelSwitcher({
                         <span className="block truncate font-mono text-xs">
                           {entry.id}
                         </span>
-                        <span className="block truncate text-[0.6875rem] text-faint">
+                        <span className="block truncate text-2xs text-faint">
                           {[entry.quant, entry.arch, fmtBytes(entry.size_bytes)]
                             .filter(Boolean)
                             .join(" · ")}
@@ -225,11 +218,11 @@ function ModelSwitcher({
             </ul>
           )}
           {error ? (
-            <p className="mt-1 rounded-lg bg-err-soft px-2 py-1.5 text-[0.6875rem] text-err">
+            <p className="mt-1 rounded-md bg-err-soft px-2 py-1.5 text-2xs text-err">
               {error}
             </p>
           ) : null}
-          <p className="mt-1 border-t border-line px-2 pt-1.5 text-[0.6875rem] text-faint">
+          <p className="mt-1 border-t border-line px-2 pt-1.5 text-2xs text-faint">
             Loading a checkpoint swaps it for every client of this server. A
             request already in flight finishes on the weights it started on.
           </p>
@@ -262,7 +255,7 @@ function SamplingPanel({
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] space-y-3 rounded-card border border-line bg-raised p-3 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(24rem,calc(100vw-1.5rem))] space-y-3 rounded-lg border border-line bg-raised p-3 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           <div className="grid grid-cols-3 gap-2">
             <Field label="temperature">
@@ -337,7 +330,7 @@ function ConversationPicker({ transcript }: { transcript: Transcript }) {
       <Popover.Trigger asChild>
         <Button variant="default" size="sm" className="max-w-[14rem]">
           <MessagesSquare className="text-faint" />
-          <span className="truncate text-[0.6875rem]">
+          <span className="truncate text-2xs">
             {current ? conversationLabel(current) : "New conversation"}
           </span>
           <ChevronDown className="text-faint" />
@@ -348,7 +341,7 @@ function ConversationPicker({ transcript }: { transcript: Transcript }) {
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-lg border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           {!summaries.length ? (
             <p className="p-2 text-xs text-faint">
@@ -365,16 +358,16 @@ function ConversationPicker({ transcript }: { transcript: Transcript }) {
                       type="button"
                       onClick={() => transcript.open(entry.id)}
                       className={cn(
-                        "min-w-0 flex-1 rounded-lg px-2 py-1.5 text-left transition-colors",
+                        "min-w-0 flex-1 rounded-md px-2 py-1.5 text-left transition-colors",
                         isActive
-                          ? "bg-accent-soft text-accent"
-                          : "hover:bg-inset",
+                          ? "bg-inset font-medium text-fg"
+                          : "hover:bg-inset/60",
                       )}
                     >
                       <span className="block truncate text-xs">
                         {conversationLabel(entry)}
                       </span>
-                      <span className="block truncate text-[0.6875rem] text-faint">
+                      <span className="block truncate text-2xs text-faint">
                         {[
                           `${entry.message_count} message${entry.message_count === 1 ? "" : "s"}`,
                           entry.model,
@@ -396,10 +389,10 @@ function ConversationPicker({ transcript }: { transcript: Transcript }) {
               })}
             </ul>
           )}
-          <p className="mt-1 border-t border-line px-2 pt-1.5 text-[0.6875rem] text-faint">
+          <p className="mt-1 border-t border-line px-2 pt-1.5 text-2xs text-faint">
             Stored on the server, not in this browser. Deleting one deletes it
-            for every client of this server, and nothing is ever deleted to
-            make room.
+            for every client of this server, and nothing is ever deleted to make
+            room.
           </p>
         </Popover.Content>
       </Popover.Portal>
@@ -432,13 +425,11 @@ function ChatInner({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-raised/70 px-4 py-2.5 backdrop-blur">
-        <h1 className="text-sm font-semibold tracking-tight">Chat</h1>
-        {serving.synthetic ? (
-          <Badge tone="err">synthetic weights</Badge>
-        ) : null}
+      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-raised px-3 py-2">
+        <h1 className="px-1 text-sm font-semibold tracking-tight">Chat</h1>
+        {serving.synthetic ? <Badge tone="err">synthetic weights</Badge> : null}
         {transcript.saving ? (
-          <span className="text-[0.6875rem] text-faint">saving…</span>
+          <span className="text-2xs text-faint">saving…</span>
         ) : null}
         <span className="flex-1" />
         {transcript.mode === "server" ? (
@@ -457,7 +448,7 @@ function ChatInner({
       serving.synthetic ||
       disabledReason ||
       transcript.error ? (
-        <div className="shrink-0 space-y-2 border-b border-line bg-raised/40 px-4 py-2.5">
+        <div className="shrink-0 space-y-2 border-b border-line bg-sunken px-4 py-3">
           {transcript.error ? (
             <Notice tone="err">
               This conversation is not being saved: {transcript.error} The
@@ -487,7 +478,7 @@ function ChatInner({
         <Thread
           disabledReason={disabledReason}
           footer={
-            <p className="text-center text-[0.6875rem] text-faint">
+            <p className="text-center text-2xs text-faint">
               {transcript.mode === "server"
                 ? "Transcript is stored on the server, branches included, and survives this browser."
                 : transcript.mode === "local"

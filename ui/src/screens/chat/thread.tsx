@@ -58,14 +58,12 @@ function StatLine() {
   const pieces = [outcome, stats.line].filter(Boolean);
   if (!pieces.length) {
     return stats.requestId ? (
-      <p className="mt-2 font-mono text-[0.6875rem] text-faint">
-        {stats.requestId}
-      </p>
+      <p className="mt-2 font-mono text-2xs text-faint">{stats.requestId}</p>
     ) : null;
   }
   return (
     <p
-      className="mt-2 font-mono text-[0.6875rem] leading-relaxed text-faint"
+      className="mt-2 font-mono text-2xs leading-relaxed text-faint"
       title="Reported by the server in the final SSE chunk's usage block. The browser holds no stopwatch."
     >
       {pieces.join("  ·  ")}
@@ -84,7 +82,7 @@ function BranchPicker({ className }: { className?: string }) {
           <ChevronLeft />
         </Button>
       </BranchPickerPrimitive.Previous>
-      <span className="font-mono text-[0.6875rem]">
+      <span className="font-mono text-2xs">
         <BranchPickerPrimitive.Number /> / <BranchPickerPrimitive.Count />
       </span>
       <BranchPickerPrimitive.Next asChild>
@@ -96,9 +94,15 @@ function BranchPicker({ className }: { className?: string }) {
   );
 }
 
+// The user's turn is a NEUTRAL bubble. It used to be a solid accent
+// block, which made the loudest thing in a transcript the text the user
+// had just typed and already knew — and on a long conversation it turned
+// the column into a stripe of orange. The references (Jan, Ollama) all
+// land on a quiet raised bubble; ferrox's accent is better spent on the
+// send button, which is the only thing in the composer worth pointing at.
 const UserMessage: FC = () => (
   <MessagePrimitive.Root className="group flex w-full flex-col items-end gap-1">
-    <div className="max-w-[min(44rem,88%)] rounded-2xl rounded-br-md bg-accent px-3.5 py-2 text-accent-fg">
+    <div className="max-w-[min(44rem,88%)] rounded-xl rounded-br-sm bg-inset px-3.5 py-2 text-fg">
       <MessagePrimitive.Parts />
     </div>
     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
@@ -115,7 +119,7 @@ const UserMessage: FC = () => (
 );
 
 const EditComposer: FC = () => (
-  <ComposerPrimitive.Root className="ml-auto w-full max-w-[min(44rem,88%)] rounded-2xl border border-line bg-raised p-2">
+  <ComposerPrimitive.Root className="ml-auto w-full max-w-[min(44rem,88%)] rounded-xl border border-line bg-raised p-2">
     <ComposerPrimitive.Input
       autoFocus
       className="w-full resize-none bg-transparent px-1.5 py-1 text-sm outline-none"
@@ -140,7 +144,7 @@ const AssistantMessage: FC = () => (
     <div className="flex gap-3">
       <span
         aria-hidden
-        className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md border border-line bg-inset text-[0.625rem] font-bold text-accent"
+        className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md border border-line bg-raised text-2xs font-semibold text-accent"
       >
         Fe
       </span>
@@ -152,7 +156,7 @@ const AssistantMessage: FC = () => (
         </div>
 
         <MessagePrimitive.Error>
-          <div className="mt-2 flex items-start gap-2 rounded-lg border border-err/35 bg-err-soft px-3 py-2 text-sm text-err">
+          <div className="mt-2 flex items-start gap-2 rounded-md border border-err/30 bg-err-soft px-3 py-2 text-sm text-err">
             <CircleAlert className="mt-0.5 size-4 shrink-0" aria-hidden />
             <ErrorPrimitive.Message className="min-w-0 whitespace-pre-wrap" />
           </div>
@@ -196,15 +200,15 @@ function Empty({ disabledReason }: { disabledReason: string | null }) {
       <div className="flex flex-col items-center gap-5 px-4 py-14 text-center">
         <span
           aria-hidden
-          className="grid size-12 place-items-center rounded-2xl bg-accent text-lg font-bold text-accent-fg shadow-panel"
+          className="grid size-11 place-items-center rounded-xl bg-accent text-base font-semibold text-accent-fg"
         >
           Fe
         </span>
         <div className="space-y-1.5">
-          <p className="text-base font-semibold tracking-tight">
+          <p className="text-lg font-semibold tracking-tight">
             Talk to your local model
           </p>
-          <p className="mx-auto max-w-md text-xs text-faint">
+          <p className="mx-auto max-w-md text-xs leading-relaxed text-muted">
             This screen posts to{" "}
             <code className="font-mono">/v1/chat/completions</code> with{" "}
             <code className="font-mono">stream: true</code> — the same endpoint
@@ -242,7 +246,7 @@ function Composer({ disabledReason }: { disabledReason: string | null }) {
   return (
     <ComposerPrimitive.Root
       className={cn(
-        "flex w-full items-end gap-2 rounded-2xl border border-line bg-raised p-2 shadow-panel transition-colors focus-within:border-accent",
+        "flex w-full items-end gap-2 rounded-xl border border-line bg-raised p-2 transition-colors focus-within:border-accent",
         disabledReason && "opacity-70",
       )}
     >
@@ -251,9 +255,10 @@ function Composer({ disabledReason }: { disabledReason: string | null }) {
         autoFocus
         disabled={!!disabledReason}
         placeholder={
-          disabledReason ?? "Message…  (Enter to send, Shift+Enter for a newline)"
+          disabledReason ??
+          "Message…  (Enter to send, Shift+Enter for a newline)"
         }
-        className="max-h-56 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-faint disabled:cursor-not-allowed"
+        className="max-h-56 min-h-8 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-relaxed outline-none placeholder:text-faint disabled:cursor-not-allowed"
       />
       {isRunning ? (
         // Stop is both tiers: assistant-ui aborts the fetch, and the
@@ -294,7 +299,7 @@ export function Thread({
         autoScroll
         className="relative flex min-h-0 flex-1 flex-col overflow-y-auto"
       >
-        <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 px-4 py-6">
+        <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 px-4 py-6 md:px-6">
           <Empty disabledReason={disabledReason} />
           <ThreadPrimitive.Messages
             components={{
@@ -307,7 +312,7 @@ export function Thread({
         </div>
 
         <ThreadPrimitive.ViewportFooter className="sticky bottom-0 z-10 mt-auto w-full bg-linear-to-t from-bg via-bg to-transparent pt-4">
-          <div className="mx-auto w-full max-w-3xl px-4 pb-3">
+          <div className="mx-auto w-full max-w-3xl px-4 pb-4 md:px-6">
             <div className="relative">
               <ThreadPrimitive.ScrollToBottom asChild>
                 <Button

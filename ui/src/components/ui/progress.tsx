@@ -14,7 +14,8 @@ export function Progress({
   className?: string;
   label?: string;
 }) {
-  const pct = fraction === null ? null : Math.max(0, Math.min(1, fraction)) * 100;
+  const pct =
+    fraction === null ? null : Math.max(0, Math.min(1, fraction)) * 100;
   return (
     <div
       role="progressbar"

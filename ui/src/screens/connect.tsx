@@ -50,9 +50,12 @@ function Snippet({
         <span className="flex-1" />
         <CopyButton getText={() => code} label="Copy snippet" showLabel />
       </CardHeader>
-      <CardBody className="space-y-2 p-0">
-        <p className="px-4 pt-3 text-xs text-faint">{note}</p>
-        <pre className="overflow-x-auto px-4 pb-4 font-mono text-[0.8125rem] leading-relaxed">
+      <CardBody className="space-y-3">
+        <p className="text-xs text-muted">{note}</p>
+        {/* Same treatment a fenced block gets in the transcript: a
+            recessed surface with its own hairline, so "this is verbatim
+            text you paste" looks the same everywhere in the app. */}
+        <pre className="overflow-x-auto rounded-md border border-line bg-sunken p-3 font-mono text-code">
           <code>{code}</code>
         </pre>
       </CardBody>
@@ -165,13 +168,13 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
         <CardHeader>
           <CardTitle>Connection</CardTitle>
           <span className="flex-1" />
-          <span className="font-mono text-[0.6875rem] text-faint">
+          <span className="truncate font-mono text-2xs text-faint">
             {status}
           </span>
         </CardHeader>
         <CardBody>
           <form
-            className="flex flex-wrap items-end gap-3"
+            className="space-y-4"
             onSubmit={(e) => {
               e.preventDefault();
               const nextKey = key.trim();
@@ -181,45 +184,51 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
               setSavedOrigin(apiBase());
             }}
           >
-            <Field
-              label="API base URL"
-              className="min-w-56 flex-1"
-              htmlFor="apibase"
-              hint={
-                origin
-                  ? "Cross-origin: the server needs FERROX_CORS_ORIGINS set to this app's origin."
-                  : `Empty — this app's own requests go to ${window.location.origin} and the dev server proxies them. Snippets below assume the server is at its default ${DEFAULT_SERVER_ORIGIN}.`
-              }
-            >
-              <Input
-                id="apibase"
-                value={origin}
-                onChange={(e) => setOrigin(e.target.value)}
-                placeholder="http://127.0.0.1:8383  (empty = same origin)"
-                className="font-mono text-xs"
-              />
-            </Field>
-            <Field
-              label="API key (FERROX_API_KEY)"
-              className="min-w-56 flex-1"
-              htmlFor="apikey"
-            >
-              <Input
-                id="apikey"
-                type="password"
-                autoComplete="off"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                placeholder="unset — this server may not require one"
-              />
-            </Field>
-            <Button type="submit" variant="primary">
-              <KeyRound />
-              Save
-            </Button>
+            {/* One row, and the hint lives UNDER it rather than inside
+                the first field. As a field hint it was long enough to
+                stretch that column, shove the key field onto its own
+                line and leave the Save button stranded beside a gap. */}
+            <div className="flex flex-wrap items-end gap-3">
+              <Field
+                label="API base URL"
+                className="min-w-56 flex-1"
+                htmlFor="apibase"
+              >
+                <Input
+                  id="apibase"
+                  value={origin}
+                  onChange={(e) => setOrigin(e.target.value)}
+                  placeholder="http://127.0.0.1:8383  (empty = same origin)"
+                  className="font-mono text-xs"
+                />
+              </Field>
+              <Field
+                label="API key (FERROX_API_KEY)"
+                className="min-w-56 flex-1"
+                htmlFor="apikey"
+              >
+                <Input
+                  id="apikey"
+                  type="password"
+                  autoComplete="off"
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                  placeholder="unset — this server may not require one"
+                />
+              </Field>
+              <Button type="submit" variant="primary">
+                <KeyRound />
+                Save
+              </Button>
+            </div>
+            <p className="text-2xs leading-relaxed text-faint">
+              {origin
+                ? "Cross-origin: the server needs FERROX_CORS_ORIGINS set to this app's origin."
+                : `Empty — this app's own requests go to ${window.location.origin} and the dev server proxies them. Snippets below assume the server is at its default ${DEFAULT_SERVER_ORIGIN}.`}
+            </p>
           </form>
         </CardBody>
-        <CardFooter className="space-y-1">
+        <CardFooter className="space-y-2">
           <p>
             The key is stored in this browser's localStorage and sent as an
             Authorization header, exactly as any other client would. Leave it
@@ -228,8 +237,8 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
             in a URL.
           </p>
           <p>
-            Studio is a separate app from the server it talks to. Pointing it
-            at another origin means the operator must start that server with{" "}
+            Studio is a separate app from the server it talks to. Pointing it at
+            another origin means the operator must start that server with{" "}
             <code className="font-mono">
               FERROX_CORS_ORIGINS={window.location.origin}
             </code>

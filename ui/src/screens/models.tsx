@@ -109,7 +109,7 @@ function TaskCard({
   if (task.error) facts.push(task.error);
 
   return (
-    <li className="space-y-2 rounded-lg border border-line bg-inset/40 p-3">
+    <li className="space-y-2 rounded-md border border-line bg-sunken p-3">
       <div className="flex flex-wrap items-center gap-2">
         <span className="min-w-0 flex-1 truncate text-sm font-medium">
           {task.label}
@@ -138,9 +138,7 @@ function TaskCard({
         )}
       </div>
       {terminal ? null : <Progress fraction={fraction} label={task.label} />}
-      <p className="font-mono text-[0.6875rem] text-faint">
-        {facts.join("  ·  ")}
-      </p>
+      <p className="font-mono text-2xs text-muted">{facts.join("  ·  ")}</p>
     </li>
   );
 }
@@ -252,8 +250,8 @@ export function ModelsScreen() {
               Not available in this build. This server answered{" "}
               <code className="font-mono">404</code> for the{" "}
               <code className="font-mono">/admin</code> control surface, so
-              model inventory, loading and downloads cannot be driven from
-              here. Chat and Activity are unaffected.
+              model inventory, loading and downloads cannot be driven from here.
+              Chat and Activity are unaffected.
             </Notice>
           </CardBody>
         </Card>
@@ -316,7 +314,7 @@ export function ModelsScreen() {
               onChange={(e) => setFilter(e.target.value)}
               placeholder="Filter by id, quant or arch"
               aria-label="Filter models"
-              className="h-8 w-56 pl-8 text-xs"
+              className="w-56 pl-8 text-xs"
             />
           </div>
         </CardHeader>
@@ -324,7 +322,7 @@ export function ModelsScreen() {
         {!inventory ? (
           <CardBody className="space-y-2">
             {[0, 1, 2].map((i) => (
-              <Skeleton key={i} className="h-9 w-full" />
+              <Skeleton key={i} className="h-8 w-full" />
             ))}
           </CardBody>
         ) : !inventory.models.length ? (
@@ -405,8 +403,12 @@ export function ModelsScreen() {
                             Unload
                           </Button>
                         ) : (
+                          // Neutral, not accent: twelve accent buttons in a
+                          // column is a wall of orange that reads as an
+                          // alarm. The accent marks the one action a screen
+                          // is FOR, which here is the download form below.
                           <Button
-                            variant="primary"
+                            variant="default"
                             size="sm"
                             disabled={anyLoading}
                             title={
