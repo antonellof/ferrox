@@ -61,7 +61,7 @@ use objc2_metal::{
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLDispatchType, MTLLibrary, MTLResource, MTLResourceOptions, MTLSize,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
@@ -151,56 +151,12 @@ pub(crate) fn memory_barrier_resources(
     memory_barrier_resource_list(encoder, &mut resources);
 }
 
-/// Thread-local pointer + length for a Metal-resident activation buffer
-/// (normalized hidden after final_norm in the dense stack). When set,
-/// [`launch_matvec_fused`] can skip re-uploading if `x` matches.
-#[derive(Clone, Copy)]
-struct ResidentActivation {
-    /// Raw pointer to the MTLBuffer (not retained — caller owns).
-    buf_ptr: *const ProtocolObject<dyn MTLBuffer>,
-    /// Number of f32 elements.
-    len: usize,
-}
-
-thread_local! {
-    /// Holds a resident activation buffer from the dense stack (final_norm
-    /// output in `x_buf`) so the next `output_head.apply_gpu` can reuse it
-    /// without uploading. Cleared after first read.
-    static RESIDENT_ACT: Cell<Option<ResidentActivation>> = const { Cell::new(None) };
-}
-
-/// Stores a resident activation buffer pointer for the current thread.
-/// Used by [`crate::attn::launch_decode_dense_stack`] when writing
-/// final_norm output to scratch so the next matvec can skip upload.
-pub(crate) fn set_resident_activation(buf: &ProtocolObject<dyn MTLBuffer>, len: usize) {
-    RESIDENT_ACT.set(Some(ResidentActivation {
-        buf_ptr: buf as *const _,
-        len,
-    }));
-}
-
-/// Clears the resident activation buffer TLS. Used to ensure clean state
-/// after a decode that doesn't consume the resident buffer.
-pub fn clear_resident_activation() {
-    RESIDENT_ACT.set(None);
-}
-
-/// Checks if a resident activation buffer matches `x`, and if so, returns
-/// the buffer and clears the TLS. Used by [`launch_matvec_fused`].
-fn take_resident_activation_if_matches(
-    x: &[f32],
-) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
-    RESIDENT_ACT.take().and_then(|res| {
-        if res.len == x.len() {
-            // Safety: pointer came from a live buffer in the same thread's
-            // dense stack call (still in scope). We use Retained::retain
-            // to get a new strong reference.
-            unsafe { Retained::retain(res.buf_ptr as *mut _) }
-        } else {
-            None
-        }
-    })
-}
+/// The resident-activation hand-off from the dense stack to the next
+/// matvec used to live here, as a thread-local raw pointer into the
+/// process-wide decode scratch, matched on LENGTH alone. It is now
+/// [`crate::resident_act`], which states the identity it matches on and
+/// why a length was not one.
+pub use crate::resident_act::{clear_resident_activation, resident_activation_reuses};
 
 /// Returns the default Metal device's name, or `None` if this machine
 /// has no Metal-capable GPU (real check, not a compile-time guess).
@@ -5644,24 +5600,10 @@ pub fn launch_matvec_fused(
     let device = &shared.device;
     let queue = &shared.queue;
 
-    // Check if x is already resident from the dense stack (final_norm
-    // output). If so, skip upload and use the resident buffer. Always
-    // clear TLS afterward to prevent stale matches.
-    let x_buf = if let Some(resident) = take_resident_activation_if_matches(x) {
-        resident
-    } else {
-        // No match or no TLS set — clear any stale TLS and upload normally.
-        clear_resident_activation();
-        let mut x_owned = x.to_vec();
-        unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
-                x_owned.len() * 4,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or(MetalError::BufferAllocFailed)?
-    };
+    // Reuses the dense stack's own `x` buffer when `x` IS the vector
+    // that stack just returned, and uploads otherwise. One helper, not
+    // one copy per consumer: see `crate::resident_act`.
+    let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
 
     let mut weight_bufs = Vec::with_capacity(launches.len());
     let mut out_bufs = Vec::with_capacity(launches.len());
@@ -5739,20 +5681,7 @@ pub fn launch_dense_ffn_swiglu(
     let device = &shared.device;
     let queue = &shared.queue;
 
-    let x_buf = if let Some(resident) = take_resident_activation_if_matches(x) {
-        resident
-    } else {
-        clear_resident_activation();
-        let mut x_owned = x.to_vec();
-        unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
-                x_owned.len() * 4,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or(MetalError::BufferAllocFailed)?
-    };
+    let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
 
     let gate_w = resident_weight_buffer(device, gate.weights)?;
     let up_w = resident_weight_buffer(device, up.weights)?;
@@ -7087,20 +7016,7 @@ pub fn launch_moe_topk_swiglu(
     let device = &shared.device;
     let queue = &shared.queue;
 
-    let x_buf = if let Some(resident) = take_resident_activation_if_matches(x) {
-        resident
-    } else {
-        clear_resident_activation();
-        let mut x_owned = x.to_vec();
-        unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(x_owned.as_mut_ptr() as *mut _).unwrap(),
-                x_owned.len() * 4,
-                MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or(MetalError::BufferAllocFailed)?
-    };
+    let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
 
     let q4_0_batched = experts.len() <= 8
         && experts.iter().all(|ex| {

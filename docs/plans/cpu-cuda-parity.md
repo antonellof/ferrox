@@ -238,13 +238,22 @@ could never have worked even had the diagnosis been right.
 **Exit:** tok/s against llama.cpp on the same GPU and model, with
 utilization already high on both sides. Not a utilization target.
 
-**The hazard to design around first.** Metal's equivalent
-(`take_resident_activation_if_matches`) matches on LENGTH alone, which
-is safe there only because exactly one site sets it and it is cleared
-aggressively. Copied to CUDA without that discipline, two same-length
-activations alias and the model silently answers wrong, which is worse
-than being slow. Whatever carries residency needs an identity the
-caller cannot get wrong, not a length comparison.
+**The hazard to design around first, and it was real.** Metal's
+equivalent used to match on LENGTH alone, which this note called safe
+"only because exactly one site sets it and it is cleared aggressively".
+It was not safe. There is one publisher but THREE consumers, each
+routinely handed a `hidden_dim`-long activation that is not the
+published one, and the publication was a thread-local raw pointer into
+`DECODE_SCRATCH` -- a process-wide `Mutex` the pointer escaped, so two
+concurrent `ferrox-server` requests could have one answer the other's
+`lm_head` with its own activation, lengths agreeing by construction.
+Fixed in `ferrox-metal/src/resident_act.rs` (issue #166): the
+publication lives inside the thing the mutex protects, records the host
+address and length of the exact vector the stack returned, is dropped by
+any borrow of the buffer it describes, and holds the guard while the
+buffer is bound. Read that module before writing the CUDA twin.
+Whatever carries residency needs an identity the caller cannot get
+wrong, not a length comparison.
 
 ### 3. Decide the CPU pool by work size, not by environment variable
 

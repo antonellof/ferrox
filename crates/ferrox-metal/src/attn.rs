@@ -75,7 +75,7 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLDevice, MTLResourceOptions, MTLSize,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
@@ -180,24 +180,14 @@ pub fn metal_attn_enabled() -> bool {
     })
 }
 
-thread_local! {
-    /// Per-request flag set by `ferrox-server::generate` when
-    /// `temperature<=0`. Thread-local so concurrent requests sharing one
-    /// `Arc<Decoder>` do not race.
-    static GREEDY_ARGMAX: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Enable/disable greedy GPU argmax for the current thread's decode steps.
-pub fn set_metal_greedy_argmax(on: bool) {
-    GREEDY_ARGMAX.with(|c| c.set(on));
-}
-
-/// True when this thread should fold final_norm+lm_head+argmax into the
-/// dense/MoE stack and return a 1-element `[token_id as f32]` instead of
-/// hidden or full vocab logits.
-pub fn metal_greedy_argmax_active() -> bool {
-    GREEDY_ARGMAX.with(|c| c.get())
-}
+// The greedy GPU argmax fold's setting lives in `crate::greedy_fold`,
+// which states what it is and why running a decode step on the wrong
+// thread used to change the answer (GitHub issue #166). Re-exported
+// here because `ferrox-models` reads it at `ferrox_metal::attn::`.
+pub use crate::greedy_fold::{
+    adopt_greedy_fold, greedy_fold_setting, metal_greedy_argmax_active, set_metal_greedy_argmax,
+    GreedyFold, GreedyFoldGuard,
+};
 
 // Norm (interleaved) and NeoX (split-half) kernels share the same buffer
 // layout so `encode_rope` only swaps the entry point. Math mirrors
@@ -2564,6 +2554,12 @@ pub(crate) struct DecodeScratch {
     pub(crate) logits: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     /// Single u32 slot for greedy argmax-in-stack (always resident; 4 bytes).
     pub(crate) argmax_idx: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// What `x` currently holds, when the dense stack has said so.
+    ///
+    /// Lives HERE, inside the thing the mutex protects, so the claim
+    /// and the buffer it describes cannot be read apart. See
+    /// [`crate::resident_act`] for what happened when it did not.
+    pub(crate) resident: Option<crate::resident_act::ResidentPublication>,
     hidden_cap: usize,
     max_q_cap: usize,
     max_kv_cap: usize,
@@ -2854,11 +2850,30 @@ struct PrefillScratchCaps {
     max_gate: usize,
 }
 
+/// The decode scratch, if no one else is using it right now.
+///
+/// `try_lock` and not `lock`: the only caller outside the decode stack
+/// is [`crate::resident_act`], whose whole contract is that a busy
+/// scratch means "upload normally". Blocking there would mean waiting
+/// out another thread's entire decode step, and it would invert a lock
+/// order. Poisoning is treated as busy for the same reason.
+pub(crate) fn try_lock_decode_scratch(
+) -> Option<std::sync::MutexGuard<'static, Option<DecodeScratch>>> {
+    DECODE_SCRATCH.try_lock().ok()
+}
+
 pub(crate) fn borrow_decode_scratch(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     caps: ScratchCaps,
 ) -> Result<std::sync::MutexGuard<'static, Option<DecodeScratch>>, MetalError> {
     let mut guard = DECODE_SCRATCH.lock().unwrap();
+    // Handing out the guard is handing out the right to WRITE `x`, so
+    // any standing claim about what `x` holds stops being true here.
+    // This is the invalidation the old thread-local publication had no
+    // way to express: it was not stored with the buffer.
+    if let Some(scratch) = guard.as_mut() {
+        scratch.resident = None;
+    }
     let fits = match guard.as_ref() {
         Some(s) => {
             s.hidden_cap >= caps.hidden
@@ -2891,6 +2906,7 @@ pub(crate) fn borrow_decode_scratch(
             down: alloc_f32_buffer(device, caps.hidden)?,
             logits,
             argmax_idx: alloc_u32_buffer(device, 1)?,
+            resident: None,
             hidden_cap: caps.hidden,
             max_q_cap: caps.max_q,
             max_kv_cap: caps.max_kv,
