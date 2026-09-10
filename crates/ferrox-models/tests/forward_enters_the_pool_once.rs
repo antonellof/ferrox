@@ -57,24 +57,27 @@ fn caches(decoder: &Decoder) -> Vec<KvCache> {
         .collect()
 }
 
-/// The two cases `par::on_workers` declines to promote, and so the two
-/// cases where there is nothing here to assert.
+/// The cases `par::on_workers` declines to promote, and so the cases
+/// where there is nothing here to assert.
 ///
-/// `FERROX_CPU_POOL=spin` deliberately keeps the rayon pool unbuilt, and
-/// a GPU backend keeps the step on its own thread because the Metal
-/// stack carries thread-local state across it. Skip rather than assert
-/// something the configuration makes untrue.
+/// `FERROX_CPU_POOL=spin` deliberately keeps the rayon pool unbuilt, a
+/// GPU backend keeps the step on its own thread because the Metal stack
+/// carries thread-local state across it, and a caller already on a
+/// worker needs no promotion. Skip rather than assert something the
+/// configuration makes untrue.
+///
+/// **Probed, not restated.** This used to spell out "not pinned to spin,
+/// and the active backend is CPU" -- a second copy of `par::policy`'s
+/// own rule, including its list of accepted env-var spellings, with
+/// nothing making the two agree. `par::policy::pinned` is `pub(crate)`
+/// to `ferrox-core`, so the copy was the only way to ask. It is not: an
+/// EMPTY step through `on_workers` costs exactly one cold region when it
+/// promotes and zero when it declines, which asks the real predicate and
+/// cannot drift from it.
 fn the_promotion_applies_here() -> bool {
-    let pinned_to_spin = matches!(
-        std::env::var("FERROX_CPU_POOL")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("spin" | "persistent" | "1" | "on" | "true")
-    );
-    !pinned_to_spin
-        && ferrox_core::weight_matrix::active_backend()
-            == ferrox_core::kernel_registry::Backend::Cpu
+    let before = par::cold_regions();
+    par::on_workers(|| {});
+    par::cold_regions() - before == 1
 }
 
 /// Runs `f` and reports how many parallel regions it opened from
@@ -214,5 +217,95 @@ fn the_pool_entry_count_does_not_grow_with_the_number_of_steps() {
     assert_eq!(
         four, 4,
         "four steps must cost four entries, not four times N"
+    );
+}
+
+/// The same property for a DEDICATED engine, on a real checkpoint.
+///
+/// #167 promoted `Decoder` alone, so every engine behind
+/// `engine::Engine` -- Gemma-4, Kimi K3, GLM-5.2, DeepSeek-V4 Pro, the
+/// MLA stack -- still opened a parallel region per matvec. Gemma-4 is
+/// the one of them a real GGUF exists for on this machine, so it is the
+/// one that can be asserted against weights rather than against a
+/// synthetic stand-in; `engine/entry.rs` carries the checkpoint-free
+/// half for the rest, which all share this one wrapper.
+///
+/// Sabotage: drop the `par::on_workers` from `Engine::forward_token` in
+/// `engine/entry.rs` and this reads dozens instead of one.
+#[test]
+#[ignore = "needs models/gemma-4-E2B-it-Q4_K_M.gguf (or FERROX_TEST_GEMMA4_GGUF)"]
+fn a_gemma4_decode_step_enters_the_pool_exactly_once() {
+    use ferrox_models::engine::Engine;
+
+    if !the_promotion_applies_here() {
+        return;
+    }
+    let path = std::env::var("FERROX_TEST_GEMMA4_GGUF").unwrap_or_else(|_| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/gemma-4-E2B-it-Q4_K_M.gguf")
+            .to_string_lossy()
+            .into_owned()
+    });
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("skip: Gemma-4 GGUF missing at {path}");
+        return;
+    }
+    let file = ferrox_gguf::GgufFile::open(&path).expect("open GGUF");
+    let engine = ferrox_models::gemma4_gguf_loader::load_gemma4_engine(&file).expect("load");
+    let mut state = Engine::new_state(&engine);
+
+    // Warm up outside the measurement, for the same reason the generic
+    // cases above do: the first pass through a weight matrix builds its
+    // repack cache, which opens regions of its own.
+    let _ = engine.forward_token(1, 0, &mut state);
+
+    let entries = cold_entries(|| {
+        let _ = engine.forward_token(2, 1, &mut state);
+    });
+    assert_eq!(
+        entries, 1,
+        "a Gemma-4 decode step must enter the pool once, not once per matvec"
+    );
+}
+
+/// The encoder seam pays the same rule.
+///
+/// `TextEncoder::encode` is a forward pass through the same quantized
+/// projections, just over a whole sequence at once instead of one token,
+/// so it opened the same per-matmul cold region and nothing wrapped it.
+/// One pass per request rather than one per token makes it a smaller
+/// win, not a different rule.
+///
+/// Sabotage: drop the `par::on_workers` from `TextEncoder::encode` in
+/// `encoder.rs` and this reads dozens instead of one.
+#[test]
+#[ignore = "needs models/bge-small-en-v1.5-q8_0.gguf (or FERROX_TEST_BERT_GGUF)"]
+fn one_encoder_pass_enters_the_pool_exactly_once() {
+    use ferrox_models::TextEncoder;
+
+    if !the_promotion_applies_here() {
+        return;
+    }
+    let path = std::env::var("FERROX_TEST_BERT_GGUF").unwrap_or_else(|_| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/bge-small-en-v1.5-q8_0.gguf")
+            .to_string_lossy()
+            .into_owned()
+    });
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("skip: BERT GGUF missing at {path}");
+        return;
+    }
+    let encoder = ferrox_models::load_bert_encoder_from_path(&path).expect("load");
+    let tokens: Vec<u32> = encoder.wrap_special(&[100, 200, 300, 400]);
+
+    let _ = encoder.encode(&tokens, None).expect("warm-up pass");
+
+    let entries = cold_entries(|| {
+        let _ = encoder.encode(&tokens, None).expect("measured pass");
+    });
+    assert_eq!(
+        entries, 1,
+        "an encoder pass must enter the pool once, not once per matmul"
     );
 }

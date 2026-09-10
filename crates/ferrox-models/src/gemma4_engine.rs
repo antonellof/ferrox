@@ -247,7 +247,12 @@ impl Engine for Gemma4Engine {
         self.weights.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, pos: usize, state: &mut Self::State) -> Vec<f32> {
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         let hp = &self.hp;
         let mut hidden = self.weights.token_embd.dequant_row(token_id);
         let emb_scale = (hp.hidden_dim as f32).sqrt();

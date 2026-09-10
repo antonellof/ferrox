@@ -274,7 +274,11 @@ impl TextEncoder for BertEncoder {
         Some(PairSequence { tokens, segments })
     }
 
-    fn encode(&self, tokens: &[u32], segments: Option<&[u32]>) -> Result<Vec<f32>, EncodeError> {
+    fn encode_on_worker(
+        &self,
+        tokens: &[u32],
+        segments: Option<&[u32]>,
+    ) -> Result<Vec<f32>, EncodeError> {
         let n = tokens.len();
         if n == 0 {
             return Err(EncodeError::EmptySequence);

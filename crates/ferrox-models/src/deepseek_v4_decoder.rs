@@ -758,6 +758,29 @@ mod tests {
         decoder_cfg_for(LayerCompressor::Hca)
     }
 
+    /// One DeepSeek-V4 decode step enters the CPU worker pool once.
+    ///
+    /// DeepSeek-V4 Pro has no checkpoint this machine can load -- the
+    /// `deepseek_v4_pro` preset is a sketch, not proof of
+    /// real-checkpoint support -- so the instance is the same synthetic
+    /// stack the tests below use. The count does not depend on the
+    /// weights: it is how many times the driving thread crossed rayon's
+    /// cold submission path, which before `engine/entry.rs` was once
+    /// per parallel region and is now once per step.
+    ///
+    /// Sabotage: drop the `par::on_workers` from
+    /// `Engine::forward_token` and this goes red with the region count.
+    #[test]
+    fn one_deepseek_v4_decode_step_enters_the_pool_once() {
+        crate::engine::assert_one_pool_entry_per_step(
+            &crate::DeepseekV4Engine {
+                weights: make_weights(),
+                cfg: decoder_cfg(),
+            },
+            0,
+        );
+    }
+
     /// All three arms of the schedule run and stay finite. The point of
     /// the dispatch is that these are three different mechanisms, so
     /// each has to be exercised as itself rather than one standing in

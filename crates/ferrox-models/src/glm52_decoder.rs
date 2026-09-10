@@ -394,6 +394,29 @@ mod tests {
         }
     }
 
+    /// One GLM-5.2 decode step enters the CPU worker pool once.
+    ///
+    /// GLM-5.2 has no checkpoint this machine can load -- the `glm_5_2`
+    /// preset is a sketch, not proof of real-checkpoint support -- so
+    /// the instance is the same synthetic two-layer stack the tests
+    /// above use. The count does not depend on the weights: it is how
+    /// many times the driving thread crossed rayon's cold submission
+    /// path, which before `engine/entry.rs` was once per parallel
+    /// region and is now once per step.
+    ///
+    /// Sabotage: drop the `par::on_workers` from
+    /// `Engine::forward_token` and this goes red with the region count.
+    #[test]
+    fn one_glm52_decode_step_enters_the_pool_once() {
+        crate::engine::assert_one_pool_entry_per_step(
+            &crate::Glm52Engine {
+                weights: make_weights(),
+                cfg: decoder_cfg(),
+            },
+            0,
+        );
+    }
+
     #[test]
     fn two_mixed_layers_run_end_to_end_across_three_tokens() {
         let weights = make_weights();
