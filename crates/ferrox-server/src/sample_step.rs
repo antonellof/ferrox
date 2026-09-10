@@ -555,6 +555,49 @@ mod tests {
                 p.sampling
             );
         }
+
+        // And the FOURTH: the repetition / presence / frequency
+        // penalties (GitHub issue #170). They are applied to the whole
+        // vocabulary on the HOST, so a device argmax over raw logits
+        // skips them and answers a chain the caller did not configure.
+        //
+        // This route defaults them off, so the bug was only reachable
+        // here for a client that sent one; `ferrox run` defaults
+        // `--repeat-penalty` to 1.1 and had it live on every greedy
+        // `--ngl 99` run.
+        //
+        // Sabotage: revert `needs_vocab_logits` to the old
+        // `greedy_equals_argmax`; all three rows go red.
+        for penalised in [
+            ferrox_models::SamplingParams {
+                repetition_penalty: 1.1,
+                ..ferrox_models::SamplingParams::default()
+            },
+            ferrox_models::SamplingParams {
+                presence_penalty: 0.5,
+                ..ferrox_models::SamplingParams::default()
+            },
+            ferrox_models::SamplingParams {
+                frequency_penalty: 0.5,
+                ..ferrox_models::SamplingParams::default()
+            },
+        ] {
+            let mut p = params(false, 0.0);
+            p.sampling = penalised;
+            assert!(
+                !greedy_gpu_fold_allowed(&p),
+                "a live penalty must stop the fold: {:?}",
+                p.sampling
+            );
+        }
+        // A penalty with no window is no penalty, so the fold stands.
+        let mut windowless = params(false, 0.0);
+        windowless.sampling = ferrox_models::SamplingParams {
+            repetition_penalty: 1.1,
+            penalty_last_n: 0,
+            ..ferrox_models::SamplingParams::default()
+        };
+        assert!(greedy_gpu_fold_allowed(&windowless));
     }
 
     /// A grammar that waits for a trigger, with the trigger MANDATORY --

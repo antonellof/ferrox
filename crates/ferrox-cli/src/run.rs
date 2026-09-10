@@ -406,17 +406,25 @@ impl TokenStep {
     ///
     /// `sampling` is taken because the CHAIN can need the vocabulary
     /// too: `xtc` and `typ_p` remove candidates the argmax may be one
-    /// of, and `dry` moves logits, so at `temperature <= 0` the answer
-    /// is not the argmax of what the device would fold.
-    /// `SamplingParams::greedy_equals_argmax` is the one predicate that
-    /// decides it, shared with the sampler's own greedy fast path and
-    /// with `ferrox_server::generate`'s copy of this gate.
+    /// of, and `dry` and the repetition / presence / frequency
+    /// penalties move logits, so at `temperature <= 0` the answer is not
+    /// the argmax of what the device would fold.
+    /// `SamplingParams::greedy_equals_raw_argmax` is the one predicate
+    /// that decides it, shared with `ferrox_server::generate`'s copy of
+    /// this gate.
+    ///
+    /// RAW argmax, not `chain_keeps_the_argmax`: the fold argmaxes the
+    /// logits before anything on the host touches them, so the
+    /// penalties are skipped too. Reading the sampler's own
+    /// already-penalised predicate here was GitHub issue #170, and with
+    /// `--repeat-penalty` defaulting to 1.1 it was live on every plain
+    /// `--ngl 99 --temp 0` run.
     // Read only by the Metal greedy guard, so a CPU-only build has no
     // fold to refuse and this is genuinely dead there. Same shape and
     // same reason as `ferrox-models`'s `FoldedLmHead`.
     #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     pub fn needs_vocab_logits(&self, sampling: &ferrox_models::sampling::SamplingParams) -> bool {
-        self.grammar.is_some() || !sampling.greedy_equals_argmax()
+        self.grammar.is_some() || !sampling.greedy_equals_raw_argmax()
     }
 
     /// `Ok(None)` means the grammar is SATISFIED and has no legal
@@ -2077,6 +2085,57 @@ mod tests {
         let mut full = vec!["ferrox"];
         full.extend_from_slice(argv);
         Cli::parse_from(full).infer
+    }
+
+    /// GitHub issue #170, at the flag rather than at the predicate: the
+    /// DEFAULT `ferrox run -m … --temp 0 --ngl 99` must not let Metal
+    /// fold `lm_head + argmax` onto the device.
+    ///
+    /// `--repeat-penalty` defaults to **1.1** here, deliberately unlike
+    /// llama.cpp's 1.0 (`docs/FEATURES.md` records the difference), and
+    /// a device argmax over raw logits never applies it. The fold gate
+    /// read a predicate that tested XTC, typical-p and DRY and not the
+    /// penalties, so a plain greedy Metal run returned a token the host
+    /// sampler would not have chosen -- and agreed instead, byte for
+    /// byte, with the same run at `--repeat-penalty 1.0`.
+    ///
+    /// This test is here and not only in `ferrox-models` because the
+    /// DEFAULT is the thing that made it live: the predicate and the
+    /// flag are two structures that have to agree, and `ferrox-models`
+    /// cannot see this crate's `default_value_t`.
+    ///
+    /// Sabotage: set `default_value_t = 1.0` on `--repeat-penalty`; the
+    /// first assertion goes red.
+    #[test]
+    fn the_default_flags_forbid_the_metal_greedy_argmax_fold() {
+        let step = super::TokenStep::new(ferrox_models::sampling::Sampler::new(1), None);
+        let sampling = |argv: &[&str]| {
+            args(argv)
+                .sampling(None, 4096)
+                .expect("no --dry-multiplier, so no vocabulary is needed")
+        };
+
+        let defaults = sampling(&["-m", "m.gguf", "--temp", "0"]);
+        assert_eq!(defaults.repetition_penalty, 1.1, "llama.cpp's is 1.0");
+        assert!(
+            step.needs_vocab_logits(&defaults),
+            "the default repetition penalty is applied on the host, so the \
+             device must hand back a vocabulary and not one token id"
+        );
+
+        // Both of llama.cpp's off switches restore the fold, which is
+        // what makes the assertion above about the penalty and not about
+        // `--top-k 40` or `--min-p 0.05`, which default on too.
+        for off in [
+            ["-m", "m.gguf", "--temp", "0", "--repeat-penalty", "1.0"],
+            ["-m", "m.gguf", "--temp", "0", "--repeat-last-n", "0"],
+        ] {
+            let s = sampling(&off);
+            assert!(
+                !step.needs_vocab_logits(&s),
+                "{off:?} switches the penalties off, so the fold is exact again"
+            );
+        }
     }
 
     /// The banner may not promise a KV dtype the run will not use.

@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(resolved.xtc_threshold, 0.1);
         assert!(!resolved.dry.is_enabled());
         assert!(!resolved.xtc_can_fire());
-        assert!(resolved.greedy_equals_argmax());
+        assert!(resolved.greedy_equals_raw_argmax());
     }
 
     /// DRY asked for against a checkpoint with no vocabulary is a

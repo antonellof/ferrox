@@ -18,7 +18,7 @@
 //! resolves to.
 
 use crate::dry::DryParams;
-use crate::sampler_order::{ChainStep, SamplerOrder};
+use crate::sampler_order::SamplerOrder;
 
 /// Sampling parameters for one generation request. `temperature <= 0.0`
 /// means "sample nothing, take the greedy argmax" -- the same
@@ -145,45 +145,13 @@ impl SamplingParams {
         self.xtc_probability > 0.0 && self.xtc_threshold <= 0.5
     }
 
-    /// True when no step in this chain can move the argmax, so greedy
-    /// decoding may skip building the candidate list entirely -- and a
-    /// backend may fold `lm_head + argmax` into its decode stack.
-    ///
-    /// llama.cpp does not special-case `temp <= 0`: it runs the whole
-    /// chain and lets the temperature step set every logit but the
-    /// maximum to `-inf` (`src/llama-sampler.cpp:271-286`), so a filter
-    /// that removed the maximum changes greedy output. Exactly two do:
-    ///
-    /// * `xtc` removes the TOP candidates, by construction;
-    /// * `typ_p` selects outward from the distribution's entropy and can
-    ///   drop the most likely token -- llama.cpp's own test case
-    ///   `test_typical({0.4, 0.2, 0.2, 0.2}, {0.2, 0.2, 0.2}, 0.5)`
-    ///   (`tests/test-sampling.cpp:346`) drops it.
-    ///
-    /// `dry` changes logits rather than removing candidates, but it can
-    /// change WHICH logit is the maximum, so it counts too. `top_k`,
-    /// `top_p`, `min_p` and `top_n_sigma` all keep the maximum by
-    /// construction, and `penalties` is applied to the whole vocabulary
-    /// before the candidate list exists.
-    ///
-    /// **One predicate, three readers**, because the alternative is this
-    /// repo's dominant defect: the sampler's own greedy shortcut
-    /// ([`super::greedy_choice`]), the Metal `lm_head + argmax` fold in
-    /// `ferrox_server::generate` and the same fold in `ferrox_cli::run`
-    /// must agree about it. A fold that ran while `xtc` was configured
-    /// would hand the sampler a single precomputed id with no
-    /// vocabulary left to remove anything from, and XTC would silently
-    /// not run.
-    ///
-    /// Chain membership is checked, not just the knob: a caller who set
-    /// `xtc_probability` but left `xtc` out of `--samplers` asked for no
-    /// XTC, and must keep the fast path.
-    pub fn greedy_equals_argmax(&self) -> bool {
-        let runs = |step| self.sampler_order.steps().contains(&step);
-        !(runs(ChainStep::Xtc) && self.xtc_can_fire())
-            && !(runs(ChainStep::TypP) && self.typical_p < 1.0)
-            && !(runs(ChainStep::Dry) && self.dry.is_enabled())
-    }
+    // The two "may an argmax stand in for the chain" predicates --
+    // [`Self::chain_keeps_the_argmax`] and
+    // [`Self::greedy_equals_raw_argmax`] -- are in
+    // [`super::greedy_equivalence`], with the exhaustive destructure of
+    // THIS struct that a knob added below must satisfy before the crate
+    // compiles. They used to be one function here, and it hand-listed
+    // three of the chain's nine steps: GitHub issue #170.
 }
 
 #[cfg(test)]
