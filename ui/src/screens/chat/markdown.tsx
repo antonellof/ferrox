@@ -25,7 +25,9 @@ import { CopyButton } from "@/components/ui/copy-button";
 
 function CodeHeader({ language, code }: CodeHeaderProps) {
   return (
-    <div className="aui-code-header flex items-center gap-2 bg-inset px-3 py-1.5">
+    // Same surface as the `<pre>` it sits on, so the two siblings read
+    // as one code card rather than as a lid on a box.
+    <div className="aui-code-header flex items-center gap-2 bg-sunken px-3 py-1.5">
       <span className="font-mono text-2xs tracking-wide text-faint uppercase">
         {language || "text"}
       </span>
