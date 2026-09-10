@@ -344,7 +344,11 @@ fn seed_oss_takes_the_norm_slot_without_taking_gpt_osss_other_tensors() {
             "blk.{il}: post_attention_norm must be the pre-FFN norm here"
         );
         assert!(
-            layer.moe.norm_weight.iter().any(|w| *w != 0.0),
+            layer
+                .moe
+                .norm_weight
+                .rms_weights()
+                .is_some_and(|w| w.iter().any(|x| *x != 0.0)),
             "blk.{il}: the pre-FFN norm must have been loaded from somewhere"
         );
     }

@@ -378,12 +378,68 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // on (:57) -- unlike `bailingmoe`, which reads the same key and
     // ignores it.
     "bailingmoe2",
+    // tests/post_norm_only_graphs.rs: the POST-NORM-ONLY family, two
+    // architectures and ONE implementation (`crate::pre_norm::PreNorm`).
+    // Neither has an `attn_norm` or an `ffn_norm` tensor; both read the
+    // raw residual at both sublayers and norm each branch's output
+    // before its residual add. Same evidence standard as the rows
+    // above: a synthetic fixture per row whose golden logits come from
+    // llama.cpp's own graph via libllama, on all three forward paths.
+    //
+    // `olmo2` (olmo2.cpp:45-52,92,160-165,169,177-182): WHOLE-VECTOR
+    // QK-norm -- :45-46 sizes the norms `{n_embd}` and
+    // `{n_head_kv * n_embd_head}` and :106-112 applies them to the 2-D
+    // projections before `ggml_reshape_3d`. An `olmo2` file carrying
+    // BOTH a sliding window and a rope scaling is Olmo-3, ropes its two
+    // kinds of layer differently (:120-146), and is refused by name in
+    // loader.rs.
+    "olmo2",
+    // `exaone4` (exaone4.cpp:60-67,118,152-169): the same graph with
+    // PER-HEAD QK-norm instead -- :61-62 sizes them `{n_embd_head_k}`
+    // and :127-128 applies them to what `build_qkv` already reshaped.
+    // EXAONE-4 32B is `block_count == 64`, where llama.cpp turns SWA on
+    // off the layer count and then gives the full-attention layers no
+    // RoPE at all (:4-9, :116); that is refused by name in loader.rs,
+    // the `baichuan` precedent. NOT the audited `exaone` row, which is
+    // EXAONE 3.x and a plain pre-norm llama.
+    "exaone4",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
 /// evidence?
 pub fn is_audited_generic(arch: &str) -> bool {
     AUDITED_GENERIC_GQA.contains(&arch)
+}
+
+/// Architectures whose layers have **no pre-attention norm and no
+/// pre-FFN norm at all**: the post-norm-only residual topology.
+///
+/// ```text
+/// ffn_inp = x       + post_attn_norm(attn(x))
+/// out     = ffn_inp + post_ffn_norm(ffn(ffn_inp))
+/// ```
+///
+/// Not a family resemblance -- the two graphs were read side by side
+/// and are the same statement for statement. `src/models/olmo2.cpp`
+/// creates only `attn_q_norm`, `attn_k_norm`, `attn_post_norm` and
+/// `ffn_post_norm` per layer (:45-52) and reads the raw residual at
+/// both sublayers (`cur = inpL` at :92, `build_ffn(ffn_inp, ...)` at
+/// :169), norming each branch's OUTPUT before its residual add
+/// (:160-165, :177-182). `src/models/exaone4.cpp` is the same list
+/// (:60-67) and the same four lines (:118, :159, :152-155, :166-169).
+///
+/// Both are refused unless [`AUDITED_GENERIC_GQA`] names them, and
+/// `crate::pre_norm::PreNorm` is the one implementation they share.
+/// Adding a third name here means having read a third `*.cpp`: this
+/// list decides whether `loader.rs` demands `blk.N.attn_norm.weight`
+/// from a file, so a wrong entry is a load that fails or a norm that
+/// silently disappears.
+pub const POST_NORM_ONLY_ARCHITECTURES: &[&str] = &["olmo2", "exaone4"];
+
+/// Does this architecture read the raw residual at both sublayers?
+/// See [`POST_NORM_ONLY_ARCHITECTURES`].
+pub fn is_post_norm_only(arch: &str) -> bool {
+    POST_NORM_ONLY_ARCHITECTURES.contains(&arch)
 }
 
 /// How the generic `Decoder` / `ModelConfig::from_gguf` path treats a
@@ -576,8 +632,11 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          deviation, no learned weight and no bias. ferrox has only `rms_norm(x, w, eps)` \
          and requires `blk.N.attn_norm.weight`, so it is both a different function and a \
          missing tensor. It also reads an optional {arch}.attention.clamp_kqv (:5) that \
-         nothing here applies. Note this is OLMo-1; `olmo2` is a separate row and a \
-         separate blocker",
+         nothing here applies. Note this is OLMo-1, and it is NOT the post-norm-only \
+         topology `olmo2` and `exaone4` share: OLMo-1 norms BEFORE both sublayers \
+         (:65-67 before attention, :104-106 before the FFN), so it is pre-norm like \
+         llama and the difference is the norm FUNCTION, not the residual shape. Three \
+         shapes, not two, and `crate::pre_norm` is no help here",
     ),
     (
         "arctic",
@@ -679,31 +738,6 @@ const GRANITE_MULTIPLIERS: &str =
 /// Triaged rows of the generic **NEOX**-RoPE group. Same rules as
 /// [`NORM_ROPE_TRIAGED`].
 const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
-    (
-        "olmo2",
-        TriageClass::NewCode,
-        "olmo2 has NO pre-attention norm and NO pre-FFN norm. load_arch_tensors creates \
-         attn_post_norm and ffn_post_norm (src/models/olmo2.cpp:47,52) and no attn_norm or \
-         ffn_norm at all; the graph projects Q/K/V straight off the residual (:92, \
-         `cur = inpL`) and runs build_ffn on the raw ffn_inp (:169). The generic decoder \
-         REQUIRES blk.N.attn_norm.weight and a pre-FFN norm and applies both on every layer, \
-         so this is a different residual topology, not a missing tensor. Its post-norms are \
-         NOT the blocker: ferrox applies post_attn_norm and post_ffn_norm in exactly \
-         llama.cpp's places already (:160-163,:178-180 vs decoder.rs:4274-4281,:4333-4341). \
-         olmo2 additionally runs its SWA layers' RoPE with YaRN disabled (freq_scale=1, \
-         ext_factor=0, attn_factor=1, :118-133), a second per-layer RoPE variant ferrox \
-         cannot express",
-    ),
-    (
-        "exaone4",
-        TriageClass::NewCode,
-        "same shape as olmo2: src/models/exaone4.cpp:60-67 creates attn_post_norm, per-head \
-         attn_q_norm/attn_k_norm and ffn_post_norm and NO attn_norm and NO ffn_norm, and the \
-         graph projects Q/K/V off the raw residual (:118) and runs build_ffn on the raw \
-         ffn_inp (:159). The generic decoder requires and applies both pre-norms, which is a \
-         different residual topology. Its optional NEXTN/MTP tensors (:69-73) are a separate \
-         matter and are refused by name by the unread-tensor gate",
-    ),
     (
         "mellum",
         TriageClass::NewCode,
@@ -1004,6 +1038,17 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "exaone",
             "bailingmoe2",
             "plamo3",
+            // Were NEW CODE in `NEOX_ROPE_TRIAGED` and are audited now.
+            // One residual topology, `crate::pre_norm`, shared by both:
+            // no pre-attention norm and no pre-FFN norm, each branch's
+            // OUTPUT normed before its residual add. The evidence is
+            // `tests/post_norm_only_graphs.rs`, one libllama-golden
+            // fixture each. `olmo2` with a sliding window AND a RoPE
+            // scaling (Olmo-3) and `exaone4` with 64 layers (the 32B)
+            // are refused by name in `loader.rs` and are NOT covered by
+            // these two rows.
+            "olmo2",
+            "exaone4",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2367,16 +2412,20 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 31,
+            seen == 29,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
              rows -- deepseek, bailingmoe, seed_oss, maincoder, hunyuan-moe -- were admitted \
              with libllama-golden fixtures, 41 until seven FIXTURE-AWAY rows -- \
              internlm2, xverse, ernie4_5, baichuan, exaone, bailingmoe2, plamo3 -- got \
-             theirs (tests/fixture_away_graphs.rs), and 34 until `gemma`, `hunyuan-dense` \
-             and `ernie4_5-moe` got theirs. `gemma` was the LAST fixture-away row, so that \
-             class is empty now and everything left needs code"
+             theirs (tests/fixture_away_graphs.rs), 34 until `gemma`, `hunyuan-dense` \
+             and `ernie4_5-moe` got theirs, and 31 until `olmo2` and `exaone4` -- the \
+             POST-NORM-ONLY pair, ONE topology and one implementation \
+             (`crate::pre_norm`) -- got theirs \
+             (tests/post_norm_only_graphs.rs). `gemma` was the LAST fixture-away row, so \
+             that class is empty and everything left needs code. Those two are the first \
+             NEW CODE rows to close"
         );
     }
 
@@ -2392,7 +2441,11 @@ mod audit_tests {
         // `every_unaudited_row_is_triaged_and_the_distribution_is_pinned`
         // now pins it at zero. Everything left needs code.
         let arm = unaudited_refusal_detail("chatglm");
-        let new_code = unaudited_refusal_detail("olmo2");
+        // `olmo`, not `olmo2`: OLMo-2 is audited now (its topology is
+        // `crate::pre_norm`), and OLMo-1 is a THIRD residual shape --
+        // non-parametric LayerNorm BEFORE both sublayers -- not the
+        // post-norm-only one, so it stays NEW CODE and is the sample.
+        let new_code = unaudited_refusal_detail("olmo");
         // TRIAGE_PENDING is empty now that all 47 are read, so the
         // untriaged branch is exercised through a name the catalog does
         // not carry. The branch has to keep working: it is what a NEW
@@ -2416,7 +2469,7 @@ mod audit_tests {
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
         assert!(arm.contains("attn_qkv.bias"), "{arm}");
-        assert!(new_code.contains("olmo2.cpp:47,52"), "{new_code}");
+        assert!(new_code.contains("olmo.cpp:27-35"), "{new_code}");
     }
 
     /// An architecture nobody has checked is not audited, which is the

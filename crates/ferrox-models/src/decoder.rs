@@ -56,13 +56,17 @@ use ferrox_moe::{
 };
 
 use crate::config::ModelConfig;
+use crate::pre_norm::PreNorm;
 
 pub struct AttnWeights {
     pub q_proj: WeightMatrix, // [n_heads*head_dim, hidden_dim]
     pub k_proj: WeightMatrix, // [n_kv_heads*head_dim, hidden_dim]
     pub v_proj: WeightMatrix, // [n_kv_heads*head_dim, hidden_dim]
     pub o_proj: WeightMatrix, // [hidden_dim, n_heads*head_dim]
-    pub norm_weight: Vec<f32>,
+    /// The PRE-attention norm, or [`PreNorm::None`] for the
+    /// post-norm-only topology (`olmo2` / `exaone4`), which projects
+    /// Q/K/V straight off the raw residual. See [`crate::pre_norm`].
+    pub norm_weight: PreNorm,
     /// OLMoE-style QK-RMSNorm (`attn_q_norm`/`attn_k_norm` GGUF tensors),
     /// applied to the *whole* q_proj/k_proj output (width `n_heads*head_dim`
     /// / `n_kv_heads*head_dim`) before RoPE -- confirmed against
@@ -150,7 +154,10 @@ pub struct MoeWeights {
     /// (DeepSeek-V3's shared experts, for one real confirmed contrast,
     /// add unconditionally with no gate at all).
     pub shared_expert_gate: Option<Vec<f32>>,
-    pub norm_weight: Vec<f32>,
+    /// The PRE-FFN norm, or [`PreNorm::None`] for the post-norm-only
+    /// topology (`olmo2` / `exaone4`), which runs the FFN on the raw
+    /// post-attention residual. See [`crate::pre_norm`].
+    pub norm_weight: PreNorm,
     /// DeepSeek-V3's aux-loss-free expert-selection bias, on disk as
     /// `blk.{N}.exp_probs_b.bias` (llama.cpp's `LLM_TENSOR_FFN_EXP_PROBS_B`
     /// -- note the on-disk name has no `ffn_` prefix, `llama-arch.cpp:416`).
@@ -605,7 +612,7 @@ impl Decoder {
                     rng.vec(hidden * n_heads * head_dim),
                     vec![hidden, n_heads * head_dim],
                 ),
-                norm_weight: vec![1.0; hidden],
+                norm_weight: PreNorm::Rms(vec![1.0; hidden]),
                 q_norm: None,
                 k_norm: None,
                 q_bias: None,
@@ -657,7 +664,7 @@ impl Decoder {
                 experts: ExpertBacking::Resident(experts),
                 shared_experts,
                 shared_expert_gate: None,
-                norm_weight: vec![1.0; hidden],
+                norm_weight: PreNorm::Rms(vec![1.0; hidden]),
                 activation_counts,
                 #[cfg(feature = "metal")]
                 packed_q4: None,
@@ -1090,8 +1097,12 @@ impl Decoder {
                 layer.attn.o_proj.mul_mm_sg_launch()?,
             );
             prefill_layers.push(ferrox_metal::attn::PrefillDenseLayerMetal {
-                attn_norm_w: &layer.attn.norm_weight,
-                ffn_norm_w: &layer.moe.norm_weight,
+                // `?`, not a `&`: the kernel applies the RMSNorm itself
+                // and the post-norm-only topology has no weight to give
+                // it, so the stack declines and the host body runs. See
+                // `crate::pre_norm`.
+                attn_norm_w: layer.attn.norm_weight.rms_weights()?,
+                ffn_norm_w: layer.moe.norm_weight.rms_weights()?,
                 q,
                 k,
                 v,
@@ -1877,19 +1888,23 @@ impl Decoder {
                                 ok = false;
                                 break;
                             };
-                            let (Some(q), Some(k), Some(v), Some(o), Some(r)) = (
+                            let (Some(q), Some(k), Some(v), Some(o), Some(r), Some(an), Some(fnw)) = (
                                 Self::metal_matvec_launch(&layer.attn.q_proj),
                                 Self::metal_matvec_launch(&layer.attn.k_proj),
                                 Self::metal_matvec_launch(&layer.attn.v_proj),
                                 Self::metal_matvec_launch(&layer.attn.o_proj),
                                 Self::metal_matvec_launch(&layer.moe.router),
+                                // The kernel bakes both RMSNorms in; the
+                                // post-norm-only topology has neither.
+                                layer.attn.norm_weight.rms_weights(),
+                                layer.moe.norm_weight.rms_weights(),
                             ) else {
                                 ok = false;
                                 break;
                             };
                             moe_layers.push(ferrox_metal::attn::MoeLayerMetal {
-                                attn_norm_w: &layer.attn.norm_weight,
-                                ffn_norm_w: &layer.moe.norm_weight,
+                                attn_norm_w: an,
+                                ffn_norm_w: fnw,
                                 q,
                                 k,
                                 v,
@@ -2031,7 +2046,17 @@ impl Decoder {
                                 break;
                             };
                             let ex = &experts[0];
-                            let (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) = (
+                            let (
+                                Some(q),
+                                Some(k),
+                                Some(v),
+                                Some(o),
+                                Some(g),
+                                Some(u),
+                                Some(d),
+                                Some(an),
+                                Some(fnw),
+                            ) = (
                                 Self::metal_matvec_launch(&layer.attn.q_proj),
                                 Self::metal_matvec_launch(&layer.attn.k_proj),
                                 Self::metal_matvec_launch(&layer.attn.v_proj),
@@ -2039,13 +2064,18 @@ impl Decoder {
                                 Self::metal_matvec_launch(&ex.gate),
                                 Self::metal_matvec_launch(&ex.up),
                                 Self::metal_matvec_launch(&ex.down),
-                            ) else {
+                                // The kernel bakes both RMSNorms in; the
+                                // post-norm-only topology has neither.
+                                layer.attn.norm_weight.rms_weights(),
+                                layer.moe.norm_weight.rms_weights(),
+                            )
+                            else {
                                 ok = false;
                                 break;
                             };
                             dense_layers.push(ferrox_metal::attn::DenseLayerMetal {
-                                attn_norm_w: &layer.attn.norm_weight,
-                                ffn_norm_w: &layer.moe.norm_weight,
+                                attn_norm_w: an,
+                                ffn_norm_w: fnw,
                                 q,
                                 k,
                                 v,
@@ -2207,10 +2237,16 @@ impl Decoder {
                     // Residual is on-device; host rms_norm would use stale hidden.
                     Vec::new()
                 } else {
-                    rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps)
+                    layer
+                        .attn
+                        .norm_weight
+                        .apply(&hidden, self.config.rms_norm_eps)
                 };
                 #[cfg(not(feature = "metal"))]
-                let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
+                let normed = layer
+                    .attn
+                    .norm_weight
+                    .apply(&hidden, self.config.rms_norm_eps);
 
                 #[cfg(feature = "metal")]
                 {
@@ -2227,11 +2263,28 @@ impl Decoder {
                             if metal_kvs[l].seq_len == pos
                                 && !self.layer_needs_metal_stack(layer, l)
                             {
-                                if let (Some(q_l), Some(k_l), Some(v_l), Some(o_l)) = (
+                                // The two pre-norm weights join the four
+                                // projection launches in ONE gate, because every
+                                // fused launch below bakes the RMSNorm into its
+                                // kernel and there is no weight to bake for the
+                                // post-norm-only topology (`olmo2` / `exaone4`).
+                                // `PreNorm::rms_weights` returning `None` sends
+                                // the whole layer to the host body, which reads
+                                // the raw residual the way llama.cpp does.
+                                if let (
+                                    Some(q_l),
+                                    Some(k_l),
+                                    Some(v_l),
+                                    Some(o_l),
+                                    Some(attn_norm_w),
+                                    Some(ffn_norm_w),
+                                ) = (
                                     Self::metal_matvec_launch(&layer.attn.q_proj),
                                     Self::metal_matvec_launch(&layer.attn.k_proj),
                                     Self::metal_matvec_launch(&layer.attn.v_proj),
                                     Self::metal_matvec_launch(&layer.attn.o_proj),
+                                    layer.attn.norm_weight.rms_weights(),
+                                    layer.moe.norm_weight.rms_weights(),
                                 ) {
                                     // Full dense layer on one CB when FFN is Metal-capable.
                                     if Self::layer_supports_metal_dense_ffn(layer) {
@@ -2245,13 +2298,13 @@ impl Decoder {
                                         };
                                         match ferrox_metal::attn::launch_decode_dense_layer(
                                             &hidden,
-                                            &layer.attn.norm_weight,
+                                            attn_norm_w,
                                             &q_l,
                                             &k_l,
                                             &v_l,
                                             &o_l,
                                             &mut metal_kvs[l],
-                                            &layer.moe.norm_weight,
+                                            ffn_norm_w,
                                             &g_l,
                                             &u_l,
                                             &d_l,
@@ -2334,13 +2387,13 @@ impl Decoder {
                                                             Self::moe_packed_q4(&layer.moe)
                                                         {
                                                             match ferrox_metal::attn::launch_moe_decode_layer_fused(
-                                                                &layer.attn.norm_weight,
+                                                                attn_norm_w,
                                                                 &q_l,
                                                                 &k_l,
                                                                 &v_l,
                                                                 &o_l,
                                                                 &mut metal_kvs[l],
-                                                                &layer.moe.norm_weight,
+                                                                ffn_norm_w,
                                                                 &router_l,
                                                                 &packed,
                                                                 self.config.moe.n_experts_active,
@@ -2375,13 +2428,13 @@ impl Decoder {
 
                                                 if !fused_ok {
                                                     match ferrox_metal::attn::launch_moe_decode_pre(
-                                                        &layer.attn.norm_weight,
+                                                        attn_norm_w,
                                                         &q_l,
                                                         &k_l,
                                                         &v_l,
                                                         &o_l,
                                                         &mut metal_kvs[l],
-                                                        &layer.moe.norm_weight,
+                                                        ffn_norm_w,
                                                         &router_l,
                                                         n_heads,
                                                         self.metal_rope(),
@@ -2416,9 +2469,11 @@ impl Decoder {
                                                             hidden = h;
                                                             metal_moe_resident = false;
                                                             // KV already advanced; finish FFN on host.
-                                                            let normed2 = rms_norm(
+                                                            let normed2 = layer
+                                                                .moe
+                                                                .norm_weight
+                                                                .apply(
                                                                 &hidden,
-                                                                &layer.moe.norm_weight,
                                                                 self.config.rms_norm_eps,
                                                             );
                                                             let ffn_out = Self::combine_ffn_outputs_for_position(
@@ -2514,8 +2569,10 @@ impl Decoder {
                     }
                     if did_metal_attn {
                         if !did_metal_dense && !did_metal_moe {
-                            let normed2 =
-                                rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
+                            let normed2 = layer
+                                .moe
+                                .norm_weight
+                                .apply(&hidden, self.config.rms_norm_eps);
                             let ffn_out = Self::run_ffn_block(
                                 layer,
                                 &normed2,
@@ -2539,7 +2596,10 @@ impl Decoder {
                 }
 
                 // --- MoE FFN block ---
-                let normed2 = rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
+                let normed2 = layer
+                    .moe
+                    .norm_weight
+                    .apply(&hidden, self.config.rms_norm_eps);
                 let mut ffn_out = match oai {
                     Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
                     None => Self::run_ffn_block(
@@ -2631,7 +2691,10 @@ impl Decoder {
 
         for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
             // --- attention block ---
-            let normed = rms_norm(&hidden, &layer.attn.norm_weight, self.config.rms_norm_eps);
+            let normed = layer
+                .attn
+                .norm_weight
+                .apply(&hidden, self.config.rms_norm_eps);
 
             // The same body the contiguous path runs, with the paged
             // backing as its one parameter. It used to be a copy, and
@@ -2655,7 +2718,10 @@ impl Decoder {
             }
 
             // --- MoE FFN block ---
-            let normed2 = rms_norm(&hidden, &layer.moe.norm_weight, self.config.rms_norm_eps);
+            let normed2 = layer
+                .moe
+                .norm_weight
+                .apply(&hidden, self.config.rms_norm_eps);
             let mut ffn_out = match oai {
                 Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
                 None => Self::run_ffn_block(
@@ -3661,8 +3727,10 @@ impl Decoder {
                                         !GluAct::from(self.config.ffn_activation).is_swiglu();
                                     let prefill_layer =
                                         ferrox_metal::attn::PrefillDenseLayerMetal {
-                                            attn_norm_w: &layer.attn.norm_weight,
-                                            ffn_norm_w: &layer.moe.norm_weight,
+                                            // See `try_metal_prefill_dense_stack`:
+                                            // no weight, no fused launch.
+                                            attn_norm_w: layer.attn.norm_weight.rms_weights()?,
+                                            ffn_norm_w: layer.moe.norm_weight.rms_weights()?,
                                             q,
                                             k,
                                             v,
@@ -3708,7 +3776,7 @@ impl Decoder {
             // --- attention block ---
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
-                .map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
 
@@ -3846,7 +3914,7 @@ impl Decoder {
                     // --- MoE FFN block (batched Metal when packed Q4) ---
                     let normed2_batch: Vec<f32> = hidden_batch
                         .chunks(hidden_dim)
-                        .flat_map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                        .flat_map(|h| layer.moe.norm_weight.apply(h, self.config.rms_norm_eps))
                         .collect();
                     let dense = Self::is_dense_layer(layer);
                     let router_logits_batch = if dense {
@@ -4092,7 +4160,7 @@ impl Decoder {
             // --- MoE FFN block ---
             let normed2_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
-                .map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                .map(|h| layer.moe.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
             if let Some(oai) = oai {
@@ -4291,7 +4359,7 @@ impl Decoder {
             // --- attention block ---
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
-                .map(|h| rms_norm(h, &layer.attn.norm_weight, self.config.rms_norm_eps))
+                .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
 
@@ -4414,7 +4482,7 @@ impl Decoder {
             // --- MoE FFN block ---
             let normed2_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
-                .map(|h| rms_norm(h, &layer.moe.norm_weight, self.config.rms_norm_eps))
+                .map(|h| layer.moe.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
             let dense = Self::is_dense_layer(layer);

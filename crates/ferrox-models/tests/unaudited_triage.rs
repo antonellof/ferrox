@@ -61,15 +61,18 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 31,
+        n, 29,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
          `hunyuan-moe` were admitted with libllama-golden fixtures, 41 until \
          `internlm2`, `xverse`, `ernie4_5`, `baichuan`, `exaone`, `bailingmoe2` and \
          `plamo3` were \
-         admitted with theirs (`tests/fixture_away_graphs.rs`), and 34 until `gemma`, \
-         `hunyuan-dense` and `ernie4_5-moe` were admitted with theirs -- rows closing is \
+         admitted with theirs (`tests/fixture_away_graphs.rs`), 34 until `gemma`, \
+         `hunyuan-dense` and `ernie4_5-moe` were admitted with theirs, and 31 until \
+         `olmo2` and `exaone4` were -- the first two NEW CODE rows to close, and they \
+         closed TOGETHER because they are one topology with one implementation \
+         (`ferrox_models::pre_norm`, `tests/post_norm_only_graphs.rs`) -- rows closing is \
          the count going DOWN \
          for the best reason. Either an architecture was audited or reclassified (good -- \
          update the count and the docs) or one was added (check it was triaged)"
@@ -125,11 +128,14 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
         //
         // --- new code: a different graph -----------------------------
         //
-        // olmo2.cpp:47,52,92,169 -- no attn_norm and no ffn_norm at all;
-        // Q/K/V come off the raw residual.
-        ("olmo2", TriageClass::NewCode, "olmo2.cpp:47,52"),
-        // exaone4.cpp:60-67,118,159 -- the same post-norm-only topology.
-        ("exaone4", TriageClass::NewCode, "exaone4.cpp:60-67"),
+        // `olmo2` and `exaone4` used to head this group -- no attn_norm
+        // and no ffn_norm at all, Q/K/V off the raw residual. That
+        // blocker was real and it is now IMPLEMENTED, once, for both
+        // (`ferrox_models::pre_norm`), so neither carries a verdict any
+        // more. They are the first NEW CODE rows to close, and
+        // `the_post_norm_group_does_not_share_one_class` below is now
+        // about which of the three shapes each of the group is.
+        //
         // granite.cpp:7-10,188,241-242,301-302 -- four multipliers the
         // generic decoder does not apply, plus a rope_finetuned gate.
         ("granite", TriageClass::NewCode, "f_residual_scale"),
@@ -153,49 +159,75 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
     }
 }
 
-/// The two olmo2-shaped architectures are NOT fixture-away, and this
-/// test exists because the inventory said they might be.
+/// The "post-norm group" was never one group, and it is THREE norm
+/// topologies, not two.
 ///
-/// `docs/plans/llama-cpp-gap-inventory.md` §1.3 groups `olmo2`,
+/// `docs/plans/llama-cpp-gap-inventory.md` §1.3 grouped `olmo2`,
 /// `seed_oss` and `exaone4` together as "likely a fixture away, if the
 /// loader wires the post-norm slots for non-Gemma families". The wiring
-/// question has a yes answer -- `loader.rs` reads
-/// `blk.N.post_attention_norm.weight` and `blk.N.post_ffw_norm.weight`
-/// for every non-gpt-oss architecture, and the decoder applies them in
-/// llama.cpp's own places -- but it is the wrong question. `olmo2` and
-/// `exaone4` create **no** `attn_norm` and **no** `ffn_norm`
-/// (`olmo2.cpp:42-52`, `exaone4.cpp:53-67`) and project Q/K/V straight
-/// off the residual (`olmo2.cpp:92`, `exaone4.cpp:118`), while the
-/// generic decoder requires both pre-norms and applies them on every
-/// layer. And `seed_oss` is a third thing again: it *has* `attn_norm`
-/// and uses `attn_post_norm` as its pre-FFN norm.
+/// question had a yes answer, and it was the wrong question: the three
+/// are three different residual shapes and were never one class.
 ///
-/// So the three do not share a class. Pinning that stops the grouping
-/// from being restored from the prose -- and the split is now settled the
-/// hard way: `seed_oss` RUNS, checked against llama.cpp's own logits,
-/// while `olmo2` and `exaone4` still refuse.
+/// * `seed_oss` HAS `attn_norm` and uses `attn_post_norm` as its
+///   pre-FFN norm (`seed-oss.cpp:36-37,113-115`). Closed 2026-09-02.
+/// * `olmo2` and `exaone4` have NEITHER pre-norm and read the raw
+///   residual at both sublayers (`olmo2.cpp:45-52,92,169`,
+///   `exaone4.cpp:60-67,118,159`). That is one topology across the two,
+///   `ferrox_models::pre_norm` is the one implementation, and
+///   `tests/post_norm_only_graphs.rs` is the evidence for both.
+/// * `olmo` (OLMo-1) is the third: it norms BEFORE both sublayers, so
+///   it is pre-norm like llama, and what it lacks is the norm FUNCTION
+///   -- non-parametric LayerNorm, all three `build_norm` calls with a
+///   NULL weight (`olmo.cpp:65-67,104-106,128-130`). It still refuses,
+///   and `pre_norm` is no help to it.
+///
+/// Pinning the split stops the grouping being restored from the prose,
+/// and it now also pins that closing two of the three did NOT sweep the
+/// third along with them.
 #[test]
-fn the_post_norm_group_does_not_share_one_class() {
-    let olmo2 = unaudited_triage("olmo2").expect("olmo2 verdict");
-    let exaone4 = unaudited_triage("exaone4").expect("exaone4 verdict");
-
-    assert_eq!(olmo2.class, TriageClass::NewCode);
-    assert_eq!(exaone4.class, TriageClass::NewCode);
+fn the_post_norm_group_is_three_topologies_and_only_two_of_them_closed() {
+    // seed_oss: has a pre-attention norm; its post_attention_norm IS
+    // the pre-FFN norm.
     assert!(
         is_audited_generic("seed_oss") && unaudited_triage("seed_oss").is_none(),
-        "seed_oss has attn_norm and olmo2 does not; they cannot share a class"
+        "seed_oss has attn_norm and olmo2 does not; they were never one class"
     );
-    for (name, t) in [("olmo2", olmo2), ("exaone4", exaone4)] {
+
+    // olmo2 / exaone4: one topology, one implementation, both audited.
+    for name in ["olmo2", "exaone4"] {
         assert!(
-            t.blocker.contains("NO attn_norm") || t.blocker.contains("no attn_norm"),
-            "`{name}`'s verdict must name the missing pre-norm, not the post-norms: {}",
-            t.blocker
+            is_audited_generic(name),
+            "`{name}` closed with a libllama-golden fixture"
         );
         assert!(
-            !t.blocker.contains("fixture away"),
-            "`{name}` is not a fixture away"
+            unaudited_triage(name).is_none(),
+            "`{name}` is audited and must carry no verdict"
+        );
+        assert!(
+            ferrox_models::capability::is_post_norm_only(name),
+            "`{name}` is the post-norm-only topology"
         );
     }
+    assert_eq!(
+        ferrox_models::capability::POST_NORM_ONLY_ARCHITECTURES,
+        &["olmo2", "exaone4"],
+        "a third name here is a third llama.cpp graph somebody read"
+    );
+
+    // olmo (OLMo-1): a different shape, still refused, and its verdict
+    // has to say so rather than pointing at the pair next door.
+    let olmo = unaudited_triage("olmo").expect("olmo verdict");
+    assert_eq!(olmo.class, TriageClass::NewCode);
+    assert!(!is_audited_generic("olmo"));
+    assert!(
+        !ferrox_models::capability::is_post_norm_only("olmo"),
+        "OLMo-1 norms before both sublayers; it is not post-norm-only"
+    );
+    assert!(
+        olmo.blocker.contains("NOT the post-norm-only topology"),
+        "olmo's verdict must say which shape it is NOT: {}",
+        olmo.blocker
+    );
 }
 
 /// `ernie4_5-moe` is audited, and the sigmoid correction moved from its
@@ -265,7 +297,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 31);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 29);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -656,10 +688,12 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 1, 26, 4),
+        (0, 1, 24, 4),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. FIXTURE-AWAY is ZERO now: `gemma` was \
-         the last row that only needed evidence, so everything still refusing needs code"
+         the last row that only needed evidence, so everything still refusing needs code. \
+         NEW CODE went 26 to 24 when `olmo2` and `exaone4` closed together -- one \
+         topology, one implementation -- which is the first movement in that column"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 31);
+    assert_eq!(fixture + arm + new_code + unknown, 29);
 }

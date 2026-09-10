@@ -365,6 +365,31 @@ impl ModelConfig {
                     .to_string(),
             ));
         }
+        // The same shape, on a different architecture: EXAONE-4 32B is
+        // a different graph from EXAONE-4 1.2B and llama.cpp decides
+        // which off the layer count with no GGUF key involved.
+        // `src/models/exaone4.cpp:4-14` switches the whole SWA
+        // machinery on inside `if (hparams.n_layer() == 64)`, and :116
+        // then makes RoPE conditional --
+        // `use_rope = is_swa(il) || swa_type == NONE` -- so in a
+        // 64-layer EXAONE-4 the FULL-ATTENTION layers get NO rotation
+        // at all. That is the NoPE class (`smollm3`, `exaone-moe`), the
+        // generic decoder rotates every layer, and there is no key for
+        // `capability::unsupported_feature_keys` to test and no unread
+        // tensor to notice: the file loads clean and answers fluently
+        // from positions it never encodes that way.
+        if arch == "exaone4" && n_layers == 64 {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                "EXAONE-4 32B (block_count=64) gives its FULL-ATTENTION layers no RoPE at \
+                 all -- llama.cpp turns SWA on off the layer count (exaone4.cpp:4-9) and \
+                 then ropes only the sliding layers (:116, `use_rope = is_swa(il) || \
+                 swa_type == NONE`) -- and the generic decoder rotates every layer. There \
+                 is no GGUF key for it. EXAONE-4 1.2B (block_count=30) is unaffected and \
+                 runs"
+                    .to_string(),
+            ));
+        }
         let hidden_dim = file
             .metadata_u64(&key("embedding_length"))
             .ok_or_else(|| LoadError::MissingHparam(key("embedding_length")))?
@@ -590,6 +615,36 @@ impl ModelConfig {
             // upstream is declining to use the file's value, not
             // choosing a different one.
             .filter(|_| !crate::capability::swa_disabled_by_arch(&arch));
+
+        // `olmo2` with a window AND a RoPE scaling is Olmo-3, and it
+        // ropes its two kinds of layer DIFFERENTLY. `olmo2.cpp:120-134`
+        // runs the sliding layers with YaRN switched off -- freq_scale
+        // = 1, ext_factor = 0, attn_factor = 1, and its own comment
+        // says so -- while the full-attention layers use the model's
+        // scaling (:136-146). ferrox carries one `rope.scaling.factor`
+        // and one `attn_factor` for the whole model
+        // (`rope_attn_factor`, and the ramp folded into `rope_freqs`),
+        // so honouring the file would mean rotating half the layers at
+        // a magnitude the checkpoint never trained at.
+        //
+        // A window with NO scaling is not this case and is not refused:
+        // both branches then reduce to the same plain RoPE, and the
+        // difference is masking alone, which ferrox implements
+        // (`default_swa_layout` gives olmo2 a period of 4).
+        if arch == "olmo2" && sliding_window.is_some() {
+            let scaling_type = file
+                .metadata_str(&key("rope.scaling.type"))
+                .unwrap_or("none")
+                .to_string();
+            if !scaling_type.eq_ignore_ascii_case("none") {
+                return Err(LoadError::UnsupportedFeature(
+                    arch.clone(),
+                    format!(
+                        "this olmo2 checkpoint declares BOTH a sliding window and                          rope.scaling.type = \"{scaling_type}\". llama.cpp ropes the                          sliding layers with the scaling switched off (freq_scale = 1,                          ext_factor = 0, attn_factor = 1; olmo2.cpp:120-134) and the                          full-attention layers with it on (:136-146), and ferrox carries                          one RoPE scaling for the whole model. An olmo2 file with a                          window and no scaling, or with scaling and no window, is                          unaffected"
+                    ),
+                ));
+            }
+        }
 
         // Gemma alternating SWA period (`attention.sliding_window_pattern`).
         // llama.cpp: gemma2 defaults period=2, gemma3 defaults period=6 when
@@ -2041,6 +2096,18 @@ impl Decoder {
             .to_string();
         let is_gpt_oss = arch == "gpt-oss";
         let post_attn_norm_is_pre_ffn_norm = pre_ffn_norm_is_post_attention_norm(&arch);
+        // The post-norm-only residual topology: no `attn_norm` and no
+        // `ffn_norm` tensors, both sublayers reading the raw residual.
+        // `crate::pre_norm` holds the graph and the two llama.cpp files
+        // it was read from.
+        //
+        // The two lists cannot overlap: for gpt-oss / seed_oss
+        // `post_attention_norm` IS the pre-FFN norm, which a topology
+        // with no pre-FFN norm cannot also have. That is pinned as a
+        // test (`the_two_norm_slot_lists_cannot_name_the_same_architecture`)
+        // rather than asserted here, so it fails in CI instead of only
+        // on a debug load of a file nobody has.
+        let post_norm_only = crate::capability::is_post_norm_only(&arch);
         let mut gpt_oss_layers: Vec<crate::decoder::GptOssLayer> = Vec::new();
 
         // One store for the whole model (keys are (layer, expert)),
@@ -2086,7 +2153,18 @@ impl Decoder {
                 k_proj,
                 v_proj,
                 o_proj: load_weight_matrix(&file, &format!("blk.{l}.attn_output.weight"))?,
-                norm_weight: load_f32_vec(&file, &format!("blk.{l}.attn_norm.weight"))?,
+                // `olmo2` and `exaone4` have no `attn_norm` tensor at
+                // all and project Q/K/V off the raw residual; every
+                // other architecture on this path norms first. See
+                // `capability::POST_NORM_ONLY_ARCHITECTURES`.
+                norm_weight: if post_norm_only {
+                    crate::pre_norm::PreNorm::None
+                } else {
+                    crate::pre_norm::PreNorm::Rms(load_f32_vec(
+                        &file,
+                        &format!("blk.{l}.attn_norm.weight"),
+                    )?)
+                },
                 q_norm,
                 k_norm,
                 // Qwen2/Qwen2-MoE-family real QKV bias (`attn_{q,k,v}.bias`,
@@ -2309,21 +2387,34 @@ impl Decoder {
                 shared_experts,
                 shared_expert_gate,
                 exp_probs_bias,
-                norm_weight: if post_attn_norm_is_pre_ffn_norm {
+                norm_weight: if post_norm_only {
+                    // No `ffn_norm` tensor: the FFN reads the raw
+                    // post-attention residual (olmo2.cpp:169,
+                    // exaone4.cpp:159).
+                    crate::pre_norm::PreNorm::None
+                } else if post_attn_norm_is_pre_ffn_norm {
                     // Same two spellings as above, and the same helper,
                     // so the pre-FFN-norm slot cannot drift away from
                     // the post-attention one about what a file may be
                     // called. gpt-oss and seed_oss both write `.weight`
                     // today; sharing the rule is what stops that being
                     // a thing to rediscover.
-                    load_norm_vec_either_spelling(&file, &format!("blk.{l}.post_attention_norm"))?
+                    crate::pre_norm::PreNorm::Rms(
+                        load_norm_vec_either_spelling(
+                            &file,
+                            &format!("blk.{l}.post_attention_norm"),
+                        )?
                         .ok_or_else(|| {
-                        LoadError::Gguf(GgufError::TensorNotFound(format!(
-                            "blk.{l}.post_attention_norm[.weight]"
-                        )))
-                    })?
+                            LoadError::Gguf(GgufError::TensorNotFound(format!(
+                                "blk.{l}.post_attention_norm[.weight]"
+                            )))
+                        })?,
+                    )
                 } else {
-                    load_f32_vec(&file, &format!("blk.{l}.ffn_norm.weight"))?
+                    crate::pre_norm::PreNorm::Rms(load_f32_vec(
+                        &file,
+                        &format!("blk.{l}.ffn_norm.weight"),
+                    )?)
                 },
                 activation_counts,
                 #[cfg(feature = "metal")]
@@ -4271,6 +4362,158 @@ mod tests {
             Err(LoadError::MissingHparam(key)) => assert_eq!(key, "baichuan.embedding_length"),
             other => panic!("Baichuan-7B must pass the ALiBi gate, got {other:?}"),
         }
+    }
+
+    /// The two norm-slot lists cannot name the same architecture.
+    ///
+    /// `PRE_FFN_NORM_IS_POST_ATTENTION_NORM` says "this file's
+    /// `post_attention_norm` IS the pre-FFN norm";
+    /// `capability::POST_NORM_ONLY_ARCHITECTURES` says "this
+    /// architecture has no pre-FFN norm at all". A name on both would be
+    /// read two ways by two branches of the same `if`, and the second
+    /// branch would win silently. Two lists that must agree about one
+    /// thing, with something enforcing it -- which is the only shape of
+    /// fix that has ever held here.
+    #[test]
+    fn the_two_norm_slot_lists_cannot_name_the_same_architecture() {
+        for name in PRE_FFN_NORM_IS_POST_ATTENTION_NORM {
+            assert!(
+                !crate::capability::is_post_norm_only(name),
+                "`{name}` claims both that post_attention_norm is its pre-FFN norm and \
+                 that it has no pre-FFN norm"
+            );
+        }
+        // And the converse, so a name added to either list is checked
+        // from whichever side it was added on.
+        for name in crate::capability::POST_NORM_ONLY_ARCHITECTURES {
+            assert!(
+                !pre_ffn_norm_is_post_attention_norm(name),
+                "`{name}` has no pre-FFN norm, so it cannot keep one in the \
+                 post_attention_norm slot"
+            );
+        }
+    }
+
+    /// EXAONE-4 32B is the `baichuan` shape on a different
+    /// architecture: llama.cpp picks a different GRAPH off the layer
+    /// count, with no GGUF key to declare it.
+    ///
+    /// `exaone4.cpp:4-9` turns SWA on inside `if (n_layer() == 64)` and
+    /// :116 then ropes only the sliding layers, so a 64-layer EXAONE-4
+    /// gives its full-attention layers no rotation at all. The generic
+    /// decoder rotates every layer, and nothing downstream could see it:
+    /// the tensor set is identical to the 1.2B's.
+    ///
+    /// This gate has to be REACHABLE, which is the half that has been
+    /// wrong here before -- this repo shipped a refusal keyed on a GGUF
+    /// spelling nothing writes. So the 30-layer half of this test is not
+    /// decoration: it proves the gate discriminates rather than refusing
+    /// the architecture outright.
+    #[test]
+    fn exaone4_32b_is_refused_because_its_full_attention_layers_get_no_rope() {
+        let thirty_two_b = open_metadata_gguf(
+            "exaone4_32b",
+            &[
+                ("general.architecture", Kv::Str("exaone4")),
+                ("exaone4.block_count", Kv::U32(64)),
+            ],
+        );
+        match ModelConfig::from_gguf(&thirty_two_b) {
+            Err(LoadError::UnsupportedFeature(arch, msg)) => {
+                assert_eq!(arch, "exaone4");
+                assert!(msg.contains("no RoPE"), "{msg}");
+                assert!(
+                    msg.contains("64"),
+                    "the refusal must name the layer count: {msg}"
+                );
+            }
+            other => panic!("EXAONE-4 32B must be refused, got {other:?}"),
+        }
+
+        // The 1.2B has 30 layers, takes neither branch of `if (n_layer()
+        // == 64)`, and rotates every layer exactly as the generic
+        // decoder does. It must pass this gate and fail on the next
+        // missing hparam instead.
+        let one_two_b = open_metadata_gguf(
+            "exaone4_1_2b",
+            &[
+                ("general.architecture", Kv::Str("exaone4")),
+                ("exaone4.block_count", Kv::U32(30)),
+            ],
+        );
+        match ModelConfig::from_gguf(&one_two_b) {
+            Err(LoadError::MissingHparam(key)) => assert_eq!(key, "exaone4.embedding_length"),
+            other => panic!("EXAONE-4 1.2B must pass the NoPE gate, got {other:?}"),
+        }
+    }
+
+    /// An `olmo2` file carrying BOTH a sliding window and a RoPE
+    /// scaling ropes its two kinds of layer differently, and ferrox
+    /// carries one scaling for the whole model.
+    ///
+    /// `olmo2.cpp:120-134` runs the sliding layers with the scaling
+    /// switched off -- `freq_scale = 1`, `ext_factor = 0`,
+    /// `attn_factor = 1`, and the comment above it says so in as many
+    /// words -- while :136-146 gives the full-attention layers the
+    /// model's own. Rotating half the layers at a magnitude the
+    /// checkpoint never trained at is the ALiBi class of divergence and
+    /// runs fluently.
+    ///
+    /// Both negative halves are here because the gate is a CONJUNCTION
+    /// and a gate that fires on either half alone would refuse every
+    /// OLMo-2 checkpoint ever published.
+    #[test]
+    fn olmo2_is_refused_only_when_it_has_a_window_and_a_rope_scaling_together() {
+        // `Kv` is not `Clone`, so the shared header is a builder
+        // rather than a value -- which also keeps the three cases
+        // reading from one list instead of three transcriptions.
+        let base = || -> Vec<(&str, Kv)> {
+            vec![
+                ("general.architecture", Kv::Str("olmo2")),
+                ("olmo2.block_count", Kv::U32(2)),
+                ("olmo2.embedding_length", Kv::U32(24)),
+                ("olmo2.attention.head_count", Kv::U32(4)),
+                ("olmo2.attention.head_count_kv", Kv::U32(2)),
+                ("olmo2.attention.key_length", Kv::U32(6)),
+                ("olmo2.attention.value_length", Kv::U32(6)),
+                ("olmo2.rope.freq_base", Kv::F32(10_000.0)),
+            ]
+        };
+
+        let mut both = base();
+        both.push(("olmo2.attention.sliding_window", Kv::U32(3)));
+        both.push(("olmo2.rope.scaling.type", Kv::Str("yarn")));
+        both.push(("olmo2.rope.scaling.factor", Kv::F32(4.0)));
+        let file = open_metadata_gguf("olmo2_swa_yarn", &both);
+        match ModelConfig::from_gguf(&file) {
+            Err(LoadError::UnsupportedFeature(arch, msg)) => {
+                assert_eq!(arch, "olmo2");
+                assert!(msg.contains("sliding window"), "{msg}");
+                assert!(msg.contains("yarn"), "{msg}");
+            }
+            other => panic!("olmo2 with a window AND yarn must refuse, got {other:?}"),
+        }
+
+        // A window with no scaling: both of llama.cpp's RoPE branches
+        // reduce to the same plain rotation, and the difference is
+        // masking alone, which ferrox implements.
+        let mut window_only = base();
+        window_only.push(("olmo2.attention.sliding_window", Kv::U32(3)));
+        let file = open_metadata_gguf("olmo2_swa_only", &window_only);
+        let config = ModelConfig::from_gguf(&file).expect("a window with no scaling must load");
+        assert_eq!(config.sliding_window, Some(3));
+        // olmo2.cpp:9-11: the period defaults to 4 and `set_swa_pattern`
+        // leaves `dense_first` false.
+        assert_eq!(config.swa_pattern, Some(4));
+
+        // Scaling with no window: one RoPE for the whole model, which is
+        // what ferrox carries.
+        let mut scaling_only = base();
+        scaling_only.push(("olmo2.rope.scaling.type", Kv::Str("yarn")));
+        scaling_only.push(("olmo2.rope.scaling.factor", Kv::F32(4.0)));
+        let file = open_metadata_gguf("olmo2_yarn_only", &scaling_only);
+        let config = ModelConfig::from_gguf(&file).expect("scaling with no window must load");
+        assert_eq!(config.sliding_window, None);
     }
 
     /// The hyper-parameters a real Gemma-3 GGUF header carries for one
