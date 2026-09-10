@@ -1,7 +1,12 @@
 # Benchmarks
 
-The published table is **[`RESULTS.md`](RESULTS.md)**. It is generated,
-so never edit it by hand.
+The published table is **[`RESULTS.md`](RESULTS.md)**. It is generated
+and holds nothing else, so never edit it by hand.
+
+Everything a generator cannot produce — measurements taken without a
+receipt, before/after studies against ferrox itself, and the sections
+that predate the code they describe — is in
+**[`HISTORY.md`](HISTORY.md)**.
 
 Every timed run writes one small JSON file of raw numbers into
 [`receipts/engine/`](receipts/engine/) (kernel) or
