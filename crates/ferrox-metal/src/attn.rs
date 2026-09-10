@@ -4837,7 +4837,6 @@ pub struct MoeLayerMetal<'a> {
 
 /// Pre-bound MTLBuffers for one MoE layer (llama: bind weights once).
 struct MoeLayerResident {
-    attn_key: usize,
     attn_nw: std::sync::Arc<ResidentF32Buffer>,
     ffn_nw: std::sync::Arc<ResidentF32Buffer>,
     q_w: std::sync::Arc<ResidentWeightBuffer>,
@@ -4847,38 +4846,22 @@ struct MoeLayerResident {
     r_w: std::sync::Arc<ResidentWeightBuffer>,
 }
 
-thread_local! {
-    /// Hoisted per-layer QKV/router/norm buffers for the MoE stack.
-    static TL_MOE_LAYER_RESIDENT: RefCell<Vec<Option<MoeLayerResident>>> =
-        const { RefCell::new(Vec::new()) };
-}
-
+/// Seven cache lookups, exactly as the dense stack does per layer per
+/// token.
+///
+/// This used to memoise the seven behind a thread-local keyed on
+/// `attn_norm_w.as_ptr()` -- an address, with no length beside it and
+/// no check that the bytes were still that layer's. It was a second,
+/// weaker copy of a decision [`crate::resident_cache`] already makes,
+/// in front of the caches that make it, so a recycled address served a
+/// whole layer of another model's weights past two caches that would
+/// have caught it. Two structures deciding one thing, and only one of
+/// them checking.
 fn moe_layer_resident(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    layer_idx: usize,
     layer: &MoeLayerMetal<'_>,
 ) -> Result<MoeLayerResident, MetalError> {
-    let attn_key = layer.attn_norm_w.as_ptr() as usize;
-    if let Some(hit) = TL_MOE_LAYER_RESIDENT.with(|c| {
-        c.borrow().get(layer_idx).and_then(|slot| {
-            slot.as_ref()
-                .filter(|r| r.attn_key == attn_key)
-                .map(|r| MoeLayerResident {
-                    attn_key: r.attn_key,
-                    attn_nw: r.attn_nw.clone(),
-                    ffn_nw: r.ffn_nw.clone(),
-                    q_w: r.q_w.clone(),
-                    k_w: r.k_w.clone(),
-                    v_w: r.v_w.clone(),
-                    o_w: r.o_w.clone(),
-                    r_w: r.r_w.clone(),
-                })
-        })
-    }) {
-        return Ok(hit);
-    }
-    let bound = MoeLayerResident {
-        attn_key,
+    Ok(MoeLayerResident {
         attn_nw: resident_f32_buffer(device, layer.attn_norm_w)?,
         ffn_nw: resident_f32_buffer(device, layer.ffn_norm_w)?,
         q_w: resident_weight_buffer(device, layer.q.weights)?,
@@ -4886,24 +4869,7 @@ fn moe_layer_resident(
         v_w: resident_weight_buffer(device, layer.v.weights)?,
         o_w: resident_weight_buffer(device, layer.o.weights)?,
         r_w: resident_weight_buffer(device, layer.router.weights)?,
-    };
-    TL_MOE_LAYER_RESIDENT.with(|c| {
-        let mut v = c.borrow_mut();
-        if v.len() <= layer_idx {
-            v.resize_with(layer_idx + 1, || None);
-        }
-        v[layer_idx] = Some(MoeLayerResident {
-            attn_key: bound.attn_key,
-            attn_nw: bound.attn_nw.clone(),
-            ffn_nw: bound.ffn_nw.clone(),
-            q_w: bound.q_w.clone(),
-            k_w: bound.k_w.clone(),
-            v_w: bound.v_w.clone(),
-            o_w: bound.o_w.clone(),
-            r_w: bound.r_w.clone(),
-        });
-    });
-    Ok(bound)
+    })
 }
 
 /// One MoE layer into a Concurrent encoder using llama-style [`MemRanges`]
@@ -4932,7 +4898,7 @@ fn encode_moe_layer_fused(
     pos: usize,
     rms_eps: f32,
 ) -> Result<(), MetalError> {
-    let bound = moe_layer_resident(device, layer_idx, layer)?;
+    let bound = moe_layer_resident(device, layer)?;
     let attn_nw = &bound.attn_nw;
     let ffn_nw = &bound.ffn_nw;
     let q_w = &bound.q_w;
