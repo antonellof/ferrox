@@ -25,8 +25,9 @@
 use ferrox_gguf::ShardedGguf;
 
 use crate::config::ModelConfig;
+use crate::decoder::KvWindowPolicy;
 use crate::device_budget::human;
-use crate::kv_budget::{ContextFit, KvBudget, KvElem, KvShape, CTX_AUTO_GRANULARITY};
+use crate::kv_budget::{ContextFit, KvBudget, KvElem, KvResidency, KvShape, CTX_AUTO_GRANULARITY};
 use crate::loader::LoadError;
 
 /// The inputs a plan is computed against. `expert_cache_bytes: None`
@@ -46,6 +47,15 @@ pub struct ResidencyAssumptions {
     /// host cache, f16 for Metal's device KV, and so on. Only this
     /// module's caller knows which backend is selected.
     pub kv_elem: KvElem,
+    /// Whether the run this plan describes will evict KV rows behind a
+    /// layer's sliding window (#61).
+    ///
+    /// The plan has to be priced against the run that will happen, so
+    /// the default reads `FERROX_KV_WINDOW` exactly as the decoder does
+    /// -- one policy value, so the report and the stores cannot be
+    /// describing different runs. Pass [`KvWindowPolicy::off`]
+    /// explicitly for a what-if plan of the non-evicting engine.
+    pub kv_window: KvWindowPolicy,
 }
 
 impl Default for ResidencyAssumptions {
@@ -58,6 +68,7 @@ impl Default for ResidencyAssumptions {
             expert_cache_bytes: None,
             headroom_fraction: 0.2,
             kv_elem: KvElem::F32,
+            kv_window: KvWindowPolicy::from_env(),
         }
     }
 }
@@ -87,6 +98,12 @@ pub struct ResidencyReport {
     pub weights_bytes: u64,
     /// The KV geometry this checkpoint runs on.
     pub kv_shape: KvShape,
+    /// How many positions each layer's store will really keep, under
+    /// [`ResidencyAssumptions::kv_window`]. Kept beside the shape so
+    /// [`Self::kv_budget`] rebuilds the inequality with the same
+    /// residency the KV line was priced with, rather than deriving a
+    /// second one.
+    pub kv_residency: KvResidency,
 }
 
 impl ResidencyReport {
@@ -172,16 +189,32 @@ impl ResidencyReport {
         // windowed checkpoint is priced at what the store keeps rather
         // than at what attention reads.
         let kv_shape = KvShape::from_config(&config, assumptions.kv_elem);
-        let kv_per_request = kv_shape.kv_bytes_for_tokens(assumptions.context_tokens);
+        let kv_residency = KvResidency::from_config(&config, assumptions.kv_window);
+        // The PEAK, not the resting number: a windowed layer holds the
+        // whole prompt while it is being prefilled and hands the rows
+        // back only afterwards, so a plan priced at rest would approve
+        // a run whose high-water mark it never modelled.
+        let kv_per_request =
+            kv_shape.peak_kv_bytes_for_tokens(assumptions.context_tokens, &kv_residency);
+        let evicting = kv_residency.evicting_layers();
         lines.push(ResidencyLine {
             label: "KV caches".to_string(),
             bytes: kv_per_request * assumptions.concurrent_requests as u64,
             reason: format!(
                 "{} at {} context tokens = {kv_per_request} bytes/request, x {} concurrent \
-                 requests",
+                 requests{}",
                 kv_shape.describe(),
                 assumptions.context_tokens,
-                assumptions.concurrent_requests
+                assumptions.concurrent_requests,
+                match evicting {
+                    0 => String::new(),
+                    n => format!(
+                        "; {n} of {} layers evict behind their sliding window \
+                         (FERROX_KV_WINDOW) and stop growing, so this is below the \
+                         per-token figure times the context",
+                        kv_shape.n_layers
+                    ),
+                }
             ),
         });
 
@@ -195,6 +228,7 @@ impl ResidencyReport {
             assumptions,
             weights_bytes,
             kv_shape,
+            kv_residency,
         })
     }
 
@@ -216,6 +250,7 @@ impl ResidencyReport {
             activation_headroom_bytes: self.budget_bytes - self.usable_bytes,
             device_budget_bytes: self.budget_bytes,
             shape: self.kv_shape,
+            residency: self.kv_residency.clone(),
             concurrent_requests: self.assumptions.concurrent_requests,
         }
     }
@@ -296,11 +331,20 @@ mod tests {
         format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
     }
 
+    /// Pinned to the non-evicting engine ON PURPOSE.
+    ///
+    /// `ResidencyAssumptions::default()` reads `FERROX_KV_WINDOW`,
+    /// because the plan has to describe the run that will happen. That
+    /// makes every test built on the default env-sensitive, and a test
+    /// whose expected numbers depend on the developer's shell is a test
+    /// that goes red for the wrong reason. Everything below asserts the
+    /// default engine's arithmetic, so it says so.
     fn assumptions(cache: Option<u64>) -> ResidencyAssumptions {
         ResidencyAssumptions {
             context_tokens: 128,
             concurrent_requests: 2,
             expert_cache_bytes: cache,
+            kv_window: KvWindowPolicy::off(),
             ..ResidencyAssumptions::default()
         }
     }

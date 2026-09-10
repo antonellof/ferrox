@@ -506,10 +506,25 @@ impl KvCache {
         // until something hands it back. Only when the excess is large
         // enough to be worth a realloc-and-copy: shrinking on every
         // eviction would trade the block drain for a full copy.
-        let want = window.max_rows() * elems_per_position;
-        if self.k.capacity() > want.saturating_mul(2) {
-            self.k.shrink_to(want);
-            self.v.shrink_to(want);
+        //
+        // **Never for a pool-backed cache**, and the reason is a bug
+        // rather than a preference. `push` asks whether the buffer is
+        // full by comparing rows against `k.capacity()`, and takes
+        // another block from the shared pool when they meet. Shrinking
+        // the buffer to a window's worth would make that condition true
+        // every `slack + 1` tokens forever, so a windowed pooled cache
+        // would draw a fresh block from the pool on a cadence, hold
+        // every one of them until it drops, and exhaust the pool
+        // mid-answer -- where `push` is documented infallible and the
+        // caller panics. The pool has already promised this cache its
+        // blocks; handing the capacity back without handing the blocks
+        // back saves nothing and costs that.
+        if self.pool_state.is_none() {
+            let want = window.max_rows() * elems_per_position;
+            if self.k.capacity() > want.saturating_mul(2) {
+                self.k.shrink_to(want);
+                self.v.shrink_to(want);
+            }
         }
         drop_rows
     }
@@ -2053,6 +2068,53 @@ mod tests {
             cache.evict_behind_window();
         }
         assert_eq!(cache.positions(), 64);
+        assert!(cache.rows() <= 5);
+    }
+
+    /// **The sibling above passes for the wrong reason on its own
+    /// sizing, so this is the same property where the trap is armed.**
+    ///
+    /// Eviction hands surplus CAPACITY back with `shrink_to`, which is
+    /// where its memory saving actually comes from. For a pool-backed
+    /// cache that is a bug rather than a saving: the pool has already
+    /// promised these blocks and does not take them back, while `push`
+    /// decides it needs another block by comparing rows against
+    /// `k.capacity()`. Shrink that capacity to a window and the
+    /// condition is true again every `slack + 1` tokens, forever -- so
+    /// the cache draws a fresh block from the shared pool on a cadence,
+    /// never releases one, and runs the pool dry underneath every OTHER
+    /// request in the process. It surfaces where `push` is documented
+    /// infallible, so the caller panics mid-answer.
+    ///
+    /// The sibling's cache is 8 positions against a 5-row ceiling,
+    /// which is under the 2x threshold `shrink_to` is gated on, so it
+    /// never reaches the shrink at all. This one is 64 positions
+    /// against the same ceiling, and the pool is given spare blocks so
+    /// the leak shows up as blocks quietly gone rather than only as the
+    /// error at the end of them.
+    #[test]
+    fn an_evicting_pooled_cache_never_hands_its_capacity_back_to_reacquire_it() {
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(8, 24)));
+        let mut cache =
+            KvCache::with_pool(1, 2, Arc::clone(&pool), 64).expect("8 of the 24 blocks");
+        let free_after_construction = pool.lock().unwrap().free_blocks();
+        assert_eq!(free_after_construction, 16, "8 blocks cover 64 positions");
+
+        cache.arm_window(KvWindow::new(4, 1).expect("positive window"));
+        let step = vec![1.0f32; 2];
+        for _ in 0..512 {
+            cache
+                .push(&step, &step)
+                .expect("a reservation made up front must not be re-made per token");
+            cache.evict_behind_window();
+        }
+
+        assert_eq!(
+            pool.lock().unwrap().free_blocks(),
+            free_after_construction,
+            "the cache drew more blocks from the shared pool while evicting"
+        );
+        assert_eq!(cache.positions(), 512);
         assert!(cache.rows() <= 5);
     }
 }
