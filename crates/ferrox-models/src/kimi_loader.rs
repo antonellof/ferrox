@@ -1972,6 +1972,8 @@ mod tests {
             attn_logit_softcap: None,
             final_logit_softcap: None,
             embedding_scale: None,
+            residual_scale: None,
+            logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,
             ffn_activation: crate::config::FfnActivation::Swiglu,

@@ -741,14 +741,34 @@ impl ModelConfig {
         let final_logit_softcap =
             metadata_f32_any(file, &[key("final_logit_softcapping")]).filter(|&v| v > 0.0);
 
+        // The four metadata-declared scalar multipliers, resolved once
+        // for whichever subset this architecture's reference graph
+        // applies. See `crate::scalar_multipliers`; the keys the graph
+        // does NOT apply were already refused above, by a list derived
+        // from the same table.
+        let multiplier_support = crate::scalar_multipliers::multiplier_support(&arch);
+        let declared = crate::scalar_multipliers::DeclaredMultipliers {
+            logit: metadata_f32_any(file, &[key("logit_scale")]),
+            residual: metadata_f32_any(file, &[key("residual_scale")]),
+            embedding: metadata_f32_any(file, &[key("embedding_scale")]),
+            attention: metadata_f32_any(file, &[key("attention.scale")]),
+        };
+        let multipliers =
+            crate::scalar_multipliers::resolve(multiplier_support, declared, head_dim)
+                .map_err(|e| LoadError::UnsupportedFeature(arch.clone(), e.message(&arch)))?;
+
         // Gemma: embeddings are scaled by sqrt(hidden_dim) at input.
+        // That is ARITHMETIC, not a key -- llama.cpp's Gemma graphs read
+        // no `embedding_scale` at all -- so it comes from the family and
+        // a Gemma file declaring the key is refused above rather than
+        // honoured. Granite's comes out of `{arch}.embedding_scale`.
         let embedding_scale = if matches!(
             arch_profile.family,
             crate::capability::DecoderFamily::GemmaFamily
         ) {
             Some((hidden_dim as f32).sqrt())
         } else {
-            None
+            multipliers.embedding_scale
         };
 
         // llama.cpp's `f_attention_scale`, and ONLY where it differs from
@@ -763,9 +783,31 @@ impl ModelConfig {
         // it, so Gemma-2-27B scored 1.061x and Gemma-3-27B 1.146x too
         // large on every layer: a sharper softmax than the trained one,
         // fluent and wrong, with no error.
+        //
+        // Granite reaches the same slot from the file's own
+        // `{arch}.attention.scale` (`granite.cpp:225`, whose `0.0f`
+        // sentinel means "use the kernels' scale"). The two sources
+        // cannot both be live on one architecture: `attention_scale_override`
+        // covers the architectures that COMPUTE the scale and
+        // `scalar_multipliers` the ones that READ it, and no llama.cpp
+        // architecture does both. `.or` rather than a match because the
+        // computed one is the one that cannot be turned off by a file.
         let attention_scale = crate::capability::attention_scale_override(
             &arch, n_layers, hidden_dim, n_heads, head_dim,
-        );
+        )
+        .or(multipliers.attention_scale);
+
+        // Granite reads `{arch}.rope.scaling.finetuned` as a switch for
+        // RoPE itself, not as a note about the scaling. A file declaring
+        // it false runs UNROTATED in llama.cpp and there is no ferrox
+        // expression for that, so it stops here.
+        if let Some(reason) = crate::rope_finetuned::unrotated_refusal(
+            &arch,
+            file.metadata(&key("rope.scaling.finetuned"))
+                .and_then(GgufValue::as_bool),
+        ) {
+            return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
+        }
 
         // SWA-layer RoPE base. `llama_hparams` defaults it to 10000 and
         // the Gemma-3 lineage relies on that default; the architectures
@@ -1064,6 +1106,8 @@ impl ModelConfig {
             attn_logit_softcap,
             final_logit_softcap,
             embedding_scale,
+            residual_scale: multipliers.residual_scale,
+            logit_multiplier: multipliers.logit_multiplier,
             attention_scale,
             rope_attn_factor,
             rope_dim,
@@ -2739,23 +2783,58 @@ mod tests {
     /// Granite / MiniCPM / Command-R multipliers are hparams, not
     /// tensors, so `assert_every_tensor_consumed` cannot see them: a
     /// checkpoint declaring one loads, runs at full speed, and computes
-    /// a differently-scaled graph than it was trained as. Refuse by name
-    /// until the math lands.
+    /// a differently-scaled graph than it was trained as. An
+    /// architecture whose reference graph does not apply one must refuse
+    /// it by name.
+    ///
+    /// Driven on `llama` rather than on `granite`, and that swap is the
+    /// point: `granite` APPLIES all four now
+    /// (`crate::scalar_multipliers`), so leaving the case here would
+    /// have turned this test into a test of nothing the day the feature
+    /// landed. llama.cpp's llama graph reads none of the four keys, so a
+    /// `llama` checkpoint declaring one is exactly the silent divergence
+    /// the gate exists for.
     #[test]
     fn a_declared_multiplier_this_decoder_does_not_apply_is_refused_by_name() {
         for (key, val) in [
-            ("granite.logit_scale", 6.0f32),
+            ("llama.logit_scale", 6.0f32),
+            ("llama.residual_scale", 0.22),
+            ("llama.embedding_scale", 12.0),
+            ("llama.attention.scale", 0.015_625),
+        ] {
+            let tag = key.replace('.', "_");
+            match config_error_for("llama", key, val, &tag) {
+                LoadError::UnsupportedFeature(arch, msg) => {
+                    assert_eq!(arch, "llama");
+                    assert!(msg.contains(key), "error must name the key: {msg}");
+                }
+                other => panic!("expected UnsupportedFeature for {key}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The complement, and the half that would otherwise have gone
+    /// missing: `granite` must NOT be refused for the keys its graph
+    /// applies.
+    ///
+    /// The refusal list and the implementation are two views of ONE
+    /// table (`scalar_multipliers::multiplier_support`), so this test
+    /// and the one above cannot both pass while they disagree -- which
+    /// is the whole value of deriving the list rather than restating it.
+    #[test]
+    fn granite_is_not_refused_for_the_multipliers_it_applies() {
+        for (key, val) in [
+            ("granite.logit_scale", 8.0f32),
             ("granite.residual_scale", 0.22),
             ("granite.embedding_scale", 12.0),
             ("granite.attention.scale", 0.015_625),
         ] {
-            let tag = key.replace('.', "_");
+            let tag = format!("granite_ok_{}", key.replace('.', "_"));
+            // The file carries no `block_count`, so the load still fails
+            // -- but on the *missing hparam*, having passed this gate.
             match config_error_for("granite", key, val, &tag) {
-                LoadError::UnsupportedFeature(arch, msg) => {
-                    assert_eq!(arch, "granite");
-                    assert!(msg.contains(key), "error must name the key: {msg}");
-                }
-                other => panic!("expected UnsupportedFeature for {key}, got {other:?}"),
+                LoadError::MissingHparam(k) => assert_eq!(k, "granite.block_count"),
+                other => panic!("{key}={val} must pass the scaling gate, got {other:?}"),
             }
         }
     }
@@ -2768,16 +2847,16 @@ mod tests {
     #[test]
     fn a_multiplier_that_is_a_no_op_is_not_refused() {
         for (key, val) in [
-            ("granite.logit_scale", 1.0f32),
-            ("granite.residual_scale", 1.0),
-            ("granite.embedding_scale", 1.0),
-            ("granite.attention.scale", 0.0),
+            ("llama.logit_scale", 1.0f32),
+            ("llama.residual_scale", 1.0),
+            ("llama.embedding_scale", 1.0),
+            ("llama.attention.scale", 0.0),
         ] {
             let tag = format!("noop_{}", key.replace('.', "_"));
             // The file carries no `block_count`, so the load still fails
             // -- but on the *missing hparam*, having passed this gate.
-            match config_error_for("granite", key, val, &tag) {
-                LoadError::MissingHparam(k) => assert_eq!(k, "granite.block_count"),
+            match config_error_for("llama", key, val, &tag) {
+                LoadError::MissingHparam(k) => assert_eq!(k, "llama.block_count"),
                 other => panic!("no-op {key}={val} must pass the scaling gate, got {other:?}"),
             }
         }

@@ -81,13 +81,24 @@ is faster.
   hunyuan-moe and afmoe from loading at all. It is checked against
   llama.cpp's own dots1 implementation reading the same synthetic
   checkpoint, and has not been validated on a published one.
-- **Granite, MiniCPM and Command-R scalar multipliers stop the load.**
-  `logit_scale`, `residual_scale`, `embedding_scale` and
-  `attention.scale` are hyperparameters, not tensors, so the check for
-  unread tensors never sees them. A checkpoint that declares one of them
-  with a value that changes the maths stops with an error naming the
-  key. `minicpm` stops outright, because llama.cpp applies its three
-  multipliers even when the file carries no key at all.
+- **Granite's four scalar multipliers**: `logit_scale`,
+  `residual_scale`, `embedding_scale` and `attention.scale`, on
+  `granite`, `granitemoe` and the `granite-moe` alias, checked against
+  llama.cpp's own logits on synthetic fixtures. They are
+  hyperparameters, not tensors, so the check for unread tensors never
+  sees them: before this, a Granite checkpoint would have loaded and
+  answered at a scale it was never trained at. One implementation
+  (`ferrox_models::scalar_multipliers`), parameterised by architecture,
+  serves all three rows.
+- **Every other architecture's scalar multipliers still stop the load**,
+  from a list derived from that same table rather than restated beside
+  it. A checkpoint that declares one with a value that changes the maths
+  stops with an error naming the key. `minicpm` stops outright, because
+  llama.cpp applies its three multipliers even when the file carries no
+  key at all; a Granite file declaring
+  `rope.scaling.finetuned = false` stops too, because llama.cpp then
+  runs it with no rotation at all and there is no way to express that
+  here.
 - **Parallel-residual architectures do not load either**: `command-r`,
   `cohere2`, `cohere2moe`, `falcon`, `gptneox`, `phi2`, `plamo`. They
   sum `inpL + attn_out + ffn_out` once instead of taking two sequential

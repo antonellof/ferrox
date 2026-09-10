@@ -283,8 +283,39 @@ pub struct ModelConfig {
     pub attn_logit_softcap: Option<f32>,
     /// Final logit soft-capping (Gemma 2+). Applied to lm_head output.
     pub final_logit_softcap: Option<f32>,
-    /// Input embedding scale (Gemma: `sqrt(hidden_dim)`).
+    /// Input embedding scale (Gemma: `sqrt(hidden_dim)`; Granite:
+    /// `{arch}.embedding_scale`).
     pub embedding_scale: Option<f32>,
+    /// Multiplier applied to EVERY branch output -- attention and FFN
+    /// alike -- immediately before it rejoins the residual stream
+    /// (Granite `residual_multiplier`, `src/models/granite.cpp:235-238`
+    /// and `:288-292`).
+    ///
+    /// `None` means the plain `hidden += branch` every other
+    /// architecture computes. The decoder never applies this field
+    /// itself: [`crate::scalar_multipliers::residual_add`] is the one
+    /// residual add, and it takes this value as a parameter, because
+    /// `decoder.rs` spells the add out eighteen times and eighteen
+    /// hand-written copies that must agree about one scalar is the
+    /// defect shape this repo keeps paying for.
+    pub residual_scale: Option<f32>,
+    /// Multiplier applied to the lm_head's output, after the projection
+    /// and before [`Self::final_logit_softcap`].
+    ///
+    /// Already resolved into a MULTIPLIER at load time, whichever
+    /// direction the architecture's graph states it in: Granite divides
+    /// by `{arch}.logit_scale` (`granite.cpp:180`), so this field holds
+    /// `1.0 / logit_scale`. Keeping the direction in
+    /// [`crate::scalar_multipliers`] rather than here is what lets the
+    /// decoder have exactly one multiply, and stops a second
+    /// architecture with the opposite convention from needing a second
+    /// field.
+    ///
+    /// Guaranteed positive when `Some`, and that is load-bearing rather
+    /// than incidental: a Metal decode stack may fold the lm_head and
+    /// return an argmax token id, which is only sound while every
+    /// post-head transform is monotone increasing.
+    pub logit_multiplier: Option<f32>,
     /// Optional override for the attention score scale baked into Q
     /// *instead of* the kernel's default `1/sqrt(head_dim)`. When set,
     /// callers must pass `score_scale = 1.0` into the attention kernel
@@ -658,6 +689,8 @@ pub fn glm_5_2() -> ModelConfig {
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -737,6 +770,8 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -848,6 +883,8 @@ pub fn kimi_k3() -> ModelConfig {
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -905,6 +942,8 @@ pub fn test_dense_fixture() -> ModelConfig {
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -957,6 +996,8 @@ pub fn test_moe_fixture() -> ModelConfig {
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,
@@ -1012,6 +1053,8 @@ pub fn test_mixed_fixture() -> ModelConfig {
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
+        residual_scale: None,
+        logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
         ffn_activation: FfnActivation::Swiglu,

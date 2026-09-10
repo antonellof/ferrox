@@ -711,11 +711,17 @@ fn gemma_resolves_its_embedding_scale_its_activation_and_its_tied_head() {
 /// Gemma-1 declares no softcap and no sliding window, so the Gemma-2/3
 /// machinery must resolve to INERT on this row.
 ///
-/// `GemmaFamily` is exempted from both `unsupported_feature_keys` and
-/// `unsupported_scaling_keys` on the grounds that it implements those
-/// features. That exemption is only honest while a Gemma checkpoint
-/// declaring none of them ends up with none of them, and Gemma-1 is the
-/// row where the whole family's machinery has nothing to do.
+/// `GemmaFamily` is exempted from `unsupported_feature_keys` on the
+/// grounds that it implements the softcap and the sliding window. That
+/// exemption is only honest while a Gemma checkpoint declaring none of
+/// them ends up with none of them, and Gemma-1 is the row where the
+/// whole family's machinery has nothing to do.
+///
+/// It is NOT exempted from `unsupported_scaling_keys` any more, and the
+/// difference is worth stating: Gemma scales its embeddings and its 27B
+/// attention scores, but reads NEITHER key -- both are arithmetic in
+/// `load_arch_hparams`. The blanket exemption meant a hand-written
+/// `gemma3.residual_scale` would have loaded and been ignored.
 #[test]
 fn gemma_one_gets_no_softcap_no_window_and_no_attention_scale_override() {
     let d = load_graph_fixture("gemma");

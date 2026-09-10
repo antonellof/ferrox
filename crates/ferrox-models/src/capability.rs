@@ -367,6 +367,41 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // `set_swa_pattern`'s default -- and the fixture sets a window
     // narrower than the prompt so the mask actually bites.
     "plamo3",
+    // tests/granite_family_graphs.rs: the Granite family, which was
+    // triaged NEW CODE on four SCALAR MULTIPLIERS the generic decoder
+    // did not apply -- `logit_scale`, `residual_scale`,
+    // `embedding_scale` and `attention.scale`. They are hparams rather
+    // than tensors, so `assert_every_tensor_consumed` cannot see them
+    // and a Granite checkpoint would otherwise have loaded and answered
+    // at the wrong scale. `crate::scalar_multipliers` implements all
+    // four ONCE, parameterised by architecture, and
+    // `capability::unsupported_scaling_keys` is now DERIVED from that
+    // same table rather than restated beside it.
+    //
+    // `granite` (granite.cpp:5-10,180,225,235-238,288-292) is the dense
+    // row. `granitemoe` has no graph of its own -- `models.h:1583-1591`
+    // is `using graph = llama_model_granite::graph` -- so the two differ
+    // in the FFN and in nothing else, and its fixture carries the MoE
+    // branch, an UNGATED shared expert, and expert tensors sized from
+    // `n_ff` rather than `n_ff_exp`.
+    //
+    // `granite-moe` is a ferrox-only alias: `llama-arch.cpp:101` spells
+    // the architecture `granitemoe` and no GGUF anywhere says
+    // `granite-moe`, so there is no libllama golden for it and there
+    // never can be. Its evidence is a SECOND fixture, byte-identical
+    // except for the architecture string and key prefixes, asserted
+    // against `granitemoe`'s libllama golden -- which is the only thing
+    // that can keep an alias nothing outside ferrox would ever exercise
+    // from drifting away from the row it aliases.
+    //
+    // The `rope_finetuned` half of the verdict landed as a REFUSAL
+    // (`crate::rope_finetuned`), not an implementation: granite.cpp:33-35
+    // reads `{arch}.rope.scaling.finetuned` as a switch for RoPE itself,
+    // and a file declaring it false runs UNROTATED in llama.cpp, which
+    // ferrox has no way to express.
+    "granite",
+    "granitemoe",
+    "granite-moe",
     // `bailingmoe2` (bailingmoe2.cpp:23-87,111-198): Ling-2.0. The one
     // MoE row in this batch, so the two MoE facts do arise and both are
     // asserted: SIGMOID gating, read from the file's REQUIRED
@@ -599,11 +634,16 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // (`crate::moe_interleave`) and the step every real checkpoint
     // carries is audited (`tests/one_match_arm_graphs.rs`), so the row
     // is in AUDITED_GENERIC_GQA and carries no verdict.
-    ("granite", TriageClass::NewCode, GRANITE_MULTIPLIERS),
-    ("granitemoe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
-    // ferrox-only alias row; no llama.cpp GGUF spells it this way, but
-    // it must not carry a different verdict from `granitemoe`.
-    ("granite-moe", TriageClass::NewCode, GRANITE_MULTIPLIERS),
+    //
+    // `granite`, `granitemoe` and the `granite-moe` alias were HERE,
+    // NEW CODE on the four scalar multipliers. All three are audited
+    // now: `crate::scalar_multipliers` implements the multipliers ONCE,
+    // parameterised by architecture, and `tests/granite_family_graphs.rs`
+    // is the libllama-golden evidence. The `rope_finetuned` half of that
+    // verdict landed as a REFUSAL rather than an implementation
+    // (`crate::rope_finetuned`), because llama.cpp runs such a file with
+    // no rotation at all and ferrox cannot express that.
+    //
     // `chatglm` was HERE, ONE MATCH ARM on the fused `attn_qkv.bias`.
     // The arm landed (`crate::qkv_fused`, which now resolves the
     // projections and their biases from ONE decision about which
@@ -746,20 +786,6 @@ const UNGATED_RELU_SQR: &str =
      fails closed rather than computing SwiGLU: `load_dense_expert` (loader.rs:1112-1136) \
      finds no `ffn_gate`, falls to the Phi-3 fused path, and rejects an `ffn_up` that is \
      `n_ff` rows rather than `2 * n_ff`";
-
-/// Shared by `granite`, `granitemoe` and the `granite-moe` alias: one
-/// blocker, one string, so the three rows cannot drift apart.
-const GRANITE_MULTIPLIERS: &str =
-    "Granite's four multipliers. src/models/granite.cpp:7 reads {arch}.logit_scale as \
-     REQUIRED (granite-moe.cpp:5 too) and :8-10 reads residual_scale / embedding_scale / \
-     attention.scale; the graph divides the final logits by f_logit_scale (:188) and scales \
-     BOTH branch outputs by f_residual_scale before every residual add (:241-242, :301-302). \
-     The generic decoder applies none of them, and residual_scale in particular touches \
-     every CPU and Metal residual path. In practice a real Granite checkpoint never reaches \
-     THIS message: capability::unsupported_scaling_keys already refuses it by name at \
-     loader.rs:191, which runs before the unaudited gate. Separately, granite.cpp:206 gates \
-     RoPE on `hparams.rope_finetuned`, so a Granite export with rope.finetuned=false gets NO \
-     rotation at all -- the ALiBi class of divergence, with no ferrox expression";
 
 /// Triaged rows of the generic **NEOX**-RoPE group. Same rules as
 /// [`NORM_ROPE_TRIAGED`].
@@ -1028,6 +1054,16 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `crate::qkv_fused` and has a libllama-golden fixture
         // (`tests/one_match_arm_graphs.rs`), so the class is empty now.
         v.push(gqa_norm("chatglm"));
+        // The Granite family. All three were NEW CODE in
+        // `NORM_ROPE_TRIAGED` on the four scalar multipliers, which
+        // `crate::scalar_multipliers` now implements once for all of
+        // them (`tests/granite_family_graphs.rs`). `granite-moe` is a
+        // ferrox-only alias -- `llama-arch.cpp:101` spells it
+        // `granitemoe` -- and is here rather than anywhere else so it
+        // cannot be given a different path from the row it aliases.
+        for n in ["granite", "granitemoe", "granite-moe"] {
+            v.push(gqa_norm(n));
+        }
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -2237,53 +2273,60 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
 /// (`src/models/granite.cpp::load_arch_hparams`); MiniCPM and
 /// Command-R/Cohere2 read the subset they use.
 ///
-/// **This is a refusal, not an implementation.** `residual_scale` in
-/// particular multiplies the attention and FFN branch outputs before
-/// every residual add, which in ferrox means every CPU decode/prefill/
-/// multi-seq path *and* the fused Metal kernels that fold the residual
-/// in -- landing it half-way would be exactly the silent divergence this
-/// list exists to stop. Until the math is there, a checkpoint that
-/// declares one of these is refused by name.
+/// **This list is DERIVED, never restated.** Which of the four an
+/// architecture applies lives in
+/// [`crate::scalar_multipliers::multiplier_support`], and this function
+/// is exactly its complement: a key appears here if and only if that
+/// table says the graph does not apply it. Two hand-written lists is the
+/// shape that once let this repo refuse a key it implemented and
+/// implement a key it refused, and the Gemma family used to be exempted
+/// from ALL FOUR of these wholesale on the strength of implementing two,
+/// so a hand-written `gemma3.residual_scale` would have loaded and been
+/// ignored.
+///
+/// `residual_scale` is the one that reaches furthest: it multiplies the
+/// attention and FFN branch outputs before every residual add, so on an
+/// architecture that does not implement it a declared value would have
+/// to be dropped by every CPU decode/prefill/multi-seq path *and* by the
+/// fused Metal kernels that fold the residual in.
 ///
 /// The no-op value differs by key: the three `*_scale` multipliers are
 /// `1.0`, while llama.cpp's `f_attention_scale` uses `0.0` as its
 /// "unset, use 1/sqrt(head_dim)" sentinel.
 pub fn unsupported_scaling_keys(arch: &str) -> Vec<(String, &'static str, f32)> {
-    let profile = resolve_profile(arch);
-    // Gemma implements its own embedding scale (`loader.rs`
-    // `embedding_scale`) and its own attention scale
-    // (`attention_scale_override`, including the 27B branch llama.cpp
-    // takes at `gemma3.cpp:30-33` / `gemma2.cpp:26-29`). That second
-    // half was an unimplemented claim until the 27B fix; the exemption
-    // is only honest while `attention_scale_override` covers it, which
-    // `gemma_27b_is_the_only_size_that_overrides_the_kernel_scale`
-    // pins.
-    if matches!(profile.map(|p| p.family), Some(DecoderFamily::GemmaFamily)) {
-        return Vec::new();
-    }
+    use crate::scalar_multipliers::LogitScaleUse;
+    let support = crate::scalar_multipliers::multiplier_support(arch);
     let key = |suffix: &str| format!("{arch}.{suffix}");
-    vec![
-        (
+    let mut out = Vec::new();
+    if support.logit == LogitScaleUse::NotApplied {
+        out.push((
             key("logit_scale"),
             "logit multiplier (Granite / Command-R `logits_scaling`); not applied by the generic decoder",
             1.0,
-        ),
-        (
+        ));
+    }
+    if !support.residual {
+        out.push((
             key("residual_scale"),
             "residual multiplier (Granite `residual_multiplier`); not applied by the generic decoder",
             1.0,
-        ),
-        (
+        ));
+    }
+    if !support.embedding {
+        out.push((
             key("embedding_scale"),
-            "embedding multiplier (Granite / MiniCPM `embedding_multiplier`); the generic decoder only scales embeddings for the Gemma family",
+            "embedding multiplier (Granite / MiniCPM `embedding_multiplier`); the generic decoder only scales embeddings for the Gemma and Granite families",
             1.0,
-        ),
-        (
+        ));
+    }
+    if !support.attention {
+        out.push((
             key("attention.scale"),
             "explicit attention score scale (Granite `attention_multiplier`); the generic decoder always uses 1/sqrt(head_dim)",
             0.0,
-        ),
-    ]
+        ));
+    }
+    out
 }
 
 /// Markdown coverage table for docs / CI drift checks.
@@ -2457,7 +2500,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 25,
+            seen == 22,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2469,12 +2512,16 @@ mod audit_tests {
              POST-NORM-ONLY pair, ONE topology and one implementation \
              (`crate::pre_norm`) -- got theirs (tests/post_norm_only_graphs.rs), 29 until \
              `chatglm` -- the LAST ONE MATCH ARM row -- got its fused-QKV-bias arm and \
-             its fixture, and 28 until `mistral`, `mixtral` and `yi` turned out not to be \
+             its fixture, 28 until `mistral`, `mixtral` and `yi` turned out not to be \
              architectures at all (libllama refuses all three strings) and moved to \
-             DedicatedOnly. `gemma` was the last fixture-away row and `chatglm` the last \
-             one-match-arm row, so BOTH classes are empty: what is left is 24 NEW CODE \
-             and one UNKNOWN (`phi4`). `olmo2` and `exaone4` were the first NEW CODE rows \
-             to close"
+             DedicatedOnly, and 25 until the three Granite rows -- granite, granitemoe \
+             and the granite-moe alias -- closed together on ONE implementation of their \
+             four scalar multipliers (tests/granite_family_graphs.rs). `gemma` was the \
+             last fixture-away row and `chatglm` the last one-match-arm row, so BOTH \
+             classes are empty: what is left is 21 NEW CODE and one UNKNOWN (`phi4`). \
+             The NEW CODE rows that have closed are `olmo2`, `exaone4` and the three \
+             Granite rows, and each closure took more than one row at a time because \
+             each found ONE cause behind several refusals"
         );
     }
 
