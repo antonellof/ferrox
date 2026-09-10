@@ -13,6 +13,123 @@ Entries name what changed and, where it matters, what was wrong
 before. A fix that closed a silent-wrong-answer class says so — those
 are the ones worth reading twice.
 
+## [0.19.0] - 2026-09-10
+
+### Fixed
+
+- **Metal greedy decoding returned the wrong token in the default
+  configuration.** This is the silent-wrong-answer kind, so read it
+  twice. Metal has two paths for the final `lm_head` step: a fused GPU
+  fold that argmaxes on device, and a host path that samples on the CPU.
+  **The fold argmaxes the RAW logits; the host path applies the
+  repetition penalties first**, and `--repeat-penalty` defaults to 1.1
+  here rather than llama.cpp's 1.0. So the fast path answered a question
+  nobody asked. Proven by checksum: at 1.1 the folded completion was
+  bit-identical to the completion at 1.0, which is what "the penalty
+  never ran" looks like, while the unfolded completion matched the CPU
+  reference exactly.
+
+  The cause was **one predicate answering two questions**.
+  `greedy_equals_argmax` was called both after the penalties had been
+  applied, where excluding them is correct, and by Metal before anything
+  had been applied, where it is not. It is now split in two, each
+  derived from one exhaustive match over the sampler chain and one
+  exhaustive destructure of the parameters with no `..`, and the old
+  name is deleted so every call site had to choose. A sampler field
+  added later fails to compile until it is classified.
+
+  The fold is refused when a penalty is live rather than the penalties
+  being reimplemented in a Metal kernel, deliberately: a second
+  implementation that must agree with the host about sign convention,
+  the once-per-candidate rule and the window is this repo's dominant
+  defect shape, and putting it inside the fix for that shape is how it
+  recurs (#170, #172).
+
+- **Two same-length activations could alias on Metal, across requests.**
+  The residency cache matched on length alone. `cpu-cuda-parity.md`
+  recorded that as safe because "exactly one site sets it": one site
+  sets it and **three** consume it, each routinely handed a same-length
+  activation that is not the published one. The published value was a
+  raw buffer pointer that escaped the mutex protecting it, so two
+  concurrent `ferrox-server` requests could have one answer the other's
+  `lm_head`. Live, not latent. Publication now lives inside the guarded
+  scratch, keyed on the host address and length of the exact buffer
+  returned, and drops on any borrow (#171).
+
+- **Metal decode was thread-affine and did not say so.** Running a
+  forward on a different thread changed its output. The stated cause was
+  the resident activation cache and that was wrong: disabling the reuse
+  changes nothing, because the dense stack downloads with an exact copy.
+  The cause was `GREEDY_ARGMAX`, a thread-local *configuration* flag set
+  on the main thread and read on whichever thread ran the step, so a
+  worker read the default and silently took the other `lm_head` path. It
+  is now a three-state type with capture and adopt, since the two
+  spellings of "false" are not the same claim (#166, #171).
+
+### Changed
+
+- **CPU decode enters the thread pool once per forward instead of about
+  150 times.** Rayon's `join` has two arms: from a rayon worker it runs
+  inline on a spin latch with no syscall, and from any other thread it
+  injects the job and blocks on a mutex and condvar. Every forward was
+  driven from a thread rayon did not own, at roughly five regions per
+  layer. A profile put **74% of the token** in `__psynch_cvwait` on the
+  driving thread, against 6.6% of samples in the actual matvec kernel.
+  Interleaved within-process ratios: **135M +29%, 3B +9%, 8B +3%**,
+  prefill flat (#128, #167).
+
+  Note what this corrects. #128 had computed scheduling at 6.7% of a
+  token and ruled it out. The arithmetic was right and **the denominator
+  was stale**, taken against a 17 ms token before the repack fix in
+  0.18.0 shrank it to about 5 ms. The ruled-out cause was the real one.
+
+- **Every engine gets that, not just the generic decoder.** The five
+  dedicated engines share the `Engine` trait, so the wrapper is written
+  once as that trait's provided body and an engine supplies only its
+  inner worker. Cold regions per decode step: Gemma-4 **100 to 1**, the
+  BERT encoder **72 to 1**, Kimi and GLM-5.2 30 to 1, DeepSeek-V4 16 to
+  1. A structural test refuses any engine that overrides the promoted
+  entry point, so the seam cannot be bypassed silently (#169).
+
+### Documented
+
+- `benchmarks/RESULTS.md` is now the generated table and nothing else,
+  291 lines to 81, with each model's prefill and decode on **one row**
+  rather than ten rows apart. Nothing was re-benchmarked: `--render`
+  reads the committed receipts, and the sorted multiset of every gap
+  cell is identical before and after. The prose moved to
+  `benchmarks/HISTORY.md` rather than being deleted, because the
+  aarch64 rows and the before/after studies are measurements a generator
+  cannot reproduce (#175).
+- The 8.2x SmolLM2-135M row is marked **stale** rather than edited. It
+  predates both the 0.18.0 repack fix and #167; on an M2 Pro it now
+  reads about 1.9x. That is a different machine, so it is recorded as
+  evidence the gap shrank rather than as a replacement number, and the
+  row still needs a quiet Cortex-A725 (#168).
+- `ferrox bench` does not use the greedy fold, so #172 cannot move the
+  published Metal rows. Written down because it looks like it should
+  (#173), along with a correction: the fold has **two** callers, not
+  one, and the conclusion rests on neither being on the bench path
+  (#174).
+- **An inverted quant claim is corrected.** `body_quant`'s doc used
+  `Llama-3.2-1B-Instruct-IQ4_XS.gguf` to teach that a filename is not a
+  quantization, and said the file holds 96 `IQ4_NL` tensors and no
+  IQ4_XS. The count was right and the type was backwards: it holds 96
+  IQ4_XS, 16 Q5_K, one Q6_K and zero IQ4_NL. That inversion crosses the
+  line that decides a verdict, because ggml declares `vec_dot_type =
+  Q8_K` for IQ4_XS and `Q8_0` for IQ4_NL, so the comment described a
+  file whose DRIFT would be unexplained while the real file's DRIFT is
+  the expected case. The tool's verdict was always right; only the
+  explanation was wrong. A new test pins the two look-alike neighbours
+  to their ggml facts, because the existing one walked whatever the
+  lists happened to contain and stayed green under the inversion (#176).
+- The file-size table in `CLAUDE.md` was re-measured. One of five files
+  shrank, so the rule still lost on balance, and the real wins left the
+  table entirely: `repack.rs` 6446 lines to a directory of ten,
+  `sampling.rs` 1569 to 894, `mul_mm.rs` to 865. Every one of those
+  splits happened because somebody was about to add to the file and
+  split it first (#165).
+
 ## [0.18.0] - 2026-09-09
 
 ### Added
@@ -422,6 +539,7 @@ benchmark ledger.
 First tag. GGUF mmap loader, quantized CPU kernels, Metal backend,
 `ferrox` CLI and `ferrox-server`.
 
+[0.19.0]: https://github.com/antonellof/ferrox/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/antonellof/ferrox/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/antonellof/ferrox/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/antonellof/ferrox/compare/v0.16.0...v0.17.0
