@@ -13,6 +13,62 @@ Entries name what changed and, where it matters, what was wrong
 before. A fix that closed a silent-wrong-answer class says so — those
 are the ones worth reading twice.
 
+## [0.19.1] - 2026-09-10
+
+Ferrox Studio only. No crate in the workspace changed, so an engine
+built from 0.19.0 behaves identically.
+
+### Changed
+
+- **One model selector instead of three surfaces claiming the model.**
+  The chat header switcher and a `Load` button on every row of the
+  Models table posted the *same* request for the same server-wide
+  effect: the server holds one checkpoint and `/v1/chat/completions` has
+  no per-request override, so these were not different scopes. Models is
+  now facts plus the one verb a picker cannot express, `Unload`, and the
+  header keeps the picker. The rule comes from how this class of UI
+  splits generally: a management screen installs, removes and reports,
+  while a picker beside the conversation selects.
+- **The status control at the bottom of the sidebar reads as status.**
+  It was rendering the loaded model id under a chevron, which made a
+  health indicator look like a fourth model selector. It now shows the
+  server state and version, with the model id, capabilities and
+  last-request age one click into its popover.
+- **The base URL is a new chat, and a conversation has its own URL.**
+  Entry previously ended in an unconditional "reopen the newest
+  conversation", on every path and after any elapsed time. `/ui/chat` is
+  now empty and `/ui/chat/<id>` is that conversation, with the id
+  stamped in by the first message.
+- **Returning after 30 minutes away starts fresh** and offers the
+  previous conversation back. "Away" is measured only while the document
+  is visible and is stored per tab, so a reload of an old tab reads as
+  away while a deep link into a new tab is simply honoured. It never
+  fires over a running generation or a half-typed message.
+
+  Worth recording that the research contradicted this one: no product
+  surveyed implements a staleness rule, and the advice was not to invent
+  one. It is here because it was asked for, which is why it is narrow,
+  announced, and undoable rather than silent.
+
+### Fixed
+
+- The staleness rule **could never fire**: the visibility heartbeat
+  stamped the tab awake from its mount effect while the entry check read
+  that stamp from inside a promise, so the evidence was always already
+  overwritten.
+- Correcting the URL **re-loaded the conversation the rule had just
+  declined**, because a route correction is a state update and the
+  effect ran again on the old id, printing its banner over a resurrected
+  transcript.
+
+### Known issue
+
+`POST /admin/models/load` can leave generation producing garbage until
+the server is restarted, and the Studio model selector is that endpoint
+([#180](https://github.com/antonellof/ferrox/issues/180)). Present in
+0.19.0 and not fixed here. Deterministic, and a fresh start on the same
+checkpoint is correct, so restarting the server clears it.
+
 ## [0.19.0] - 2026-09-10
 
 ### Fixed
@@ -539,6 +595,7 @@ benchmark ledger.
 First tag. GGUF mmap loader, quantized CPU kernels, Metal backend,
 `ferrox` CLI and `ferrox-server`.
 
+[0.19.1]: https://github.com/antonellof/ferrox/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/antonellof/ferrox/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/antonellof/ferrox/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/antonellof/ferrox/compare/v0.17.0...v0.17.1
