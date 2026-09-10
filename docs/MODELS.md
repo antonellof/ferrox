@@ -187,13 +187,13 @@ of this. The speed recovery from returning to the fused path is
 unmeasured, because measuring it needs a quiet host.
 
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **31** stop with `UnauditedArchitecture`.
+   **29** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. One of the 31 is one named match arm away
+"Unaudited" is not one thing. One of the 29 is one named match arm away
 and the rest need an attention implementation or a reading nobody has
 done, so the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
@@ -205,7 +205,7 @@ done, so the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 31 have now been read on both sides (`ferrox_models::capability`,
+All 29 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -214,7 +214,7 @@ on models":
 |---|---|
 | fixture-away | 0 |
 | one match arm | 1 |
-| new code | 26 |
+| new code | 24 |
 | unknown | 4 |
 
 **Fixture-away is empty.** Every row that only needed evidence has it
@@ -254,13 +254,26 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (26).** A different attention or residual structure. The
-recurring shapes, rather than 26 separate stories:
+**New code (24).** A different attention or residual structure. The
+recurring shapes, rather than 24 separate stories:
+
+The column moved for the first time on 2026-09-10, 26 to 24. `olmo2`
+and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and no
+`ffn_norm` at all, both sublayers reading the raw residual, each
+branch's output normed before its residual add -- and they closed
+together because reading `olmo2.cpp:45-52,92,160-182` against
+`exaone4.cpp:60-67,118,152-169` showed one graph, not two. One
+implementation (`ferrox_models::pre_norm`), one fixture each
+(`tests/post_norm_only_graphs.rs`). Two sub-cases stay refused by name:
+an `olmo2` with BOTH a sliding window and a RoPE scaling (Olmo-3) ropes
+its sliding and full layers differently, and EXAONE-4 32B
+(`block_count == 64`) gives its full-attention layers no RoPE at all --
+both decided by llama.cpp with no GGUF key, the `baichuan` shape.
 
 | Shape | Architectures |
 |---|---|
 | Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
-| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `olmo2`, `exaone4`, `olmo`, `talkie`, `bitnet`, `dbrx` |
+| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `olmo` (and `olmo2` / `exaone4`, now CLOSED), `talkie`, `bitnet`, `dbrx` |
 | LayerNorm rather than RMSNorm | `dbrx`, `olmo` |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |

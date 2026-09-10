@@ -12,21 +12,34 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-09. **26** architectures run with
+Honest position, re-audited 2026-09-10. **28** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 31 unaudited refusals are now TRIAGED, and the refusal says which of
+The 29 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away**, 1 needs one named
-match arm, 26 need new code, 4 are unknown with the question stated.
+match arm, 24 need new code, 4 are unknown with the question stated.
 Five one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, and `gemma`, `hunyuan-dense` and `ernie4_5-moe` on
 2026-09-09, each with a libllama-golden fixture, which is what moved 46
 to 41 to 34 to 31. The fixture-away class being EMPTY is the honest
 headline: every row that only needed evidence has it, so what is left
 needs code.
+
+**And on 2026-09-10 the NEW CODE column moved for the first time**, 26
+to 24, which is what took 31 to 29. `olmo2` and `exaone4` closed
+TOGETHER, because they are ONE residual topology: no `attn_norm` and no
+`ffn_norm` tensor, both sublayers reading the raw residual, each
+branch's output normed before its residual add. Reading
+`olmo2.cpp:45-52,92,160-182` beside `exaone4.cpp:60-67,118,152-169`
+gives the same graph line for line, so they got one implementation
+(`ferrox-models/src/pre_norm.rs`) and a fixture each. Two sub-cases stay
+refused by name rather than swept in -- an `olmo2` with both a window
+and a RoPE scaling, and EXAONE-4 32B, whose full-attention layers get no
+RoPE at all -- and `olmo` (OLMo-1) is a THIRD shape, pre-norm with a
+non-parametric LayerNorm, still needing code.
 
 Building those fixtures keeps finding defects worth more than the
 admissions. `plamo3` could never have loaded a real checkpoint, because
@@ -135,7 +148,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 26
+Those files are why llama.cpp has 140 architectures and ferrox has 28
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model
