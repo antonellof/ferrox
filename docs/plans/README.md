@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **33** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **35** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 22 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 92 (60 `dedicated` + 32 `deferred` in the manifest) |
+| Refuses as **unaudited**, now triaged | 21 |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 91 (59 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 55 generic-gqa (33 of
-them audited), 60 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 56 generic-gqa (35 of
+them audited), 59 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -78,8 +78,8 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 22 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-21 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 21 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+20 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
 refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
@@ -87,8 +87,11 @@ different graph. Five one-match-arm rows closed on 2026-09-02
 seven fixture-away rows on 2026-09-03, `gemma`, `hunyuan-dense` and
 `ernie4_5-moe` after them, and on 2026-09-10 `olmo2` and `exaone4`
 (below) plus `chatglm` -- the last one-match-arm row -- and `qwen`,
-which the same arm turned out to close only halfway, and the three
-Granite rows (below). Each with a libllama-golden fixture.
+which the same arm turned out to close only halfway, the three
+Granite rows and `olmo` (both below). Each with a libllama-golden
+fixture. `minicpm` closed the same day and is not in that arithmetic: it
+was refused BY NAME rather than as unaudited, so it raises the audited
+count without lowering the refusing one.
 
 The three UNKNOWN rows `mistral`, `mixtral` and `yi` closed the same
 day by turning out not to be architectures: libllama refuses all three
@@ -96,24 +99,63 @@ strings outright and every real checkpoint of all three declares
 `llama`, so they are refused as spellings now rather than triaged as
 graphs. `phi4` is the one UNKNOWN left.
 
-**The NEW CODE column moved for the first time on 2026-09-10**, twice,
-from 26 to 24 and then to 21. Both movements took several rows at once,
-and for the same reason: each found ONE cause behind several refusals.
-That is so far the only way this column has moved.
+**The NEW CODE column moved for the first time on 2026-09-10**, three
+times: 26 to 24, 24 to 21, then 21 to 20. The first two took several
+rows at once for the same reason -- each found ONE cause behind several
+refusals.
+
+`olmo` is the one that did not, and it is worth reading for the way the
+question was settled rather than for the row. "What else shares this
+cause" was answered by MEASUREMENT before any code was written: every
+`build_norm` call in all 140 of llama.cpp's `src/models/*.cpp` graphs
+was scanned for a null weight argument, and all three hits are
+`olmo.cpp`. `openelm`, `bitnet`, `arcee`, `mellum`, `nanbeige` and
+`deci` were the rows the search was aimed at and not one of them norms
+without parameters -- they are checked-and-recorded now instead of
+still-plausible, which is most of the value. The LayerNorm *function*
+IS shared, by `dbrx` and the `nemotron` / `orion` / `stablelm` /
+`codeshell` / `jais2` / `starcoder` / `starcoder2` / `phimoe` bias
+group, and none of them is one variant away because each refuses for
+more than the norm; `capability::NON_PARAMETRIC_LAYER_NORM` carries the
+whole finding.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`
 tensor; both read the raw residual at each sublayer and norm each
 branch's output before its residual add (`olmo2.cpp:45-52,92,160-182`,
 `exaone4.cpp:60-67,118,152-169`, line for line the same graph).
-`ferrox_models::pre_norm` is the one implementation and
+`ferrox_models::norm` is the one implementation and
 `tests/post_norm_only_graphs.rs` the evidence, a libllama-golden fixture
 each. Two sub-cases stay refused BY NAME rather than being swept in: an
 `olmo2` carrying both a sliding window and a RoPE scaling (Olmo-3) ropes
 its two kinds of layer differently, and EXAONE-4 32B
 (`block_count == 64`) gives its full-attention layers no RoPE at all.
 `olmo` (OLMo-1) is a THIRD shape -- pre-norm with a non-parametric
-LayerNorm -- and still needs code.
+LayerNorm at all three sites, `olmo.cpp:65-67,104-106,128-130` -- and
+closed as a third variant of the same enum
+(`tests/olmo_graphs.rs`). `Decoder::final_norm` became a `NormOp` with
+it: OLMo-1's final norm has no weights either, and the fused Metal
+stacks that fold `final_norm + lm_head + argmax` had
+`Some(&self.final_norm)` written into them unconditionally. Half its
+verdict stayed a refusal, and the half that looked like an aside:
+`olmo.cpp:5` reads `{arch}.attention.clamp_kqv`,
+`llama-graph.cpp:1611-1652` clamps Q, K and V by it, and
+`conversion/olmo.py:23-25` writes it for every checkpoint whose HF
+config carries a `clip_qkv` -- OLMo-7B-Twin-2T and OLMo-1.7-7B do, the
+original OLMo-7B does not. A second fixture measures that llama.cpp's
+own logits move when the key is present, so it is not a no-op that
+could be ignored.
+
+`minicpm` was never an unaudited row: it was refused BY NAME, because
+`minicpm.cpp:5-7` assigns an embedding multiplier of 12.0, a residual
+multiplier of `1.4/sqrt(n_layer)` and a logit multiplier of `256/n_embd`
+BEFORE `:12-14` lets the file override them, so a key-PRESENCE gate sees
+nothing in a file that is still scaled three ways. It runs Granite's
+graph verbatim (`models.h:1594-1601`), so the fix was a DEFAULTS field
+on the table `scalar_multipliers` already had, and the fixture that
+evidences it declares no scaling key at all -- the only fixture shape
+that can tell the hook from its absence. A second one declares all three
+and pins the merge ORDER, which one fixture cannot see.
 
 `granite`, `granitemoe` and the `granite-moe` alias closed together too,
 on ONE implementation of the four scalar multipliers they share
@@ -132,7 +174,7 @@ declaring it false runs unrotated, which ferrox cannot express.
 
 | | llama.cpp | ferrox |
 |---|---|---|
-| Per-architecture graphs | 140 hand-written | 150 catalog rows, **33 proven** |
+| Per-architecture graphs | 140 hand-written | 150 catalog rows, **35 proven** |
 | Metal `pp512` | baseline | 0.98x-1.10x, at parity |
 | Metal `tg128` | baseline | **8 of 12 rows faster** |
 | CPU, all rows | baseline | **1.41x-5.06x slower** |

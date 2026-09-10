@@ -12,42 +12,70 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-10. **33** architectures run with
+Honest position, re-audited 2026-09-10. **35** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 22 unaudited refusals are now TRIAGED, and the refusal says which of
+The 21 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 21 need new code, 1 is unknown with the question stated. Five
+away**, 20 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
-and `olmo2`, `exaone4`, `chatglm`, `qwen` and the three Granite rows on
-2026-09-10, each with a libllama-golden fixture, which is what moved 46
-to 41 to 34 to 31 to 29 to 28 to 25 to 22; the step from 28 to 25 was
-moving the three alias rows off the generic path rather than a closure.
+and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
+`olmo` on 2026-09-10, each with a libllama-golden fixture, which is what
+moved 46 to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21; the step from
+28 to 25 was moving the three alias rows off the generic path rather
+than a closure. `minicpm` moved too and is not in that count: it was
+refused BY NAME, never as unaudited, so it raises the audited number
+without lowering the refusing one.
 BOTH cheap classes being EMPTY is the honest headline: nothing still
 refusing is one fixture or one arm away, so every row that is left
 needs a different graph.
 
-**On 2026-09-10 the NEW CODE column moved for the first time**, twice:
-26 to 24, then 24 to 21. Both movements took several rows at once, and
-the reason is the same both times and is the lesson: each found ONE
-cause behind several refusals. Nothing has ever moved this column one
-row at a time.
+**On 2026-09-10 the NEW CODE column moved for the first time**, three
+times: 26 to 24, 24 to 21, then 21 to 20. The first two took several
+rows at once for the same reason, and it is the lesson: each found ONE
+cause behind several refusals.
+
+`olmo` is the exception that says what the rule is really made of. It
+closed ALONE, and before writing a line of code the question "what else
+shares this cause" was answered by MEASUREMENT rather than by hope:
+every `build_norm` call in all 140 of llama.cpp's `src/models/*.cpp`
+graphs was scanned for a null weight argument, and all three hits are
+`olmo.cpp`. So there was no second row to take, and knowing that in
+advance is worth as much as a shared cause would have been -- the six
+rows the search was aimed at (`openelm`, `bitnet`, `arcee`, `mellum`,
+`nanbeige`, `deci`) are now checked-and-recorded rather than
+still-plausible. What IS shared is the LayerNorm *function* with a
+learned weight: `dbrx` plus the `nemotron` / `orion` / `stablelm` /
+`codeshell` / `jais2` / `starcoder` / `starcoder2` / `phimoe` bias
+group. None of them is one variant away, because each refuses for more
+than the norm, so that variant was deliberately NOT written --
+`capability::NON_PARAMETRIC_LAYER_NORM` records the whole finding where
+the next person will look.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are ONE residual
 topology: no `attn_norm` and no `ffn_norm` tensor, both sublayers
 reading the raw residual, each branch's output normed before its
 residual add. Reading `olmo2.cpp:45-52,92,160-182` beside
 `exaone4.cpp:60-67,118,152-169` gives the same graph line for line, so
-they got one implementation (`ferrox-models/src/pre_norm.rs`) and a
+they got one implementation (`ferrox-models/src/norm.rs`) and a
 fixture each. Two sub-cases stay refused by name rather than swept in --
 an `olmo2` with both a window and a RoPE scaling, and EXAONE-4 32B,
-whose full-attention layers get no RoPE at all -- and `olmo` (OLMo-1) is
-a THIRD shape, pre-norm with a non-parametric LayerNorm, still needing
-code.
+whose full-attention layers get no RoPE at all. `olmo` (OLMo-1) is a
+THIRD shape, pre-norm with a non-parametric LayerNorm, and closed on
+2026-09-10 as a third variant of the same enum; the type is
+`ferrox-models/src/norm.rs`'s `NormOp` now rather than `PreNorm`,
+because `Decoder::final_norm` is one too -- OLMo-1's final norm has no
+weights either, and the fused Metal stacks had `Some(&self.final_norm)`
+written into them unconditionally. Its `attention.clamp_kqv` stayed a
+REFUSAL: `llama-graph.cpp:1611-1652` clamps Q, K and V by it,
+`conversion/olmo.py:23-25` really writes it for OLMo-7B-Twin-2T and
+OLMo-1.7-7B, and a second fixture measures that llama.cpp's own logits
+move when it is present, so the row is admitted for the checkpoints it
+covers rather than all of them.
 
 `granite`, `granitemoe` and the `granite-moe` alias closed together for
 the same kind of reason: they differ in the FFN, not in the four scalar
@@ -65,9 +93,21 @@ expensive half was `residual_scale`: it multiplies both branch outputs
 of every layer, so `decoder.rs`'s EIGHTEEN hand-written residual adds
 collapsed onto one function taking the scalar as a parameter, and the
 four Metal eligibility checks gained one shared predicate rather than
-four spellings of it. MiniCPM runs the same llama.cpp graph object and
-is now a defaults hook plus a fixture away; Command-R is not, because
-its blocker is a parallel residual over LayerNorm rather than the
+four spellings of it. MiniCPM ran the same llama.cpp graph
+object -- `models.h:1594-1601` is
+`using graph = llama_model_granite::graph` -- and closed on 2026-09-10
+on the defaults hook that was predicted: `minicpm.cpp:5-7` assigns 12.0,
+`1.4/sqrt(n_layer)` and `256/n_embd` BEFORE `:12-14` lets the file
+override them, so a MiniCPM export declaring nothing is still scaled by
+all three and a key-PRESENCE gate has nothing to see. That is why it was
+refused by name rather than detected. `MultiplierDefaults` is a FIELD of
+the same table, so a default for a key the graph does not apply is not
+expressible, and the fixture that evidences it declares NO key at all --
+the only fixture shape that can tell the hook from its absence. A second
+one declares all three and pins that the file still wins, because a hook
+merged the wrong way round would agree with llama.cpp on exactly the
+files that prove it exists. Command-R is still not close, because its
+blocker is a parallel residual over LayerNorm rather than the
 multiplier.
 
 Building those fixtures keeps finding defects worth more than the
@@ -192,7 +232,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 33
+Those files are why llama.cpp has 140 architectures and ferrox has 35
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

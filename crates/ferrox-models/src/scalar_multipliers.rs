@@ -29,6 +29,7 @@
 //! |---|---|---|---|---|---|
 //! | `granite` | `granite.cpp:5-10` | yes | yes | divide | yes |
 //! | `granitemoe` | `granite-moe.cpp:3-10` | yes | yes | divide | yes |
+//! | `minicpm` | `minicpm.cpp:5-14` | yes | yes | divide | **no** |
 //!
 //! **Gemma is not in that table, and that is the interesting part.** It
 //! scales its embeddings by `sqrt(n_embd)` and, at 27B, overrides its
@@ -44,18 +45,30 @@
 //! `capability::attention_scale_override` and `loader.rs`'s family
 //! branch, which is where an arch-computed value belongs.
 //!
-//! Two rows are deliberately NOT here, and both are one table entry
-//! away rather than a second implementation:
+//! **MiniCPM is the row that made the DEFAULTS column real.** It runs
+//! `llama_model_granite::graph` verbatim (`models.h:1594-1601`) -- the
+//! same graph object, not a similar one -- so it needs no arithmetic of
+//! its own. What it adds is DEFAULTS: `minicpm.cpp:5-7` hardcodes
+//! `f_embedding_scale = 12.0`, `f_residual_scale = 1.4/sqrt(n_layer)`
+//! and `f_logit_scale = 256/n_embd` and only THEN reads the three keys
+//! with `required = false` (`:12-14`), so an older MiniCPM export
+//! carrying none of them is still scaled by all three. A key-presence
+//! gate sees nothing in such a file, which is why MiniCPM used to be
+//! refused by NAME rather than detected: nothing in the metadata
+//! reveals it. [`MultiplierDefaults`] is that hook, and it is a FIELD
+//! of [`MultiplierSupport`] rather than a second table, so an
+//! architecture cannot be given a default for a key its graph does not
+//! apply.
 //!
-//! * **MiniCPM** runs `llama_model_granite::graph` verbatim
-//!   (`models.h:1594-1601`) -- the same graph object, not a similar one.
-//!   What it adds is DEFAULTS: `minicpm.cpp:5-7` hardcodes
-//!   `f_embedding_scale = 12.0`, `f_residual_scale = 1.4/sqrt(n_layer)`
-//!   and `f_logit_scale = 256/n_embd` BEFORE letting the file override
-//!   them, so an older MiniCPM export carrying none of the three keys is
-//!   still scaled by all three. That is a fallback hook this module does
-//!   not have yet, and adding it without a MiniCPM fixture would be dead
-//!   code, so MiniCPM stays a `DedicatedOnly` refusal.
+//! MiniCPM differs from Granite in exactly one column: it never reads
+//! `{arch}.attention.scale` (`minicpm.cpp:3-24` contains no
+//! `LLM_KV_ATTENTION_SCALE`), so `hparams.f_attention_scale` keeps its
+//! `0.0f` and `granite.cpp:225` falls back to `1/sqrt(n_embd_head)`.
+//! That key is still refused for `minicpm`, by the derived list, which
+//! is what deriving it is for.
+//!
+//! One row is deliberately NOT here, and it is not one table entry away:
+//!
 //! * **Command-R / Cohere2** apply `f_logit_scale` as a MULTIPLY rather
 //!   than a divide (`command-r.cpp:136-138`), which is
 //!   [`LogitScaleUse`]'s missing third variant. But their blocker is not
@@ -84,8 +97,113 @@ pub enum LogitScaleUse {
     #[default]
     NotApplied,
     /// Granite / MiniCPM: `ggml_scale(cur, 1.0f / f_logit_scale)`
-    /// (`granite.cpp:180`). The key is REQUIRED for both Granite rows.
+    /// (`granite.cpp:180`).
+    ///
+    /// Whether the KEY is required is not part of this variant: it
+    /// follows from [`MultiplierSupport::defaults`]. `granite.cpp:7`
+    /// reads it with no default, so a Granite file omitting it is
+    /// refused; `minicpm.cpp:7` seeds `256/n_embd` first, so a MiniCPM
+    /// file omitting it is scaled by that. One fact, derived, rather
+    /// than a `required` flag beside the table that could come to
+    /// disagree with it.
     Reciprocal,
+}
+
+/// The value a multiplier takes when the file declares no key.
+///
+/// llama.cpp spells this as plain assignment before a `required = false`
+/// `get_key`, so the default and the override are one statement apart
+/// and easy to read past. Here it is a variant, because "the file said
+/// nothing" and "the file said 1.0" are the same input to [`resolve`]
+/// and must not be the same output.
+///
+/// It is a field of [`MultiplierSupport`] rather than a table beside it:
+/// a default for a key the graph does not apply would be arithmetic
+/// nothing performs, and this way that combination is not expressible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MultiplierDefaults {
+    /// The file is the only source. A key it omits is not applied, and
+    /// a `logit_scale` it omits is an error where the graph divides by
+    /// it (`granite.cpp:7` reads that key with no default and throws).
+    #[default]
+    FromFileOnly,
+    /// MiniCPM: `minicpm.cpp:5-7` assigns all three multipliers BEFORE
+    /// `:12-14` lets the file override them.
+    ///
+    /// ```text
+    /// f_embedding_scale = 12.0f;
+    /// f_residual_scale  = 1.4f / sqrtf(float(n_layer));
+    /// f_logit_scale     = n_embd ? (256.0f / float(n_embd)) : 1.0f;
+    /// ```
+    ///
+    /// No `attention.scale` default: MiniCPM does not read that key at
+    /// all, so `f_attention_scale` keeps llama.cpp's own `0.0f`.
+    MiniCpm,
+}
+
+impl MultiplierDefaults {
+    /// What this architecture applies for each key the file leaves out.
+    ///
+    /// `None` in a field means "nothing to fall back on", which for
+    /// [`LogitScaleUse::Reciprocal`] is what makes the key required.
+    pub fn values(self, dims: MultiplierDims) -> DeclaredMultipliers {
+        match self {
+            Self::FromFileOnly => DeclaredMultipliers::default(),
+            Self::MiniCpm => DeclaredMultipliers {
+                // `n_embd ? 256/n_embd : 1.0` -- the ternary is
+                // llama.cpp's own guard against a zero embedding width,
+                // kept because dropping it turns a malformed file into a
+                // division by zero instead of the missing-hyper-parameter
+                // error the loader already raises for it.
+                logit: Some(if dims.n_embd == 0 {
+                    1.0
+                } else {
+                    256.0 / dims.n_embd as f32
+                }),
+                residual: Some(1.4 / (dims.n_layer as f32).sqrt()),
+                embedding: Some(12.0),
+                attention: None,
+            },
+        }
+    }
+
+    /// The file's declaration where it has one, this architecture's
+    /// default where it does not.
+    ///
+    /// Destructured exhaustively with no `..` on purpose: a fifth
+    /// multiplier must not be able to slip through unmerged.
+    fn merge(self, declared: DeclaredMultipliers, dims: MultiplierDims) -> DeclaredMultipliers {
+        let DeclaredMultipliers {
+            logit,
+            residual,
+            embedding,
+            attention,
+        } = declared;
+        let d = self.values(dims);
+        DeclaredMultipliers {
+            logit: logit.or(d.logit),
+            residual: residual.or(d.residual),
+            embedding: embedding.or(d.embedding),
+            attention: attention.or(d.attention),
+        }
+    }
+}
+
+/// The model dimensions the defaults and the sentinels are computed
+/// from.
+///
+/// One struct rather than three positional `usize` arguments, because
+/// `resolve(support, declared, 6, 2, 24)` is three chances to swap two
+/// of them and no way for the compiler to notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiplierDims {
+    /// `n_embd_head`, for the `attention.scale` that restates the
+    /// kernels' own `1/sqrt(head_dim)`.
+    pub head_dim: usize,
+    /// `n_layer`, for MiniCPM's `1.4/sqrt(n_layer)` residual default.
+    pub n_layer: usize,
+    /// `n_embd`, for MiniCPM's `256/n_embd` logit default.
+    pub n_embd: usize,
 }
 
 /// Which of the four multipliers this architecture's reference graph
@@ -107,6 +225,8 @@ pub struct MultiplierSupport {
     pub logit: LogitScaleUse,
     /// `{arch}.attention.scale` replaces the kernels' `1/sqrt(head_dim)`.
     pub attention: bool,
+    /// What the graph applies for a key the file does NOT declare.
+    pub defaults: MultiplierDefaults,
 }
 
 impl MultiplierSupport {
@@ -117,6 +237,7 @@ impl MultiplierSupport {
         residual: false,
         logit: LogitScaleUse::NotApplied,
         attention: false,
+        defaults: MultiplierDefaults::FromFileOnly,
     };
 
     /// `granite`, `granitemoe` and the `granite-moe` alias. One
@@ -127,6 +248,20 @@ impl MultiplierSupport {
         residual: true,
         logit: LogitScaleUse::Reciprocal,
         attention: true,
+        defaults: MultiplierDefaults::FromFileOnly,
+    };
+
+    /// `minicpm`. The same graph as [`Self::GRANITE`]
+    /// (`models.h:1594-1601` is `using graph = llama_model_granite::graph`)
+    /// with two differences, both from `minicpm.cpp:3-24`: it never
+    /// reads `{arch}.attention.scale`, and it seeds the other three
+    /// before the file is consulted.
+    pub const MINICPM: Self = Self {
+        embedding: true,
+        residual: true,
+        logit: LogitScaleUse::Reciprocal,
+        attention: false,
+        defaults: MultiplierDefaults::MiniCpm,
     };
 }
 
@@ -143,6 +278,7 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     ("granite", MultiplierSupport::GRANITE),
     ("granitemoe", MultiplierSupport::GRANITE),
     ("granite-moe", MultiplierSupport::GRANITE),
+    ("minicpm", MultiplierSupport::MINICPM),
 ];
 
 /// Which multipliers ferrox applies for `arch`.
@@ -249,24 +385,32 @@ fn scale_or_none(v: Option<f32>) -> Option<f32> {
     v.filter(|&v| v != 0.0 && v != 1.0)
 }
 
-/// Turn what the file declared into what the decoder applies.
+/// Turn what the file declared -- plus what this architecture applies
+/// when it declared nothing -- into what the decoder applies.
 ///
-/// `head_dim` is only used to drop an `attention.scale` that restates
-/// the kernels' own `1/sqrt(head_dim)`: `ModelConfig::attention_scale`
-/// means "pre-scale Q and pass 1.0 to the kernel", so restating the
-/// default would be arithmetically identical but would fence the layer
-/// off every fused Metal launch for nothing.
+/// The defaults are merged FIRST, in llama.cpp's own order: assignment,
+/// then the optional key read, then the graph's sentinel tests. Doing it
+/// the other way round would let a MiniCPM file declaring
+/// `residual_scale = 1.0` fall back to `1.4/sqrt(n_layer)` instead of
+/// switching the scaling off, which is the opposite of what
+/// `granite.cpp:235`'s `if (hparams.f_residual_scale)` does with it.
+///
+/// `dims.head_dim` is only used to drop an `attention.scale` that
+/// restates the kernels' own `1/sqrt(head_dim)`:
+/// `ModelConfig::attention_scale` means "pre-scale Q and pass 1.0 to the
+/// kernel", so restating the default would be arithmetically identical
+/// but would fence the layer off every fused Metal launch for nothing.
 pub fn resolve(
     support: MultiplierSupport,
     declared: DeclaredMultipliers,
-    head_dim: usize,
+    dims: MultiplierDims,
 ) -> Result<ResolvedMultipliers, MultiplierError> {
     let DeclaredMultipliers {
         logit,
         residual,
         embedding,
         attention,
-    } = declared;
+    } = support.defaults.merge(declared, dims);
 
     let logit_multiplier = match support.logit {
         LogitScaleUse::NotApplied => None,
@@ -286,7 +430,7 @@ pub fn resolve(
     // real override. See `scale_or_none`, which must not be used here.
     let attention_scale = if support.attention {
         attention.filter(|&v| v != 0.0).filter(|&v| {
-            let kernel = 1.0 / (head_dim as f32).sqrt();
+            let kernel = 1.0 / (dims.head_dim as f32).sqrt();
             (v - kernel).abs() > f32::EPSILON * kernel.max(1.0)
         })
     } else {
@@ -336,6 +480,17 @@ pub fn residual_add(hidden: &mut [f32], branch: &[f32], scale: Option<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dimensions for the rows whose arithmetic does not depend on
+    /// them. Only the MiniCPM defaults read `n_layer` / `n_embd`, and
+    /// those tests spell their own out.
+    fn dims(head_dim: usize) -> MultiplierDims {
+        MultiplierDims {
+            head_dim,
+            n_layer: 2,
+            n_embd: 24,
+        }
+    }
 
     /// The three Granite rows share one support constant, so they cannot
     /// be given different arithmetic by an edit to one of them.
@@ -408,7 +563,7 @@ mod tests {
                 logit: Some(8.0),
                 ..Default::default()
             },
-            64,
+            dims(64),
         )
         .expect("8.0 resolves");
         assert_eq!(got.logit_multiplier, Some(0.125));
@@ -424,7 +579,7 @@ mod tests {
             resolve(
                 MultiplierSupport::GRANITE,
                 DeclaredMultipliers::default(),
-                64
+                dims(64),
             ),
             Err(MultiplierError::MissingRequiredLogitScale)
         );
@@ -449,7 +604,7 @@ mod tests {
                         logit: Some(bad),
                         ..Default::default()
                     },
-                    64
+                    dims(64),
                 ),
                 Err(MultiplierError::NonPositiveLogitScale(bad)),
                 "logit_scale {bad} must be refused"
@@ -474,7 +629,7 @@ mod tests {
                 embedding: Some(1.0),
                 attention: Some(0.0),
             },
-            64,
+            dims(64),
         )
         .expect("all no-ops resolve");
         assert_eq!(got, ResolvedMultipliers::default(), "{got:?}");
@@ -488,7 +643,7 @@ mod tests {
                 embedding: Some(0.0),
                 attention: Some(1.0),
             },
-            64,
+            dims(64),
         )
         .expect("resolves");
         assert_eq!(
@@ -522,7 +677,7 @@ mod tests {
                 attention: Some(kernel),
                 ..Default::default()
             },
-            head_dim,
+            dims(head_dim),
         )
         .expect("resolves");
         assert_eq!(got.attention_scale, None);
@@ -535,7 +690,7 @@ mod tests {
                 attention: Some(0.015_625),
                 ..Default::default()
             },
-            head_dim,
+            dims(head_dim),
         )
         .expect("resolves");
         assert_eq!(got.attention_scale, Some(0.015_625));
@@ -557,7 +712,7 @@ mod tests {
                 embedding: Some(12.0),
                 attention: Some(0.015_625),
             },
-            64,
+            dims(64),
         )
         .expect("an unsupported logit_scale is not even read");
         assert_eq!(got, ResolvedMultipliers::default());

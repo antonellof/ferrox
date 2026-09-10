@@ -56,7 +56,7 @@ use ferrox_moe::{
 };
 
 use crate::config::ModelConfig;
-use crate::pre_norm::PreNorm;
+use crate::norm::NormOp;
 use crate::scalar_multipliers::residual_add;
 
 pub struct AttnWeights {
@@ -64,10 +64,10 @@ pub struct AttnWeights {
     pub k_proj: WeightMatrix, // [n_kv_heads*head_dim, hidden_dim]
     pub v_proj: WeightMatrix, // [n_kv_heads*head_dim, hidden_dim]
     pub o_proj: WeightMatrix, // [hidden_dim, n_heads*head_dim]
-    /// The PRE-attention norm, or [`PreNorm::None`] for the
+    /// The PRE-attention norm, or [`NormOp::None`] for the
     /// post-norm-only topology (`olmo2` / `exaone4`), which projects
-    /// Q/K/V straight off the raw residual. See [`crate::pre_norm`].
-    pub norm_weight: PreNorm,
+    /// Q/K/V straight off the raw residual. See [`crate::norm`].
+    pub norm_weight: NormOp,
     /// OLMoE-style QK-RMSNorm (`attn_q_norm`/`attn_k_norm` GGUF tensors),
     /// applied to the *whole* q_proj/k_proj output (width `n_heads*head_dim`
     /// / `n_kv_heads*head_dim`) before RoPE -- confirmed against
@@ -155,10 +155,10 @@ pub struct MoeWeights {
     /// (DeepSeek-V3's shared experts, for one real confirmed contrast,
     /// add unconditionally with no gate at all).
     pub shared_expert_gate: Option<Vec<f32>>,
-    /// The PRE-FFN norm, or [`PreNorm::None`] for the post-norm-only
+    /// The PRE-FFN norm, or [`NormOp::None`] for the post-norm-only
     /// topology (`olmo2` / `exaone4`), which runs the FFN on the raw
-    /// post-attention residual. See [`crate::pre_norm`].
-    pub norm_weight: PreNorm,
+    /// post-attention residual. See [`crate::norm`].
+    pub norm_weight: NormOp,
     /// DeepSeek-V3's aux-loss-free expert-selection bias, on disk as
     /// `blk.{N}.exp_probs_b.bias` (llama.cpp's `LLM_TENSOR_FFN_EXP_PROBS_B`
     /// -- note the on-disk name has no `ffn_` prefix, `llama-arch.cpp:416`).
@@ -389,7 +389,17 @@ pub struct Decoder {
     /// row-wise.
     pub embedding: WeightMatrix,
     pub layers: Vec<LayerWeights>,
-    pub final_norm: Vec<f32>,
+    /// The norm before the LM head.
+    ///
+    /// A [`NormOp`] rather than a `Vec<f32>` because `olmo` is the first
+    /// architecture whose final norm is not an RMSNorm: `olmo.cpp:128-130`
+    /// is `build_norm(cur, NULL, NULL, LLM_NORM, -1)`, and `olmo.cpp:15-36`
+    /// creates no `output_norm` tensor for it to weight. The fused Metal
+    /// stacks that fold `final_norm + lm_head + argmax` had
+    /// `Some(&self.final_norm)` written into them unconditionally; now
+    /// they ask [`NormOp::rms_weights`] and fall back to the host body
+    /// when there is nothing to hand over.
+    pub final_norm: NormOp,
     pub output_head: WeightMatrix, // [vocab_size, hidden_dim]
     /// Real VRAM budget for GPU-resident routed experts.
     /// `None` (both constructors below
@@ -613,7 +623,7 @@ impl Decoder {
                     rng.vec(hidden * n_heads * head_dim),
                     vec![hidden, n_heads * head_dim],
                 ),
-                norm_weight: PreNorm::Rms(vec![1.0; hidden]),
+                norm_weight: NormOp::Rms(vec![1.0; hidden]),
                 q_norm: None,
                 k_norm: None,
                 q_bias: None,
@@ -665,7 +675,7 @@ impl Decoder {
                 experts: ExpertBacking::Resident(experts),
                 shared_experts,
                 shared_expert_gate: None,
-                norm_weight: PreNorm::Rms(vec![1.0; hidden]),
+                norm_weight: NormOp::Rms(vec![1.0; hidden]),
                 activation_counts,
                 #[cfg(feature = "metal")]
                 packed_q4: None,
@@ -674,7 +684,7 @@ impl Decoder {
             layers.push(LayerWeights { attn, moe });
         }
 
-        let final_norm = vec![1.0; hidden];
+        let final_norm = NormOp::Rms(vec![1.0; hidden]);
         let output_head = wm(rng.vec(vocab_size * hidden), vec![vocab_size, hidden]);
         let execution_plan = crate::execution_plan::ExecutionPlan::from_config(
             &config,
@@ -1126,7 +1136,7 @@ impl Decoder {
                 // `?`, not a `&`: the kernel applies the RMSNorm itself
                 // and the post-norm-only topology has no weight to give
                 // it, so the stack declines and the host body runs. See
-                // `crate::pre_norm`.
+                // `crate::norm`.
                 attn_norm_w: layer.attn.norm_weight.rms_weights()?,
                 ffn_norm_w: layer.moe.norm_weight.rms_weights()?,
                 q,
@@ -1951,7 +1961,19 @@ impl Decoder {
                             // stack" and "the stack returns an argmax id",
                             // so the second cannot drift off the first.
                             // See `decoder::lm_head`.
-                            let folded = FoldedLmHead::permit(greedy_gpu, lm_head_gpu_launch);
+                            let folded = FoldedLmHead::permit(
+                                greedy_gpu,
+                                &self.final_norm,
+                                lm_head_gpu_launch,
+                            );
+                            // The MoE stack used to be handed
+                            // `Some(&self.final_norm)` unconditionally,
+                            // which is unrepresentable now: a model whose
+                            // final norm has no RMS weights leaves the
+                            // norm to the host body below, and
+                            // `final_norm_done_in_stack` is read off the
+                            // SAME value rather than hardcoded `true`.
+                            let final_norm_w = self.final_norm.rms_weights();
                             let embd_launch = Self::metal_matvec_launch(&self.embedding);
                             // Gemma scales embd on host; GPU gather has no scale.
                             let embd_gather = if self.config.embedding_scale.is_some() {
@@ -2006,7 +2028,7 @@ impl Decoder {
                                     self.config.layer_rope_freqs(0),
                                     pos,
                                     self.config.rms_norm_eps,
-                                    Some(&self.final_norm),
+                                    final_norm_w,
                                     folded.as_ref().map(FoldedLmHead::launch),
                                     folded.as_ref().is_some_and(FoldedLmHead::argmax_only),
                                     true,
@@ -2033,7 +2055,7 @@ impl Decoder {
                                         );
                                     }
                                     hidden = out;
-                                    final_norm_done_in_stack = true;
+                                    final_norm_done_in_stack = final_norm_w.is_some();
                                     metal_stack_done = true;
                                 }
                                 Err(e) => {
@@ -2128,12 +2150,21 @@ impl Decoder {
                             // See `decoder::lm_head`: folding lm_head into
                             // the stack and the stack returning an argmax id
                             // are one decision, held in one value.
-                            let folded = FoldedLmHead::permit(greedy_gpu, lm_head_gpu_launch);
+                            let folded = FoldedLmHead::permit(
+                                greedy_gpu,
+                                &self.final_norm,
+                                lm_head_gpu_launch,
+                            );
                             // Pass final_norm_w when: (1) lm_head runs in stack (folded),
                             // OR (2) lm_head will route to GPU after stack (lm_head_gpu_launch
                             // but no fold) so we can skip download→reupload via TLS.
+                            //
+                            // `rms_weights()` is what makes the second
+                            // case safe for a non-RMS final norm: it is
+                            // `None` there, so the stack does not norm
+                            // and the host body does.
                             let final_norm_w = if folded.is_some() || lm_head_gpu_launch.is_some() {
-                                Some(self.final_norm.as_slice())
+                                self.final_norm.rms_weights()
                             } else {
                                 None
                             };
@@ -2297,7 +2328,7 @@ impl Decoder {
                                 // fused launch below bakes the RMSNorm into its
                                 // kernel and there is no weight to bake for the
                                 // post-norm-only topology (`olmo2` / `exaone4`).
-                                // `PreNorm::rms_weights` returning `None` sends
+                                // `NormOp::rms_weights` returning `None` sends
                                 // the whole layer to the host body, which reads
                                 // the raw residual the way llama.cpp does.
                                 if let (
@@ -2655,10 +2686,10 @@ impl Decoder {
         let final_normed = if final_norm_done_in_stack {
             hidden.clone()
         } else {
-            rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps)
+            self.final_norm.apply(&hidden, self.config.rms_norm_eps)
         };
         #[cfg(not(feature = "metal"))]
-        let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
+        let final_normed = self.final_norm.apply(&hidden, self.config.rms_norm_eps);
 
         let logits = self.logits_from_normed(&final_normed);
         // Clear dense-stack activation TLS after lm_head (may have consumed it).
@@ -2759,7 +2790,7 @@ impl Decoder {
             residual_add(&mut hidden, &ffn_out, self.config.residual_scale);
         }
 
-        let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
+        let final_normed = self.final_norm.apply(&hidden, self.config.rms_norm_eps);
         Ok(self.logits_from_normed(&final_normed))
     }
 
@@ -4294,7 +4325,7 @@ impl Decoder {
 
         hidden_batch
             .chunks(hidden_dim)
-            .map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
+            .map(|h| self.final_norm.apply(h, self.config.rms_norm_eps))
             .collect()
     }
 
@@ -4535,7 +4566,7 @@ impl Decoder {
 
         let final_normed_batch: Vec<f32> = hidden_batch
             .par_chunks(hidden_dim)
-            .map(|h| rms_norm(h, &self.final_norm, self.config.rms_norm_eps))
+            .map(|h| self.final_norm.apply(h, self.config.rms_norm_eps))
             .flatten()
             .collect();
         self.logits_from_flat_hidden(final_normed_batch, batch_size)

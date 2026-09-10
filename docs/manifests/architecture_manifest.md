@@ -18,8 +18,8 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `granite` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `granitemoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `granite-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `deci` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmo` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `deci` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `arctic` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mistral3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `nanbeige` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -81,7 +81,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `gptneox` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `phi2` | TextGeneration | PhiFamily | KvGqa | dedicated |
 | `plamo` | TextGeneration | StandardGqa | KvGqa | dedicated |
-| `minicpm` | TextGeneration | StandardGqa | KvGqa | dedicated |
+| `minicpm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `phi3` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `phi4` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `llama4` | TextGeneration | Dedicated | KvGqa | dedicated |

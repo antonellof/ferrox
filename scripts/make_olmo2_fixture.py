@@ -19,7 +19,7 @@ So the layer is:
 
 `exaone4` is the same shape (`src/models/exaone4.cpp:60-67,118,152-169`)
 and shares one implementation with this row; see
-`crates/ferrox-models/src/pre_norm.rs`.
+`crates/ferrox-models/src/norm.rs`.
 
 What this fixture pins beyond that topology, each against the C:
 

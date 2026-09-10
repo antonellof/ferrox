@@ -102,10 +102,11 @@ The error always names the reason. Six things cause it:
    `x + attn(norm(x))` then `y + ffn(norm(y))` shape the generic decoder
    computes: `command-r`, `cohere2`, `cohere2moe`, `falcon`, `gptneox`,
    `phi2` and `plamo` feed both branches the same normed input and sum
-   once. `minicpm` scales its embeddings, residuals and logits by
-   multipliers llama.cpp applies even when the GGUF omits every key.
-   None of that shows up in a tensor or, for MiniCPM, in metadata, so
-   these are listed by name rather than detected.
+   once. None of that shows up in a tensor, so these are listed by name
+   rather than detected. `minicpm` was on this list and no longer is:
+   it never had a different residual, only three multipliers llama.cpp
+   applies whether or not the GGUF declares them, and those are
+   implemented now (see 4 below).
 
 3. **The file contains weights Ferrox never reads.** The GGUF reader
    records every tensor name a loader looks up and stops if any are left
@@ -153,14 +154,27 @@ The error always names the reason. Six things cause it:
    (`conversion/granite.py:253` is `GraniteHybridModel`, a different
    architecture string), so a real export never sees that message.
 
-   `minicpm` still stops outright, and not for a key: llama.cpp
-   hardcodes its three multipliers (`minicpm.cpp:5-7`) and only then
-   lets the file override them, so a key-presence gate sees nothing on
-   an older export. Its graph is `llama_model_granite::graph` verbatim
-   (`models.h:1594-1601`), so what it needs now is a defaults hook on
-   that same table plus a fixture. `command-r` and `cohere2` are
-   further off: their `logit_scale` is a multiply rather than a divide,
-   but their real blocker is a parallel residual over LayerNorm.
+   **MiniCPM runs now**, and it is the case a key-presence gate could
+   never have caught. llama.cpp assigns its three multipliers
+   (`minicpm.cpp:5-7`: 12.0, `1.4/sqrt(n_layer)` and `256/n_embd`) and
+   only THEN lets the file override them (`:12-14`), so an export
+   declaring nothing is still scaled three ways and the metadata looks
+   ordinary -- which is why the row was refused on its architecture
+   string. Its graph is `llama_model_granite::graph` verbatim
+   (`models.h:1594-1601`), so the fix was a DEFAULTS field on the same
+   table, and the fixture that evidences it declares no scaling key at
+   all: a fixture that declared them would pass with or without the
+   hook. A second fixture declares all three and pins that the FILE
+   still wins, which one fixture cannot see
+   (`crates/ferrox-models/tests/minicpm_graphs.rs`). MiniCPM reads no
+   `attention.scale` (`minicpm.cpp:3-24` has no such key), so that one
+   is still refused for this row, by the derived list -- measured, too:
+   libllama's logits for a file declaring it are byte-identical to the
+   file without it.
+
+   `command-r` and `cohere2` are further off: their `logit_scale` is a
+   multiply rather than a divide, but their real blocker is a parallel
+   residual over LayerNorm.
 
 5. **The architecture encodes position some other way than RoPE.** The
    generic decoder rotates every Q and K head of every layer. `gpt2`
@@ -179,14 +193,15 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **33** do
+   logit comparison against real `libllama`, or a fixture; **35** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
    `ernie4_5-moe`, `internlm2`, `xverse`, `baichuan`, `exaone`,
    `exaone4`, `plamo3`, `granite`, `granitemoe`, `granite-moe`,
+   `minicpm`, `olmo`,
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **22** stop with `UnauditedArchitecture`.
+   **21** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
@@ -230,7 +245,7 @@ unmeasured, because measuring it needs a quiet host.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. None of the 22 is a fixture or a single
+"Unaudited" is not one thing. None of the 21 is a fixture or a single
 match arm away any more: they need an attention implementation or a
 reading nobody has done, and the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
@@ -242,7 +257,7 @@ reading nobody has done, and the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 22 have now been read on both sides (`ferrox_models::capability`,
+All 21 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -251,13 +266,13 @@ on models":
 |---|---|
 | fixture-away | 0 |
 | one match arm | 0 |
-| new code | 21 |
+| new code | 20 |
 | unknown | 1 |
 
 **Both cheap classes are empty.** `gemma` was the last fixture-away row
 and `chatglm` the last one-match-arm row; nothing still refusing is one
 fixture or one arm away. That is a better answer than the count alone:
-the cheap wins are spent, and what is left is 24 rows needing a
+the cheap wins are spent, and what is left is 20 rows needing a
 different graph plus one name nobody can get a file for.
 
 It was 47 until the triage itself removed one. Reading
@@ -313,20 +328,20 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (21).** A different attention or residual structure. The
-recurring shapes, rather than 21 separate stories:
+**New code (20).** A different attention or residual structure. The
+recurring shapes, rather than 20 separate stories:
 
-The column moved for the first time on 2026-09-10, twice: 26 to 24, then
-24 to 21. Both movements took several rows at once, and for the same
-reason -- each found ONE cause behind several refusals. Nothing has ever
-moved this column one row at a time.
+The column moved for the first time on 2026-09-10, three times: 26 to
+24, 24 to 21, then 21 to 20. The first two took several rows at once,
+and for the same reason -- each found ONE cause behind several
+refusals.
 
 `olmo2` and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and
 no `ffn_norm` at all, both sublayers reading the raw residual, each
 branch's output normed before its residual add -- and they closed
 together because reading `olmo2.cpp:45-52,92,160-182` against
 `exaone4.cpp:60-67,118,152-169` showed one graph, not two. One
-implementation (`ferrox_models::pre_norm`), one fixture each
+implementation (`ferrox_models::norm`), one fixture each
 (`tests/post_norm_only_graphs.rs`). Two sub-cases stay refused by name:
 an `olmo2` with BOTH a sliding window and a RoPE scaling (Olmo-3) ropes
 its sliding and full layers differently, and EXAONE-4 32B
@@ -343,11 +358,34 @@ alias for the second. One implementation
 (`tests/granite_family_graphs.rs`). Half the verdict stayed a refusal --
 see cause 4 above for `rope.scaling.finetuned`.
 
+`olmo` (OLMo-1) closed ALONE, and that is the interesting part. It is a
+THIRD norm shape: pre-norm like llama, but `olmo.cpp:65-67,104-106,128-130`
+normalise with `build_norm(x, NULL, NULL, LLM_NORM, il)` -- a
+non-parametric LayerNorm -- and `olmo.cpp:15-36` creates no norm tensor
+of any kind, not even an `output_norm`. Before writing it, the question
+"what else shares this cause" was answered by measurement rather than
+hope: every `build_norm` call in all 140 of llama.cpp's
+`src/models/*.cpp` graphs was scanned for a null weight argument, and
+all three hits are `olmo.cpp`. `openelm`, `bitnet`, `arcee`, `mellum`,
+`nanbeige` and `deci` were the candidates and none of them qualifies.
+The LayerNorm *function* is shared -- `dbrx` and the bias group below --
+but none of those is one variant away, so a weighted-LayerNorm variant
+would have had no caller and was deliberately not written
+(`capability::NON_PARAMETRIC_LAYER_NORM` carries the whole finding).
+Half of OLMo-1's verdict stayed a refusal, and it is the half that read
+like an aside: `olmo.cpp:5` reads `{arch}.attention.clamp_kqv`,
+`llama-graph.cpp:1611-1652` clamps Q, K and V by it inside `build_qkv`,
+and `conversion/olmo.py:23-25` writes it for every checkpoint whose HF
+config has a `clip_qkv` -- OLMo-7B-Twin-2T and OLMo-1.7-7B do, at 8.0;
+the original OLMo-7B does not. A second fixture measures that llama.cpp
+answers differently with it, so it is not a no-op that could be
+ignored.
+
 | Shape | Architectures |
 |---|---|
 | Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
-| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `olmo` (and `olmo2` / `exaone4`, now CLOSED), `talkie`, `bitnet`, `dbrx` |
-| LayerNorm rather than RMSNorm | `dbrx`, `olmo` |
+| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `talkie`, `bitnet`, `dbrx` (`olmo`, `olmo2` and `exaone4` were here and are CLOSED) |
+| LayerNorm rather than RMSNorm | `dbrx` (with a learned weight; `olmo`'s non-parametric one is CLOSED) |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
 | Hardcoded scales applied even when the GGUF carries no key | `grok`, `mistral3` |
