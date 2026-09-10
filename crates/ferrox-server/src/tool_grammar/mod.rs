@@ -80,7 +80,7 @@
 //! `<function=` instead would fire only after the name it introduces had
 //! already been sampled unconstrained.
 
-mod exclude;
+pub(super) mod exclude;
 mod wire;
 
 #[cfg(test)]
