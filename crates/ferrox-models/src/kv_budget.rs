@@ -43,10 +43,12 @@
 //! Gemma-3-4B context look 5.8x cheaper than it is and gpt-oss 2x. **No
 //! KV store ferrox allocates ever gave that cap back** (#33):
 //!
-//! - `ferrox_core::cache::KvCache` has no window concept at all. `push`
-//!   extends `k`/`v` for every position, so a plain or pool-backed cache
-//!   holds the whole sequence in every layer. This is what the CLI
-//!   allocates and what the server allocates on its non-paged paths.
+//! - `ferrox_core::cache::KvCache` had no window concept at all. `push`
+//!   extended `k`/`v` for every position, so a plain or pool-backed
+//!   cache held the whole sequence in every layer. This is what the CLI
+//!   allocates and what the server allocates on its non-paged paths, and
+//!   it is still what they do unless `FERROX_KV_WINDOW` is on -- see the
+//!   section after next.
 //! - The paged store *can* recycle pages behind a window, but only for a
 //!   model whose every layer shares one window
 //!   (`ModelConfig::uniform_sliding_window`, `None` by design for the
@@ -83,6 +85,15 @@
 //! `Decoder::forward_batch` evicts per layer rather than after the
 //! stack. `resident_` is what a measurement of the caches finds at rest;
 //! `peak_` is what the machine has to survive.
+//!
+//! [`KvBudget`] CARRIES the residency rather than taking it as an
+//! argument, and [`KvBudget::kv_bytes_at`] is the one expression the
+//! estimate, the refusal text and `--ctx auto` all read. Until #61 step
+//! 2 was wired here, the store took the saving and the admission check
+//! did not know: `-c auto` still divided a Gemma-3 budget by every
+//! layer's full per-token cost, so a context that would have fit was
+//! refused. That is #33 read backwards, and it is the same defect
+//! shape -- two statements of one rule, with nothing making them agree.
 //!
 //! What is NOT priced here, because no store does it yet: eviction
 //! inside the paged store (#61 step 4) and eviction of the prompt region
@@ -379,8 +390,8 @@ impl KvShape {
             .fold(0u64, |acc, b| acc.saturating_add(b))
     }
 
-    /// The number an admission decision must use: the resting cost, plus
-    /// the one layer that is still mid-prefill.
+    /// The number an admission decision must use: the resting ceiling,
+    /// plus the one layer that is still mid-prefill.
     ///
     /// `Decoder::forward_batch` writes a whole prompt into layer `l`'s
     /// cache, attends over it, and only then hands the rows behind the
@@ -393,18 +404,39 @@ impl KvShape {
     ///
     /// The extra term is the largest single windowed layer's shortfall,
     /// because layers are prefilled one at a time.
+    ///
+    /// # Why the resting term is the CEILING and not `rows_after`
+    ///
+    /// [`KvWindow::rows_after`] is exact and it OSCILLATES: a cache
+    /// that runs `slack` rows past its window and then drains holds
+    /// anywhere in `[window, window + slack]`, cycling with period
+    /// `slack + 1`. So bytes priced from it are not monotone in
+    /// `tokens`, and [`KvBudget::max_context`] searches for the largest
+    /// context that fits -- a search over a function that goes back
+    /// down cannot be trusted to find the largest one.
+    ///
+    /// [`KvWindow::max_rows`] is the same type's own statement of the
+    /// top of that cycle, so pricing against it is still the store's
+    /// rule rather than a second opinion about it, it is monotone, and
+    /// it is wrong only in the direction that refuses a context instead
+    /// of OOMing on one. The gap is at most `slack` rows per windowed
+    /// layer, against a term that already carries a whole layer's
+    /// prompt.
     pub fn peak_kv_bytes_for_tokens(&self, tokens: usize, residency: &KvResidency) -> u64 {
         let per_layer = self.layout.elems_per_token_per_layer();
         let full = self.elem.bytes_for(per_layer.saturating_mul(tokens as u64));
+        let resting = residency
+            .ceiling_rows_per_layer(self.n_layers, tokens)
+            .map(|rows| self.elem.bytes_for(per_layer.saturating_mul(rows as u64)))
+            .fold(0u64, |acc, b| acc.saturating_add(b));
         let transient = residency
-            .rows_per_layer(self.n_layers, tokens)
+            .ceiling_rows_per_layer(self.n_layers, tokens)
             .map(|rows| {
                 full.saturating_sub(self.elem.bytes_for(per_layer.saturating_mul(rows as u64)))
             })
             .max()
             .unwrap_or(0);
-        self.resident_kv_bytes_for_tokens(tokens, residency)
-            .saturating_add(transient)
+        resting.saturating_add(transient)
     }
 
     /// The sentence a user should be able to read and reproduce with a
@@ -489,6 +521,32 @@ impl KvResidency {
             None => tokens,
         })
     }
+
+    /// The most rows each layer can hold at `tokens` of context.
+    ///
+    /// [`Self::rows_per_layer`] is the instantaneous count and cycles
+    /// through `[window, window + slack]`; this is the top of that
+    /// cycle, taken from [`KvWindow::max_rows`] so the ceiling is the
+    /// window type's own and not a second arithmetic beside it. Never
+    /// below `rows_per_layer`, never above `tokens`, and non-decreasing
+    /// in `tokens` -- which is what [`KvBudget::max_context`]'s search
+    /// needs and the oscillating count cannot give it.
+    fn ceiling_rows_per_layer(
+        &self,
+        n_layers: usize,
+        tokens: usize,
+    ) -> impl Iterator<Item = usize> + '_ {
+        (0..n_layers).map(move |l| match self.layer_window(l) {
+            Some(w) => w.max_rows().min(tokens),
+            None => tokens,
+        })
+    }
+
+    /// How many layers evict, for a report that has to explain why the
+    /// context is not simply the budget divided by a per-token cost.
+    pub fn evicting_layers(&self) -> usize {
+        self.per_layer.iter().filter(|w| w.is_some()).count()
+    }
 }
 
 /// Which ceiling a rejection hit. The point of naming it is that the
@@ -541,7 +599,14 @@ impl KvBudgetError {
 
 /// A priced plan: every term of the inequality, kept separately so the
 /// report can show the arithmetic rather than just the verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`, because [`Self::residency`] is a per-layer vector. That
+/// is deliberate: the residency belongs IN the budget rather than
+/// beside it as an argument every caller has to remember to pass. A
+/// method taking it as a parameter is exactly the shape that let the
+/// store and the budget disagree in #33 -- one caller passes it, the
+/// next one does not, and nothing says which run the number describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvBudget {
     /// Checkpoint bytes. See the module doc on why this is an
     /// approximation for mmap'd weights.
@@ -552,6 +617,16 @@ pub struct KvBudget {
     /// [`crate::device_budget::DeviceBudget::usable_bytes`]).
     pub device_budget_bytes: u64,
     pub shape: KvShape,
+    /// What the stores this run allocates will really keep, per layer.
+    ///
+    /// [`KvResidency::keeps_everything`] is the engine's default and
+    /// reproduces every number this type produced before #61.
+    /// [`KvResidency::from_config`] with a live [`KvWindowPolicy`] is
+    /// what a run with `FERROX_KV_WINDOW` on must be priced against --
+    /// otherwise the store takes a saving the admission check refuses
+    /// to spend, which is #33 read backwards: a context that would have
+    /// fit, turned away.
+    pub residency: KvResidency,
     /// KV caches are per request; concurrency multiplies them.
     pub concurrent_requests: usize,
 }
@@ -565,11 +640,21 @@ impl KvBudget {
             .saturating_sub(self.activation_headroom_bytes)
     }
 
+    /// KV bytes at `tokens` of context, across every concurrent
+    /// request, at the moment the run costs most.
+    ///
+    /// The ONE expression the estimate, the refusal message and the
+    /// context search all read, so a change to what the stores keep
+    /// cannot reach two of the three and miss the other.
+    pub fn kv_bytes_at(&self, tokens: usize) -> u64 {
+        self.shape
+            .peak_kv_bytes_for_tokens(tokens, &self.residency)
+            .saturating_mul(self.concurrent_requests.max(1) as u64)
+    }
+
     /// Total estimated resident bytes at `tokens` of context.
     pub fn estimated_bytes(&self, tokens: usize) -> u64 {
-        self.weights_bytes
-            + self.activation_headroom_bytes
-            + self.shape.kv_bytes_for_tokens(tokens) * self.concurrent_requests.max(1) as u64
+        self.weights_bytes + self.activation_headroom_bytes + self.kv_bytes_at(tokens)
     }
 
     /// The one-line check the plan is named for. `Ok` carries the
@@ -587,7 +672,7 @@ impl KvBudget {
                 "{} weight bytes + {} KV bytes at {tokens} tokens x{} concurrent + {} \
                  activation headroom exceeds the {} byte device budget",
                 self.weights_bytes,
-                self.shape.kv_bytes_for_tokens(tokens) * self.concurrent_requests.max(1) as u64,
+                self.kv_bytes_at(tokens),
                 self.concurrent_requests.max(1),
                 self.activation_headroom_bytes,
                 self.device_budget_bytes,
@@ -595,49 +680,61 @@ impl KvBudget {
         })
     }
 
-    /// Largest context that fits, closed form:
-    /// `(budget - weights - headroom) / (per_token_kv * concurrency)`,
-    /// floored to `granularity` and clamped to `cap` (the model's own
-    /// trained context length).
+    /// Largest context that fits: the biggest `tokens` for which
+    /// [`Self::kv_bytes_at`] still sits inside
+    /// `budget - weights - headroom`, floored to `granularity` and
+    /// clamped to `cap` (the model's own trained context length).
     ///
-    /// Every layer is in the divisor. A sliding-window model used to
-    /// have its windowed layers subtracted out of it and added back as a
-    /// saturated constant, which is the #33 under-estimate: nothing
-    /// evicts, so nothing saturates.
+    /// Every layer is in the cost. A sliding-window model used to have
+    /// its windowed layers subtracted out of a divisor and added back
+    /// as a saturated constant, which is the #33 under-estimate:
+    /// nothing evicted, so nothing saturated. What is different now is
+    /// that a run CAN evict (#61), and this asks the residency instead
+    /// of assuming either answer.
+    ///
+    /// # Why a search and not a division
+    ///
+    /// With no eviction the cost is linear and
+    /// `available / per_token_kv` is exact; a test below asserts this
+    /// search returns that same number for a residency that keeps
+    /// everything, so the closed form is not lost, it is checked
+    /// against. With eviction the cost is piecewise: a windowed layer
+    /// stops charging past `window + slack` while the dense ones keep
+    /// going, so there is no single divisor to divide by and a division
+    /// would price a 32k Gemma-3 context at 5.4x what it costs. The
+    /// searched function is non-decreasing in `tokens` -- that is what
+    /// `ceiling_rows_per_layer` is for -- so bisection finds the
+    /// largest fitting context rather than any fitting context.
     pub fn max_context(&self, cap: usize, granularity: usize) -> ContextFit {
         let granularity = granularity.max(1);
         let concurrency = self.concurrent_requests.max(1) as u64;
         let available = self.kv_bytes_available();
-        let per_token = self.shape.per_token_kv_bytes().saturating_mul(concurrency);
 
         let (tokens, capped_by) = if available == 0 {
             (0, ContextCap::DeviceBudget)
         } else {
-            // `checked_div` rather than a `per_token == 0` guard around
-            // a bare `/`: a model with no KV at all (no layers, or a
-            // zero-width layout) is not an error here, it is just
-            // unbounded by memory, and expressing it as `None` keeps
-            // that meaning in one place instead of splitting it across
-            // a check and a division that clippy then has to
-            // re-associate.
-            match available.checked_div(per_token) {
-                None => (cap, ContextCap::ModelContextLength),
-                Some(raw) => {
-                    let raw = raw as usize;
-                    // Flooring must never turn a real answer into
-                    // "nothing fits": under one granularity step,
-                    // report the exact number of tokens rather than
-                    // rounding it away.
-                    let floored = if raw >= granularity {
-                        (raw / granularity) * granularity
-                    } else {
-                        raw
-                    };
-                    if floored >= cap {
-                        (cap, ContextCap::ModelContextLength)
-                    } else {
-                        (floored, ContextCap::DeviceBudget)
-                    }
+            // Bisection over `[0, cap]` only, never past it: the answer
+            // above `cap` is always `cap`, so a search that stops there
+            // needs no upper bound invented for it and cannot overflow
+            // on a model with no KV at all (where every probe fits and
+            // the answer is `cap`).
+            let raw = self.largest_fitting_context(cap, available);
+            if raw >= cap {
+                (cap, ContextCap::ModelContextLength)
+            } else {
+                // Flooring must never turn a real answer into
+                // "nothing fits": under one granularity step, report
+                // the exact number of tokens rather than rounding it
+                // away.
+                let floored = if raw >= granularity {
+                    (raw / granularity) * granularity
+                } else {
+                    raw
+                };
+                if floored >= cap {
+                    (cap, ContextCap::ModelContextLength)
+                } else {
+                    (floored, ContextCap::DeviceBudget)
                 }
             }
         };
@@ -650,11 +747,34 @@ impl KvBudget {
             kv_available_bytes: available,
             per_token_kv_bytes: self.shape.per_token_kv_bytes(),
             concurrent_requests: concurrency as usize,
-            kv_bytes: self.shape.kv_bytes_for_tokens(tokens) * concurrency,
+            kv_bytes: self.kv_bytes_at(tokens),
+            evicting_layers: self.residency.evicting_layers(),
             weights_bytes: self.weights_bytes,
             activation_headroom_bytes: self.activation_headroom_bytes,
             device_budget_bytes: self.device_budget_bytes,
         }
+    }
+
+    /// Largest `tokens` in `0..=cap` whose KV still fits `available`.
+    ///
+    /// `kv_bytes_at` is non-decreasing in `tokens`, so the predicate
+    /// "fits" is a prefix of the range and bisection is exact.
+    fn largest_fitting_context(&self, cap: usize, available: u64) -> usize {
+        if self.kv_bytes_at(cap) <= available {
+            return cap;
+        }
+        // Invariant: `lo` fits and `hi` does not. `0` fits because a
+        // zero-token context costs no KV bytes at all.
+        let (mut lo, mut hi) = (0usize, cap);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if self.kv_bytes_at(mid) <= available {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 }
 
@@ -676,10 +796,21 @@ pub struct ContextFit {
     pub granularity: usize,
     pub capped_by: ContextCap,
     pub kv_available_bytes: u64,
-    /// The divisor: bytes one token of context costs across every layer.
+    /// Bytes one token of context costs across every layer, with
+    /// nothing evicting. The divisor when `evicting_layers` is 0, and
+    /// an upper bound on the marginal cost otherwise.
     pub per_token_kv_bytes: u64,
     pub concurrent_requests: usize,
+    /// KV bytes at `tokens`: [`KvBudget::kv_bytes_at`], which is what
+    /// the fit was actually decided on.
     pub kv_bytes: u64,
+    /// How many layers stop growing at their window. Zero for every
+    /// model unless `FERROX_KV_WINDOW` is on, and the reason the
+    /// division in [`Display`] stops being the whole story when it is
+    /// not.
+    ///
+    /// [`Display`]: std::fmt::Display
+    pub evicting_layers: usize,
     pub weights_bytes: u64,
     pub activation_headroom_bytes: u64,
     pub device_budget_bytes: u64,
@@ -692,7 +823,7 @@ impl std::fmt::Display for ContextFit {
             "ctx auto = {} tokens ({}): ({} device budget - {} weights - {} activation headroom) \
              = {} for KV; / {} bytes/token/request / {} request(s) -> rounded down to a multiple \
              of {} (reported exactly below one step), capped at the model's {} trained context. \
-             KV at the chosen context: {} bytes.",
+             KV at the chosen context: {} bytes.{}",
             self.tokens,
             match self.capped_by {
                 ContextCap::ModelContextLength => "limited by the model's context length",
@@ -707,6 +838,19 @@ impl std::fmt::Display for ContextFit {
             self.granularity,
             self.cap,
             self.kv_bytes,
+            // Said explicitly rather than left for the reader to
+            // notice the division does not reproduce the answer: with
+            // eviction on, the per-token figure above is the cost only
+            // until each windowed layer saturates, and the chosen
+            // context came from the search that knows that.
+            match self.evicting_layers {
+                0 => String::new(),
+                n => format!(
+                    " {n} of those layers stop growing at their sliding window \
+                     (FERROX_KV_WINDOW), so the per-token figure is the cost before \
+                     they saturate, not a divisor that reproduces this answer."
+                ),
+            },
         )
     }
 }
@@ -996,11 +1140,22 @@ mod tests {
         // left. The 29 windowed ones hold 1475 rows each instead of
         // 32768.
         assert_eq!(resting, 1_692_590_080, "5.4x less than the 9.13 GB above");
+        // The admission number prices each windowed layer at the top of
+        // its cycle (`KvWindow::max_rows`, 1536 here) rather than at the
+        // instantaneous `rows_after`, because `max_context` searches
+        // this function and a search needs it not to fall. That costs
+        // 13,991,936 bytes -- 0.7% -- against a term that already
+        // carries a whole layer's prompt.
         assert_eq!(
-            peak, 1_948_942_336,
-            "resting plus the one windowed layer still mid-prefill"
+            peak, 1_962_934_272,
+            "resting ceiling plus the one windowed layer still mid-prefill"
         );
         assert!(peak < full && peak > resting);
+        // The saving is what makes the difference worth having: the
+        // whole point of #61 is that this is the number `-c auto`
+        // divides a machine by, and 4.65x is a 32k context fitting on a
+        // 16 GB box or not.
+        assert!(full / peak >= 4, "{full} / {peak}");
     }
 
     /// The pool-backed store is the other thing a server allocates, and
@@ -1161,6 +1316,7 @@ mod tests {
             activation_headroom_bytes: 0,
             device_budget_bytes: device,
             shape,
+            residency: KvResidency::keeps_everything(shape.n_layers),
             concurrent_requests: 1,
         }
     }
@@ -1184,7 +1340,7 @@ mod tests {
         let one = budget(1_000, 1 << 40, shape);
         let four = KvBudget {
             concurrent_requests: 4,
-            ..one
+            ..one.clone()
         };
         assert_eq!(
             four.estimated_bytes(100) - 1_000,
@@ -1207,6 +1363,132 @@ mod tests {
         assert!(b.check(fit.tokens).is_ok());
         // One granularity step further does not.
         assert!(b.check(fit.tokens + 256).is_err());
+    }
+
+    /// **The closed form is not gone, it is checked against.**
+    ///
+    /// `max_context` used to be one division and is now a search,
+    /// because with eviction there is no single divisor. A search is
+    /// free to be subtly wrong in a way a division cannot be, so the
+    /// division stays here as the oracle: for a run where nothing
+    /// evicts -- which is every run unless `FERROX_KV_WINDOW` is on --
+    /// the searched answer must be exactly
+    /// `available / per_token_kv`, at every budget, not just at the
+    /// round ones.
+    #[test]
+    fn the_context_search_reproduces_the_closed_form_when_nothing_evicts() {
+        let shape = llama31_8b(); // 262144 bytes/token
+        let per_token = shape.per_token_kv_bytes();
+        for tokens_of_room in [0u64, 1, 7, 999, 1000, 1001, 65_536] {
+            for slack in [0u64, 1, per_token - 1] {
+                let device = 5_000_000 + per_token * tokens_of_room + slack;
+                let b = budget(5_000_000, device, shape);
+                // Granularity 1 so the comparison is against the raw
+                // division rather than against the rounding.
+                let fit = b.max_context(131_072, 1);
+                assert_eq!(
+                    fit.tokens as u64,
+                    (per_token * tokens_of_room + slack) / per_token,
+                    "budget {device} disagreed with the division it replaced"
+                );
+            }
+        }
+    }
+
+    /// **The property the search rests on.**
+    ///
+    /// Bisection finds the largest fitting context only if "fits" is a
+    /// prefix of the range, i.e. if the cost never falls as the context
+    /// grows. `KvWindow::rows_after` OSCILLATES between `window` and
+    /// `window + slack`, so pricing admission from it directly would
+    /// break exactly that, and a search over it could stop one cycle
+    /// early and report a context smaller than the one that fits.
+    #[test]
+    fn the_admission_ceiling_never_falls_as_the_context_grows() {
+        let cfg = alternating_swa_config();
+        let residency = KvResidency::from_config(&cfg, KvWindowPolicy::on());
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        let mut previous = 0u64;
+        // Well past the window (4) and its default slack (2), so the
+        // whole oscillation is covered rather than only the ramp.
+        for tokens in 0..64 {
+            let bytes = shape.peak_kv_bytes_for_tokens(tokens, &residency);
+            assert!(
+                bytes >= previous,
+                "cost fell from {previous} to {bytes} between {} and {tokens} tokens",
+                tokens.saturating_sub(1)
+            );
+            previous = bytes;
+        }
+    }
+
+    /// The ceiling admission is decided on must never sit below what a
+    /// measurement of the caches would find, or the run is admitted
+    /// against a number smaller than the memory it takes. `resident_`
+    /// is that measurement (asserted against real `KvCache`s above);
+    /// this is the ordering between the two, at every context, not just
+    /// at the one the sibling test measures.
+    #[test]
+    fn the_admission_ceiling_is_never_below_what_the_store_will_hold() {
+        let cfg = alternating_swa_config();
+        let residency = KvResidency::from_config(&cfg, KvWindowPolicy::on());
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        for tokens in 0..64 {
+            assert!(
+                shape.peak_kv_bytes_for_tokens(tokens, &residency)
+                    >= shape.resident_kv_bytes_for_tokens(tokens, &residency),
+                "admission under-priced the resting store at {tokens} tokens"
+            );
+        }
+    }
+
+    /// **The gap this wiring closed.**
+    ///
+    /// #61 step 2 taught the store to evict and left the budget
+    /// pricing every layer at every position, so a Gemma-3-shaped model
+    /// with `FERROX_KV_WINDOW` on kept 5x less KV than `-c auto` was
+    /// dividing by, and the context it could really carry was refused.
+    /// The two arms here differ ONLY in the policy the residency was
+    /// built from.
+    #[test]
+    fn an_evicting_run_is_offered_more_context_than_a_non_evicting_one() {
+        let cfg = alternating_swa_config();
+        let shape = KvShape::from_config(&cfg, KvElem::F32);
+        let base = budget(1_000, 1_000 + shape.per_token_kv_bytes() * 64, shape);
+        let evicting = KvBudget {
+            residency: KvResidency::from_config(&cfg, KvWindowPolicy::on()),
+            ..base.clone()
+        };
+        assert!(
+            base.residency.keeps_every_position(),
+            "the control arm must be the engine's default"
+        );
+
+        let plain = base.max_context(131_072, 1);
+        let windowed = evicting.max_context(131_072, 1);
+        assert!(
+            windowed.tokens > plain.tokens,
+            "eviction bought no context: {} vs {}",
+            windowed.tokens,
+            plain.tokens
+        );
+        assert_eq!(windowed.evicting_layers, 4, "4 of 6 layers slide");
+        assert_eq!(plain.evicting_layers, 0);
+        // The context the evicting run was offered is one the plain
+        // budget refuses, and the evicting budget accepts. That is the
+        // whole difference, stated as the decision rather than as a
+        // number.
+        assert!(evicting.check(windowed.tokens).is_ok());
+        assert!(base.check(windowed.tokens).is_err());
+        // And the report says why the division above it no longer
+        // reproduces the answer, rather than leaving a reader to
+        // subtract two numbers that do not match.
+        assert!(
+            windowed
+                .to_string()
+                .contains("stop growing at their sliding window"),
+            "{windowed}"
+        );
     }
 
     #[test]

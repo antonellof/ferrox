@@ -49,7 +49,7 @@ library or overriding the CLI.
 | `FERROX_VULKAN_LOADER` | Path to a `libvulkan` the loader should use. Only needed when the platform default is not found; the error names this variable |
 | `FERROX_MODEL_NAME` | What the served model is called in `/v1/models` and every response's `model` field. Same as `--alias`. Read in one place, so it cannot apply to some routes and not others |
 | `FERROX_CACHE` | Where `-hf` puts downloaded checkpoints. Default `$XDG_CACHE_HOME/ferrox`, else `~/.cache/ferrox`; models go under `hub/<owner>__<repo>/`. llama.cpp spells this `LLAMA_CACHE` |
-| `FERROX_KV_WINDOW` | `1` evicts KV rows behind a sliding window on the CPU contiguous store. **Off by default.** Gemma-3-4B at 32768 tokens holds 1.69 GiB at rest instead of 9.13 GiB, with a 1.95 GiB prefill peak. Output is token-identical either way, tested on a real quantized SWA checkpoint. Turns itself off under `FERROX_METAL_ATTN`, and does not apply to a draft model; disables the prefix cache, which cannot represent a windowed cache. See the note below |
+| `FERROX_KV_WINDOW` | `1` evicts KV rows behind a sliding window on the CPU contiguous store. **Off by default.** Gemma-3-4B at 32768 tokens holds 1.69 GiB at rest instead of 9.13 GiB, with a 1.96 GiB admission ceiling, and `--ctx-size auto` is priced against that ceiling rather than the unwindowed one. Output is token-identical either way, tested on a real quantized SWA checkpoint. Turns itself off under `FERROX_METAL_ATTN`, and does not apply to a draft model; disables the prefix cache, which cannot represent a windowed cache. See the note below |
 | `FERROX_CPU_POOL` | **An A/B override, not the decision.** Unset, the scheduler is chosen **per operation from its size**: an operation carrying at least `par::policy::SPIN_MIN_OP_MACS` multiply-accumulates (2.1M, i.e. `rows x cols`) runs on a persistent pool parked on a spin-then-park barrier, the shape llama.cpp's `ggml_threadpool` uses; anything smaller forks and joins with rayon as before. `spin` / `persistent` / `1` / `on` pins the pool at every size; `rayon` / `0` / `off` pins fork-join at every size and is the exact revert. The rule exists because the pool is not uniformly better, **measured on 2026-09-04**: on a quiet 20-core Cortex-A725 (aarch64, `tg128`, 19 threads) it is **+123% at 3B and +87% at 8B**, taking decode from LOSING to llama.cpp to beating it (23.14 vs 17.86 tok/s at 3B, 12.41 vs 9.06 at 8B), and **-37% at 135M**, reproducibly and on quiet hosts, so it is not contention. On a quiet 10-core Xeon it is +49% / +23% / +15% at 135M / 3B / 8B. The crossover constant is *bracketed* by those model-level numbers rather than swept; see its doc comment. Output is token-identical on all settings, which is tested |
 | `FERROX_CPU_POOL_SPIN_US` | Microseconds a `spin` worker spins before parking. Default 100. A pool that never parks burns a core per thread on an idle server |
 | `FERROX_CPU_THREADS` | Worker threads; same as `-t`. Default: **performance cores** (`hw.perflevel0.physicalcpu` on macOS), matching llama.cpp, not logical cores |
@@ -273,12 +273,19 @@ What it saves, on Gemma-3-4B at 32768 tokens of host f32 KV:
 |---|---|
 | Off (every layer holds everything) | 9,126,805,504 |
 | On, at rest | 1,692,590,080 |
-| On, prefill peak | 1,948,942,336 |
+| On, admission ceiling (prefill peak) | 1,962,934,272 |
 
 The peak is not the full 9.13 GiB because prefill evicts per layer: one
 layer holds the whole prompt at a time rather than all 34 at once. Five
 of the 34 layers are full attention and still hold everything, which is
 most of what remains.
+
+The ceiling prices each windowed layer at `window + slack` rows -- the
+top of the cycle a draining cache runs through, `KvWindow::max_rows` --
+rather than at the exact instantaneous count, which oscillates. That
+costs 0.7% against a number that already carries a whole layer's prompt,
+and it buys a cost that never falls as the context grows, which is what
+`--ctx-size auto`'s search for the largest fitting context needs.
 
 **It is off by default because it is new, not because it is doubted.**
 Output is token-identical with it on or off, asserted on identical logit
@@ -296,7 +303,23 @@ It disables itself in three cases rather than guessing:
 - Beside the prefix cache, which refuses to store a windowed cache
   rather than hand back a truncation it cannot represent.
 
-The server's admission check still prices the full, unwindowed number.
-That is the safe direction and it is correct while the switch is off; a
-context is refused that would in fact have fit, rather than admitted and
-then OOM.
+**Admission and `--ctx-size auto` price what the switch really keeps.**
+`KvBudget` carries the same per-layer residency the stores evict with,
+so a run with the switch on is offered the context it can really carry
+instead of one divided by every layer's full per-token cost. On
+gemma-2-2b-it-Q4_K_M (window 4096 on 13 of 26 layers) against a
+3.72 GiB budget, `ctx auto` reads 6912 tokens with the switch off and
+7680 with it on; the same header at a 32768 context prices its KV line
+at 6.50 GiB off and 4.06 GiB on. With the switch off the residency says
+every layer keeps everything, which is the arithmetic this engine always
+had, asserted rather than assumed.
+
+What is still priced at the full number, because no store evicts there
+yet: the paged store ([#61](https://github.com/antonellof/ferrox/issues/61)
+step 4) and the prompt region while a prefill batch is being written
+(step 5).
+
+The byte figures inside a *context-length* refusal
+(`ContextCeiling::bytes_for`) are still the unwindowed ones. They are a
+message, not a decision -- the decision is the position ceiling above,
+which does know.

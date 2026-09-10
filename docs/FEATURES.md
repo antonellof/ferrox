@@ -290,15 +290,27 @@ OpenAI-compatible HTTP API:
   host cache with placeholders that the paged prefill then copied into
   the page store, and that refusal is lifted. See
   [`CONFIG.md`](CONFIG.md)
-- On a model whose layers *all* slide by the same window, that
+- **On the paged store**, a model whose layers *all* slide by the same
   window slides during decode, so a request holds its prompt and a
   window rather than its whole context , and admission prices it
   that way, so a store too small for the whole context still serves
   it. A tool call anchors the slide at the position the next agentic
   turn will rejoin at, and the anchor is dropped once the cursor
   drifts a window past it. An alternating-SWA model (gpt-oss,
-  Gemma-3) does not slide: a page group holds one block in every
-  layer, and the full-attention layers still read position 0
+  Gemma-3) does not slide *there*: a page group holds one block in
+  every layer, and the full-attention layers still read position 0
+- **On the contiguous host store**, eviction is PER LAYER, so the
+  alternating models do get it: each layer's `KvCache` carries its own
+  window from `attention.sliding_window` /
+  `attention.sliding_window_pattern` and drops the rows behind it, while
+  the full-attention layers keep everything. Off unless
+  `FERROX_KV_WINDOW` is set, and it turns itself off under Metal
+  attention, on a draft model, and beside the prefix cache. Output is
+  token-identical with it on or off, asserted on logits as well as token
+  ids against gemma-2-2b-it-Q4_K_M. `--ctx-size auto` and the pre-load
+  admission check are priced against the same per-layer residency the
+  stores evict with, so the saving is context a user is actually offered
+  rather than memory nothing spends. See [`CONFIG.md`](CONFIG.md)
 - `ferrox serve-bench`: concurrency, TTFT, TPOT and queueing numbers
   for a live server, with the methodology (positional split, pooled
   nearest-rank percentiles, whole-run throughput) tested socket-free.

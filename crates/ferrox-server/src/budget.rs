@@ -89,9 +89,19 @@ impl ContextCeiling {
         }
     }
 
-    /// KV bytes `positions` of context costs: every layer at every
-    /// position, which is what the stores this server allocates really
-    /// keep (see `ferrox_models::kv_budget`'s module doc).
+    /// KV bytes `positions` of context costs, every layer at every
+    /// position.
+    ///
+    /// **A reporting number, not the admission number.** What decides
+    /// whether a request is admitted is `limit`, in POSITIONS, and that
+    /// limit came from [`KvBudget::max_context`], which does know about
+    /// eviction (#61). This only fills the byte fields of a refusal
+    /// whose stated reason is the position ceiling, so under
+    /// `FERROX_KV_WINDOW` it over-states the bytes a windowed model
+    /// would really have held -- in the direction that makes a refusal
+    /// look more justified rather than less, and never in a decision.
+    /// Giving this the residency too would mean threading it through
+    /// eighteen constructor call sites to change a message.
     pub fn bytes_for(&self, positions: usize) -> u64 {
         self.shape.kv_bytes_for_tokens(positions)
     }
@@ -319,6 +329,27 @@ pub fn price_gguf(
         context_tokens: gguf_ctx,
         concurrent_requests: concurrent_requests.max(1),
         kv_elem,
+        // **The server prices the UNWINDOWED number even when
+        // `FERROX_KV_WINDOW` is on, and that is deliberate.**
+        //
+        // Sliding-window eviction (#61 step 2) is a property of the
+        // contiguous host `KvCache`, and it is not the only store this
+        // server allocates. `FERROX_KV_POOL_BLOCKS` reserves
+        // `max_seq_len` positions per layer from a shared pool up front
+        // and never gives a block back mid-sequence, and
+        // `FERROX_PAGED_KV_BLOCKS` runs the paged store, whose decode
+        // arm never calls `evict_layer_kv` at all (#61 step 4). Either
+        // holds the whole context however narrow the window is.
+        //
+        // This runs before either is chosen, so pricing the window here
+        // would hand a pooled or paged deployment a ceiling smaller
+        // than the memory it goes on to reserve -- which is exactly #33,
+        // admitted and then OOM, in the direction that hurts. An
+        // over-estimate only costs context.
+        //
+        // Lifting this needs the store the request will really use to
+        // be known at this point, which is #61 steps 4 and 5.
+        kv_window: ferrox_models::decoder::KvWindowPolicy::off(),
         ..ResidencyAssumptions::default()
     };
     match ResidencyReport::from_gguf(path, assumptions, device.usable_bytes) {
@@ -373,6 +404,7 @@ mod tests {
             activation_headroom_bytes: 0,
             device_budget_bytes: device_bytes,
             shape: shape(),
+            residency: ferrox_models::KvResidency::keeps_everything(shape().n_layers),
             concurrent_requests: 1,
         }
     }
