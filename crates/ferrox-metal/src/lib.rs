@@ -24,6 +24,12 @@ pub mod attn;
 pub mod decode_dense;
 
 #[cfg(feature = "metal")]
+pub mod resident_act;
+
+#[cfg(feature = "metal")]
+pub mod greedy_fold;
+
+#[cfg(feature = "metal")]
 mod dispatch;
 
 #[cfg(feature = "metal")]

@@ -160,7 +160,7 @@ pub fn launch_decode_dense_stack(
     let device = &shared.device;
     let queue = &shared.queue;
 
-    let scratch_guard = borrow_decode_scratch(
+    let mut scratch_guard = borrow_decode_scratch(
         device,
         ScratchCaps {
             hidden: hidden_dim,
@@ -570,12 +570,6 @@ pub fn launch_decode_dense_stack(
         kv.seq_len = pos + 1;
     }
 
-    // If final_norm ran but no lm_head, mark normalized hidden (x_buf)
-    // as resident so the next apply_gpu can skip re-upload.
-    if norm_resident {
-        crate::gpu::set_resident_activation(x_buf, hidden_dim);
-    }
-
     if argmax_only && download_n == 1 && output.is_some() {
         let ptr = argmax_idx_buf.contents();
         let idx = unsafe { *(ptr.as_ptr() as *const u32) as usize };
@@ -590,7 +584,24 @@ pub fn launch_decode_dense_stack(
         logits_buf.expect("logits buffer when downloading logits")
     };
     let out_ptr = src.contents();
-    Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, download_n).to_vec() })
+    // SAFETY: `src` is a StorageModeShared buffer allocated for at least
+    // `download_n` f32 and written by the command buffer waited on above.
+    let out =
+        unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, download_n).to_vec() };
+
+    // final_norm ran but no lm_head: `scratch.x` still holds exactly the
+    // vector being returned, so say so and let the caller's next matvec
+    // bind it instead of uploading a copy. Published UNDER THE GUARD, on
+    // the vector's own address, so nothing but that vector can claim it.
+    // See `crate::resident_act` for the version of this that used a raw
+    // pointer and a length.
+    if norm_resident {
+        let scratch = scratch_guard
+            .as_mut()
+            .expect("scratch ensured at entry and held throughout");
+        crate::resident_act::publish(scratch, &out);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
