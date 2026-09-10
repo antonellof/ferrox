@@ -135,7 +135,14 @@ On `Q8_0` and `IQ4_NL`, ferrox's logits match llama.cpp's. On K-quants
 they drift, for a
 [known reason](docs/plans/llama-cpp-gap-inventory.md) that is not a
 ferrox bug: llama.cpp quantizes activations to `Q8_K` before the dot
-product and ferrox keeps them in f32. Use whichever quant you would
+product and ferrox keeps them in f32.
+
+**`IQ4_XS` is on the drifting side, not the matching one**, which the
+pair of names above makes easy to misread. ggml declares
+`vec_dot_type = Q8_K` for `IQ4_XS` and `Q8_0` for `IQ4_NL`, so they
+behave oppositely here despite the spelling. `ferrox parity` on an
+`IQ4_XS` checkpoint reads `DRIFT` by design and says so in its own
+output. Use whichever quant you would
 use with llama.cpp; if you are comparing the two, `Q8_0` is the one
 that answers the question without that variable in it.
 [docs/MODELS.md](docs/MODELS.md) lists what runs today, and which

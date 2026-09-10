@@ -47,12 +47,30 @@ pub(super) fn llama_dots_this_against_q8k(kind: &str) -> bool {
 
 /// The most common quantization among a checkpoint's PER-LAYER tensors.
 ///
-/// The FILENAME is not this. `Llama-3.2-1B-Instruct-IQ4_XS.gguf`
-/// contains no IQ4_XS tensors at all -- 96 of its per-layer weights are
-/// `IQ4_NL` -- because the name is the quantization RECIPE and the
-/// recipe falls back. Reading the tensor table is the only way to know,
-/// and mistaking the two is what made that file look like a
-/// counterexample.
+/// The FILENAME is not this, because the name is the quantization
+/// RECIPE and a recipe falls back per tensor. Reading the tensor table
+/// is the only way to know.
+///
+/// `Llama-3.2-1B-Instruct-IQ4_XS.gguf`, counted from its own header, is
+/// **147 tensors: 96 IQ4_XS, 16 Q5_K (every `attn_v`), 1 Q6_K
+/// (`token_embd`, which is also the tied head), 34 F32 norms**. So the
+/// name gets the body right and says nothing about the other 17
+/// quantized tensors, and this function answers `IQ4_XS`.
+///
+/// That census replaces a claim this comment used to make -- that the
+/// same file "contains no IQ4_XS tensors at all" and is 96x `IQ4_NL` --
+/// which was inverted. The count was right and the type was wrong, and
+/// it mattered in the one direction that changes a verdict:
+/// [`llama_dots_this_against_q8k`] lists `IQ4XS` and does NOT list
+/// `IQ4NL`, so the comment described a file whose drift would be
+/// unexplained while the real file's drift is the expected §10 one. A
+/// reader who checked the claim against the file would have found the
+/// opposite and had no reason to trust the rule it was illustrating.
+///
+/// Re-checkable in one line, which is why the numbers are here rather
+/// than an assertion that it "falls back":
+/// `ferrox inspect models/Llama-3.2-1B-Instruct-IQ4_XS.gguf`
+/// (it truncates; the full census is a header parse).
 ///
 /// The output head and the embedding table are EXCLUDED, so "body" here
 /// means the body and cannot be outvoted into meaning the head on a
@@ -315,5 +333,39 @@ pub(super) mod tests {
         for q8_0_dotted in Q8_0_DOTTED {
             assert!(!llama_dots_this_against_q8k(q8_0_dotted));
         }
+    }
+
+    /// `IQ4XS` and `IQ4NL` are one character apart and land on OPPOSITE
+    /// sides of this predicate. Named as a pair, because the tests above
+    /// cannot catch them being swapped.
+    ///
+    /// `the_q8k_predicate_uses_the_dtype_debug_spelling` walks whatever
+    /// [`Q8K_DOTTED`] and [`Q8_0_DOTTED`] happen to contain, so moving
+    /// `IQ4NL` from one list to the other keeps every assertion above
+    /// green while inverting what the tool says about a real
+    /// checkpoint. This pins the two to their ggml facts directly.
+    ///
+    /// It is worth its runtime because the swap has already happened in
+    /// prose: `body_quant`'s doc claimed
+    /// `Llama-3.2-1B-Instruct-IQ4_XS.gguf` was 96x `IQ4_NL` and contained
+    /// no `IQ4_XS` at all. Counted from the file's own header it is 96x
+    /// `IQ4_XS` and zero `IQ4_NL` -- the count right, the type inverted,
+    /// and inverted across exactly this line, so the comment described a
+    /// file whose DRIFT would be unexplained while the real one's is the
+    /// expected §10 case.
+    ///
+    /// Sabotage: move `"IQ4XS"` out of the `matches!` in
+    /// [`llama_dots_this_against_q8k`], or add `"IQ4NL"` to it.
+    #[test]
+    fn iq4_xs_is_q8k_dotted_and_iq4_nl_is_not() {
+        assert!(
+            llama_dots_this_against_q8k("IQ4XS"),
+            "ggml declares vec_dot_type = Q8_K for IQ4_XS, so its drift is expected"
+        );
+        assert!(
+            !llama_dots_this_against_q8k("IQ4NL"),
+            "ggml declares vec_dot_type = Q8_0 for IQ4_NL, so a drift there is NOT \
+             excused by §10 and would be a real finding"
+        );
     }
 }
