@@ -5,6 +5,7 @@ mod bench_bw;
 mod bench_client;
 mod bench_guard;
 mod bench_model;
+mod bench_render;
 mod bench_suite;
 mod chat;
 mod download;
@@ -1100,7 +1101,7 @@ fn main() -> anyhow::Result<()> {
             max_load,
         } => {
             if render {
-                return bench_suite::render(std::path::Path::new(&bench_dir));
+                return bench_render::render(std::path::Path::new(&bench_dir));
             }
             if suite {
                 return bench_suite::run_suite(bench_suite::SuiteArgs {
