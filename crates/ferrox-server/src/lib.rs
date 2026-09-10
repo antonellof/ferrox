@@ -56,6 +56,7 @@ mod model;
 mod openai_extra;
 mod output;
 mod policy;
+mod prefill_batch;
 mod reasoning_tokens;
 mod rerank;
 mod response_cache;
@@ -2081,7 +2082,13 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                  ferrox_kv_rejected_context_length_total {}\n\
                  # HELP ferrox_scheduler_aborted_total Requests the batch scheduler stopped because they were cancelled.\n\
                  # TYPE ferrox_scheduler_aborted_total counter\n\
-                 ferrox_scheduler_aborted_total {}\n",
+                 ferrox_scheduler_aborted_total {}\n\
+                 # HELP ferrox_scheduler_max_seqs Cap on in-flight sequences (-np / FERROX_CB_MAX_SEQS); 0 when unlimited.\n\
+                 # TYPE ferrox_scheduler_max_seqs gauge\n\
+                 ferrox_scheduler_max_seqs {}\n\
+                 # HELP ferrox_scheduler_prefill_chunk Prompt tokens per prefill chunk (-b / -ub / FERROX_CB_PREFILL_CHUNK).\n\
+                 # TYPE ferrox_scheduler_prefill_chunk gauge\n\
+                 ferrox_scheduler_prefill_chunk {}\n",
                 sched.prefill_chunks,
                 sched.prefill_tokens,
                 sched.decode_steps,
@@ -2093,6 +2100,8 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                 sched.kv_rejected_too_large,
                 sched.kv_rejected_context_length,
                 sched.aborted,
+                sched.max_seqs,
+                sched.prefill_chunk,
             )
         }
         None => body,

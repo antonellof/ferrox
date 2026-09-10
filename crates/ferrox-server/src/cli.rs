@@ -192,6 +192,17 @@ pub struct ServerArgs {
     #[arg(long = "parallel", visible_alias = "np", value_name = "N")]
     parallel: Option<usize>,
 
+    /// Logical maximum prompt tokens per forward pass, llama.cpp's
+    /// `-b`. See [`crate::prefill_batch`] for how it and `-ub` resolve
+    /// to the one number ferrox keeps.
+    #[arg(long = "batch-size", visible_alias = "b", value_name = "N")]
+    batch_size: Option<usize>,
+
+    /// Physical maximum prompt tokens per forward pass, llama.cpp's
+    /// `-ub`. Clamped to `--batch-size` when both are given.
+    #[arg(long = "ubatch-size", visible_alias = "ub", value_name = "N")]
+    ubatch_size: Option<usize>,
+
     /// Start even though another ferrox process is already holding a
     /// model. Off by default: two models on one box do not share it,
     /// they thrash it, and both serve slower than either would alone.
@@ -283,6 +294,8 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
             "-dev" => "--device".into(),
             "-cb" => "--cont-batching".into(),
             "-np" => "--parallel".into(),
+            "-b" => "--batch-size".into(),
+            "-ub" => "--ubatch-size".into(),
             // One token in llama.cpp's hand-written parser. clap sees
             // `-h` followed by `f` and prints help, which is what
             // `ferrox serve -hf repo:Q4_K_M` did: the flag looked
@@ -534,6 +547,25 @@ pub(crate) fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
         unsafe { std::env::set_var("FERROX_CB_MAX_SEQS", n.to_string()) };
     }
 
+    for (flag, value) in [
+        ("--batch-size", args.batch_size),
+        ("--ubatch-size", args.ubatch_size),
+    ] {
+        if value == Some(0) {
+            anyhow::bail!("{flag} must be greater than zero");
+        }
+    }
+    if let Some(chunk) = crate::prefill_batch::effective_chunk(args.batch_size, args.ubatch_size) {
+        // Both spellings, from one number and one array of names: the
+        // private decode loop and the batch scheduler each read their
+        // own variable, and an operator who names `-ub` must not have
+        // to know which path this server happens to be serving on.
+        for key in crate::prefill_batch::PREFILL_CHUNK_ENV_KEYS {
+            // SAFETY: called before the runtime starts worker threads.
+            unsafe { std::env::set_var(key, chunk.to_string()) };
+        }
+    }
+
     if args.cont_batching {
         // SAFETY: called before the runtime starts worker threads.
         unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
@@ -612,6 +644,36 @@ mod tests {
             .collect();
         let args = ServerArgs::try_parse_from(rewrite_llama_style_argv(argv)).unwrap();
         assert_eq!(args.parallel, Some(4));
+    }
+
+    /// `-b` and `-ub` are two tokens in llama.cpp's hand-written
+    /// parser and one token to clap, which sees `-b` as a short option
+    /// it has never heard of. The rewrite is what makes a copied
+    /// `llama-server ... -b 2048 -ub 512` command run here at all.
+    #[test]
+    fn batch_flags_parse_and_rewrite_their_llama_cpp_short_forms() {
+        let argv = ["ferrox-server", "-b", "2048", "-ub", "512"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let args = ServerArgs::try_parse_from(rewrite_llama_style_argv(argv)).unwrap();
+        assert_eq!(args.batch_size, Some(2048));
+        assert_eq!(args.ubatch_size, Some(512));
+    }
+
+    /// Zero is not a batch size, and accepting it would make
+    /// `env_positive` panic the server later with a message naming an
+    /// environment variable the operator never set.
+    #[test]
+    fn a_zero_batch_size_is_refused_by_name_rather_than_lowered_to_the_environment() {
+        for flag in ["--batch-size", "--ubatch-size"] {
+            let args = ServerArgs::try_parse_from(
+                ["ferrox-server", flag, "0"].into_iter().map(String::from),
+            )
+            .unwrap();
+            let err = apply_cli_overrides(&args).unwrap_err().to_string();
+            assert!(err.contains(flag), "{flag}: {err}");
+        }
     }
 
     #[test]

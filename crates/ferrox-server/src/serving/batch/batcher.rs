@@ -42,6 +42,12 @@ pub struct ContinuousBatcher {
     /// paged store would happily serve -- two components disagreeing
     /// about the same server.
     paged_window: Option<WindowPolicy>,
+    /// The knobs this worker was spawned with, kept so `stats()` can
+    /// report them. The worker owns its own copy (`BatcherConfig` is
+    /// `Copy`); this one exists to be *read back*, which is what makes
+    /// `-np` and `-ub` verifiable from outside the process rather than
+    /// only assertable from inside it.
+    config: BatcherConfig,
 }
 
 pub(super) struct WorkerGuard {
@@ -148,6 +154,7 @@ impl ContinuousBatcher {
             budget,
             aborts,
             paged_window,
+            config,
         }
     }
 
@@ -167,6 +174,15 @@ impl ContinuousBatcher {
             kv_rejected_context_length: self.budget.ceiling.refused(),
             kv_blocks_peak: self.counters.peak_blocks.load(Ordering::Relaxed),
             aborted: self.aborts.aborted(),
+            // `usize::MAX` is `BatcherConfig`'s "unlimited"; a gauge
+            // reporting 18446744073709551615 would read as a number
+            // somebody chose.
+            max_seqs: if self.config.max_seqs == usize::MAX {
+                0
+            } else {
+                self.config.max_seqs
+            },
+            prefill_chunk: self.config.prefill_chunk,
         }
     }
 
