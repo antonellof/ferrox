@@ -38,13 +38,20 @@ npm run check       # typecheck + lint + test
 
 `npm test` runs `node --test` over `src/lib/*.test.ts`, node strips the
 types itself, so there is no test framework in the dependency tree and
-nothing for the licence check to weigh. It covers the stream recovery
-paths in `lib/api.ts`, which are the half of SSE hardening that cannot
-be proven from the server: that a reconnect resumes from the last `id:`
-without repeating a token, that a lost replay window surfaces as a
-truncation error instead of a partial answer shown as a whole one, and
-that a non-resumable stream never tries to reconnect into a buffer that
-does not exist.
+nothing for the licence check to weigh. It covers three things a browser
+cannot show you:
+
+- the stream recovery paths in `lib/api.ts`, the half of SSE hardening
+  that cannot be proven from the server: that a reconnect resumes from
+  the last `id:` without repeating a token, that a lost replay window
+  surfaces as a truncation error instead of a partial answer shown as a
+  whole one, and that a non-resumable stream never tries to reconnect
+  into a buffer that does not exist;
+- the transcript sync's pure half in `lib/conversations.ts`, where
+  getting "which nodes are new" wrong duplicates or drops a message;
+- the entry rule in `lib/entry-state.ts` (below), where being too eager
+  throws away the conversation you were in and being too lazy resurrects
+  one for ever. Both failures are silent.
 
 CI runs `npm run licenses`, `npm run typecheck`, `npm run lint` and
 `npm run build`. It does not run `npm test`, so run `npm run check`
@@ -94,11 +101,64 @@ src/
                         one prefers-color-scheme block, nothing else)
   lib/api.ts            the ONLY place that talks HTTP
   lib/api.test.ts       stream recovery, against a stubbed fetch
+  lib/entry-state.ts    what Chat opens with, and why
+  lib/use-tab-activity  the heartbeat that measures "away"
   lib/format.ts         "unknown" is an em dash, never a zero
-  components/           app shell, health pill, shadcn-style primitives
+  components/           app shell, server status, shadcn-style primitives
   screens/chat/         assistant-ui runtime, markdown, thread
   screens/{models,activity,connect}.tsx
 ```
+
+## Where you land, and what it opens
+
+**The URL says which conversation you are in.** `/ui/chat` is a new
+chat, `/ui/chat/<id>` is that conversation, and `/` and `/ui` redirect to
+the first of those. That is what every chat UI of this shape does, and it
+is what makes the base URL a predictable entry point instead of "whatever
+was open last" — which is what this app used to do, from any path, after
+any amount of time, by opening the newest conversation it could find.
+
+The id is stamped into the URL by the first message, with `replace`, so
+Back leaves Chat rather than walking into the empty version of the
+conversation you are looking at. Opening one from the picker and starting
+a new chat are pushes, so Back undoes them.
+
+**A tab that has been away comes back to a new chat.** The window is
+`RESUME_WINDOW_MS` in `lib/entry-state.ts`, thirty minutes, and it is
+measured rather than assumed: a heartbeat stamps `sessionStorage` only
+while the document is visible, so a hidden tab, a closed lid and a
+sleeping machine accumulate away-time and a tab you are sitting in front
+of never does. `sessionStorage`, not `localStorage`, is the whole trick —
+it is per tab and dies with the tab, so a reload of a tab that was away
+all night still reads as away, while a fresh tab opened on a deep link
+has no record at all and the link is simply honoured.
+
+Two things keep this from being a rule that loses work. It never fires
+over a running generation or a half-typed message. And when it does fire
+it says so, in the number, and offers the conversation back in one click.
+No other chat UI does this at all — the research behind it found not one
+product with a staleness rule — so it is deliberately narrow, announced
+and undoable rather than silent.
+
+Local mode (a server with no `/v1/conversations`) has no ids to put in a
+URL, so it asks the same function with the one slot it has and its own
+saved-at stamp. One rule, two callers.
+
+## One model selector
+
+Choosing which model answers happens in **one** place: the menu in the
+Chat header. **Models** is the library — what is on disk, downloads, and
+`Unload`, which is the one verb the menu cannot express. It used to carry
+a second selector (a `Load` button per row, the same `POST
+/admin/models/load` for the same server-wide effect), a second `Unload`,
+and an `active:` badge restating the row's own `state` column.
+
+The sidebar's bottom control is **server status**, not a model picker. It
+used to render the loaded model id under a chevron, in the slot an
+account or settings control normally occupies, which made it read as a
+third selector; the model id belongs where the model is chosen. It never
+names a backend, either: `/health` says which backends are *available*,
+never which one is running, so "on Metal" there would be invented.
 
 ## Streams that survive a proxy
 

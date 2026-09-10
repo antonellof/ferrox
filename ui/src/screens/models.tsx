@@ -1,6 +1,21 @@
-// Models: the inventory, the swap, and the download job.
+// Models: the library. What is on disk, how to get more, and how to give
+// the memory back.
 //
-// Two rules this screen exists to respect.
+// **Choosing which model answers is not done here.** It is done in the
+// picker in the Chat header, which is the only model selector in this
+// app. This screen used to carry a second one — a `Load` button on every
+// row, posting the same `/admin/models/load` to the same server for the
+// same effect — plus an `Unload` in the header AND an `Unload` in the
+// loaded row, and an `active:` badge restating what the row's own state
+// column already said. Four controls and two badges for two verbs.
+//
+// The split it now follows is the one every UI of this shape converged
+// on: a management screen installs, removes and reports; a picker beside
+// the conversation selects. `Unload` stays because it is the one verb
+// the picker cannot express — give the memory back without putting
+// something else in it — and it exists exactly once.
+//
+// Two more rules this screen exists to respect.
 //
 // **A rate is shown only when the server calls the task `stable`.** The
 // backend runs a rolling-window estimator that refuses to divide until
@@ -14,13 +29,8 @@
 // explanation rather than as a broken table.
 
 import { useCallback, useEffect, useState } from "react";
-import {
-  Boxes,
-  CloudDownload,
-  HardDriveDownload,
-  RefreshCw,
-  Search,
-} from "lucide-react";
+import { Boxes, CloudDownload, RefreshCw, Search } from "lucide-react";
+import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -209,8 +219,6 @@ export function ModelsScreen() {
     await refresh();
   };
 
-  const loadModel = (id: string) =>
-    act(`Loading ${id}`, () => postJson(routes.adminModelsLoad, { id }));
   const unloadModel = () =>
     act("Unload", () => postJson(routes.adminModelsUnload));
   const cancelTask = (taskId: string) =>
@@ -262,9 +270,6 @@ export function ModelsScreen() {
   }
 
   const active = inventory?.active ?? null;
-  const anyLoading = (inventory?.models ?? []).some(
-    (m) => m.state === "loading",
-  );
   const needle = filter.trim().toLowerCase();
   const visible = (inventory?.models ?? []).filter(
     (m) =>
@@ -281,7 +286,7 @@ export function ModelsScreen() {
         description={
           inventory?.model_dir
             ? `Scanning ${inventory.model_dir}`
-            : "Inventory, load / unload, and Hugging Face downloads."
+            : "What is on disk, Hugging Face downloads, and giving the memory back."
         }
         actions={
           <>
@@ -303,11 +308,12 @@ export function ModelsScreen() {
       <Card>
         <CardHeader>
           <CardTitle>Inventory</CardTitle>
-          {active ? (
-            <Badge tone="ok">active: {active}</Badge>
-          ) : (
-            <Badge tone="neutral">nothing loaded</Badge>
-          )}
+          {/* The active checkpoint is stated once on this screen. When
+              there is one it is on the `Unload …` button, which names it
+              and does something about it; only the empty case needs a
+              badge of its own. The `state` column says the same thing
+              per row and is where the eye goes anyway. */}
+          {active ? null : <Badge tone="neutral">nothing loaded</Badge>}
           <span className="flex-1" />
           <div className="relative">
             <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-faint" />
@@ -361,12 +367,10 @@ export function ModelsScreen() {
                   <Th numeric>on disk</Th>
                   <Th numeric>resident</Th>
                   <Th>state</Th>
-                  <Th />
                 </Tr>
               </thead>
               <tbody>
                 {visible.map((entry) => {
-                  const loaded = entry.id === active;
                   return (
                     <Tr key={entry.id}>
                       <Td mono className="max-w-[22rem]">
@@ -395,32 +399,6 @@ export function ModelsScreen() {
                       <Td>
                         <StateBadge entry={entry} activeId={active} />
                       </Td>
-                      <Td className="text-right">
-                        {loaded ? (
-                          <Button
-                            variant="default"
-                            size="sm"
-                            onClick={unloadModel}
-                          >
-                            Unload
-                          </Button>
-                        ) : (
-                          <Button
-                            variant="primary"
-                            size="sm"
-                            disabled={anyLoading}
-                            title={
-                              anyLoading
-                                ? "a load is already in progress"
-                                : undefined
-                            }
-                            onClick={() => loadModel(entry.id)}
-                          >
-                            <HardDriveDownload />
-                            Load
-                          </Button>
-                        )}
-                      </Td>
                     </Tr>
                   );
                 })}
@@ -430,7 +408,11 @@ export function ModelsScreen() {
         )}
 
         <CardFooter>
-          A load swaps the checkpoint for every client of this server; an
+          Pick which of these answers in the model menu at the top of{" "}
+          <Link to="/ui/chat" className="text-accent underline">
+            Chat
+          </Link>
+          . A swap loads the checkpoint for every client of this server; an
           in-flight request finishes on the weights it started on.
         </CardFooter>
       </Card>
