@@ -49,6 +49,7 @@ use rayon::prelude::*;
 
 use crate::cpu_pool::CpuPool;
 
+mod carry;
 pub mod policy;
 
 pub use policy::{backend, macs_per_row, with_op_work};
@@ -129,22 +130,26 @@ fn note_rayon_region() {
 /// `f()` directly), so an entry point may wrap unconditionally without
 /// having to know whether its caller already did.
 ///
+/// # What crosses with the work
+///
+/// A step that reads a thread-local *setting* would read the worker's
+/// default instead of its caller's choice, which is exactly what
+/// GitHub issue #166 was: a Metal decode moved to a worker silently took
+/// the other `lm_head` path and answered differently from the tenth
+/// token. So the settings are captured on this thread and adopted on the
+/// worker for the length of the job. [`carry::Carry`] is the single list
+/// of them and its `adopt` destructures exhaustively, so a new one that
+/// is not carried does not compile.
+///
 /// # Two cases this deliberately does NOT promote
 ///
-/// **A GPU backend.** Measured on an M2 Pro, moving the decode step off
-/// the process's main thread CHANGES METAL'S OUTPUT: `Llama-3.2-3B
-/// Q4_K_M --ngl 99`, greedy, diverges from the same build's main-thread
-/// answer at around the tenth token, deterministically on both sides.
-/// The Metal stack carries thread-local state across a step (the
-/// resident-activation hand-off from the dense stack to `output_head`,
-/// and the two thread-local mirrors of the pipeline and weight caches),
-/// so which thread runs the step is not the free choice it is on CPU.
-/// That is worth its own investigation and is not worth risking on a CPU
-/// scheduling change, so promotion asks
-/// [`crate::weight_matrix::active_backend`] first: the same cached
-/// predicate dispatch itself uses, not a second opinion about it. Under
-/// Metal or CUDA there is also almost nothing to win, because the
-/// parallel regions this saves are the ones the GPU is not running.
+/// **A backend whose thread-affine state is not proven carried.**
+/// Promotion asks [`crate::weight_matrix::active_backend`] -- the same
+/// cached predicate dispatch itself uses, not a second opinion about it
+/// -- and puts the answer to [`carry::promotable`], which holds the
+/// per-backend verdict and the evidence behind each one. CPU and Metal
+/// promote; CUDA and Vulkan do not, for want of hardware to check them
+/// on rather than for a known defect.
 ///
 /// **The pinned spin pool.** Under `FERROX_CPU_POOL=spin` the rayon
 /// global pool is never used for work, and `rayon::scope` would BUILD
@@ -156,7 +161,7 @@ where
     F: FnOnce() -> R + Send,
     R: Send,
 {
-    if crate::weight_matrix::active_backend() != crate::kernel_registry::Backend::Cpu {
+    if !carry::promotable(crate::weight_matrix::active_backend()) {
         return f();
     }
     if policy::pinned() == Some(Backend::Spin) {
@@ -165,11 +170,18 @@ where
     if rayon::current_thread_index().is_some() {
         return f();
     }
+    // Captured HERE, on the thread whose caller made the decision, and
+    // before anything is submitted. Reading it on the worker would read
+    // the worker's default, which is the defect.
+    let carried = carry::Carry::capture();
     // The one cold entry this whole design is willing to pay. Counted
     // like any other, so [`cold_regions`] reports the true total and a
     // test can assert it is exactly one.
     note_rayon_region();
-    rayon::scope(move |_| f())
+    rayon::scope(move |_| {
+        let _adopted = carried.adopt();
+        f()
+    })
 }
 
 /// Which scheduler CPU parallel regions use.
@@ -578,9 +590,13 @@ mod tests {
     /// The two configurations `on_workers` declines to promote in, and
     /// so the two it cannot be asserted in. One predicate, shared by
     /// every test below, rather than three spellings of it.
+    ///
+    /// The backend half asks [`carry::promotable`] rather than naming a
+    /// backend: the rule used to be "the backend is CPU", and writing
+    /// that here a second time is how a test comes to assert the rule
+    /// the code used to have.
     fn the_promotion_applies_here() -> bool {
-        policy::pinned().is_none()
-            && crate::weight_matrix::active_backend() == crate::kernel_registry::Backend::Cpu
+        policy::pinned().is_none() && carry::promotable(crate::weight_matrix::active_backend())
     }
 
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -875,6 +891,41 @@ mod tests {
             inside, 1,
             "the whole batch should enter the pool exactly once"
         );
+    }
+
+    /// A promoted step runs with the setting its SUBMITTER announced,
+    /// not with the worker's default.
+    ///
+    /// This is GitHub issue #166's whole mechanism at the seam that
+    /// caused it. `on_workers` moves the step to a thread the caller
+    /// never configured; before the carry, a Metal decode read the
+    /// default there and took the other `lm_head` path, changing the
+    /// completion from the tenth token. The test asserts on the thread
+    /// id first, so it cannot pass by not having moved.
+    ///
+    /// Sabotage: delete the `carried.adopt()` line from `on_workers`.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_promoted_step_runs_with_the_setting_its_submitter_announced() {
+        use ferrox_metal::greedy_fold::{greedy_fold_setting, set_metal_greedy_argmax, GreedyFold};
+        if !the_promotion_applies_here() {
+            return;
+        }
+        set_metal_greedy_argmax(true);
+        let submitter = std::thread::current().id();
+
+        let (ran_on, seen) = on_workers(|| (std::thread::current().id(), greedy_fold_setting()));
+
+        assert_ne!(
+            ran_on, submitter,
+            "nothing is being tested unless the step actually moved"
+        );
+        assert_eq!(
+            seen,
+            GreedyFold::On,
+            "the worker must run the fold the caller asked for"
+        );
+        set_metal_greedy_argmax(false);
     }
 
     /// A nested call must not open a second entry, so an entry point can

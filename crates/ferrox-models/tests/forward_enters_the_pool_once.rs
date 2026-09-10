@@ -61,9 +61,10 @@ fn caches(decoder: &Decoder) -> Vec<KvCache> {
 /// where there is nothing here to assert.
 ///
 /// `FERROX_CPU_POOL=spin` deliberately keeps the rayon pool unbuilt, a
-/// GPU backend keeps the step on its own thread because the Metal stack
-/// carries thread-local state across it, and a caller already on a
-/// worker needs no promotion. Skip rather than assert something the
+/// backend whose thread-affine state `par::carry` does not carry keeps
+/// the step on its own thread (CUDA and Vulkan today; Metal's one
+/// setting is carried, so it promotes), and a caller already on a worker
+/// needs no promotion. Skip rather than assert something the
 /// configuration makes untrue.
 ///
 /// **Probed, not restated.** This used to spell out "not pinned to spin,

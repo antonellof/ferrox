@@ -88,8 +88,8 @@ pub trait Engine: Sync {
     /// parallel region the step opens takes rayon's in-worker path. See
     /// the module docs for what that is worth, and
     /// [`ferrox_core::par::on_workers`] for the three cases it declines
-    /// to promote (a non-CPU active backend, a pinned spin pool, and a
-    /// caller already on a worker).
+    /// to promote (a backend whose thread-affine state `par::carry` does
+    /// not carry, a pinned spin pool, and a caller already on a worker).
     ///
     /// Do not override this. The body is one line, and the only reason
     /// it is a provided method rather than a free function is that a
