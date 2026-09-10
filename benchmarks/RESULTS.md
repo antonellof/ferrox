@@ -176,8 +176,17 @@ Four traps, each of which put a wrong number in this file before:
   the engine for full logits and argmaxes them on the host
   (`bench_guard::greedy_pick`), because a row that cannot show which
   token it produced cannot show it computed anything. The fold is opt-in
-  through `set_metal_greedy_argmax`, which only `ferrox run` calls, and
-  its thread-local setting defaults to unset.
+  through `set_metal_greedy_argmax`, and its thread-local setting
+  defaults to unset. It has **two** non-test callers, `ferrox-cli`'s
+  `run.rs` and `ferrox-server`'s `generate.rs`, and neither is in the
+  bench path. An earlier version of this note said only `ferrox run`
+  calls it, which was wrong: the conclusion survives because what matters
+  is that no caller is on the bench path, not how many callers exist.
+  The two also differ in what the fix changed for them, which is worth
+  knowing: `ferrox run` defaults `--repeat-penalty` to 1.1 so its greedy
+  Metal path stops folding, while the server defaults
+  `repetition_penalty` to 1.0 so its greedy requests still fold unless a
+  client sends a penalty.
 
 Do not compare this file to a pre-0.13 version: those receipts had no
 warmup, so their prefill numbers include cold mmap page faults.
