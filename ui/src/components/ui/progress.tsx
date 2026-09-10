@@ -28,10 +28,10 @@ export function Progress({
       )}
     >
       {pct === null ? (
-        <div className="h-full w-1/3 animate-[indeterminate_1.4s_ease-in-out_infinite] rounded-full bg-accent/70" />
+        <div className="h-full w-1/3 animate-[indeterminate_1.4s_ease-in-out_infinite] rounded-full bg-ink/70" />
       ) : (
         <div
-          className="h-full rounded-full bg-accent transition-[width] duration-500 ease-out"
+          className="h-full rounded-full bg-ink transition-[width] duration-500 ease-out"
           style={{ width: `${pct.toFixed(1)}%` }}
         />
       )}

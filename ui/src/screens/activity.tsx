@@ -62,7 +62,7 @@ function Counter({
       className="rounded-lg border border-line bg-inset/40 px-3 py-2"
       title={hint}
     >
-      <p className="text-[0.6875rem] tracking-wide text-faint uppercase">
+      <p className="text-2xs tracking-wide text-faint uppercase">
         {label}
       </p>
       <p className="mt-0.5 font-mono text-lg tabular-nums">{value}</p>
@@ -367,7 +367,7 @@ export function ActivityScreen() {
           ).map(([label, values]) => (
             <Card key={label}>
               <CardBody className="space-y-2 p-3">
-                <p className="text-[0.6875rem] tracking-wide text-faint uppercase">
+                <p className="text-2xs tracking-wide text-faint uppercase">
                   {label}
                 </p>
                 <Sparkline label={label} values={[...values]} />
@@ -423,7 +423,7 @@ export function ActivityScreen() {
                             type="button"
                             onClick={header.column.getToggleSortingHandler()}
                             className={cn(
-                              "flex w-full items-center gap-1 px-3 py-2 text-[0.6875rem] font-semibold tracking-wide text-faint uppercase hover:text-fg",
+                              "flex w-full items-center gap-1 px-3 py-2 text-2xs font-semibold tracking-wide text-faint uppercase hover:text-fg",
                               numeric && "justify-end",
                             )}
                           >
@@ -434,7 +434,7 @@ export function ActivityScreen() {
                             <Icon
                               className={cn(
                                 "size-3",
-                                sorted ? "text-accent" : "opacity-40",
+                                sorted ? "text-fg" : "opacity-40",
                               )}
                             />
                           </button>

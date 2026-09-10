@@ -52,7 +52,7 @@ function Snippet({
       </CardHeader>
       <CardBody className="space-y-2 p-0">
         <p className="px-4 pt-3 text-xs text-faint">{note}</p>
-        <pre className="overflow-x-auto px-4 pb-4 font-mono text-[0.8125rem] leading-relaxed">
+        <pre className="overflow-x-auto px-4 pb-4 font-mono text-code leading-relaxed">
           <code>{code}</code>
         </pre>
       </CardBody>
@@ -165,13 +165,13 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
         <CardHeader>
           <CardTitle>Connection</CardTitle>
           <span className="flex-1" />
-          <span className="font-mono text-[0.6875rem] text-faint">
+          <span className="font-mono text-2xs text-faint">
             {status}
           </span>
         </CardHeader>
         <CardBody>
           <form
-            className="flex flex-wrap items-end gap-3"
+            className="flex flex-col gap-2"
             onSubmit={(e) => {
               e.preventDefault();
               const nextKey = key.trim();
@@ -181,42 +181,50 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
               setSavedOrigin(apiBase());
             }}
           >
-            <Field
-              label="API base URL"
-              className="min-w-56 flex-1"
-              htmlFor="apibase"
-              hint={
-                origin
-                  ? "Cross-origin: the server needs FERROX_CORS_ORIGINS set to this app's origin."
-                  : `Empty — this app's own requests go to ${window.location.origin} and the dev server proxies them. Snippets below assume the server is at its default ${DEFAULT_SERVER_ORIGIN}.`
-              }
-            >
-              <Input
-                id="apibase"
-                value={origin}
-                onChange={(e) => setOrigin(e.target.value)}
-                placeholder="http://127.0.0.1:8383  (empty = same origin)"
-                className="font-mono text-xs"
-              />
-            </Field>
-            <Field
-              label="API key (FERROX_API_KEY)"
-              className="min-w-56 flex-1"
-              htmlFor="apikey"
-            >
-              <Input
-                id="apikey"
-                type="password"
-                autoComplete="off"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                placeholder="unset — this server may not require one"
-              />
-            </Field>
-            <Button type="submit" variant="primary">
-              <KeyRound />
-              Save
-            </Button>
+            {/* The three controls share one row, and the base URL's
+                explanation sits UNDER it rather than in the field's own
+                hint slot. As a hint it was two lines long, which made its
+                column taller than the other two and — with `items-end` —
+                staggered the API key field and the Save button down beside
+                a gap. A caption is the same words without the layout. */}
+            <div className="flex flex-wrap items-end gap-3">
+              <Field
+                label="API base URL"
+                className="min-w-56 flex-1"
+                htmlFor="apibase"
+              >
+                <Input
+                  id="apibase"
+                  value={origin}
+                  onChange={(e) => setOrigin(e.target.value)}
+                  placeholder="http://127.0.0.1:8383  (empty = same origin)"
+                  className="font-mono text-xs"
+                />
+              </Field>
+              <Field
+                label="API key (FERROX_API_KEY)"
+                className="min-w-56 flex-1"
+                htmlFor="apikey"
+              >
+                <Input
+                  id="apikey"
+                  type="password"
+                  autoComplete="off"
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                  placeholder="unset — this server may not require one"
+                />
+              </Field>
+              <Button type="submit" variant="primary">
+                <KeyRound />
+                Save
+              </Button>
+            </div>
+            <p className="text-2xs text-faint">
+              {origin
+                ? "Cross-origin: the server needs FERROX_CORS_ORIGINS set to this app's origin."
+                : `Empty — this app's own requests go to ${window.location.origin} and the dev server proxies them. Snippets below assume the server is at its default ${DEFAULT_SERVER_ORIGIN}.`}
+            </p>
           </form>
         </CardBody>
         <CardFooter className="space-y-1">

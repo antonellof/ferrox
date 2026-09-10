@@ -95,7 +95,7 @@ export function HealthPill({ state, className }: { state: HealthState; className
         {/* The word first. A status control you have to click to find out
             is a status control is the thing being fixed here. */}
         <span className="min-w-0 flex-1">
-          <span className="block text-[0.6875rem] leading-tight text-faint">
+          <span className="block text-2xs leading-tight text-faint">
             Server
           </span>
           <span
@@ -117,7 +117,7 @@ export function HealthPill({ state, className }: { state: HealthState; className
           align="start"
           sideOffset={8}
           collisionPadding={12}
-          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-card border border-line bg-raised p-3 text-xs shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-xl border border-line bg-raised p-3 text-xs shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           {health ? (
             <div className="space-y-3">

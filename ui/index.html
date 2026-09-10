@@ -9,10 +9,13 @@
       name="description"
       content="Chat, model manager and live request log for a local ferrox-server."
     />
-    <link
-      rel="icon"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23c2410c'/%3E%3Cpath d='M11 8h12v4h-8v4h7v4h-7v8h-4z' fill='%23fff'/%3E%3C/svg%3E"
-    />
+    <!-- The mark, drawn from the geometry in src/lib/logo-geometry.ts and
+         held to it by src/lib/logo-geometry.test.ts. It is a file rather
+         than a data: URI because it needs a `prefers-color-scheme` rule
+         of its own: a favicon cannot inherit `currentColor` from the
+         page, and one fixed colour disappears into one of the two
+         browser chromes. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   </head>
   <body>
     <div id="root"></div>
