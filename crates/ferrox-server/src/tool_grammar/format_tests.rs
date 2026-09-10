@@ -155,8 +155,38 @@ fn sample(format: ToolCallFormat) -> Option<Sample> {
             near_miss: "<|channel|>commentary to=functions.get_weather<|message|>{\"days\"",
         }),
 
-        // The three that refuse. See `wire::shape` for each reason.
-        ToolCallFormat::Gemma4 | ToolCallFormat::MiniMaxM3 | ToolCallFormat::MuseGlimmer => None,
+        // MiniMax-M3, whose element grammar is M2's with every tag
+        // behind the `]<]minimax[>[` namespace. The shape is the
+        // parser's own `M3_*` constants, and its fixture in
+        // `policy::parser::tool_call` writes a call the same way.
+        ToolCallFormat::MiniMaxM3 => Some(Sample {
+            model: "minimax-m3",
+            prose: "Let me look that up. ",
+            call: "]<]minimax[>[<tool_call>\
+                   ]<]minimax[>[<invoke name=\"get_weather\">\
+                   ]<]minimax[>[<city>Rome]<]minimax[>[</city>\
+                   ]<]minimax[>[<days>3]<]minimax[>[</days>\
+                   ]<]minimax[>[</invoke>]<]minimax[>[</tool_call>",
+            near_miss: "]<]minimax[>[<tool_call>\
+                        ]<]minimax[>[<invoke name=\"get_weather\">\
+                        ]<]minimax[>[<days>",
+        }),
+
+        // Gemma 4. The call is the chat template's own
+        // `'<|tool_call>call:' + name + '{'`, then
+        // `key:format_argument(value, escape_keys=False)` per argument
+        // `| dictsort`ed, then `'}<tool_call|>'` -- read off
+        // `gemma-4-E2B-it`'s embedded template, and exercised against
+        // that checkpoint through the server.
+        ToolCallFormat::Gemma4 => Some(Sample {
+            model: "gemma-4-e2b-it",
+            prose: "Let me look that up. ",
+            call: "<|tool_call>call:get_weather{city:<|\"|>Rome<|\"|>,days:3}<tool_call|>",
+            near_miss: "<|tool_call>call:get_weather{days:",
+        }),
+
+        // The one that refuses. See `wire::shape` for the reason.
+        ToolCallFormat::MuseGlimmer => None,
     }
 }
 
@@ -449,6 +479,179 @@ fn a_json_argument_may_sit_on_its_own_line_and_still_arrive_typed() {
     );
     let (_, calls) = parser.parse_complete(call);
     assert_eq!(calls[0].arguments, EXPECTED_ARGUMENTS);
+}
+
+/// Gemma's arguments are separated by a comma, so an optional one is not
+/// an independent `?`: what may be skipped is the pair TOGETHER WITH the
+/// comma in front of it, and whichever pair is written first has none.
+///
+/// A grammar that made each pair `?` on its own would accept `{,b:1}`
+/// and `{a:…,}`, and `gemma_arguments` reads a pair with no `:` in it as
+/// nothing at all -- so a call with a stray comma loses an argument
+/// silently.
+#[test]
+fn a_gemma_call_may_skip_any_optional_argument_and_still_be_comma_separated() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "a": {"type": "string"},
+            "b": {"type": "integer"},
+        },
+        "additionalProperties": false,
+    });
+    let offered = [ToolSpec {
+        name: "ping",
+        parameters: Some(&schema),
+    }];
+    let grammar = build(Forced::Any, &offered, ToolCallFormat::Gemma4).expect("a grammar");
+
+    for legal in [
+        "<|tool_call>call:ping{}<tool_call|>",
+        "<|tool_call>call:ping{a:<|\"|>x<|\"|>}<tool_call|>",
+        "<|tool_call>call:ping{b:1}<tool_call|>",
+        "<|tool_call>call:ping{a:<|\"|>x<|\"|>,b:1}<tool_call|>",
+    ] {
+        assert!(
+            feed(&grammar, &[legal]).unwrap_or_else(|e| panic!("{legal:?}: {e}")),
+            "{legal:?} should be a complete call"
+        );
+    }
+    for illegal in [
+        // A separator with nothing before it, and one with nothing
+        // after it.
+        "<|tool_call>call:ping{,b:1}",
+        "<|tool_call>call:ping{a:<|\"|>x<|\"|>,}",
+        // The template writes the pairs `| dictsort`ed, so this order
+        // is not one the checkpoint emits.
+        "<|tool_call>call:ping{b:1,a:",
+        // An argument the schema never declared.
+        "<|tool_call>call:ping{c:",
+    ] {
+        assert!(
+            feed(&grammar, &[illegal]).is_err(),
+            "{illegal:?} must not be a legal forced call"
+        );
+    }
+}
+
+/// A gemma string value is wrapped in gemma's own quote, and the reader
+/// toggles quoting at every one of those while ending the whole call at
+/// the first `<tool_call|>` regardless. So a value may hold any markup
+/// except those two -- which is what makes a forced call usable by a
+/// coding agent, whose arguments are whole files.
+#[test]
+fn a_gemma_string_holds_markup_but_not_the_two_markers_that_end_it() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"patch": {"type": "string"}},
+        "required": ["patch"],
+    });
+    let offered = [ToolSpec {
+        name: "write_file",
+        parameters: Some(&schema),
+    }];
+    let grammar = build(Forced::Any, &offered, ToolCallFormat::Gemma4).expect("a grammar");
+
+    let call = "<|tool_call>call:write_file{patch:<|\"|>\
+                <html>a < b, {\"json\": true} & <|tool_call> too\
+                <|\"|>}<tool_call|>";
+    assert!(feed(&grammar, &[call]).expect("markup is legal in a value"));
+
+    let parser = ToolCallParser::new(
+        ToolCallFormat::Gemma4,
+        vec![ToolSchema::with_parameters("write_file", schema)],
+    );
+    let (_, calls) = parser.parse_complete(call);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].arguments,
+        r#"{"patch":"<html>a < b, {\"json\": true} & <|tool_call> too"}"#
+    );
+
+    for stops_the_reader in [
+        "<|tool_call>call:write_file{patch:<|\"|>a<|\"|>b",
+        "<|tool_call>call:write_file{patch:<|\"|>a<tool_call|>",
+    ] {
+        assert!(
+            feed(&grammar, &[stops_the_reader]).is_err(),
+            "{stops_the_reader:?} is text this server would read back wrong"
+        );
+    }
+}
+
+/// A gemma argument the schema calls an object or an array is REFUSED by
+/// name, because the writer and the reader disagree about it: gemma's
+/// template spells a composite in its own DSL -- bare keys, gemma-quoted
+/// strings -- and `parse_loose` reads a value with `serde_json`, so the
+/// spelling the checkpoint writes comes back as a string.
+#[test]
+fn a_gemma_composite_argument_is_refused_by_name() {
+    for declared in ["object", "array"] {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"where": {"type": declared}},
+            "required": ["where"],
+        });
+        let offered = [ToolSpec {
+            name: "get_weather",
+            parameters: Some(&schema),
+        }];
+        let (status, axum::Json(body)) = build(Forced::Any, &offered, ToolCallFormat::Gemma4)
+            .expect_err("gemma writes a composite in a DSL this server reads as a string");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("where"), "{message}");
+        assert!(message.contains(declared), "{message}");
+    }
+}
+
+/// An M3 value is bare text between two elements, and
+/// `m3_scan_elements` re-reads it as STRUCTURE from any occurrence of
+/// the namespace prefix -- not just from the tag that closes this
+/// argument. So the prefix is what a value may not contain.
+#[test]
+fn an_m3_value_may_not_contain_the_namespace_that_starts_every_tag() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"patch": {"type": "string"}},
+        "required": ["patch"],
+    });
+    let offered = [ToolSpec {
+        name: "write_file",
+        parameters: Some(&schema),
+    }];
+    let grammar = build(Forced::Any, &offered, ToolCallFormat::MiniMaxM3).expect("a grammar");
+
+    let call = "]<]minimax[>[<tool_call>]<]minimax[>[<invoke name=\"write_file\">\
+                ]<]minimax[>[<patch><html>a < b</html> and ]<]minimax[ too\
+                ]<]minimax[>[</patch>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>";
+    assert!(feed(&grammar, &[call]).expect("markup that is not a tag is legal"));
+
+    let parser = ToolCallParser::new(
+        ToolCallFormat::MiniMaxM3,
+        vec![ToolSchema::with_parameters("write_file", schema)],
+    );
+    let (_, calls) = parser.parse_complete(call);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].arguments,
+        r#"{"patch":"<html>a < b</html> and ]<]minimax[ too"}"#
+    );
+
+    // The namespace prefix is legal at the value's END, because that is
+    // how its own closing tag begins -- so the text that must be
+    // unreachable is a tag that is NOT this argument's closer.
+    for opens_a_tag in [
+        "]<]minimax[>[<tool_call>]<]minimax[>[<invoke name=\"write_file\">\
+         ]<]minimax[>[<patch>a]<]minimax[>[<x",
+        "]<]minimax[>[<tool_call>]<]minimax[>[<invoke name=\"write_file\">\
+         ]<]minimax[>[<patch>a]<]minimax[>[</other>",
+    ] {
+        assert!(
+            feed(&grammar, &[opens_a_tag]).is_err(),
+            "a value that opens a tag of its own would be read back as structure"
+        );
+    }
 }
 
 /// gpt-oss opens its reasoning on the same marker its calls use, so the

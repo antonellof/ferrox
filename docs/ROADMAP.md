@@ -107,10 +107,13 @@ that genuinely have none say `&[]` visibly in the diff.
   hardcoded both to zero
 - **Five one-match-arm architectures admitted**, so unaudited went 46 to
   41 and audited 11 to 16
-- **Forced `tool_choice` on eight of the eleven wire formats**, up from
+- **Forced `tool_choice` on ten of the eleven wire formats**, up from
   three, with the grammar's literals built from the same marker
-  description the parser reads with. The remaining three refuse for
-  stated reasons rather than for effort
+  description the parser reads with. `gemma4` got a shape of its own
+  (`call:NAME{k:v}` in gemma's quoting) and `minimax_m3` joined the
+  element shape; only `muse_glimmer` refuses, because its call boundary
+  is a channel header whose recipient name is a fact about a template
+  rather than about the format
 - **Gemma-2-27B and Gemma-3-4B/12B/27B numerics**, and Gemma-3 4B+ is
   back on the fused Metal stacks with a per-layer `LayerRope`
 - **The response cache cannot store a cancelled answer**, enforced by a
@@ -139,7 +142,7 @@ Everything open, as of 2026-09-02:
 | [#128](https://github.com/antonellof/ferrox/issues/128) | Decode carries a fixed per-token cost of roughly 60 ms that no thread count or pool removes: 135M runs at 13 to 15 tok/s on 4, 8 and 19 aarch64 threads while llama.cpp does 190 to 204 | Finding what the constant IS. It is flat in thread count, so it is not fork-join, and flat in model size, so it is not arithmetic |
 | [#126](https://github.com/antonellof/ferrox/issues/126) | `ferrox bench --n-gpu-layers 0` does not force CPU, and `bench_suite.rs` uses that flag for every published `cpu` row, so the ledger's CPU numbers may include Metal | Nothing. The backend decision is cached in a `OnceLock` before the flag can apply; the fix is to stop having two answers |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86_64 CPU throughput looks ~10x off llama.cpp (3B Q4_K_M at 1.03 tok/s on 10 Broadwell cores), and `benchmarks/RESULTS.md` has no x86 row to show it | A `llama-bench` comparison on the same x86 host, then finding whether the AVX2 arms are reached at all |
-| [#29](https://github.com/antonellof/ferrox/issues/29) | A forced `tool_choice` reaches eight of the eleven wire formats. `gemma4`, `minimax_m3` and `muse_glimmer` still answer 501 | Nothing: each refuses for a stated reason, not for effort. Reopen only with a better idea than approximating a framing |
+| [#29](https://github.com/antonellof/ferrox/issues/29) | A forced `tool_choice` reaches ten of the eleven wire formats. `muse_glimmer` still answers 501 | A muse-glimmer checkpoint or its chat template. The block is already an element grammar this can write; what is missing is which recipient name the template addresses a tool with, and how much of the channel header the rendered prompt already wrote |
 | [#61](https://github.com/antonellof/ferrox/issues/61) | No KV store evicts behind a sliding window, so Gemma-3-4B holds 9.1 GB where 1.6 GB would do | Splitting `KvCache::seq_len` into positions and rows first. The design and the ordered steps are in the issue |
 | [#70](https://github.com/antonellof/ferrox/issues/70) | `ferrox quantize` writes Q8_0 byte-identically to llama.cpp and refuses the rest by name | K-quant encoders with importance-weighted rounding. Steps 2 to 4 are in the issue |
 | [#82](https://github.com/antonellof/ferrox/issues/82) | Rerank scores are the head minus its pooler, so a thresholding client gets a range that never fires | A converter that keeps `bert.pooler.dense`, which ferrox can now write. Ordering is unaffected |

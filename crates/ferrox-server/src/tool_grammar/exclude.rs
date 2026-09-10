@@ -1,4 +1,4 @@
-//! "Every string that does not contain this literal", as GBNF.
+//! "Every string that does not contain any of these literals", as GBNF.
 //!
 //! The XML-ish wire formats end an argument's value at a closing tag,
 //! so the value rule is *everything up to* `</parameter>` (or whatever
@@ -6,14 +6,23 @@
 //! able to say exactly that. `[^<]*` says something else: it forbids
 //! every `<`, and a coding agent's arguments are whole files.
 //!
-//! This is the complement of the literal's KMP automaton, one
+//! This is the complement of the literals' Aho-Corasick automaton, one
 //! right-recursive rule per state -- llama.cpp's
 //! `gbnf_excluding_grammar` (`common/peg-parser.cpp`, added by
-//! ggml-org/llama.cpp#24839) for the single-pattern case, where its
-//! Aho-Corasick automaton degenerates to KMP. Every state accepts, and
-//! the transition that would COMPLETE the literal is the one
-//! alternative that is never written, so the literal can never be
-//! matched.
+//! ggml-org/llama.cpp#24839). Every state accepts, and the transition
+//! that would COMPLETE a literal is the one alternative that is never
+//! written, so no literal can ever be matched.
+//!
+//! # Why a SET rather than one literal
+//!
+//! Most formats stop reading a value at exactly one string, and for
+//! those the automaton degenerates to KMP. Gemma 4 is the one that does
+//! not: its string values are wrapped in `<|"|>`, and the reader toggles
+//! quoting at every one of those *and* ends the whole call at the first
+//! `<tool_call|>` without regard for quoting, so a value that may
+//! contain either is a value this server would read back wrong. Two
+//! separate KMP exclusions cannot be intersected in GBNF; one automaton
+//! over both patterns is the same construction and answers it.
 //!
 //! Right recursion is deliberate and is not a stack leak: a rule
 //! reference in final position is not pushed as a continuation
@@ -21,14 +30,14 @@
 //! `llama_grammar_advance_stack`), so a value of any length costs one
 //! stack entry.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ferrox_models::grammar::json_schema::GrammarBuilder;
 
 use crate::ApiError;
 
-/// Emit the rules for text that cannot contain `forbidden`, and return
-/// the name of the rule to reference.
+/// Emit the rules for text that cannot contain any of `forbidden`, and
+/// return the name of the rule to reference.
 ///
 /// `prefix` must be free in `builder`: these rules reference each other
 /// by name, and `GrammarBuilder::add_rule` renames a name already bound
@@ -39,22 +48,21 @@ use crate::ApiError;
 pub(super) fn text_excluding(
     builder: &mut GrammarBuilder,
     prefix: &str,
-    forbidden: &str,
+    forbidden: &[&str],
 ) -> Result<String, ApiError> {
-    let chars: Vec<char> = forbidden.chars().collect();
-    if chars.is_empty() {
-        // Every string contains the empty string, so the honest
-        // language here is the empty one, which GBNF cannot spell. The
-        // empty string is the only under-approximation, and it is safe:
-        // it never lets through text the reader would not read back.
-        // Every format `wire::shape` gives the element treatment to has
-        // a non-empty closing tag, so this is a guard on the call rather
-        // than a case a request can reach.
+    if forbidden.is_empty() || forbidden.iter().any(|literal| literal.is_empty()) {
+        // Every string contains the empty string, and a set with no
+        // literal in it forbids nothing this caller meant to forbid, so
+        // the honest language here is the empty one -- which GBNF cannot
+        // spell. The empty string is the only under-approximation, and
+        // it is safe: it never lets through text the reader would not
+        // read back. Every format `wire::shape` gives a value rule to
+        // names at least one non-empty literal, so this is a guard on
+        // the call rather than a case a request can reach.
         return Ok(builder.add_rule(prefix, r#""""#));
     }
 
-    let failure = kmp_failure(&chars);
-    let alphabet: BTreeSet<char> = chars.iter().copied().collect();
+    let automaton = Automaton::over(forbidden);
     let name_of = |state: usize| {
         if state == 0 {
             prefix.to_string()
@@ -63,17 +71,24 @@ pub(super) fn text_excluding(
         }
     };
 
-    for state in 0..chars.len() {
+    for state in 0..automaton.nodes.len() {
+        if automaton.matched[state] {
+            // A state only reached by completing a literal. The
+            // complement never enters it, so it gets no rule -- and
+            // nothing references one, because every transition into a
+            // matched state is the alternative that is never written.
+            continue;
+        }
         // Chars whose transition leads somewhere other than the start
         // state, grouped by where; plus every char that has any
         // explicit transition at all, so the rest can be swept up by
         // one negated class.
         let mut buckets: BTreeMap<usize, Vec<char>> = BTreeMap::new();
         let mut specific: Vec<char> = Vec::new();
-        for &c in &alphabet {
-            let next = step(&chars, &failure, state, c);
-            if next == chars.len() {
-                // Completing the literal. Listed as "explicit" so the
+        for &c in &automaton.alphabet {
+            let next = automaton.step(state, c);
+            if automaton.matched[next] {
+                // Completing a literal. Listed as "explicit" so the
                 // catch-all cannot match it, and given no alternative
                 // of its own: that is the whole exclusion.
                 specific.push(c);
@@ -84,8 +99,8 @@ pub(super) fn text_excluding(
         }
 
         // The empty first alternative: every state of the complement
-        // accepts, because a string that has not completed the literal
-        // does not contain it.
+        // accepts, because a string that has not completed a literal
+        // does not contain one.
         let mut alternatives = vec![String::new()];
         for (next, group) in &buckets {
             alternatives.push(format!("{} {}", char_class(group, false), name_of(*next)));
@@ -104,35 +119,84 @@ pub(super) fn text_excluding(
     Ok(name_of(0))
 }
 
-/// `failure[q]` is the length of the longest proper prefix of
-/// `chars[..=q]` that is also a suffix of it.
-fn kmp_failure(chars: &[char]) -> Vec<usize> {
-    let mut failure = vec![0usize; chars.len()];
-    let mut k = 0usize;
-    for i in 1..chars.len() {
-        while k > 0 && chars[i] != chars[k] {
-            k = failure[k - 1];
-        }
-        if chars[i] == chars[k] {
-            k += 1;
-        }
-        failure[i] = k;
-    }
-    failure
+/// The Aho-Corasick automaton of a set of literals, over the characters
+/// those literals are spelled with.
+///
+/// A state is one node of the trie of the literals: the longest suffix
+/// of the input read so far that is a prefix of some literal.
+struct Automaton {
+    /// The trie's explicit edges, one map per node.
+    nodes: Vec<BTreeMap<char, usize>>,
+    /// The longest proper suffix of this node's string that is also a
+    /// node.
+    fail: Vec<usize>,
+    /// Whether reaching this node means a literal has been matched --
+    /// either because the node IS a literal, or because one ends inside
+    /// the string that reaches it.
+    matched: Vec<bool>,
+    /// Every character any literal is spelled with. A character outside
+    /// it can end no literal's prefix, so it always leads back to the
+    /// start state and is swept up by the catch-all class.
+    alphabet: BTreeSet<char>,
 }
 
-/// The state reached from `state` on `c`: how much of the literal is
-/// matched by the longest suffix of the input read so far.
-fn step(chars: &[char], failure: &[usize], state: usize, c: char) -> usize {
-    let mut state = state;
-    loop {
-        if chars[state] == c {
-            return state + 1;
+impl Automaton {
+    fn over(literals: &[&str]) -> Self {
+        let mut automaton = Automaton {
+            nodes: vec![BTreeMap::new()],
+            fail: vec![0],
+            matched: vec![false],
+            alphabet: BTreeSet::new(),
+        };
+        for literal in literals {
+            let mut node = 0usize;
+            for c in literal.chars() {
+                automaton.alphabet.insert(c);
+                node = match automaton.nodes[node].get(&c) {
+                    Some(&next) => next,
+                    None => {
+                        automaton.nodes.push(BTreeMap::new());
+                        automaton.fail.push(0);
+                        automaton.matched.push(false);
+                        let next = automaton.nodes.len() - 1;
+                        automaton.nodes[node].insert(c, next);
+                        next
+                    }
+                };
+            }
+            automaton.matched[node] = true;
         }
-        if state == 0 {
-            return 0;
+
+        // Breadth-first, so a node's failure link is computed after the
+        // shorter node it points at. `matched` propagates BOTH ways a
+        // literal can be present in the string that reaches a node: as
+        // a suffix (the failure link) and as a prefix (the parent).
+        let mut queue: VecDeque<usize> = automaton.nodes[0].values().copied().collect();
+        while let Some(node) = queue.pop_front() {
+            automaton.matched[node] =
+                automaton.matched[node] || automaton.matched[automaton.fail[node]];
+            for (&c, &child) in &automaton.nodes[node].clone() {
+                automaton.fail[child] = automaton.step(automaton.fail[node], c);
+                automaton.matched[child] = automaton.matched[child] || automaton.matched[node];
+                queue.push_back(child);
+            }
         }
-        state = failure[state - 1];
+        automaton
+    }
+
+    /// The state reached from `state` on `c`: the longest suffix of the
+    /// input read so far that is a prefix of some literal.
+    fn step(&self, state: usize, c: char) -> usize {
+        let mut state = state;
+        loop {
+            if let Some(&next) = self.nodes[state].get(&c) {
+                return next;
+            }
+            if state == 0 {
+                return 0;
+            }
+            state = self.fail[state];
+        }
     }
 }
 
@@ -175,6 +239,12 @@ mod tests {
     /// exclusion is tested where it has to be exact: right before the
     /// literal it excludes.
     fn accepts(forbidden: &str, text: &str) -> bool {
+        accepts_any(&[forbidden], text)
+    }
+
+    /// The same, for a set of literals: the text must contain none of
+    /// them.
+    fn accepts_any(forbidden: &[&str], text: &str) -> bool {
         let mut builder = GrammarBuilder::new();
         let body = text_excluding(&mut builder, "not", forbidden).expect("a rule");
         builder.add_rule("root", &format!("{body} \"END\""));
@@ -226,6 +296,87 @@ mod tests {
         assert!(accepts("</｜DSML｜parameter>", "値 with a ｜ in it"));
         assert!(accepts("</｜DSML｜parameter>", "</｜DSML｜invoke>"));
         assert!(!accepts("</｜DSML｜parameter>", "x</｜DSML｜parameter>y"));
+    }
+
+    /// Two literals at once, which is the case a pair of KMP exclusions
+    /// cannot express: gemma 4's string values may contain neither the
+    /// quote that ends them nor the marker that ends the whole call.
+    #[test]
+    fn a_set_of_literals_excludes_every_member() {
+        const QUOTE: &str = "<|\"|>";
+        const BLOCK_CLOSE: &str = "<tool_call|>";
+        let gemma = [QUOTE, BLOCK_CLOSE];
+
+        assert!(accepts_any(&gemma, "plain text"));
+        // Long proper prefixes of both, and the other family's markers.
+        assert!(accepts_any(&gemma, "<| <|\" <tool_call| </tool_call>"));
+        assert!(!accepts_any(&gemma, "before<|\"|>after"));
+        assert!(!accepts_any(&gemma, "before<tool_call|>after"));
+        // Each member is excluded even when the other is the one that
+        // nearly matched first: a KMP automaton for either alone accepts
+        // the string that ends in the other.
+        assert!(!accepts_any(&gemma, "<tool_call<|\"|>"));
+        assert!(!accepts_any(&gemma, "<|\"<tool_call|>"));
+    }
+
+    /// A literal that is a suffix of another shares states, so the
+    /// automaton's failure links -- not just its trie -- have to carry
+    /// `matched` for the shorter one.
+    #[test]
+    fn a_literal_that_is_a_suffix_of_another_is_still_excluded() {
+        assert!(!accepts_any(&["abc", "bc"], "xbcx"));
+        assert!(!accepts_any(&["abc", "bc"], "xabcx"));
+        assert!(accepts_any(&["abc", "bc"], "xacx"));
+        // And a literal that CONTAINS another: the longer one is
+        // unreachable, and the shorter one still bites.
+        assert!(!accepts_any(&["bc", "abcd"], "xbcx"));
+        assert!(accepts_any(&["bc", "abcd"], "xabd"));
+    }
+
+    /// A literal reached only by passing THROUGH another one can never
+    /// be matched, so its states must not be written down at all.
+    ///
+    /// This is not about the language -- an unreferenced rule accepts
+    /// nothing extra. It is about the grammar staying the size of the
+    /// automaton it means: the tail of `"abcde"` past the `"bc"` inside
+    /// it is a state nothing can enter, and a value rule is emitted once
+    /// per argument of every offered tool.
+    #[test]
+    fn a_state_behind_a_matched_one_gets_no_rule() {
+        let mut builder = GrammarBuilder::new();
+        let body = text_excluding(&mut builder, "not", &["bc", "abcde"]).expect("a rule");
+        builder.add_rule("root", &body);
+        let text = builder.finish().expect("grammar");
+
+        let mut defined: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            if let Some((name, _)) = line.split_once("::=") {
+                let name = name.trim();
+                if name.starts_with("not") {
+                    defined.push(name);
+                }
+            }
+        }
+        assert!(
+            defined.len() > 1,
+            "the automaton should have states of its own: {text}"
+        );
+        for name in &defined {
+            if *name == "not" {
+                continue;
+            }
+            let referenced = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(&format!("{name} ")))
+                .any(|line| {
+                    line.split_once("::=")
+                        .is_some_and(|(_, body)| body.split_whitespace().any(|word| word == *name))
+                });
+            assert!(
+                referenced,
+                "{name} is a state nothing can enter, so it should not have been written: {text}"
+            );
+        }
     }
 
     /// Every character that has to be escaped to reach a GBNF class
