@@ -60,6 +60,7 @@ pub mod penalty_window;
 pub mod pooling;
 pub mod pre_norm;
 pub mod prefix_cache;
+pub(crate) mod qkv_fused;
 pub mod rank_head;
 pub mod recurrent_engine;
 pub mod residency_report;

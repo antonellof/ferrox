@@ -281,8 +281,12 @@ mod tests {
             select_engine_kind("phi3").unwrap(),
             SelectedEngineKind::GenericDecoder
         );
+        // `mixtral` was HERE and is not a generic-decoder row any
+        // more: no converter writes that string, libllama refuses it,
+        // and every real Mixtral checkpoint declares `llama` (which is
+        // the first case in this test). See `capability::NO_UPSTREAM_ARCH`.
         assert_eq!(
-            select_engine_kind("mixtral").unwrap(),
+            select_engine_kind("olmoe").unwrap(),
             SelectedEngineKind::GenericDecoder
         );
     }

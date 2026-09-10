@@ -147,8 +147,12 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; 11 do today
-   (`llama`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`, `olmoe`,
+   logit comparison against real `libllama`, or a fixture; **30** do
+   today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
+   `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
+   `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
+   `ernie4_5-moe`, `internlm2`, `xverse`, `baichuan`, `exaone`,
+   `exaone4`, `plamo3`,
 **Gemma-2-27B, Gemma-3-4B/12B/27B: corrected 2026-09-02.** Those four
 sizes were quietly wrong until then, in two ways that both produce
 fluent text. The 27B checkpoints took `1/sqrt(head_dim)` as their
@@ -187,15 +191,15 @@ of this. The speed recovery from returning to the fused path is
 unmeasured, because measuring it needs a quiet host.
 
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **29** stop with `UnauditedArchitecture`.
+   **25** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. One of the 29 is one named match arm away
-and the rest need an attention implementation or a reading nobody has
-done, so the refusal says which, with the
+"Unaudited" is not one thing. None of the 25 is a fixture or a single
+match arm away any more: they need an attention implementation or a
+reading nobody has done, and the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
 
 | Class | Means |
@@ -205,7 +209,7 @@ done, so the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 29 have now been read on both sides (`ferrox_models::capability`,
+All 25 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -213,13 +217,15 @@ on models":
 | Class | Count |
 |---|---|
 | fixture-away | 0 |
-| one match arm | 1 |
+| one match arm | 0 |
 | new code | 24 |
-| unknown | 4 |
+| unknown | 1 |
 
-**Fixture-away is empty.** Every row that only needed evidence has it
-now, so everything still refusing needs code or a reading. That is a
-better answer than the count alone: the cheap wins are spent.
+**Both cheap classes are empty.** `gemma` was the last fixture-away row
+and `chatglm` the last one-match-arm row; nothing still refusing is one
+fixture or one arm away. That is a better answer than the count alone:
+the cheap wins are spent, and what is left is 24 rows needing a
+different graph plus one name nobody can get a file for.
 
 It was 47 until the triage itself removed one. Reading
 `src/models/minicpm3.cpp:5-6,41-46` showed `minicpm3` requires
@@ -236,11 +242,31 @@ right reason.
 were admitted with libllama-golden fixtures on 2026-09-03, `gemma`
 followed, and `chatglm` left the class the other way: an attempt to
 build its fixture found the fused `attn_qkv.bias` that every real
-ChatGLM2/3 export carries and ferrox drops, so it is ONE MATCH ARM now.
+ChatGLM2/3 export carries and ferrox dropped, so it became ONE MATCH
+ARM before closing as that.
 
-**One match arm (1).** `chatglm`, above: the fused `attn_qkv.bias`,
-which is the same arm `qwen` and `starcoder` are refused by name for.
-The other six all closed. `seed_oss` and the gpt-oss norm slot;
+**One match arm (0).** `chatglm` was the last row here and closed on
+2026-09-10. Its arm was the fused `attn_qkv.bias`: llama.cpp's
+`create_tensor_qkv` puts the bias where the weight is, and ferrox split
+the fused weight while reading the bias only under the split
+`attn_q.bias` names, so ChatGLM2/3's `add_qkv_bias: true` was dropped
+and all three projections ran unbiased. Both halves now come out of one
+decision in `qkv_fused`, sliced by the same spans.
+
+**`qwen` came with it, and needed a second arm nobody had named.** The
+`chatglm` verdict predicted the bias would close both rows. The bias
+really is shared -- `qwen.cpp:28` marks it REQUIRED, stronger than
+chatglm's optional one -- but building the fixture found that
+`qwen.cpp:33-35` also sizes every FFN matrix at `n_ff / 2`, because
+Qwen-1's `intermediate_size` counts gate and up together. That costs no
+logits (ferrox loads the dense FFN by tensor name and uses each
+matrix's own shape) and still made `expert_ffn_dim` twice the real
+width, which is what every memory estimate prices the FFN from. Both
+rows are audited against libllama now, and a test compares the declared
+FFN width against the matrices that load, over every dense fixture.
+
+The other seven one-match-arm rows had closed earlier. `seed_oss` and
+the gpt-oss norm slot;
 `deepseek` and top-k renormalisation; `bailingmoe` and a
 `leading_dense_block_count` llama.cpp reads but never uses;
 `hunyuan-moe`, `maincoder` and `hunyuan-dense`, which all wanted the
@@ -281,14 +307,35 @@ both decided by llama.cpp with no GGUF key, the `baichuan` shape.
 | An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |
 | Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
 
-**Unknown (4).** Reading both trees did not settle it, and each says
-what would. `phi4`, `mistral`, `mixtral` and `yi` are all names that do
-not exist in llama.cpp's `LLM_ARCH_NAMES`, so there is no reference
-graph to diff against. For the three alias rows this is not academic:
-Ferrox gives them NEOX RoPE, while `llama`, the string real Mistral,
-Mixtral and Yi checkpoints actually ship under, is in llama.cpp's NORM
-group. A file spelling `mistral` would be rotated on the wrong pairs of
-every Q/K head. Latent only because the row refuses.
+**Unknown (1).** `phi4` is the only row left here. It is not in
+llama.cpp's `LLM_ARCH_NAMES` -- `src/llama-arch.cpp` carries `phi3` and
+no phi4 entry -- so there is no reference graph to diff against, and
+Ferrox admits it as phi3's fused-QKV / fused gate+up graph on the
+assumption that a file spelling it means the same thing. It refuses
+until a real file settles that, and its message says which tensor in
+`blk.0` would decide it.
+
+**`mistral`, `mixtral` and `yi` were the other three, and were resolved
+on 2026-09-10 by finding they are not architectures.** The old verdict
+asked for "a real GGUF whose `general.architecture` is literally one of
+these three". No such file can be produced: none of the three is in
+llama.cpp's `LLM_ARCH_NAMES` or in gguf-py's `MODEL_ARCH_NAMES`
+(`mistral3` and `mistral4` are the only strings under that prefix), and
+libllama REFUSES a file declaring one -- `unknown model architecture:
+'mistral'`, measured on a synthetic llama-shaped file written under
+each string. The two real checkpoints on the development host,
+`Mistral-7B-Instruct-v0.2-Q4_K_M.gguf` and `Yi-1.5-6B-Chat-Q4_K_M.gguf`,
+both declare `general.architecture = llama`, which is audited and runs.
+
+So all three are refused as *strings*, not triaged as architectures,
+and the refusal says the actionable thing: re-convert with
+`convert_hf_to_gguf.py` and your file will load as `llama`. Moving them
+also closed a live hazard. They sat on the generic path with NEOX RoPE
+while `llama` -- the graph they claim to be -- is in llama.cpp's NORM
+group, so a file spelling `mistral` would have been rotated on the
+wrong pairs of every Q/K head, and the only test that compares RoPE
+layouts could not see it, because a name absent from llama.cpp's table
+is a `continue` there. That skip now has to be declared by name.
 
 `FERROX_ALLOW_UNKNOWN_TENSORS=1` loads the checkpoint anyway and accepts
 whatever comes out. Use it while you debug, not to get past the error

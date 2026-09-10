@@ -50,9 +50,30 @@ is faster.
   and is the only piece ported. Neither is blocked on MTP draft heads,
   which no MiniMax GGUF can carry: `gguf-py`'s tensor lists for both
   have no `NEXTN_*` entry, so the writer physically cannot emit one.
-- **Also loadable**: yi, qwen2moe / qwen3moe (MiroThinker GGUFs, for
+- **OLMo-2 and EXAONE-4**, audited against libllama on 2026-09-10 as
+  ONE residual topology rather than two: neither has an `attn_norm` or
+  an `ffn_norm` tensor, both sublayers read the raw residual, and each
+  branch's output is normed before its residual add
+  (`ferrox_models::pre_norm`). Two sub-cases stay refused by name -- an
+  `olmo2` carrying both a sliding window and a RoPE scaling (Olmo-3),
+  and EXAONE-4 32B, whose full-attention layers get no RoPE at all.
+  `olmo` (OLMo-1) is a third shape and still refuses.
+- **ChatGLM and Qwen-1**, both audited against libllama on 2026-09-10
+  and both closed by the same arm: the *fused* `blk.N.attn_qkv.bias`.
+  ferrox split a fused `attn_qkv.weight` and then looked for the bias
+  only under the split `attn_q.bias` names, so ChatGLM2/3's
+  `add_qkv_bias: true` and Qwen-1's required bias were dropped and every
+  Q, K and V projection ran unbiased. `chatglm` also exercises PARTIAL
+  RoPE (its converter writes `rope_dimension_count` as half a head) and
+  a fused gate+up SwiGLU; `qwen` needed a second arm, since its
+  `feed_forward_length` counts gate and up together and every FFN matrix
+  is half as wide as the key says.
+- **Also loadable**: Yi-1.5, qwen2moe / qwen3moe (MiroThinker GGUFs, for
   example), Gemma-2, Phi-3, Llama-3.1, and GLM4 when the tensors are
-  there. None of these are in the published suite.
+  there. None of these are in the published suite. Note Yi loads as
+  `llama`, which is what its GGUF declares -- the `yi` architecture
+  string does not exist in llama.cpp and ferrox refuses it by name,
+  saying so.
 - **MoE routing bias** (`exp_probs_b`, DeepSeek-V3's aux-loss-free
   selection bias) plus `expert_weights_scale` and
   `expert_weights_norm`, on the generic path. That one tensor is what

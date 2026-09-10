@@ -31,10 +31,16 @@
 //! specific llama.cpp line, so that changing the verdict without
 //! changing the reading fails.
 //!
-//! Nothing here loads a checkpoint. Every claim it pins was read in
+//! Every claim pinned here was read in
 //! `.scratch/llama.cpp/src/models/*.cpp` against ferrox's generic
-//! decoder, and the citation is in the verdict string itself.
+//! decoder, and the citation is in the verdict string itself. One test
+//! is the exception and reads FILES rather than source --
+//! `real_mistral_and_yi_checkpoints_declare_llama`, `#[ignore]`d
+//! because it needs the checkpoints in `models/`. It is the measurement
+//! that closed the last three UNKNOWN rows.
 
+mod common;
+use common::collect_gguf;
 use ferrox_models::capability::{
     architecture_catalog, is_audited_generic, unaudited_refusal_detail, unaudited_triage, ArchPath,
     TriageClass, TRIAGE_PENDING,
@@ -61,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 29,
+        n, 25,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -69,11 +75,13 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          `internlm2`, `xverse`, `ernie4_5`, `baichuan`, `exaone`, `bailingmoe2` and \
          `plamo3` were \
          admitted with theirs (`tests/fixture_away_graphs.rs`), 34 until `gemma`, \
-         `hunyuan-dense` and `ernie4_5-moe` were admitted with theirs, and 31 until \
+         `hunyuan-dense` and `ernie4_5-moe` were admitted with theirs, 31 until \
          `olmo2` and `exaone4` were -- the first two NEW CODE rows to close, and they \
          closed TOGETHER because they are one topology with one implementation \
-         (`ferrox_models::pre_norm`, `tests/post_norm_only_graphs.rs`) -- rows closing is \
-         the count going DOWN \
+         (`ferrox_models::pre_norm`, `tests/post_norm_only_graphs.rs`) -- 29 until \
+         `chatglm` was admitted with the fused-QKV-bias arm and its fixture, and 28 until \
+         `mistral`, `mixtral` and `yi` were found not to be architectures at all and \
+         moved to DedicatedOnly -- rows closing is the count going DOWN \
          for the best reason. Either an architecture was audited or reclassified (good -- \
          update the count and the docs) or one was added (check it was triaged)"
     );
@@ -297,7 +305,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 29);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 25);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -473,22 +481,21 @@ fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
 #[test]
 fn batch_three_verdicts_are_pinned_to_what_was_read() {
     let cases: &[(&str, TriageClass, &str)] = &[
-        // `chatglm` was FIXTURE-AWAY here. Trying to build its fixture
-        // read the converter and found the fused `attn_qkv.bias` --
-        // present in every real ChatGLM2/3 export, dropped by ferrox,
-        // and the same arm this file already refuses `qwen` by name for.
-        // A verdict that reads as a cheap win and is not one is the
-        // thing this suite exists to stop, so it is ONE MATCH ARM now.
-        (
-            "chatglm",
-            TriageClass::OneMatchArm,
-            "the same arm `qwen` is refused by name for",
-        ),
+        // `chatglm` was FIXTURE-AWAY here, then ONE MATCH ARM once
+        // somebody tried to build its fixture and read the converter.
+        // The arm -- the fused `attn_qkv.bias` -- landed in
+        // `qkv_fused`, so the row is audited and carries no verdict at
+        // all. It was the LAST one-match-arm row anywhere; see
+        // `tests/one_match_arm_graphs.rs`.
+        //
+        // `mistral`, `mixtral` and `yi` were HERE too, UNKNOWN on "what
+        // would settle it: a real GGUF spelling one of these". The
+        // answer came back NO -- libllama refuses all three strings --
+        // so they are refused as strings now, not triaged as
+        // architectures. See
+        // `the_alias_rows_are_refused_as_strings_no_converter_writes`.
         ("deci", TriageClass::NewCode, "PER LAYER"),
         ("olmo", TriageClass::NewCode, "NO norm weights at all"),
-        ("mistral", TriageClass::Unknown, "WHAT WOULD SETTLE IT"),
-        ("mixtral", TriageClass::Unknown, "WHAT WOULD SETTLE IT"),
-        ("yi", TriageClass::Unknown, "WHAT WOULD SETTLE IT"),
     ];
     for (arch, class, evidence) in cases {
         let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
@@ -501,28 +508,123 @@ fn batch_three_verdicts_are_pinned_to_what_was_read() {
     }
 }
 
-/// The three alias rows are UNKNOWN, and the verdict names the RoPE
-/// hazard rather than calling them llama-shaped.
+/// The three alias rows are refused as STRINGS NOBODY WRITES, not
+/// triaged as architectures.
 ///
-/// Marking them fixture-away would be the cheap answer and the wrong
-/// one. `llama` -- the string real Mistral, Mixtral and Yi checkpoints
-/// actually ship under -- is in `llama_model_rope_type`'s NORM group,
-/// while these three rows are NEOX. A file spelling `mistral` would be
-/// rotated on the wrong pairs of every Q/K head, the defect behind the
-/// Llama-3.1-8B wrong-logits bug.
+/// This closes the UNKNOWN their old verdict opened. That verdict asked
+/// for "a real GGUF whose general.architecture is literally one of
+/// these three", and the answer is that no such file can be produced:
+///
+///   * `mistral`, `mixtral` and `yi` are in neither `LLM_ARCH_NAMES`
+///     (`src/llama-arch.cpp` carries `mistral3` and `mistral4` and
+///     nothing else under that prefix) nor gguf-py's
+///     `MODEL_ARCH_NAMES`.
+///   * libllama REFUSES a file declaring any of the three:
+///     `llama_model_load: error loading model: unknown model
+///     architecture: 'mistral'` -- measured on a synthetic llama-shaped
+///     file written under each string, which is also why no golden
+///     reference for these rows can ever exist.
+///   * The two real checkpoints in `models/` both declare `llama`; see
+///     `real_mistral_and_yi_checkpoints_declare_llama` below.
+///
+/// Leaving them on the generic path was a live hazard, and the reason
+/// this had to move rather than merely be re-worded: they carried NEOX
+/// while `llama` -- the graph they claim to be -- is in
+/// `llama_model_rope_type`'s NORM group, and
+/// `rope_layout_matches_llama_cpp` cannot see it, because a name absent
+/// from llama.cpp's table is a `continue` there.
 #[test]
-fn the_alias_rows_name_the_rope_hazard_rather_than_claiming_llama_shape() {
+fn the_alias_rows_are_refused_as_strings_no_converter_writes() {
     for arch in ["mistral", "mixtral", "yi"] {
-        let t = unaudited_triage(arch).expect("verdict");
-        assert_eq!(t.class, TriageClass::Unknown, "`{arch}`");
-        for claim in ["NEOX", "NORM group", "LLM_ARCH_NAMES"] {
-            assert!(
-                t.blocker.contains(claim),
-                "`{arch}`'s verdict drops {claim:?}: {}",
-                t.blocker
+        assert!(
+            unaudited_triage(arch).is_none(),
+            "`{arch}` still carries a triage verdict; it is not an unaudited architecture, \
+             it is a string no converter writes"
+        );
+        match ferrox_models::capability::resolve_architecture(arch) {
+            Some(ArchPath::DedicatedOnly { reason }) => {
+                // The refusal has to carry the actionable half -- "your
+                // file is spelled `llama`" -- and the measurement that
+                // decided it. A refusal that only says no sends the user
+                // back to the same question.
+                for claim in [
+                    "LLM_ARCH_NAMES",
+                    "unknown model architecture",
+                    "general.architecture = llama",
+                    "convert_hf_to_gguf.py",
+                ] {
+                    assert!(
+                        reason.contains(claim),
+                        "`{arch}`'s refusal drops {claim:?}: {reason}"
+                    );
+                }
+            }
+            other => panic!("`{arch}` must be refused as an alias, got {other:?}"),
+        }
+    }
+    // And the string they redirect to must actually run, or the advice
+    // is wrong.
+    assert!(is_audited_generic("llama"));
+}
+
+/// The measurement behind the row above, re-runnable on this machine.
+///
+/// `#[ignore]`d because it needs the real checkpoints in `models/`.
+/// Every Mistral, Mixtral and Yi GGUF converts to `llama`, and this is
+/// what says so from FILES rather than from a reading of
+/// `conversion/*.py`. If a checkpoint ever turns up declaring one of
+/// the three, this fails and the alias rows need re-reading with that
+/// file in hand -- which is exactly the evidence their old UNKNOWN
+/// verdict asked for and nobody could supply.
+///
+///     FERROX_TEST_MODELS_DIR=$PWD/models \
+///       cargo test -p ferrox-models --test unaudited_triage -- --ignored
+///
+/// The env var is not optional in practice: `cargo test` runs with the
+/// PACKAGE directory as its cwd, so the bare `models` default resolves
+/// under `crates/ferrox-models/` and finds nothing. Same convention as
+/// `tests/chat_template_real_gguf.rs`. Run once on 2026-09-10 over the
+/// development host's 20 checkpoints: none declares one of the three
+/// strings, and both Mistral/Yi files declare `llama`.
+#[test]
+#[ignore = "needs the real GGUF checkpoints in models/"]
+fn real_mistral_and_yi_checkpoints_declare_llama() {
+    let root = std::env::var("FERROX_TEST_MODELS_DIR").unwrap_or_else(|_| "models".to_string());
+    let mut files = Vec::new();
+    collect_gguf(std::path::Path::new(&root), &mut files);
+    assert!(!files.is_empty(), "no GGUFs under {root}");
+
+    let mut checked = 0;
+    for path in &files {
+        let Ok(file) = ferrox_gguf::GgufFile::open(path.to_str().unwrap()) else {
+            continue;
+        };
+        let arch = ferrox_gguf::TensorSource::metadata_str(&file, "general.architecture")
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !["mistral", "mixtral", "yi"].contains(&arch.as_str()),
+            "{}: declares `{arch}`, which no converter was thought to write -- re-read \
+             the alias rows with this file in hand",
+            path.display()
+        );
+        let name = ferrox_gguf::TensorSource::metadata_str(&file, "general.name")
+            .unwrap_or_default()
+            .to_lowercase();
+        if name.contains("mistral") || name.contains("mixtral") || name.contains("yi-") {
+            checked += 1;
+            assert_eq!(
+                arch,
+                "llama",
+                "{}: a Mistral/Mixtral/Yi checkpoint that is not `llama`",
+                path.display()
             );
         }
     }
+    assert!(
+        checked > 0,
+        "no Mistral/Mixtral/Yi checkpoint under {root}, so this proved nothing"
+    );
 }
 
 /// `baichuan` is one architecture string covering two different models,
@@ -688,12 +790,15 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 1, 24, 4),
+        (0, 0, 24, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
-         update this and docs/MODELS.md together. FIXTURE-AWAY is ZERO now: `gemma` was \
-         the last row that only needed evidence, so everything still refusing needs code. \
-         NEW CODE went 26 to 24 when `olmo2` and `exaone4` closed together -- one \
-         topology, one implementation -- which is the first movement in that column"
+         update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
+         the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
+         refusing today is one fixture or one arm away. NEW CODE went 26 to 24 when \
+         `olmo2` and `exaone4` closed together -- one topology, one implementation -- \
+         which is the first movement in that column. The single UNKNOWN left is `phi4`; \
+         `mistral`, `mixtral` and `yi` were the other three and turned out not to be \
+         architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 29);
+    assert_eq!(fixture + arm + new_code + unknown, 25);
 }
