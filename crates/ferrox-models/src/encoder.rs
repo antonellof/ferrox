@@ -94,7 +94,10 @@ pub struct PairSequence {
 
 /// A model that turns a whole token sequence into hidden states in one
 /// pass, with no carried state and no logits.
-pub trait TextEncoder {
+///
+/// `Sync` because [`TextEncoder::encode`] hands `&self` to a rayon
+/// worker for the duration of the pass; see its doc comment.
+pub trait TextEncoder: Sync {
     /// Width of one hidden-state row, and of the pooled embedding.
     fn n_embd(&self) -> usize;
 
@@ -159,7 +162,35 @@ pub trait TextEncoder {
     /// copied forward pass it has ever had, and the pair path is
     /// exercised far less often than the embedding path, so a copy is
     /// exactly where a fix would fail to land.
-    fn encode(&self, tokens: &[u32], segments: Option<&[u32]>) -> Result<Vec<f32>, EncodeError>;
+    ///
+    /// This is the body an encoder writes; callers want
+    /// [`Self::encode`], which is the same computation with the CPU
+    /// worker pool entered once for the whole pass.
+    fn encode_on_worker(
+        &self,
+        tokens: &[u32],
+        segments: Option<&[u32]>,
+    ) -> Result<Vec<f32>, EncodeError>;
+
+    /// [`Self::encode_on_worker`], with the CPU worker pool entered once
+    /// for the whole pass.
+    ///
+    /// Same rule, and the same reason, as
+    /// [`crate::engine::Engine::forward_token`]: a forward pass through
+    /// a stack of quantized projections opens a parallel region per
+    /// matmul, and every one of them costs a pthread park and wake when
+    /// the driving thread is not a rayon worker. An encoder pass is one
+    /// pass over the whole sequence rather than one per token, so the
+    /// saving is smaller than a decode loop's -- but it is the same
+    /// saving, and an encoder that had to remember to ask for it would
+    /// be one more place for the rule to be forgotten.
+    ///
+    /// Do not override. See
+    /// [`ferrox_core::par::on_workers`] for the three cases it declines
+    /// to promote.
+    fn encode(&self, tokens: &[u32], segments: Option<&[u32]>) -> Result<Vec<f32>, EncodeError> {
+        ferrox_core::par::on_workers(move || self.encode_on_worker(tokens, segments))
+    }
 
     /// [`Self::encode`] for a single sequence: every position is
     /// segment 0.

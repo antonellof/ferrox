@@ -39,18 +39,15 @@ use crate::kimi_tokenizer::KimiTokenizer;
 use ferrox_core::cache::KvCache;
 use ferrox_core::weight_matrix::WeightMatrix;
 
-/// A decoder that can run one incremental forward step given a token id
-/// and position, updating its own per-layer state in place.
-pub trait Engine {
-    type State;
+mod entry;
 
-    /// Builds fresh (empty) per-layer state for a new request.
-    fn new_state(&self) -> Self::State;
+pub use entry::Engine;
 
-    fn vocab_size(&self) -> usize;
-
-    fn forward_token(&self, token_id: usize, pos: usize, state: &mut Self::State) -> Vec<f32>;
-}
+/// The shared pool-entry assertion each engine's own tests call, and the
+/// probe for whether promotion happens in this process at all. See
+/// `entry.rs` for why each is one function and not one copy per engine.
+#[cfg(test)]
+pub(crate) use entry::{assert_one_pool_entry_per_step, on_workers_promotes_here};
 
 impl Engine for Decoder {
     type State = Vec<KvCache>;
@@ -66,7 +63,17 @@ impl Engine for Decoder {
         self.config.vocab_size
     }
 
-    fn forward_token(&self, token_id: usize, pos: usize, state: &mut Self::State) -> Vec<f32> {
+    /// Delegates to the inherent [`Decoder::forward_token`], which is
+    /// itself promoted in `decoder/entry.rs`. The two wrappers nest, and
+    /// nesting is free -- the inner one sees a rayon worker and returns
+    /// the body directly -- so this stays a delegation rather than
+    /// reaching past the entry module for a private body.
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         Decoder::forward_token(self, token_id, pos, state)
     }
 }
@@ -93,7 +100,12 @@ impl Engine for KimiEngine {
         self.weights.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        _pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         kimi_forward_token(
             &self.weights,
             &self.cfg,
@@ -125,7 +137,12 @@ impl Engine for Glm52Engine {
         self.weights.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        _pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         glm52_forward_token(&self.weights, &self.cfg, token_id, state)
     }
 }
@@ -252,7 +269,12 @@ impl Engine for MlaEngine {
         self.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        _pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         use ferrox_core::matmul::{rms_norm, swiglu};
         let mut hidden = self.embedding.dequant_row(token_id);
         for (layer, (k_cache, v_cache)) in self.layers.iter().zip(state.layers.iter_mut()) {
@@ -304,7 +326,12 @@ impl Engine for DeepseekV4Engine {
         self.weights.output_head.rows()
     }
 
-    fn forward_token(&self, token_id: usize, _pos: usize, state: &mut Self::State) -> Vec<f32> {
+    fn forward_token_on_worker(
+        &self,
+        token_id: usize,
+        _pos: usize,
+        state: &mut Self::State,
+    ) -> Vec<f32> {
         deepseek_v4_forward_token(&self.weights, &self.cfg, token_id, state)
     }
 }

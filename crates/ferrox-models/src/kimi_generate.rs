@@ -37,6 +37,49 @@ pub fn kimi_generate(
     eos_id: Option<u32>,
     seed: u64,
 ) -> (String, Vec<u32>) {
+    ferrox_core::par::on_workers(move || {
+        generate_on_workers(
+            weights,
+            cfg,
+            mla_cfg,
+            kda_cfg,
+            tokenizer,
+            prompt,
+            max_new_tokens,
+            sampling,
+            eos_id,
+            seed,
+        )
+    })
+}
+
+/// [`kimi_generate`]'s body, running on a rayon worker.
+///
+/// The promotion is placed around the WHOLE loop rather than around each
+/// `kimi_forward_token`, because this is the outermost public entry
+/// point of this path: `ferrox run-kimi` calls `kimi_generate` and
+/// nothing else. One `rayon::scope` for the generation makes every
+/// parallel region inside it -- every layer of every token, plus the
+/// sampler's -- take rayon's in-worker path, where wrapping each forward
+/// call instead would still pay one cold entry per token and would put a
+/// second spelling of the rule in this file.
+///
+/// This path does not reach [`crate::engine::Engine`]: it is handed
+/// borrowed weights and configs rather than an owned [`crate::KimiEngine`],
+/// so `Engine::forward_token`'s promotion cannot cover it.
+#[allow(clippy::too_many_arguments)]
+fn generate_on_workers(
+    weights: &KimiDecoderWeights,
+    cfg: &KimiDecoderConfig,
+    mla_cfg: &MlaConfig,
+    kda_cfg: &KdaConfig,
+    tokenizer: &KimiTokenizer,
+    prompt: &str,
+    max_new_tokens: usize,
+    sampling: &SamplingParams,
+    eos_id: Option<u32>,
+    seed: u64,
+) -> (String, Vec<u32>) {
     let prompt_ids = tokenizer.encode(prompt);
     let mut state = KimiDecodeState::new(weights, kda_cfg);
     let mut sampler = Sampler::new(seed);
@@ -95,8 +138,25 @@ mod tests {
         lines.join("\n")
     }
 
-    #[test]
-    fn kimi_generate_produces_a_finite_length_bounded_token_sequence() {
+    /// The smallest thing `kimi_generate` will actually run: a
+    /// one-layer dense+KDA stack over the tiny byte vocab, with every
+    /// config it needs.
+    ///
+    /// Extracted rather than written out twice. Two tests drive this
+    /// loop for different reasons -- one checks the token sequence it
+    /// produces, one counts how many times it enters the worker pool --
+    /// and a second copy of a ninety-line builder is exactly where the
+    /// two would drift into exercising different graphs while both
+    /// still passed.
+    #[allow(clippy::type_complexity)]
+    fn tiny_kda_stack() -> (
+        KimiDecoderWeights,
+        KimiDecoderConfig,
+        MlaConfig,
+        KdaConfig,
+        KimiTokenizer,
+        usize,
+    ) {
         let hidden_dim = 8;
         let kda_num_heads = 2;
         let kda_head_dim = 3;
@@ -194,6 +254,20 @@ mod tests {
             use_full_rank_gate: true,
         };
 
+        (
+            weights,
+            decoder_cfg,
+            mla_cfg,
+            kda_cfg,
+            tokenizer,
+            vocab_size,
+        )
+    }
+
+    #[test]
+    fn kimi_generate_produces_a_finite_length_bounded_token_sequence() {
+        let (weights, decoder_cfg, mla_cfg, kda_cfg, tokenizer, vocab_size) = tiny_kda_stack();
+
         let (text, ids) = kimi_generate(
             &weights,
             &decoder_cfg,
@@ -220,6 +294,75 @@ mod tests {
         // confirms decode() ran without panicking, not a byte-count
         // equivalence.
         let _ = text;
+    }
+
+    /// A whole `kimi_generate` run enters the CPU worker pool ONCE.
+    ///
+    /// This path never reaches [`crate::engine::Engine`] -- it is handed
+    /// borrowed weights rather than an owned `KimiEngine` -- so the
+    /// promotion every other engine gets from `engine/entry.rs` cannot
+    /// cover it, and before this it paid rayon's cold submission arm
+    /// once per parallel region of every token. `ferrox run-kimi` is
+    /// the caller.
+    ///
+    /// Measured against the unpromoted body, because a count of one
+    /// means nothing on its own: a loop that opened no regions would
+    /// read the same.
+    ///
+    /// Sabotage: drop the `par::on_workers` from `kimi_generate` and
+    /// the two counts become equal.
+    #[test]
+    fn a_whole_kimi_generation_enters_the_pool_once() {
+        let (weights, decoder_cfg, mla_cfg, kda_cfg, tokenizer, _) = tiny_kda_stack();
+        if !crate::engine::on_workers_promotes_here() {
+            return;
+        }
+        // `generate_on_workers` is the same loop with the wrapper NOT
+        // applied, so this compares the shipped entry point against its
+        // own body rather than against a hand-wrapped stand-in.
+        let count = |f: &dyn Fn()| {
+            let before = ferrox_core::par::cold_regions();
+            f();
+            ferrox_core::par::cold_regions() - before
+        };
+        let raw = count(&|| {
+            generate_on_workers(
+                &weights,
+                &decoder_cfg,
+                &mla_cfg,
+                &kda_cfg,
+                &tokenizer,
+                "hi",
+                5,
+                &SamplingParams::default(),
+                None,
+                42,
+            );
+        });
+        let promoted = count(&|| {
+            kimi_generate(
+                &weights,
+                &decoder_cfg,
+                &mla_cfg,
+                &kda_cfg,
+                &tokenizer,
+                "hi",
+                5,
+                &SamplingParams::default(),
+                None,
+                42,
+            );
+        });
+        assert_eq!(
+            promoted, 1,
+            "a whole generation must enter the pool once, not once per region"
+        );
+        assert!(
+            raw > promoted,
+            "the unpromoted loop must open a region per parallel section \
+             ({raw} vs {promoted}); equal counts mean this is not measuring \
+             the promotion at all"
+        );
     }
 
     #[test]
