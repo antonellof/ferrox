@@ -13,6 +13,29 @@ Entries name what changed and, where it matters, what was wrong
 before. A fix that closed a silent-wrong-answer class says so — those
 are the ones worth reading twice.
 
+## [Unreleased]
+
+### Fixed
+
+- **Swapping the model through `POST /admin/models/load` could leave
+  generation fluent and wrong** (#180). Silent-wrong-answer class, so
+  read it twice. Two Metal caches map `(host pointer, host length)` to
+  an uploaded `MTLBuffer`, and an address is not an identity: the
+  outgoing model's allocations are freed with it and the incoming
+  model's land on the same addresses. `resident_weight_buffer` knew
+  that and checked; `resident_f32_buffer`, seventy lines below it in the
+  same file, did not, and what it caches are the RMSNorm gammas a
+  `Decoder` owns. Measured, not assumed: instrumenting every hit to
+  compare it against the host bytes reported **49 stale hits in a
+  24-token decode** of Llama-3.2-1B-Q6_K loaded after
+  Llama-3.2-1B-Q4_K_M. The MoE stack had a third cache in front of both,
+  keyed on a bare pointer with no length at all. Every resident cache
+  now goes through one lookup that will not serve an entry unless the
+  entry can still prove it holds the caller's bytes, and the Studio
+  model selector is that endpoint. The repack cache named as the likely
+  cause in the issue was NOT it: the same swap sequence under
+  `FERROX_METAL=0` answers identically on every pair.
+
 ## [0.19.1] - 2026-09-10
 
 Ferrox Studio only. No crate in the workspace changed, so an engine
