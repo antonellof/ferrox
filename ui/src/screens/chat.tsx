@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import * as Popover from "@radix-ui/react-popover";
-import { Link, useOutletContext } from "react-router";
+import { Link, useNavigate, useOutletContext, useParams } from "react-router";
 import {
   Check,
   ChevronDown,
+  History,
   Loader2,
   MessagesSquare,
   SlidersHorizontal,
@@ -37,6 +38,8 @@ import {
   type Transcript,
 } from "@/screens/chat/persistence";
 import { conversationLabel } from "@/lib/conversations";
+import { describeAway, RESUME_WINDOW_MS } from "@/lib/entry-state";
+import { useTabActivity } from "@/lib/use-tab-activity";
 
 const SETTINGS_KEY = "ferrox.studio.sampling.v1";
 
@@ -428,7 +431,7 @@ function ChatInner({
     ? null
     : serving.error
       ? `Could not read ${routes.models}: ${serving.error}`
-      : "No model is loaded — load one on the Models screen before sending.";
+      : "No model is loaded — pick one from the model menu above before sending.";
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -456,8 +459,38 @@ function ChatInner({
       transport ||
       serving.synthetic ||
       disabledReason ||
+      transcript.stale ||
       transcript.error ? (
         <div className="shrink-0 space-y-2 border-b border-line bg-raised/40 px-4 py-2.5">
+          {transcript.stale ? (
+            <Notice>
+              <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span>
+                  You were away for {describeAway(transcript.stale.awayMs)}, so
+                  this is a new chat. Anything idle for over{" "}
+                  {Math.round(RESUME_WINDOW_MS / 60_000)} minutes is not picked
+                  back up on its own.
+                </span>
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={transcript.resumeStale}
+                >
+                  <History />
+                  <span className="max-w-[14rem] truncate">
+                    Reopen {transcript.stale.label}
+                  </span>
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={transcript.dismissStale}
+                >
+                  Dismiss
+                </Button>
+              </span>
+            </Notice>
+          ) : null}
           {transcript.error ? (
             <Notice tone="err">
               This conversation is not being saved: {transcript.error} The
@@ -468,7 +501,7 @@ function ChatInner({
             <Notice tone="warn">
               {disabledReason}{" "}
               <Link to="/ui/models" className="underline underline-offset-2">
-                Open Models
+                Or download one
               </Link>
             </Notice>
           ) : null}
@@ -504,6 +537,11 @@ function ChatInner({
 
 export function ChatScreen() {
   const health = useOutletContext<HealthState>();
+  const navigate = useNavigate();
+  // `/ui/chat` is a new chat and `/ui/chat/<id>` is that conversation.
+  // The URL is the only place that says which one is open, so the
+  // address bar cannot disagree with the screen — see `lib/entry-state`.
+  const { conversationId } = useParams();
   const [sampling, setSamplingState] = useState<Sampling>(loadSampling);
   const [serving, refreshServing] = useServingModel(
     health?.health?.model?.id ?? null,
@@ -550,12 +588,44 @@ export function ChatScreen() {
       ),
   });
 
+  // A push moves you somewhere you asked to go; a replace corrects an
+  // address that was never a place. Opening a conversation and starting
+  // a new chat are the first kind, so Back undoes them. The URL a
+  // just-created conversation gets, and the URL a declined entry is put
+  // back to, are the second.
+  const onRoute = useCallback(
+    (id: string | null, opts?: { replace?: boolean }) => {
+      navigate(id ? `/ui/chat/${encodeURIComponent(id)}` : "/ui/chat", {
+        replace: opts?.replace ?? false,
+      });
+    },
+    [navigate],
+  );
+
   // Above the provider on purpose: the sync loop needs the runtime
   // object itself (export/import/subscribe), not the React context a
   // component under the provider would read.
   const transcript = useTranscript(runtime, {
     model: () => servingRef.current.modelId,
+    routeId: conversationId ?? null,
+    onRoute,
   });
+
+  // Coming back to a tab that has been away long enough drops to a new
+  // chat — but never over the top of work in progress. A running
+  // generation or a half-typed message means the tab was left mid-task,
+  // and "you were away" is not a reason to throw that out.
+  const transcriptRef = useLatest(transcript);
+  useTabActivity(
+    useCallback(
+      (awayMs: number) => {
+        if (runtime.thread.getState().isRunning) return;
+        if (runtime.thread.composer.getState().text.trim()) return;
+        transcriptRef.current.onReturnedAfterAway(awayMs);
+      },
+      [runtime, transcriptRef],
+    ),
+  );
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>

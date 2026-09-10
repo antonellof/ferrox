@@ -4,15 +4,30 @@ import { cn } from "@/lib/utils";
 import { fmtDuration } from "@/lib/format";
 import type { HealthState } from "@/lib/use-health";
 
+// The bottom of the sidebar, which is where an app of this shape puts
+// "how is my connection" and nothing else. This one used to put the
+// LOADED MODEL ID there, under a chevron, in the slot an account or a
+// settings control normally occupies. It read as a third model picker
+// beside the two real ones, it was the widest thing in the sidebar, and
+// the one word that would have explained it ("Backend status") was in a
+// `title` attribute nobody hovers. The model id belongs where the model
+// is chosen. This belongs to the server.
+//
 // Three states, and the third one is the point: while the server is
 // still probing backends it answers `detecting`, and this shows a
 // probing pill rather than a verdict. Rendering "CPU only" from a guess
 // is pixel-identical to rendering it from a measurement, and the user
-// cannot tell which they were shown.
+// cannot tell which they were shown. The line beside the state is the
+// server's VERSION, which it states, and never a backend name: `/health`
+// says which backends are *available*, never which one is running, so an
+// "on Metal" here would be invented.
 type Visual = {
   dot: string;
   ring: string;
+  /** The state, in the server's own words wherever it has any. */
   label: string;
+  /** What is worth knowing beside it, or nothing. */
+  detail: string | null;
 };
 
 function visual({ health, error }: HealthState): Visual {
@@ -21,29 +36,34 @@ function visual({ health, error }: HealthState): Visual {
       dot: "bg-err",
       ring: "bg-err/25",
       label: error.status === 503 ? "unavailable" : "unreachable",
+      detail: error.status === 503 ? "answered, not serving" : "no answer",
     };
   }
   if (!health) {
-    return { dot: "bg-faint", ring: "bg-faint/25", label: "connecting…" };
+    return {
+      dot: "bg-faint",
+      ring: "bg-faint/25",
+      label: "connecting…",
+      detail: null,
+    };
   }
+  const version = health.version ? `v${health.version}` : null;
   switch (health.state) {
     case "ready":
-      return {
-        dot: "bg-ok",
-        ring: "bg-ok/25",
-        label: health.model?.id || "ready",
-      };
+      return { dot: "bg-ok", ring: "bg-ok/25", label: "ready", detail: version };
     case "detecting":
       return {
         dot: "bg-warn",
         ring: "bg-warn/30",
         label: "detecting backends…",
+        detail: version,
       };
     default:
       return {
         dot: "bg-err",
         ring: "bg-err/25",
         label: health.reason || "unavailable",
+        detail: version,
       };
   }
 }
@@ -55,11 +75,11 @@ export function HealthPill({ state, className }: { state: HealthState; className
   return (
     <Popover.Root>
       <Popover.Trigger
+        aria-label="Server status — open for backend and capability detail"
         className={cn(
-          "group flex w-full items-center gap-2 rounded-lg border border-line bg-raised px-2.5 py-2 text-left text-xs transition-colors hover:border-line-strong hover:bg-inset",
+          "group flex w-full items-center gap-2.5 rounded-lg border border-line bg-raised px-2.5 py-2 text-left text-xs transition-colors hover:border-line-strong hover:bg-inset",
           className,
         )}
-        title="Backend status — open for capability detail"
       >
         <span className="relative grid size-2.5 shrink-0 place-items-center">
           {state.health?.state === "detecting" ? (
@@ -72,8 +92,21 @@ export function HealthPill({ state, className }: { state: HealthState; className
           ) : null}
           <span className={cn("size-2 rounded-full", v.dot)} />
         </span>
-        <span className="min-w-0 flex-1 truncate font-medium" aria-live="polite">
-          {v.label}
+        {/* The word first. A status control you have to click to find out
+            is a status control is the thing being fixed here. */}
+        <span className="min-w-0 flex-1">
+          <span className="block text-[0.6875rem] leading-tight text-faint">
+            Server
+          </span>
+          <span
+            className="block truncate leading-tight font-medium"
+            aria-live="polite"
+          >
+            {v.label}
+            {v.detail ? (
+              <span className="font-normal text-faint"> · {v.detail}</span>
+            ) : null}
+          </span>
         </span>
         <ChevronDown className="size-3.5 shrink-0 text-faint transition-transform group-data-[state=open]:rotate-180" />
       </Popover.Trigger>
