@@ -179,12 +179,17 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **30** do
+   logit comparison against real `libllama`, or a fixture; **33** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
    `ernie4_5-moe`, `internlm2`, `xverse`, `baichuan`, `exaone`,
-   `exaone4`, `plamo3`,
+   `exaone4`, `plamo3`, `granite`, `granitemoe`, `granite-moe`,
+   `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
+   **22** stop with `UnauditedArchitecture`.
+   `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
+   against llama.cpp yourself before you trust it.
+
 **Gemma-2-27B, Gemma-3-4B/12B/27B: corrected 2026-09-02.** Those four
 sizes were quietly wrong until then, in two ways that both produce
 fluent text. The 27B checkpoints took `1/sqrt(head_dim)` as their
@@ -222,10 +227,6 @@ only, and 1B is neither 27B nor rope-scaled, so it is untouched by all
 of this. The speed recovery from returning to the fused path is
 unmeasured, because measuring it needs a quiet host.
 
-   `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **22** stop with `UnauditedArchitecture`.
-   `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
-   against llama.cpp yourself before you trust it.
 
 ### What "unaudited" costs you, per architecture
 
