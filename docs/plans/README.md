@@ -60,15 +60,15 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **30** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **33** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 25 |
+| Refuses as **unaudited**, now triaged | 22 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 92 (60 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 55 generic-gqa (30 of
+regenerated with `ferrox archs --write`: 150 rows, 55 generic-gqa (33 of
 them audited), 60 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
@@ -78,17 +78,17 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 25 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-24 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 22 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+21 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
-refusing is one fixture or one arm away, so what is left needs a
+refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
 (`seed_oss`, `maincoder`, `bailingmoe`, `deepseek`, `hunyuan-moe`),
 seven fixture-away rows on 2026-09-03, `gemma`, `hunyuan-dense` and
 `ernie4_5-moe` after them, and on 2026-09-10 `olmo2` and `exaone4`
 (below) plus `chatglm` -- the last one-match-arm row -- and `qwen`,
-which the same arm turned out to close only halfway. Each with a
-libllama-golden fixture.
+which the same arm turned out to close only halfway, and the three
+Granite rows (below). Each with a libllama-golden fixture.
 
 The three UNKNOWN rows `mistral`, `mixtral` and `yi` closed the same
 day by turning out not to be architectures: libllama refuses all three
@@ -96,24 +96,43 @@ strings outright and every real checkpoint of all three declares
 `llama`, so they are refused as spellings now rather than triaged as
 graphs. `phi4` is the one UNKNOWN left.
 
-**The NEW CODE column moved for the first time on 2026-09-10**, from 26
-to 24: `olmo2` and `exaone4` closed TOGETHER, because they are one
-residual topology and not two. Neither has an `attn_norm` or an
-`ffn_norm` tensor; both read the raw residual at each sublayer and norm
-each branch's output before its residual add
-(`olmo2.cpp:45-52,92,160-182`, `exaone4.cpp:60-67,118,152-169`, line for
-line the same graph). `ferrox_models::pre_norm` is the one
-implementation and `tests/post_norm_only_graphs.rs` the evidence, a
-libllama-golden fixture each. Two sub-cases stay refused BY NAME rather
-than being swept in: an `olmo2` carrying both a sliding window and a
-RoPE scaling (Olmo-3) ropes its two kinds of layer differently, and
-EXAONE-4 32B (`block_count == 64`) gives its full-attention layers no
-RoPE at all. `olmo` (OLMo-1) is a THIRD shape -- pre-norm with a
-non-parametric LayerNorm -- and still needs code.
+**The NEW CODE column moved for the first time on 2026-09-10**, twice,
+from 26 to 24 and then to 21. Both movements took several rows at once,
+and for the same reason: each found ONE cause behind several refusals.
+That is so far the only way this column has moved.
+
+`olmo2` and `exaone4` closed TOGETHER, because they are one residual
+topology and not two. Neither has an `attn_norm` or an `ffn_norm`
+tensor; both read the raw residual at each sublayer and norm each
+branch's output before its residual add (`olmo2.cpp:45-52,92,160-182`,
+`exaone4.cpp:60-67,118,152-169`, line for line the same graph).
+`ferrox_models::pre_norm` is the one implementation and
+`tests/post_norm_only_graphs.rs` the evidence, a libllama-golden fixture
+each. Two sub-cases stay refused BY NAME rather than being swept in: an
+`olmo2` carrying both a sliding window and a RoPE scaling (Olmo-3) ropes
+its two kinds of layer differently, and EXAONE-4 32B
+(`block_count == 64`) gives its full-attention layers no RoPE at all.
+`olmo` (OLMo-1) is a THIRD shape -- pre-norm with a non-parametric
+LayerNorm -- and still needs code.
+
+`granite`, `granitemoe` and the `granite-moe` alias closed together too,
+on ONE implementation of the four scalar multipliers they share
+(`ferrox_models::scalar_multipliers`, `tests/granite_family_graphs.rs`).
+`granite-moe.cpp` has no graph of its own -- `models.h:1583-1591` is
+`using graph = llama_model_granite::graph` -- so the two upstream rows
+differ in the FFN and in nothing else, and the third is a ferrox-only
+alias for the second. Deriving
+`capability::unsupported_scaling_keys` from that same table instead of
+restating it beside it found a live gap on the way past: the Gemma
+family was exempted from all four keys while reading none of them, so a
+hand-written `gemma3.residual_scale` would have loaded and been ignored.
+Half the Granite verdict stayed a refusal: llama.cpp reads
+`{arch}.rope.scaling.finetuned` as a switch for RoPE itself, and a file
+declaring it false runs unrotated, which ferrox cannot express.
 
 | | llama.cpp | ferrox |
 |---|---|---|
-| Per-architecture graphs | 140 hand-written | 150 catalog rows, **30 proven** |
+| Per-architecture graphs | 140 hand-written | 150 catalog rows, **33 proven** |
 | Metal `pp512` | baseline | 0.98x-1.10x, at parity |
 | Metal `tg128` | baseline | **8 of 12 rows faster** |
 | CPU, all rows | baseline | **1.41x-5.06x slower** |

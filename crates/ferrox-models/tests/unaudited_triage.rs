@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 25,
+        n, 22,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -79,9 +79,12 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          `olmo2` and `exaone4` were -- the first two NEW CODE rows to close, and they \
          closed TOGETHER because they are one topology with one implementation \
          (`ferrox_models::pre_norm`, `tests/post_norm_only_graphs.rs`) -- 29 until \
-         `chatglm` was admitted with the fused-QKV-bias arm and its fixture, and 28 until \
+         `chatglm` was admitted with the fused-QKV-bias arm and its fixture, 28 until \
          `mistral`, `mixtral` and `yi` were found not to be architectures at all and \
-         moved to DedicatedOnly -- rows closing is the count going DOWN \
+         moved to DedicatedOnly, and 25 until `granite`, `granitemoe` and the \
+         `granite-moe` alias closed together on ONE implementation of their four scalar \
+         multipliers (`tests/granite_family_graphs.rs`) -- rows closing is the count \
+         going DOWN \
          for the best reason. Either an architecture was audited or reclassified (good -- \
          update the count and the docs) or one was added (check it was triaged)"
     );
@@ -140,15 +143,31 @@ fn batch_one_verdicts_are_pinned_to_what_was_read() {
         // and no ffn_norm at all, Q/K/V off the raw residual. That
         // blocker was real and it is now IMPLEMENTED, once, for both
         // (`ferrox_models::pre_norm`), so neither carries a verdict any
-        // more. They are the first NEW CODE rows to close, and
-        // `the_post_norm_group_does_not_share_one_class` below is now
-        // about which of the three shapes each of the group is.
+        // more, and `the_post_norm_group_is_three_topologies_and_only_two_of_them_closed` below
+        // is now about which of the three shapes each of the group is.
         //
-        // granite.cpp:7-10,188,241-242,301-302 -- four multipliers the
-        // generic decoder does not apply, plus a rope_finetuned gate.
-        ("granite", TriageClass::NewCode, "f_residual_scale"),
-        ("granitemoe", TriageClass::NewCode, "f_residual_scale"),
-        ("granite-moe", TriageClass::NewCode, "f_residual_scale"),
+        // `granite`, `granitemoe` and the `granite-moe` alias were HERE
+        // too, NEW CODE on the four scalar multipliers
+        // (granite.cpp:5-10,180,225,235-238,288-292). All three closed
+        // together, on ONE implementation of the multipliers
+        // (`ferrox_models::scalar_multipliers`) rather than three, and
+        // all three have libllama-golden fixtures
+        // (`tests/granite_family_graphs.rs`) -- the alias by reading
+        // `granitemoe`'s golden out of a file that differs only in its
+        // architecture string, because no llama.cpp GGUF spells it that
+        // way and none ever will. They carry no verdict now;
+        // `every_verdict_is_attached_to_a_row_that_actually_refuses_as_unaudited`
+        // is what stops a stale one outliving its refusal.
+        //
+        // BOTH closures took more than one row at a time, and for the
+        // same reason: each found ONE cause behind several refusals.
+        // That is what the NEW CODE column moving looks like.
+        //
+        // The `rope_finetuned` half of the Granite verdict did NOT
+        // become an implementation. granite.cpp:33-35 reads
+        // `{arch}.rope.scaling.finetuned` as a switch for RoPE itself,
+        // so a file declaring it false runs unrotated in llama.cpp and
+        // ferrox refuses it by name (`ferrox_models::rope_finetuned`).
         // --- unknown: say so, and say what would settle it -----------
         //
         // `phi4` is not a llama.cpp architecture at all, so there is no
@@ -305,7 +324,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 25);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 22);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -452,23 +471,26 @@ fn dbrx_says_why_the_bias_group_does_not_catch_it() {
 /// says so rather than letting the reader assume the triage line is what
 /// they got.
 ///
-/// `granite` dies on `capability::unsupported_scaling_keys` and
-/// `openelm` on a missing-hparam error for keys its file does carry,
-/// both before the unaudited gate. A verdict that stayed silent about
+/// `openelm` dies on a missing-hparam error for keys its file does
+/// carry, before the unaudited gate. A verdict that stayed silent about
 /// that would send someone looking for a message they will never see.
+///
+/// `granite` was the other case here: it died on
+/// `capability::unsupported_scaling_keys`, which refused the very
+/// multipliers its verdict named. Both halves are gone -- the
+/// multipliers are implemented and the row is audited -- so the case
+/// left this list rather than being kept as a stale example. One row is
+/// enough to pin the rule; nothing is left that has to be true about
+/// `granite` for it to hold.
 #[test]
 fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
-    for (arch, marker) in [
-        ("granite", "never reaches THIS message"),
-        ("openelm", "before the unaudited gate is reached"),
-    ] {
-        let t = unaudited_triage(arch).expect("verdict");
-        assert!(
-            t.blocker.contains(marker),
-            "`{arch}` must disclose that an earlier refusal fires first: {}",
-            t.blocker
-        );
-    }
+    let (arch, marker) = ("openelm", "before the unaudited gate is reached");
+    let t = unaudited_triage(arch).expect("verdict");
+    assert!(
+        t.blocker.contains(marker),
+        "`{arch}` must disclose that an earlier refusal fires first: {}",
+        t.blocker
+    );
 }
 
 /// Batch 3: the alias rows and the plain long-tail.
@@ -790,15 +812,18 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 24, 1),
+        (0, 0, 21, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
-         refusing today is one fixture or one arm away. NEW CODE went 26 to 24 when \
-         `olmo2` and `exaone4` closed together -- one topology, one implementation -- \
-         which is the first movement in that column. The single UNKNOWN left is `phi4`; \
-         `mistral`, `mixtral` and `yi` were the other three and turned out not to be \
-         architectures at all"
+         refusing today is one fixture or one arm away and EVERY remaining row is NEW \
+         CODE. That column went 26 to 24 when `olmo2` and `exaone4` closed together -- \
+         one topology, one implementation -- and 24 to 21 when `granite`, `granitemoe` \
+         and the `granite-moe` alias closed on ONE implementation of their four scalar \
+         multipliers. Each closure took several rows at once because each found ONE cause \
+         behind several refusals, which is the only way this column has ever moved. The \
+         single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
+         three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 25);
+    assert_eq!(fixture + arm + new_code + unknown, 22);
 }

@@ -119,16 +119,48 @@ The error always names the reason. Six things cause it:
 
 4. **The file declares a scale factor Ferrox does not apply.** These are
    hyperparameters rather than weights, so the check above cannot see
-   them, and a Granite, MiniCPM or Command-R checkpoint would otherwise
-   load cleanly while computing a differently-scaled graph than it was
-   trained as. `{arch}.logit_scale`, `{arch}.residual_scale`,
+   them, and a checkpoint declaring one would otherwise load cleanly
+   while computing a differently-scaled graph than it was trained as.
+   `{arch}.logit_scale`, `{arch}.residual_scale`,
    `{arch}.embedding_scale` and `{arch}.attention.scale` stop the load
-   unless they hold a value that changes nothing. Implementing
-   `residual_scale` properly means touching every CPU residual add plus
-   the fused Metal kernels that fold the residual in, and getting half
-   of that right gives you a model that loads, runs, and returns wrong
-   answers with nothing in the output to say so. That is the outcome
-   this check exists to prevent.
+   unless they hold a value that changes nothing.
+
+   **Granite is the exception now, and the refusal list is derived from
+   the same table that says so.** `granite`, `granitemoe` and the
+   `granite-moe` alias apply all four, checked against llama.cpp's own
+   logits (`crates/ferrox-models/tests/granite_family_graphs.rs`), and
+   `ferrox_models::scalar_multipliers` implements them once for all
+   three rather than once per architecture. `residual_scale` was the
+   expensive half: it multiplies both branch outputs of every layer,
+   which meant collapsing eighteen hand-written residual adds in
+   `decoder.rs` onto one function that takes the scalar as a parameter,
+   and fencing the fused Metal launches -- which fold the residual in on
+   device with no uniform for a multiplier -- off any model that
+   declares one. Getting half of that right gives you a model that
+   loads, runs, and returns wrong answers with nothing in the output to
+   say so, which is what the refusal existed to prevent and what the
+   fixtures now check.
+
+   Two Granite cases still stop, and both are the same class of
+   metadata-only fact. `{arch}.logit_scale` is REQUIRED for Granite
+   (`granite.cpp:7` reads it with no default), so a file omitting it is
+   refused rather than defaulted to 1.0 -- llama.cpp cannot load such a
+   file either. And `{arch}.rope.scaling.finetuned = false` is refused
+   outright, because `granite.cpp:33-35` reads that key as a switch for
+   **RoPE itself**: llama.cpp then builds no positions and runs the
+   checkpoint unrotated, which the generic decoder has no way to
+   express. No Granite converter writes it
+   (`conversion/granite.py:253` is `GraniteHybridModel`, a different
+   architecture string), so a real export never sees that message.
+
+   `minicpm` still stops outright, and not for a key: llama.cpp
+   hardcodes its three multipliers (`minicpm.cpp:5-7`) and only then
+   lets the file override them, so a key-presence gate sees nothing on
+   an older export. Its graph is `llama_model_granite::graph` verbatim
+   (`models.h:1594-1601`), so what it needs now is a defaults hook on
+   that same table plus a fixture. `command-r` and `cohere2` are
+   further off: their `logit_scale` is a multiply rather than a divide,
+   but their real blocker is a parallel residual over LayerNorm.
 
 5. **The architecture encodes position some other way than RoPE.** The
    generic decoder rotates every Q and K head of every layer. `gpt2`
@@ -191,13 +223,13 @@ of this. The speed recovery from returning to the fused path is
 unmeasured, because measuring it needs a quiet host.
 
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **25** stop with `UnauditedArchitecture`.
+   **22** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. None of the 25 is a fixture or a single
+"Unaudited" is not one thing. None of the 22 is a fixture or a single
 match arm away any more: they need an attention implementation or a
 reading nobody has done, and the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
@@ -209,7 +241,7 @@ reading nobody has done, and the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 25 have now been read on both sides (`ferrox_models::capability`,
+All 22 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -218,7 +250,7 @@ on models":
 |---|---|
 | fixture-away | 0 |
 | one match arm | 0 |
-| new code | 24 |
+| new code | 21 |
 | unknown | 1 |
 
 **Both cheap classes are empty.** `gemma` was the last fixture-away row
@@ -280,12 +312,16 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (24).** A different attention or residual structure. The
-recurring shapes, rather than 24 separate stories:
+**New code (21).** A different attention or residual structure. The
+recurring shapes, rather than 21 separate stories:
 
-The column moved for the first time on 2026-09-10, 26 to 24. `olmo2`
-and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and no
-`ffn_norm` at all, both sublayers reading the raw residual, each
+The column moved for the first time on 2026-09-10, twice: 26 to 24, then
+24 to 21. Both movements took several rows at once, and for the same
+reason -- each found ONE cause behind several refusals. Nothing has ever
+moved this column one row at a time.
+
+`olmo2` and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and
+no `ffn_norm` at all, both sublayers reading the raw residual, each
 branch's output normed before its residual add -- and they closed
 together because reading `olmo2.cpp:45-52,92,160-182` against
 `exaone4.cpp:60-67,118,152-169` showed one graph, not two. One
@@ -296,6 +332,16 @@ its sliding and full layers differently, and EXAONE-4 32B
 (`block_count == 64`) gives its full-attention layers no RoPE at all --
 both decided by llama.cpp with no GGUF key, the `baichuan` shape.
 
+`granite`, `granitemoe` and the `granite-moe` alias were the SCALAR
+MULTIPLIER trio, and the same story again: `granite-moe.cpp` has no
+graph of its own (`models.h:1583-1591` is
+`using graph = llama_model_granite::graph`), so the two upstream rows
+differ in the FFN and in nothing else, and the third is a ferrox-only
+alias for the second. One implementation
+(`ferrox_models::scalar_multipliers`), one libllama-golden fixture each
+(`tests/granite_family_graphs.rs`). Half the verdict stayed a refusal --
+see cause 4 above for `rope.scaling.finetuned`.
+
 | Shape | Architectures |
 |---|---|
 | Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
@@ -303,7 +349,7 @@ both decided by llama.cpp with no GGUF key, the `baichuan` shape.
 | LayerNorm rather than RMSNorm | `dbrx`, `olmo` |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
-| Hardcoded scales applied even when the GGUF carries no key | `grok`, `granite`, `granitemoe`, `granite-moe`, `mistral3` |
+| Hardcoded scales applied even when the GGUF carries no key | `grok`, `mistral3` |
 | An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |
 | Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
 

@@ -57,6 +57,7 @@ use ferrox_moe::{
 
 use crate::config::ModelConfig;
 use crate::pre_norm::PreNorm;
+use crate::scalar_multipliers::residual_add;
 
 pub struct AttnWeights {
     pub q_proj: WeightMatrix, // [n_heads*head_dim, hidden_dim]
@@ -764,12 +765,36 @@ impl Decoder {
         }
     }
 
+    /// The scalar multipliers no Metal kernel applies, as ONE predicate
+    /// the four Metal eligibility checks share.
+    ///
+    /// Today that is `residual_scale` alone. Every fused launch that
+    /// folds a residual add in -- the dense decode stack, the resident
+    /// MoE decode stack, and both prefill stacks -- adds the branch
+    /// output to the stream on device, with no uniform for a multiplier,
+    /// so a Granite layer served by any of them would be scaled by the
+    /// host bodies and not by the GPU: the same weights answering
+    /// differently depending on which backend took the token. That is
+    /// the exact failure `attention_scale` is fenced off for next door.
+    ///
+    /// It is one function rather than four spellings because the GPU
+    /// router's eligibility check has already drifted four ways in this
+    /// file -- prefill tested three conditions, fused decode two, and
+    /// the whole-stack decode NONE.
+    #[cfg(feature = "metal")]
+    fn metal_can_serve_scalars(config: &ModelConfig) -> bool {
+        config.residual_scale.is_none()
+    }
+
     /// True when this layer can use the fused Metal attention block
     /// (Norm or NeoX RoPE, quantized projections; QKV bias + QK-norm
     /// via [`ferrox_metal::attn::AttnExtras`]).
     #[cfg(feature = "metal")]
     fn layer_supports_metal_attn(&self, layer: &LayerWeights) -> bool {
         use crate::config::RopeLayout;
+        if !Self::metal_can_serve_scalars(&self.config) {
+            return false;
+        }
         // gpt-oss: no Metal kernel implements attention sinks, so the
         // fused stacks would compute a *different* attention than the
         // CPU path for the same weights. Keep this family on CPU rather
@@ -950,8 +975,8 @@ impl Decoder {
     /// QKV bias / QK-norm are applied on-GPU via [`AttnExtras`] (same as
     /// decode); SWA fit is checked separately.
     #[cfg(feature = "metal")]
-    fn metal_prefill_dense_layer_eligible(layer: &LayerWeights) -> bool {
-        Self::is_dense_layer(layer)
+    fn metal_prefill_dense_layer_eligible(layer: &LayerWeights, config: &ModelConfig) -> bool {
+        Self::is_dense_layer(layer) && Self::metal_can_serve_scalars(config)
     }
 
     #[cfg(feature = "metal")]
@@ -978,7 +1003,8 @@ impl Decoder {
         layer: &'a LayerWeights,
         config: &ModelConfig,
     ) -> Option<ferrox_metal::gpu::PrefillMoeMetal<'a>> {
-        if Self::is_dense_layer(layer)
+        if !Self::metal_can_serve_scalars(config)
+            || Self::is_dense_layer(layer)
             || !layer.moe.shared_experts.is_empty()
             || !GluAct::from(config.ffn_activation).is_swiglu()
             // See `gpu_router_matches_host_routing`: the GPU router
@@ -1180,7 +1206,8 @@ impl Decoder {
     /// routing decision the GPU router reproduces exactly.
     #[cfg(feature = "metal")]
     fn layer_supports_metal_moe_resident(layer: &LayerWeights, config: &ModelConfig) -> bool {
-        !Self::is_dense_layer(layer)
+        Self::metal_can_serve_scalars(config)
+            && !Self::is_dense_layer(layer)
             && layer.moe.shared_experts.is_empty()
             && Self::gpu_router_matches_host_routing(layer, config)
             && GluAct::from(config.ffn_activation).is_swiglu()
@@ -2002,6 +2029,7 @@ impl Decoder {
                                             out,
                                             self.output_head.rows(),
                                             self.config.final_logit_softcap,
+                                            self.config.logit_multiplier,
                                         );
                                     }
                                     hidden = out;
@@ -2164,6 +2192,7 @@ impl Decoder {
                                             out,
                                             self.output_head.rows(),
                                             self.config.final_logit_softcap,
+                                            self.config.logit_multiplier,
                                         );
                                     }
                                     // Stack downloaded hidden (possibly normalized if
@@ -2484,11 +2513,11 @@ impl Decoder {
                                                                 hidden_dim,
                                                                 residency.as_ref().map(|p| p.layer_plan(l)),
                                                             );
-                                                            for (h, f) in
-                                                                hidden.iter_mut().zip(ffn_out.iter())
-                                                            {
-                                                                *h += f;
-                                                            }
+                                                            residual_add(
+                                                                &mut hidden,
+                                                                &ffn_out,
+                                                                self.config.residual_scale,
+                                                            );
                                                             did_metal_attn = true;
                                                             did_metal_moe = true; // skip second FFN
                                                         }
@@ -2538,11 +2567,11 @@ impl Decoder {
                                                 // Keep Metal KV authoritative — skip per-layer
                                                 // host catch-up (dense-stack style). Host is
                                                 // flushed on CPU fallback / prefix sync.
-                                                for (h, p) in
-                                                    hidden.iter_mut().zip(projected.iter())
-                                                {
-                                                    *h += p;
-                                                }
+                                                residual_add(
+                                                    &mut hidden,
+                                                    &projected,
+                                                    self.config.residual_scale,
+                                                );
                                                 did_metal_attn = true;
                                             }
                                             Err(e) => {
@@ -2580,9 +2609,7 @@ impl Decoder {
                                 hidden_dim,
                                 residency.as_ref().map(|p| p.layer_plan(l)),
                             );
-                            for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
-                                *h += f;
-                            }
+                            residual_add(&mut hidden, &ffn_out, self.config.residual_scale);
                         }
                         continue;
                     }
@@ -2591,9 +2618,7 @@ impl Decoder {
                 let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
                 let projected =
                     self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache));
-                for (h, p) in hidden.iter_mut().zip(projected.iter()) {
-                    *h += p;
-                }
+                residual_add(&mut hidden, &projected, self.config.residual_scale);
 
                 // --- MoE FFN block ---
                 let normed2 = layer
@@ -2613,9 +2638,7 @@ impl Decoder {
                 if let Some(post) = &layer.attn.post_ffn_norm {
                     ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
                 }
-                for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
-                    *h += f;
-                }
+                residual_add(&mut hidden, &ffn_out, self.config.residual_scale);
             }
         } // run_cpu_layers
 
@@ -2713,9 +2736,7 @@ impl Decoder {
                     stores,
                 },
             );
-            for (h, p) in hidden.iter_mut().zip(projected.iter()) {
-                *h += p;
-            }
+            residual_add(&mut hidden, &projected, self.config.residual_scale);
 
             // --- MoE FFN block ---
             let normed2 = layer
@@ -2735,9 +2756,7 @@ impl Decoder {
             if let Some(post) = &layer.attn.post_ffn_norm {
                 ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
             }
-            for (h, f) in hidden.iter_mut().zip(ffn_out.iter()) {
-                *h += f;
-            }
+            residual_add(&mut hidden, &ffn_out, self.config.residual_scale);
         }
 
         let final_normed = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
@@ -3438,6 +3457,7 @@ impl Decoder {
         Logits::from_output_head(
             self.output_head.apply(final_normed),
             self.config.final_logit_softcap,
+            self.config.logit_multiplier,
         )
         .into_vec()
     }
@@ -3450,6 +3470,7 @@ impl Decoder {
         let logits_batch = Logits::from_output_head(
             self.output_head.apply_batch(&flat, batch_size),
             self.config.final_logit_softcap,
+            self.config.logit_multiplier,
         );
         logits_batch
             .as_slice()
@@ -3700,7 +3721,9 @@ impl Decoder {
             // One-CB dense prefill (RMSNorm→QKV GEMM→attn→O→FFN) when every
             // projection has mul_mm_sg and the layer has no QKV bias / QK-norm.
             #[cfg(feature = "metal")]
-            if use_metal_attn && batch_size >= 4 && Self::metal_prefill_dense_layer_eligible(layer)
+            if use_metal_attn
+                && batch_size >= 4
+                && Self::metal_prefill_dense_layer_eligible(layer, &self.config)
             {
                 let swa_fits = self.metal_prefill_dense_swa_fits(l, start_pos, batch_size);
                 if swa_fits {
@@ -3887,11 +3910,11 @@ impl Decoder {
                                         } else {
                                             projected_batch
                                         };
-                                    for (h, p) in
-                                        hidden_batch.iter_mut().zip(projected_batch.iter())
-                                    {
-                                        *h += p;
-                                    }
+                                    residual_add(
+                                        &mut hidden_batch,
+                                        &projected_batch,
+                                        self.config.residual_scale,
+                                    );
                                     true
                                 })
                             };
@@ -3941,9 +3964,7 @@ impl Decoder {
                                 .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
                                 .collect();
                         }
-                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                            *h += f;
-                        }
+                        residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
                     } else if let Some(mut ffn_batch) =
                         Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
                     {
@@ -3953,9 +3974,7 @@ impl Decoder {
                                 .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
                                 .collect();
                         }
-                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                            *h += f;
-                        }
+                        residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
                     } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
                         layer,
                         &normed2_batch,
@@ -3971,9 +3990,7 @@ impl Decoder {
                                 .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
                                 .collect();
                         }
-                        for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                            *h += f;
-                        }
+                        residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
                     } else {
                         let n_experts = layer.moe.n_experts().max(1);
                         for b in 0..batch_size {
@@ -4003,9 +4020,7 @@ impl Decoder {
                             }
                             let hidden_row =
                                 &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                            for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
-                                *h += f;
-                            }
+                            residual_add(hidden_row, &ffn_out, self.config.residual_scale);
                         }
                     }
                     l += 1;
@@ -4153,9 +4168,11 @@ impl Decoder {
             } else {
                 projected_batch
             };
-            for (h, p) in hidden_batch.iter_mut().zip(projected_batch.iter()) {
-                *h += p;
-            }
+            residual_add(
+                &mut hidden_batch,
+                &projected_batch,
+                self.config.residual_scale,
+            );
 
             // --- MoE FFN block ---
             let normed2_batch: Vec<f32> = hidden_batch
@@ -4171,9 +4188,7 @@ impl Decoder {
                     let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
                     let ffn_out = Self::gpt_oss_ffn(layer, oai, normed2, &self.config, hidden_dim);
                     let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
-                        *h += f;
-                    }
+                    residual_add(hidden_row, &ffn_out, self.config.residual_scale);
                 }
                 l += 1;
                 continue;
@@ -4211,9 +4226,7 @@ impl Decoder {
                         .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
                         .collect();
                 }
-                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                    *h += f;
-                }
+                residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
             } else if let Some(mut ffn_batch) =
                 Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
             {
@@ -4228,9 +4241,7 @@ impl Decoder {
                         .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
                         .collect();
                 }
-                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                    *h += f;
-                }
+                residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
             } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
                 layer,
                 &normed2_batch,
@@ -4246,9 +4257,7 @@ impl Decoder {
                         .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
                         .collect();
                 }
-                for (h, f) in hidden_batch.iter_mut().zip(ffn_batch.iter()) {
-                    *h += f;
-                }
+                residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
             } else {
                 let n_experts = layer.moe.n_experts().max(1);
                 for b in 0..batch_size {
@@ -4277,9 +4286,7 @@ impl Decoder {
                         ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
                     }
                     let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
-                        *h += f;
-                    }
+                    residual_add(hidden_row, &ffn_out, self.config.residual_scale);
                 }
             }
             l += 1;
@@ -4475,9 +4482,11 @@ impl Decoder {
             } else {
                 projected_batch
             };
-            for (h, p) in hidden_batch.iter_mut().zip(projected_batch.iter()) {
-                *h += p;
-            }
+            residual_add(
+                &mut hidden_batch,
+                &projected_batch,
+                self.config.residual_scale,
+            );
 
             // --- MoE FFN block ---
             let normed2_batch: Vec<f32> = hidden_batch
@@ -4520,9 +4529,7 @@ impl Decoder {
                     ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
                 }
                 let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                for (h, f) in hidden_row.iter_mut().zip(ffn_out.iter()) {
-                    *h += f;
-                }
+                residual_add(hidden_row, &ffn_out, self.config.residual_scale);
             }
         }
 
@@ -6565,6 +6572,50 @@ mod metal_rope_tests {
         let mut odd = phi_like_config();
         odd.rope_dim = Some(95);
         assert!(!supported(odd), "odd n_rot must keep the model off Metal");
+    }
+
+    /// A `residual_scale` keeps every fused Metal path off the model,
+    /// through ONE predicate the four eligibility checks share.
+    ///
+    /// Granite multiplies both branch outputs before every residual add.
+    /// The fused launches -- dense decode, resident MoE decode, and both
+    /// prefill stacks -- fold the residual add in on device with no
+    /// uniform for a multiplier, so a Granite layer served by any of
+    /// them would be scaled by the host bodies and not by the GPU: the
+    /// same weights answering differently depending on which backend
+    /// took the token. That is exactly what `attention_scale` is fenced
+    /// off for next door, and this repo has already watched the GPU
+    /// router's eligibility check drift four ways when it was four
+    /// spellings instead of one.
+    ///
+    /// Only reachable in a `--features metal` build, which is where the
+    /// fence exists at all.
+    #[test]
+    fn a_residual_scale_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut scaled = plain;
+        scaled.residual_scale = Some(0.22);
+        let d = Decoder::new_random_small(scaled.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a residual multiplier no Metal kernel applies must refuse the fused attention"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &scaled),
+            "...and the prefill dense stack"
+        );
+        assert!(
+            !Decoder::metal_can_serve_scalars(&scaled),
+            "the shared predicate is what all four read"
+        );
     }
 
     /// A Gemma-3-4B-shaped config: `rope_scaling {linear, factor 8}`

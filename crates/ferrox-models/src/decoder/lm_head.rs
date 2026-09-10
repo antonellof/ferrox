@@ -38,8 +38,31 @@ use ferrox_core::matmul::softcap_inplace;
 pub(crate) struct Logits(Vec<f32>);
 
 impl Logits {
-    /// The one place the final softcap is applied.
-    pub(crate) fn from_output_head(mut raw: Vec<f32>, softcap: Option<f32>) -> Self {
+    /// The one place the output head's two post-projection transforms
+    /// are applied, in llama.cpp's order.
+    ///
+    /// `multiplier` is [`crate::ModelConfig::logit_multiplier`], the
+    /// already-resolved Granite `1.0 / logit_scale` (`granite.cpp:180`),
+    /// and it goes FIRST because it belongs to the head: llama.cpp
+    /// scales the `build_lora_mm` result, and a softcap applied before
+    /// it would be capping a differently-scaled distribution.
+    ///
+    /// No architecture declares both today -- Granite scales and does
+    /// not cap, Gemma-2 caps and does not scale -- so the order has
+    /// never been exercised by a real checkpoint. It is fixed here
+    /// anyway rather than left to whichever call site runs first,
+    /// because "no model does both" is exactly the kind of fact that
+    /// stops being true without anybody editing this file.
+    pub(crate) fn from_output_head(
+        mut raw: Vec<f32>,
+        softcap: Option<f32>,
+        multiplier: Option<f32>,
+    ) -> Self {
+        if let Some(m) = multiplier {
+            for v in raw.iter_mut() {
+                *v *= m;
+            }
+        }
         if let Some(sc) = softcap {
             softcap_inplace(&mut raw, sc);
         }
@@ -115,15 +138,25 @@ impl<L> FoldedLmHead<L> {
     /// a token id would corrupt it. It is safe uncapped for the reason
     /// in this module's header -- the cap is monotone, so it cannot move
     /// an argmax -- and this is the only place that reasoning is relied
-    /// upon.
+    /// upon. The same reasoning, and only that reasoning, is what makes
+    /// `multiplier` safe to skip on an id: it is guaranteed POSITIVE by
+    /// `scalar_multipliers::resolve`, so it cannot reorder a vocabulary
+    /// either. A negative one could, which is why that function rejects
+    /// it rather than trusting no checkpoint to declare one.
     pub(crate) fn interpret(
         &self,
         out: Vec<f32>,
         vocab_size: usize,
         softcap: Option<f32>,
+        multiplier: Option<f32>,
     ) -> Vec<f32> {
+        debug_assert!(
+            multiplier.is_none_or(|m| m > 0.0),
+            "a non-positive logit multiplier would reorder the vocabulary, so a folded \
+             argmax id could not be passed through"
+        );
         if out.len() == vocab_size {
-            Logits::from_output_head(out, softcap).into_vec()
+            Logits::from_output_head(out, softcap, multiplier).into_vec()
         } else {
             out
         }
@@ -143,7 +176,7 @@ mod tests {
 
     #[test]
     fn logits_cannot_be_built_without_the_cap_being_applied() {
-        let out = Logits::from_output_head(vec![100.0, -100.0, 0.5], Some(30.0)).into_vec();
+        let out = Logits::from_output_head(vec![100.0, -100.0, 0.5], Some(30.0), None).into_vec();
         for (got, &raw) in out.iter().zip([100.0f32, -100.0, 0.5].iter()) {
             assert!(
                 (got - capped(raw, 30.0)).abs() < 1e-5,
@@ -151,9 +184,40 @@ mod tests {
             );
         }
         assert_eq!(
-            Logits::from_output_head(vec![100.0, -100.0], None).into_vec(),
+            Logits::from_output_head(vec![100.0, -100.0], None, None).into_vec(),
             vec![100.0, -100.0],
             "no cap configured must leave the head's output exactly alone"
+        );
+    }
+
+    /// Granite's logit multiplier goes through the same constructor as
+    /// the cap, and multiplies rather than divides.
+    ///
+    /// The direction is resolved at load time
+    /// (`scalar_multipliers::resolve` inverts Granite's `logit_scale`),
+    /// so a reader of THIS file cannot tell which way round it should
+    /// be. Getting it backwards produces a perfectly ordered
+    /// distribution at the wrong temperature -- no error, no NaN, just a
+    /// model that samples differently from llama.cpp on the same file.
+    #[test]
+    fn the_logit_multiplier_multiplies_and_runs_before_the_cap() {
+        assert_eq!(
+            Logits::from_output_head(vec![8.0, -4.0, 1.0], None, Some(0.25)).into_vec(),
+            vec![2.0, -1.0, 0.25]
+        );
+
+        // Order: cap AFTER the multiply. With a multiplier of 0.25 and a
+        // cap of 3.0, `cap(0.25 * 100)` is 3.0 * tanh(25/3) and
+        // `0.25 * cap(100)` would be 0.75 -- far enough apart that a
+        // swapped order cannot pass.
+        let got = Logits::from_output_head(vec![100.0], Some(3.0), Some(0.25)).into_vec();
+        assert!(
+            (got[0] - capped(25.0, 3.0)).abs() < 1e-5,
+            "got {got:?}, want cap applied to the SCALED logit"
+        );
+        assert!(
+            (got[0] - 0.25 * capped(100.0, 3.0)).abs() > 1.0,
+            "the two orders must be distinguishable here"
         );
     }
 
@@ -187,7 +251,7 @@ mod tests {
         let folded = FoldedLmHead::permit(true, Some(())).unwrap();
         let vocab = 4;
         let raw = vec![100.0f32, -100.0, 31.0, 0.25];
-        let got = folded.interpret(raw.clone(), vocab, Some(30.0));
+        let got = folded.interpret(raw.clone(), vocab, Some(30.0), None);
         for (i, (g, r)) in got.iter().zip(raw.iter()).enumerate() {
             assert!(
                 (g - capped(*r, 30.0)).abs() < 1e-4,
@@ -210,7 +274,7 @@ mod tests {
     fn a_folded_stack_returning_an_argmax_id_is_passed_through_untouched() {
         let folded = FoldedLmHead::permit(true, Some(())).unwrap();
         assert_eq!(
-            folded.interpret(vec![100.0], 32_000, Some(30.0)),
+            folded.interpret(vec![100.0], 32_000, Some(30.0), None),
             vec![100.0],
             "a 1-element argmax id must not be softcapped"
         );
