@@ -43,6 +43,8 @@
 //! the measured 13-16x small-model regression documented on
 //! [`crate::weight_matrix::WeightMatrix::min_rows_per_task`].
 
+use std::cell::Cell;
+
 use rayon::prelude::*;
 
 use crate::cpu_pool::CpuPool;
@@ -50,6 +52,125 @@ use crate::cpu_pool::CpuPool;
 pub mod policy;
 
 pub use policy::{backend, macs_per_row, with_op_work};
+
+thread_local! {
+    /// How many parallel regions THIS thread has opened while not being
+    /// a rayon worker. See [`on_workers`] for why that is the number
+    /// worth counting, and [`cold_regions`] for how a test reads it.
+    ///
+    /// Per thread rather than process-wide on purpose. A cold region is
+    /// always counted on the thread that submits it, so nothing is lost;
+    /// and a shared counter would make the assertion depend on whatever
+    /// else the test binary happened to be running at the time, which is
+    /// the difference between a guard and a flake.
+    static COLD_REGIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Parallel regions this thread has opened without being a rayon worker.
+///
+/// Monotonic, so a test reads it before and after the operation it cares
+/// about and asserts on the DIFFERENCE. It is not a benchmark: it is an
+/// operation count, which is load-immune, and it is the only thing that
+/// distinguishes "this decode step entered the pool once" from "it
+/// entered it a hundred and fifty times".
+pub fn cold_regions() -> u64 {
+    COLD_REGIONS.with(Cell::get)
+}
+
+/// Records one region about to be opened on the rayon arm.
+///
+/// Called from every rayon fallback in this module and nowhere else.
+/// The worker-index read is the same TLS lookup rayon is about to do
+/// anyway, and the counter is touched only on the cold path, which after
+/// [`on_workers`] is once per decode step rather than once per matvec.
+fn note_rayon_region() {
+    if rayon::current_thread_index().is_none() {
+        COLD_REGIONS.with(|c| c.set(c.get().saturating_add(1)));
+    }
+}
+
+/// Run `f` on a rayon worker, so every parallel region it opens takes
+/// rayon's IN-WORKER path instead of its cold-submission path.
+///
+/// # What this is for
+///
+/// `rayon::join` and the `par_iter` bridges both funnel through
+/// `Registry::in_worker`. That call has two arms and they do not cost
+/// the same thing:
+///
+/// - **From a worker** (`in_worker_hot`): the calling thread runs one
+///   half itself, the other half is posted for stealing, and the wait is
+///   a `SpinLatch`. No syscall.
+/// - **From any other thread** (`in_worker_cold`): the job is injected,
+///   and the caller blocks on a `LockLatch`, which is a pthread mutex
+///   and condvar. That is a park and a wake, per region, and the caller
+///   contributes no arithmetic while it sleeps.
+///
+/// A decode step opens roughly five regions per layer, so a 30-layer
+/// model paid ~150 of the cold arm per token. Measured on an M2 Pro with
+/// `sample` over SmolLM2-135M Q8_0 `tg128`, the main thread spent **74%
+/// of the token** inside `__psynch_cvwait` under `LockLatch`, and over
+/// that same window the six workers it was waiting for held only about
+/// an eighth as many samples in the matvec kernel: most of the wait was
+/// the round trip, not the work.
+///
+/// Wrapping the whole step in one `rayon::scope` turns those ~150 cold
+/// entries into ONE. The step then runs on worker 0 and every nested
+/// region is hot.
+///
+/// # Why it is not simply free
+///
+/// The caller still parks once, for the whole step, and the step no
+/// longer runs on the caller's thread. Both are deliberate: one park per
+/// token against one per matvec, and rayon's own worker count is
+/// unchanged, so the same number of cores do the work.
+///
+/// Nesting is free (a call from inside another `on_workers` returns
+/// `f()` directly), so an entry point may wrap unconditionally without
+/// having to know whether its caller already did.
+///
+/// # Two cases this deliberately does NOT promote
+///
+/// **A GPU backend.** Measured on an M2 Pro, moving the decode step off
+/// the process's main thread CHANGES METAL'S OUTPUT: `Llama-3.2-3B
+/// Q4_K_M --ngl 99`, greedy, diverges from the same build's main-thread
+/// answer at around the tenth token, deterministically on both sides.
+/// The Metal stack carries thread-local state across a step (the
+/// resident-activation hand-off from the dense stack to `output_head`,
+/// and the two thread-local mirrors of the pipeline and weight caches),
+/// so which thread runs the step is not the free choice it is on CPU.
+/// That is worth its own investigation and is not worth risking on a CPU
+/// scheduling change, so promotion asks
+/// [`crate::weight_matrix::active_backend`] first: the same cached
+/// predicate dispatch itself uses, not a second opinion about it. Under
+/// Metal or CUDA there is also almost nothing to win, because the
+/// parallel regions this saves are the ones the GPU is not running.
+///
+/// **The pinned spin pool.** Under `FERROX_CPU_POOL=spin` the rayon
+/// global pool is never used for work, and `rayon::scope` would BUILD
+/// it, spawning a second set of workers that then only sit there. So
+/// that pin short-circuits, exactly as [`num_threads`] avoids
+/// `rayon::current_num_threads` for the same reason.
+pub fn on_workers<R, F>(f: F) -> R
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    if crate::weight_matrix::active_backend() != crate::kernel_registry::Backend::Cpu {
+        return f();
+    }
+    if policy::pinned() == Some(Backend::Spin) {
+        return f();
+    }
+    if rayon::current_thread_index().is_some() {
+        return f();
+    }
+    // The one cold entry this whole design is willing to pay. Counted
+    // like any other, so [`cold_regions`] reports the true total and a
+    // test can assert it is exactly one.
+    note_rayon_region();
+    rayon::scope(move |_| f())
+}
 
 /// Which scheduler CPU parallel regions use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +297,7 @@ where
             return;
         }
     }
+    note_rayon_region();
     (0..n)
         .into_par_iter()
         .with_min_len(min_len.max(1))
@@ -210,6 +332,7 @@ where
             return;
         }
     }
+    note_rayon_region();
     (0..n)
         .into_par_iter()
         .with_min_len(min_len.max(1))
@@ -245,6 +368,7 @@ where
             return;
         }
     }
+    note_rayon_region();
     data.par_iter_mut()
         .with_min_len(min_len.max(1))
         .enumerate()
@@ -295,6 +419,7 @@ where
             return;
         }
     }
+    note_rayon_region();
     a.par_chunks_mut(chunk_len)
         .zip(b.par_chunks_mut(chunk_len))
         .with_min_len(min_len.max(1))
@@ -334,6 +459,7 @@ where
             return;
         }
     }
+    note_rayon_region();
     data.par_chunks_mut(chunk_len)
         .with_min_len(min_len.max(1))
         .enumerate()
@@ -395,6 +521,7 @@ where
             return;
         }
     }
+    note_rayon_region();
     data.par_chunks_mut(chunk_len)
         .with_min_len(min_len.max(1))
         .enumerate()
@@ -416,7 +543,10 @@ where
     RB: Send,
 {
     match backend() {
-        Backend::Rayon => rayon::join(a, b),
+        Backend::Rayon => {
+            note_rayon_region();
+            rayon::join(a, b)
+        }
         Backend::Spin => (a(), b()),
     }
 }
@@ -433,6 +563,7 @@ where
 {
     match backend() {
         Backend::Rayon => {
+            note_rayon_region();
             let (ra, (rb, rc)) = rayon::join(a, || rayon::join(b, c));
             (ra, rb, rc)
         }
@@ -443,6 +574,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two configurations `on_workers` declines to promote in, and
+    /// so the two it cannot be asserted in. One predicate, shared by
+    /// every test below, rather than three spellings of it.
+    fn the_promotion_applies_here() -> bool {
+        policy::pinned().is_none()
+            && crate::weight_matrix::active_backend() == crate::kernel_registry::Backend::Cpu
+    }
+
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// With nothing published and nothing pinned, the helpers fork with
@@ -642,5 +782,120 @@ mod tests {
 
             assert_eq!(spun, forked, "n={n}");
         }
+    }
+
+    /// Every helper in this module must report the region it is about
+    /// to open, or the counter reads as coverage while measuring
+    /// nothing. This walks all eight of them rather than trusting that
+    /// a new one remembered, because a helper that forgot would leave
+    /// the counter reading low and every assertion built on it passing.
+    ///
+    /// Sabotage: delete any single `note_rayon_region()` call and the
+    /// helper whose name is in the failure message goes red.
+    #[test]
+    fn every_helper_reports_the_cold_region_it_opens() {
+        if !the_promotion_applies_here() {
+            return;
+        }
+        let mut buf = vec![0f32; 64];
+        let mut other = vec![0f32; 64];
+
+        // Spelled out one at a time rather than as a table of boxed
+        // closures: the slice helpers borrow `buf`, so a table could
+        // hold only half of them, and half a table is exactly the
+        // coverage illusion this test exists to avoid.
+        let before = cold_regions();
+        indices(64, 1, |_| {});
+        assert!(cold_regions() > before, "indices did not report");
+
+        let before = cold_regions();
+        indices_init(64, 1, || 0u8, |_, _| {});
+        assert!(cold_regions() > before, "indices_init did not report");
+
+        let before = cold_regions();
+        join2(|| (), || ());
+        assert!(cold_regions() > before, "join2 did not report");
+
+        let before = cold_regions();
+        join3(|| (), || (), || ());
+        assert!(cold_regions() > before, "join3 did not report");
+
+        let before = cold_regions();
+        items_mut(&mut buf, 1, |_, _| {});
+        assert!(cold_regions() > before, "items_mut did not report");
+
+        let before = cold_regions();
+        chunks_mut(&mut buf, 8, 1, |_, _| {});
+        assert!(cold_regions() > before, "chunks_mut did not report");
+
+        let before = cold_regions();
+        chunks_mut_init(&mut buf, 8, 1, || 0u8, |_, _, _| {});
+        assert!(cold_regions() > before, "chunks_mut_init did not report");
+
+        let before = cold_regions();
+        chunks_mut2(&mut buf, &mut other, 8, 1, |_, _, _| {});
+        assert!(cold_regions() > before, "chunks_mut2 did not report");
+    }
+
+    /// The whole claim of `on_workers`: many regions inside it cost ONE
+    /// cold entry into the pool, where the same regions outside it cost
+    /// one each.
+    ///
+    /// This is the operation-count form of the fix. It needs no clock
+    /// and no quiet host, which is why it is the guard rather than a
+    /// throughput assertion.
+    ///
+    /// Sabotage: make `on_workers` call `f()` unconditionally and the
+    /// `inside` count jumps from 1 to `REGIONS`, turning this red.
+    #[test]
+    fn on_workers_collapses_many_regions_into_one_cold_entry() {
+        if !the_promotion_applies_here() {
+            return;
+        }
+        const REGIONS: u64 = 16;
+        let open_them = || {
+            for _ in 0..REGIONS {
+                indices(64, 1, |_| {});
+            }
+        };
+
+        let before = cold_regions();
+        open_them();
+        let outside = cold_regions() - before;
+
+        let before = cold_regions();
+        on_workers(open_them);
+        let inside = cold_regions() - before;
+
+        assert_eq!(
+            outside, REGIONS,
+            "each region opened from a cold thread should count once"
+        );
+        assert_eq!(
+            inside, 1,
+            "the whole batch should enter the pool exactly once"
+        );
+    }
+
+    /// A nested call must not open a second entry, so an entry point can
+    /// wrap unconditionally without knowing what its caller did.
+    #[test]
+    fn a_nested_on_workers_opens_no_further_cold_entry() {
+        if !the_promotion_applies_here() {
+            return;
+        }
+        let before = cold_regions();
+        on_workers(|| {
+            on_workers(|| {
+                indices(64, 1, |_| {});
+            });
+        });
+        assert_eq!(cold_regions() - before, 1);
+    }
+
+    /// `on_workers` must return what `f` returns, not swallow it.
+    #[test]
+    fn on_workers_hands_back_the_closures_value() {
+        assert_eq!(on_workers(|| 41usize + 1), 42);
     }
 }
