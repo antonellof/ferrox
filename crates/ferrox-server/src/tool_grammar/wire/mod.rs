@@ -23,8 +23,9 @@
 //! | Shape | Formats | Root |
 //! |---|---|---|
 //! | [`Shape::Json`] | hermes/qwen2.5, llama3, mistral | a marker, a JSON object naming the tool, a closing marker |
-//! | [`Shape::Elements`] | qwen3_coder, glm47, minimax, deepseekv32 | an invoke element holding one element per argument |
+//! | [`Shape::Elements`] | qwen3_coder, glm47, minimax, deepseekv32, minimax_m3 | an invoke element holding one element per argument |
 //! | [`Shape::Harmony`] | gpt_oss | a channel header addressed to `functions.<name>`, then JSON |
+//! | [`Shape::Pairs`] | gemma4 | a name, then `k:v` pairs in gemma's own quoting |
 //!
 //! One module per shape, beside this one. What each does about a
 //! value's TYPE is written where that shape is built.
@@ -32,6 +33,7 @@
 mod elements;
 mod harmony;
 mod json;
+mod pairs;
 
 use serde_json::Value;
 
@@ -53,6 +55,10 @@ enum Shape {
     Elements,
     /// gpt-oss's harmony channel addressed to a function.
     Harmony,
+    /// Gemma 4's `call:NAME{k:v,k:v}`: a comma-separated list of pairs
+    /// in gemma's own quoting, which is neither JSON nor an element
+    /// grammar.
+    Pairs,
 }
 
 /// The shape a format's root rule takes, or the refusal naming it.
@@ -67,30 +73,31 @@ fn shape(format: ToolCallFormat) -> Result<Shape, ApiError> {
         ToolCallFormat::Qwen3Coder
         | ToolCallFormat::Glm47
         | ToolCallFormat::MiniMax
-        | ToolCallFormat::DeepSeekV32 => Ok(Shape::Elements),
+        | ToolCallFormat::DeepSeekV32
+        // MiniMax-M3 is the same shape with its own tags: an invoke
+        // naming the call, one element per argument. The doubt about it
+        // was that a REPEATED element means an array, so what an element
+        // means depends on siblings that have not been written -- but
+        // that is a fact about reading arbitrary text, and this writes
+        // each declared property exactly once, from the schema. What it
+        // cannot do is write two elements of one name, so a forced call
+        // never reaches the ambiguity.
+        | ToolCallFormat::MiniMaxM3 => Ok(Shape::Elements),
         ToolCallFormat::GptOss => Ok(Shape::Harmony),
-        // The three that stay refused, each for a reason about the
-        // format rather than about effort.
-        ToolCallFormat::Gemma4 => Err(refused(
-            format,
-            "a gemma4 call's arguments are a comma-separated list in gemma's own quoting rather \
-             than a JSON object, so which of them are required cannot be expressed by the object \
-             rule every other format here shares; writing a second one beside the JSON Schema \
-             converter is the drift this refusal exists to avoid",
-        )),
-        ToolCallFormat::MiniMaxM3 => Err(refused(
-            format,
-            "a minimax_m3 call names each argument with an ELEMENT of its own, and what a \
-             repeated element means -- an array rather than a value -- depends on siblings that \
-             have not been written yet, so no root rule can force a call whose arguments this \
-             server would read back the way the schema declares them",
-        )),
+        ToolCallFormat::Gemma4 => Ok(Shape::Pairs),
+        // The one that stays refused, for a reason about the format
+        // rather than about effort.
         ToolCallFormat::MuseGlimmer => Err(refused(
             format,
-            "a muse_glimmer call's boundary is not syntactic: the same <atem:function_calls> \
+            "a muse_glimmer call's boundary is not syntactic. The same <atem:function_calls> \
              block is a call inside a channel addressed to a tool and prose inside one addressed \
              to the user, so a grammar over the block alone would force text this server reads \
-             back as content",
+             back as content -- and forcing the HEADER instead needs two things this seam does \
+             not have: which recipient name this checkpoint's template writes (the parser accepts \
+             any name that is not \"self\" or \"user\", so the format does not fix it), and how \
+             much of that header the rendered prompt already wrote, since a muse_glimmer prompt \
+             ends INSIDE one. Both are facts about a template, and no muse_glimmer checkpoint or \
+             template is on hand to read them off",
         )),
     }
 }
@@ -111,6 +118,7 @@ pub(super) fn build_root(
         Shape::Json { array } => json::json_root(builder, format, tools, array),
         Shape::Elements => elements::elements_root(builder, format, tools),
         Shape::Harmony => harmony::harmony_root(builder, tools),
+        Shape::Pairs => pairs::pairs_root(builder, format, tools),
     }
 }
 

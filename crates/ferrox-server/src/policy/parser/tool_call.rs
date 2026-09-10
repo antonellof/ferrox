@@ -212,6 +212,35 @@ pub(crate) mod harmony {
     pub(crate) const CHANNELS: [&str; 2] = ["commentary", "analysis"];
 }
 
+/// Gemma 4's own call syntax, which is neither JSON nor XML-ish.
+///
+/// A call is `<|tool_call>call:NAME{k:v,k:v}<tool_call|>`, and the
+/// arguments are a comma-separated list of `key:value` pairs in gemma's
+/// own quoting: a string is wrapped in [`QUOTE`], everything else is
+/// written the way JSON writes it. That is the chat template's
+/// `format_argument(value, escape_keys=False)`, and the pairs arrive in
+/// the template's `| dictsort` order -- sorted by key.
+///
+/// These are the literals [`ToolCallParser::parse_gemma`] reads a call
+/// with, and they are `pub(crate)` because [`crate::tool_grammar`]
+/// WRITES a forced call from the same ones.
+pub(crate) mod gemma {
+    /// Opens and closes the call block.
+    pub(crate) const BLOCK_OPEN: &str = "<|tool_call>";
+    pub(crate) const BLOCK_CLOSE: &str = "<tool_call|>";
+    /// Introduces the function's name inside the block.
+    pub(crate) const CALL_KEY: &str = "call:";
+    /// Wrap the argument list.
+    pub(crate) const ARGS_OPEN: &str = "{";
+    pub(crate) const ARGS_CLOSE: &str = "}";
+    /// Between two pairs, and between a key and its value.
+    pub(crate) const PAIR_SEPARATOR: &str = ",";
+    pub(crate) const KEY_SEPARATOR: &str = ":";
+    /// What a STRING value is wrapped in. Gemma spells its own quote
+    /// this way; a `"` is an ordinary character inside one.
+    pub(crate) const QUOTE: &str = "<|\"|>";
+}
+
 /// MiniMax-M3's namespace prefix, in front of every structural tag.
 const M3_NS: &str = "]<]minimax[>[";
 /// `M3_NS` plus `<`: where every M3 tag begins.
@@ -282,7 +311,12 @@ impl ToolCallFormat {
             ToolCallFormat::MiniMaxM3
         } else if has("minimax") {
             ToolCallFormat::MiniMax
-        } else if has("gemma4") {
+        // Every spelling a real Gemma 4 file uses. `gemma4` alone was
+        // the whole test, and no checkpoint is named that: the one on
+        // hand calls itself `Gemma-4-E2B-It`, so this arm could not fire
+        // and every Gemma 4 tool call fell through to the Llama 3
+        // fallback, which reads none of them.
+        } else if has("gemma4") || has("gemma-4") || has("gemma_4") || has("gemma 4") {
             ToolCallFormat::Gemma4
         } else if has("qwen3_5") || has("qwen3.5") || (has("qwen3") && has("coder")) {
             ToolCallFormat::Qwen3Coder
@@ -363,11 +397,35 @@ impl ToolCallFormat {
             ToolCallFormat::Qwen25 => Markers::block("<tool_call>", "</tool_call>"),
             ToolCallFormat::Llama3 => Markers::block("<|python_tag|>", ""),
             ToolCallFormat::Mistral => Markers::block("[TOOL_CALLS]", ""),
-            ToolCallFormat::Gemma4 => Markers::block("<|tool_call>", "<tool_call|>"),
+            ToolCallFormat::Gemma4 => Markers::block(gemma::BLOCK_OPEN, gemma::BLOCK_CLOSE),
             ToolCallFormat::GptOss => Markers::block("<|channel|>", "<|call|>"),
-            // The element grammar is scanned by `parse_m3`; only the
-            // wrapper is a marker in the ordinary sense.
-            ToolCallFormat::MiniMaxM3 => Markers::block(M3_OPEN, M3_CLOSE),
+            // The element grammar is scanned by `parse_m3` rather than
+            // by the shared invoke machinery, so these tags are read
+            // straight off the `M3_*` constants there. They are spelled
+            // out here anyway because `tool_grammar` WRITES a forced
+            // call from them, and the same constants on both sides is
+            // what keeps the writer and the reader one description.
+            ToolCallFormat::MiniMaxM3 => Markers {
+                open: M3_OPEN,
+                close: M3_CLOSE,
+                invoke: Some(TagGrammar {
+                    open: M3_INVOKE_OPEN,
+                    name: NameStyle::Attribute,
+                    close: M3_INVOKE_CLOSE,
+                }),
+                param: Some(TagGrammar {
+                    open: M3_TAG,
+                    name: NameStyle::Element,
+                    close: M3_CLOSE_TAG,
+                }),
+                // `m3_typed_leaf` hands a declared string over verbatim
+                // and trims only before it parses a number, which is
+                // what `convert_declared` does for `TrimStyle::None`.
+                trim_newlines: TrimStyle::None,
+                // An element the schema never mentioned reaches
+                // `parse_loose` there.
+                undeclared: Undeclared::Loose,
+            },
             ToolCallFormat::MuseGlimmer => Markers {
                 open: "<atem:function_calls>",
                 close: "</atem:function_calls>",
@@ -474,6 +532,14 @@ pub(crate) enum NameStyle {
         /// Opens the value element. [`TagGrammar::close`] closes it.
         value_open: &'static str,
     },
+    /// The name IS the element: MiniMax-M3 writes
+    /// `]<]minimax[>[<city>Rome]<]minimax[>[</city>`, so
+    /// [`TagGrammar::open`] and [`TagGrammar::close`] are the two
+    /// PREFIXES the name is written after, each finished with a `>`.
+    ///
+    /// The only style whose closing tag depends on the argument, which
+    /// is why `TagGrammar::close` cannot be used as a literal for it.
+    Element,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1080,6 +1146,14 @@ impl ToolCallParser {
                 let key = self.buffer[attrs_start..gt].trim().to_string();
                 Some((key, false, gt + 1))
             }
+            // MiniMax-M3's elements are read by `drain_m3` /
+            // `m3_read_element`, which depth-match a value's closing tag
+            // against the name that opened it. This machinery cannot:
+            // it looks for one FIXED closing tag, and M3's depends on
+            // the argument. Reaching here would mean M3 had been routed
+            // through the shared invoke path, which `push` and
+            // `parse_complete` both send to `drain_m3` instead.
+            NameStyle::Element => None,
             NameStyle::Attribute => {
                 let attrs_start = start + param.open.len();
                 let gt = self.buffer[attrs_start..].find('>')? + attrs_start;
@@ -1249,11 +1323,11 @@ impl ToolCallParser {
         let mut normal = String::new();
         let mut calls = Vec::new();
         let mut cursor = 0usize;
-        while let Some(start) = text[cursor..].find("<|tool_call>").map(|i| i + cursor) {
+        while let Some(start) = text[cursor..].find(gemma::BLOCK_OPEN).map(|i| i + cursor) {
             normal.push_str(&text[cursor..start]);
-            let body_start = start + "<|tool_call>".len();
+            let body_start = start + gemma::BLOCK_OPEN.len();
             let Some(end) = text[body_start..]
-                .find("<tool_call|>")
+                .find(gemma::BLOCK_CLOSE)
                 .map(|i| i + body_start)
             else {
                 normal.push_str(&text[start..]);
@@ -1261,10 +1335,12 @@ impl ToolCallParser {
                 break;
             };
             let body = text[body_start..end].trim();
-            if let Some(rest) = body.strip_prefix("call:") {
-                if let Some(brace) = rest.find('{') {
+            if let Some(rest) = body.strip_prefix(gemma::CALL_KEY) {
+                if let Some(brace) = rest.find(gemma::ARGS_OPEN) {
                     let name = rest[..brace].trim();
-                    let args = rest[brace + 1..].trim_end().trim_end_matches('}');
+                    let args = rest[brace + gemma::ARGS_OPEN.len()..]
+                        .trim_end()
+                        .trim_end_matches(gemma::ARGS_CLOSE);
                     if self.known(name) {
                         calls.push(ToolCall {
                             index: calls.len(),
@@ -1274,7 +1350,7 @@ impl ToolCallParser {
                     }
                 }
             }
-            cursor = end + "<tool_call|>".len();
+            cursor = end + gemma::BLOCK_CLOSE.len();
         }
         normal.push_str(&text[cursor..]);
         (normal, calls)
@@ -2331,6 +2407,10 @@ fn read_name(attrs: &str, style: NameStyle) -> Option<String> {
         // Only a parameter tag is ever paired, and a paired parameter's
         // key is read by `read_param_header` before this is reached.
         NameStyle::Paired { .. } => None,
+        // An element-named tag has no attribute text at all: its name is
+        // the tag. `m3_read_element` reads it, and nothing routes an M3
+        // tag through this function.
+        NameStyle::Element => None,
     }
 }
 
@@ -2380,19 +2460,18 @@ fn normalize_arguments(raw: &str) -> String {
     }
 }
 
-/// Gemma's `k: v, k: v` argument list, with `<|"|>` for quotes.
+/// Gemma's `k: v, k: v` argument list, with [`gemma::QUOTE`] for quotes.
 fn gemma_arguments(text: &str) -> String {
-    const QUOTE: &str = "<|\"|>";
     let mut map = Map::new();
-    for pair in split_top_level(text, ',') {
-        let Some((key, value)) = pair.split_once(':') else {
+    for pair in split_top_level(text, gemma::PAIR_SEPARATOR) {
+        let Some((key, value)) = pair.split_once(gemma::KEY_SEPARATOR) else {
             continue;
         };
         let key = key.trim().trim_matches('"').to_string();
         let value = value.trim();
         let parsed = match value
-            .strip_prefix(QUOTE)
-            .and_then(|v| v.strip_suffix(QUOTE))
+            .strip_prefix(gemma::QUOTE)
+            .and_then(|v| v.strip_suffix(gemma::QUOTE))
         {
             Some(inner) => Value::String(inner.to_string()),
             None => parse_loose(value),
@@ -2403,17 +2482,24 @@ fn gemma_arguments(text: &str) -> String {
 }
 
 /// Split on `delimiter`, ignoring delimiters inside brackets or quotes.
-fn split_top_level(text: &str, delimiter: char) -> Vec<String> {
+fn split_top_level(text: &str, delimiter: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut quoted = false;
     let mut current = String::new();
     let mut chars = text.char_indices().peekable();
     while let Some((index, ch)) = chars.next() {
-        if text[index..].starts_with("<|\"|>") {
+        if text[index..].starts_with(gemma::QUOTE) {
             quoted = !quoted;
-            current.push_str("<|\"|>");
-            for _ in 0..4 {
+            current.push_str(gemma::QUOTE);
+            for _ in 0..gemma::QUOTE.chars().count() - 1 {
+                chars.next();
+            }
+            continue;
+        }
+        if !quoted && text[index..].starts_with(delimiter) && depth == 0 {
+            parts.push(std::mem::take(&mut current));
+            for _ in 0..delimiter.chars().count() - 1 {
                 chars.next();
             }
             continue;
@@ -2422,10 +2508,6 @@ fn split_top_level(text: &str, delimiter: char) -> Vec<String> {
             match ch {
                 '{' | '[' => depth += 1,
                 '}' | ']' => depth -= 1,
-                c if c == delimiter && depth == 0 => {
-                    parts.push(std::mem::take(&mut current));
-                    continue;
-                }
                 _ => {}
             }
         }
@@ -2995,6 +3077,25 @@ mod tests {
             ToolCallFormat::Llama3,
             "the fallback is the shape an untrained model improvises"
         );
+        // The arm that could not fire: `gemma4` was the only spelling
+        // tested, and the checkpoint on hand calls itself
+        // `Gemma-4-E2B-It` -- so every gemma tool call fell through to
+        // the Llama 3 fallback, which reads none of them. The earlier
+        // Gemmas are a different wire format and must still not match.
+        for name in ["Gemma-4-E2B-It", "gemma4-27b", "gemma_4_27b", "Gemma 4 27B"] {
+            assert_eq!(
+                ToolCallFormat::infer(name),
+                ToolCallFormat::Gemma4,
+                "{name} is a Gemma 4 checkpoint"
+            );
+        }
+        for name in ["gemma-2-2b-it", "gemma-3-12b-it"] {
+            assert_ne!(
+                ToolCallFormat::infer(name),
+                ToolCallFormat::Gemma4,
+                "{name} does not write gemma 4's call syntax"
+            );
+        }
         assert_eq!(ToolCallFormat::parse("qwen"), Some(ToolCallFormat::Qwen25));
         assert_eq!(ToolCallFormat::parse("nonsense"), None);
     }

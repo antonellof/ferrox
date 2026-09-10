@@ -8498,27 +8498,45 @@ mod tests {
             .expect_err("a grammar and a forced call are two constraints");
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
-        // A checkpoint whose wire format has no grammar yet is refused
-        // by name at params time, when the served model is known. GLM
-        // used to stand here and is forced now; gemma4 is one of the
-        // three `tool_grammar::wire::shape` still refuses, and it says
-        // which of them and why.
+        // A checkpoint whose wire format has no grammar is refused by
+        // name at params time, when the served model is known. GLM and
+        // gemma4 both used to stand here and are forced now;
+        // muse_glimmer is the one `tool_grammar::wire::shape` still
+        // refuses, and the refusal says which format and why.
         let req = tool_request(serde_json::json!("required"));
         let (status, Json(body)) = match req.generation_params_for_template(
             &graded_template(),
-            "Gemma4-27B",
+            "muse-glimmer-8b",
             crate::sampling_knobs::SamplerModel::absent(),
         ) {
             Err(e) => e,
-            Ok(_) => panic!("a gemma4 call's arguments are not an object rule"),
+            Ok(_) => panic!("a muse_glimmer call's boundary is a channel, not a marker"),
         };
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert!(
             body["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("gemma4"),
+                .contains("muse_glimmer"),
             "{body}"
+        );
+
+        // And the format this once refused is served: a served model
+        // whose name resolves to gemma4 reaches a grammar rather than a
+        // 501. `generation_params_for_template` is the only place a
+        // forced choice becomes one, so this is the request-level
+        // evidence that the wire work is wired.
+        let req = tool_request(serde_json::json!("required"));
+        let params = req
+            .generation_params_for_template(
+                &graded_template(),
+                "gemma-4-E2B-it",
+                crate::sampling_knobs::SamplerModel::absent(),
+            )
+            .expect("a gemma4 forced tool_choice is served");
+        assert!(
+            params.grammar.is_some(),
+            "a forced tool_choice must arrive as the generation's grammar"
         );
     }
 

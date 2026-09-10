@@ -65,9 +65,9 @@ pub(super) fn elements_root(
             format.as_str()
         )));
     };
-    // Every value ends at this tag, so it is also the one string a value
-    // may not contain.
-    let text = text_excluding(builder, "arg-text", &[param.close])?;
+    // The literals a value ends at are the ones it may not contain.
+    let forbidden = value_forbidden(param);
+    let text = text_excluding(builder, "arg-text", &forbidden)?;
 
     let mut alternatives = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -159,7 +159,7 @@ fn param_rule(
     // layout puts a newline there, and `convert_declared` trims before it
     // parses. A text or `enum` value may NOT: it reaches the tool
     // verbatim, so whitespace around it would be part of it.
-    let value = match value_shape(tool.name, key, property, param.close)? {
+    let value = match value_shape(tool.name, key, property, &value_forbidden(param))? {
         ValueShape::Text => text.to_string(),
         ValueShape::Literals(body) => {
             builder.add_rule(&format!("tool-{}-enum-{key}", tool.name), &body)
@@ -171,22 +171,50 @@ fn param_rule(
                 .map_err(|e| schema_refused(tool.name, &e))?
         ),
     };
-    let head = match param.name {
-        NameStyle::Bare => format!(r#""{}{}>""#, escape(param.open), escape(key)),
-        NameStyle::Attribute => format!(r#""{} name=\"{}\">""#, escape(param.open), escape(key)),
+    let (head, close) = param_tags(param, key);
+    let body = format!(r#""{}" {value} "{}""#, escape(&head), escape(&close));
+    Ok(builder.add_rule(&format!("tool-{}-param-{key}", tool.name), &body))
+}
+
+/// The two literals that wrap one argument's value: what opens it, and
+/// what closes it, both as they reach the wire.
+///
+/// A pair rather than "the head, and `TagGrammar::close`", because
+/// [`NameStyle::Element`] is the style whose CLOSING tag repeats the
+/// argument's name -- MiniMax-M3 writes
+/// `]<]minimax[>[<city>Rome]<]minimax[>[</city>` -- so there is no one
+/// closing literal to read off the framing.
+fn param_tags(param: TagGrammar, key: &str) -> (String, String) {
+    let close = param.close.to_string();
+    match param.name {
+        NameStyle::Bare => (format!("{}{key}>", param.open), close),
+        NameStyle::Attribute => (format!("{} name=\"{key}\">", param.open), close),
         NameStyle::Paired {
             key_close,
             value_open,
-        } => format!(
-            r#""{}{}{}{}""#,
-            escape(param.open),
-            escape(key),
-            escape(key_close),
-            escape(value_open)
+        } => (format!("{}{key}{key_close}{value_open}", param.open), close),
+        NameStyle::Element => (
+            format!("{}{key}>", param.open),
+            format!("{}{key}>", param.close),
         ),
-    };
-    let body = format!(r#"{head} {value} "{}""#, escape(param.close));
-    Ok(builder.add_rule(&format!("tool-{}-param-{key}", tool.name), &body))
+    }
+}
+
+/// The literals a value written as bare TEXT may not contain, because
+/// the reader would stop or restart at one.
+fn value_forbidden(param: TagGrammar) -> [&'static str; 1] {
+    match param.name {
+        // The value runs to one fixed closing tag, and the reader looks
+        // for exactly that.
+        NameStyle::Bare | NameStyle::Attribute | NameStyle::Paired { .. } => [param.close],
+        // M3's closing tag depends on the argument, so there is no
+        // single one to forbid -- but every structural tag it has (the
+        // wrapper's, the invoke's, an element's, and every closer)
+        // begins with this prefix, and `m3_scan_elements` re-reads a
+        // value as STRUCTURE from any occurrence of it. Forbidding the
+        // prefix forbids all of them at once.
+        NameStyle::Element => [param.open],
+    }
 }
 
 /// How one argument's value must be written so that
@@ -220,7 +248,7 @@ fn value_shape(
     tool: &str,
     key: &str,
     property: &Value,
-    param_close: &str,
+    forbidden: &[&str],
 ) -> Result<ValueShape, ApiError> {
     let Some(object) = property.as_object() else {
         return Err(untyped(tool, key, "it is not a schema object"));
@@ -260,11 +288,11 @@ fn value_shape(
                     "it is a string whose \"enum\" holds a member that is not a string",
                 ));
             };
-            if member.contains(param_close) {
+            if forbidden.iter().any(|literal| member.contains(literal)) {
                 return Err(untyped(
                     tool,
                     key,
-                    "one of its \"enum\" members contains the tag that ends an argument, so \
+                    "one of its \"enum\" members contains the markup that ends an argument, so \
                      writing it would end the argument early",
                 ));
             }
@@ -299,7 +327,7 @@ fn invoke_open(invoke: Option<TagGrammar>, name: &str) -> Result<String, ApiErro
                 escape(tag.open),
                 escape(name)
             )),
-            NameStyle::Paired { .. } => Err(internal(format!(
+            NameStyle::Paired { .. } | NameStyle::Element => Err(internal(format!(
                 "the invoke tag {:?} is named the way a parameter is, which has no reader",
                 tag.open
             ))),

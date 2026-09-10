@@ -66,7 +66,7 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `presence_penalty`, `frequency_penalty` | Supported |
 | `stream` | Supported (overlapped SSE when tools off and CB off) |
 | `tools` / `tool_choice: none\|auto` | Supported (prompt-engineered, parsed in eleven wire formats) |
-| `tool_choice: required` / named function | Supported on **eight of the eleven** wire formats, by a lazy grammar built from the same marker description the parser reads with. **501 naming the format** on the remaining three (`gemma4`, `minimax_m3`, `muse_glimmer`), each for a reason the refusal states |
+| `tool_choice: required` / named function | Supported on **ten of the eleven** wire formats, by a lazy grammar built from the same marker description the parser reads with. **501 naming the format** on the remaining one (`muse_glimmer`), for the reason the refusal states |
 | `logprobs` / `top_logprobs` / `n` (>1) | **Reject** |
 | `response_format: json_object` | Supported (best-effort character mask + validate) |
 | `grammar` | Supported. llama.cpp's own field: a GBNF string, enforced per token by a real parser |
@@ -1247,9 +1247,15 @@ The cost, stated: a model that never opens a call runs to `max_tokens`
 and finishes `"length"`, a visible failure rather than prose served as
 the call that was asked for.
 
-**Eight of the eleven** wire formats are supported: the three whose call
-is a JSON object behind a marker (Hermes/Qwen2.5, Llama 3, Mistral),
-plus `qwen3_coder`, `glm47`, `minimax`, `deepseekv32` and `gpt_oss`.
+**Ten of the eleven** wire formats are supported. One root rule per
+SHAPE, not one per format:
+
+| Shape | Formats | Root rule |
+|---|---|---|
+| JSON payload | Hermes/Qwen2.5, Llama 3, Mistral | a marker, a JSON object naming the tool, a closing marker |
+| Elements | `qwen3_coder`, `glm47`, `minimax`, `deepseekv32`, `minimax_m3` | an invoke element holding one element per argument |
+| Harmony | `gpt_oss` | a channel header addressed to `functions.<name>`, then JSON |
+| Pairs | `gemma4` | `call:NAME{k:v,k:v}`, the values in gemma's own quoting |
 
 The grammar's literals are built from the SAME marker description the
 streaming parser reads with, which is the only reason this is safe to
@@ -1257,18 +1263,25 @@ widen. Two hand-kept tables, one for writing a call and one for reading
 it, would drift, and the symptom would be output the engine forced and
 then could not parse back.
 
-Three still return **501 naming the format**, each for a reason the
-refusal states:
+An argument whose declared type the family's own spelling and this
+server's own reader disagree about is refused BY PROPERTY NAME rather
+than written approximately. On `gemma4` that is an `object` or `array`
+argument: the template writes a composite in gemma's DSL (bare keys,
+gemma-quoted strings) and ferrox reads a value with `serde_json`, so the
+spelling the checkpoint was trained to write comes back as a string. On
+the element formats it is a property with no declared `type` at all.
 
-- `gemma4`: arguments are a comma-separated list in gemma's own quoting
-  rather than a JSON object, so required-versus-optional cannot be said
-  by the object rule every other format shares. llama.cpp does not
-  schema-constrain gemma4 either.
-- `minimax_m3`: an argument is named by an element, and a repeated
-  element means an array, so what a name means depends on siblings that
-  have not been written yet.
+One still returns **501 naming the format**:
+
 - `muse_glimmer`: the call boundary is not syntactic. The same ATEM
-  block is a call in a tool channel and prose in a user-facing one.
+  block is a call in a tool channel and prose in a user-facing one, and
+  forcing the channel HEADER instead would need two facts about the
+  checkpoint's template rather than about the format: which recipient
+  name it addresses a tool with (the parser accepts any name that is not
+  `self` or `user`), and how much of that header the rendered prompt
+  already wrote, since a muse-glimmer prompt ends *inside* one. No
+  muse-glimmer checkpoint or template is on hand to read either off, and
+  guessing is the thing this refusal exists to prevent.
 
 ## Not yet
 

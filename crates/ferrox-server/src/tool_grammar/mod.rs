@@ -41,14 +41,14 @@
 //! one to write it, is this repo's dominant bug shape, and it decays into
 //! a 200 whose forced call this server cannot parse.
 //!
-//! Eight of the eleven formats this server parses can be forced today:
-//! the three whose payload is a JSON object behind a marker
-//! (hermes/qwen2.5, llama3, mistral), the four element grammars
-//! (qwen3_coder, glm47, minimax, deepseekv32), and gpt-oss's harmony
-//! channel. The remaining three -- gemma4, minimax_m3, muse_glimmer --
-//! are refused BY FORMAT NAME with the reason, in [`wire`]'s `shape`.
-//! A forced call served with a 200 that does not parse is worse than the
-//! 501, because the caller stops checking.
+//! Ten of the eleven formats this server parses can be forced: the three
+//! whose payload is a JSON object behind a marker (hermes/qwen2.5,
+//! llama3, mistral), the five element grammars (qwen3_coder, glm47,
+//! minimax, deepseekv32, minimax_m3), gemma4's pair list, and gpt-oss's
+//! harmony channel. The remaining one -- muse_glimmer -- is refused BY
+//! FORMAT NAME with the reason, in [`wire`]'s `shape`. A forced call
+//! served with a 200 that does not parse is worse than the 501, because
+//! the caller stops checking.
 //!
 //! # Lazy, and mandatory
 //!
@@ -403,14 +403,21 @@ mod tests {
         )
         .unwrap());
 
-        let (status, Json(body)) = build(Forced::Any, &tools, ToolCallFormat::Gemma4)
-            .expect_err("a gemma4 call's arguments are not an object rule this can write");
+        let gemma = build(Forced::Any, &tools, ToolCallFormat::Gemma4).unwrap();
+        assert!(feed(
+            &gemma,
+            &[r#"<|tool_call>call:get_weather{city:<|"|>Rome<|"|>}<tool_call|>"#]
+        )
+        .unwrap());
+
+        let (status, Json(body)) = build(Forced::Any, &tools, ToolCallFormat::MuseGlimmer)
+            .expect_err("a muse_glimmer call's boundary is a channel this cannot write");
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         assert!(
             body["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("gemma4"),
+                .contains("muse_glimmer"),
             "the refusal must name the format: {body}"
         );
     }
