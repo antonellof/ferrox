@@ -14,6 +14,7 @@ import {
   isStorable,
   pendingAppend,
   plainText,
+  restoredStatus,
   storedIds,
   toBranchable,
   type Conversation,
@@ -308,4 +309,83 @@ test("a reloaded conversation is immediately in sync", () => {
     false,
     "opening a conversation must not write it straight back",
   );
+});
+
+test("thinking is stored beside the answer, never inside it", () => {
+  // The user's case: an R1 turn cut off inside its thought is ALL
+  // reasoning. Stored as `content: ""` alone it reloaded as an empty
+  // bubble with the thinking gone.
+  const pending = pendingAppend(
+    repo([
+      item("u1", null, "user", "why"),
+      {
+        parentId: "u1",
+        message: {
+          id: "a1",
+          role: "assistant",
+          content: [{ type: "reasoning", text: "Let me think" }],
+          status: { type: "incomplete", reason: "length" },
+        },
+      },
+    ]),
+    new Set(),
+  );
+  assert.equal(pending.messages.length, 2, "a cut-off turn is stored");
+  assert.equal(pending.messages[1].content, "");
+  assert.equal(pending.messages[1].reasoning_content, "Let me think");
+  // A turn that never thought carries no key at all.
+  assert.equal("reasoning_content" in pending.messages[0], false);
+});
+
+test("a stored thought reloads above its answer, and a cut-off turn offers the way out", () => {
+  const conversation: Conversation = {
+    ...CONVERSATION,
+    messages: [
+      CONVERSATION.messages[0],
+      {
+        id: "a1",
+        parent_id: "u1",
+        role: "assistant",
+        content: "",
+        reasoning_content: "Let me think",
+        created_at: 1_700_000_001,
+        metadata: { custom: { stats: { outcome: "length" } } },
+      },
+      {
+        id: "a2",
+        parent_id: "u1",
+        role: "assistant",
+        content: "hello",
+        created_at: 1_700_000_002,
+        metadata: { custom: { stats: { outcome: "stopped-by-you" } } },
+      },
+    ],
+  };
+  const { items } = toBranchable(conversation);
+  assert.deepEqual(items[1].message.content, [
+    { type: "reasoning", text: "Let me think" },
+    { type: "text", text: "" },
+  ]);
+  // The status comes back from the outcome the runtime recorded, so
+  // Continue is offered after a reload exactly where it was before.
+  assert.deepEqual(items[1].message.status, {
+    type: "incomplete",
+    reason: "length",
+  });
+  assert.deepEqual(items[2].message.status, {
+    type: "incomplete",
+    reason: "cancelled",
+  });
+  assert.deepEqual(
+    items[2].message.content,
+    [{ type: "text", text: "hello" }],
+    "a turn that never thought grows no empty reasoning part",
+  );
+  // A record from before the field existed, or with no outcome at all,
+  // is complete: the old shape reads exactly as it did.
+  assert.deepEqual(restoredStatus(undefined), { type: "complete", reason: "stop" });
+  assert.deepEqual(restoredStatus({ custom: { stats: { outcome: "ok" } } }), {
+    type: "complete",
+    reason: "stop",
+  });
 });

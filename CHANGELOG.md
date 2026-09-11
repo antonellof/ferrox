@@ -13,6 +13,37 @@ Entries name what changed and, where it matters, what was wrong
 before. A fix that closed a silent-wrong-answer class says so — those
 are the ones worth reading twice.
 
+## [Unreleased]
+
+### Fixed
+
+- **A reasoning model that ran out of `max_tokens` inside its thought
+  showed thinking and then nothing.** Studio sent `max_tokens: 512` on
+  every request, DeepSeek-R1-Distill spends about 900 tokens thinking
+  on an ordinary question, the server correctly returned `finish_reason:
+  "length"` with empty content, and the UI rendered that as silence.
+  The default is now no cap (the context is the limit, llama.cpp's
+  `n_predict: -1`), a saved 512 from the old default is migrated away,
+  a `length` finish is shown as a cut-off with the token count, and a
+  **Continue** button carries on from where it stopped.
+- **The conversation store dropped a reasoning model's chain of
+  thought.** An answer that was entirely `reasoning_content` persisted
+  as `content: ""` and reloaded as an empty turn. The store keeps
+  `reasoning_content` beside `content`; records written before the
+  field read back unchanged.
+
+### Added
+
+- `continue_final_message` on `/v1/chat/completions`, llama.cpp's field
+  and value set (`true`, `"reasoning_content"`, `"content"`): the
+  trailing assistant message renders as a turn still being written, its
+  thought re-opened in the family's own markers, so the model continues
+  rather than starting over. Default off; the channel-grammar families
+  and a content continuation for an always-open family are 501 by name.
+- `reasoning_budget_tokens` / `thinking_budget_tokens` are refused by
+  name (501) except `-1`, rather than silently dropped. llama.cpp
+  enforces the budget in its sampler; ferrox has no such sampler yet.
+
 ## [0.20.0] - 2026-09-11
 
 ### Fixed

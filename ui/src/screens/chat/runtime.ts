@@ -12,6 +12,7 @@ import { useState } from "react";
 import {
   useLocalRuntime,
   type ChatModelAdapter,
+  type ChatModelRunOptions,
   type ChatModelRunResult,
   type ThreadMessage,
 } from "@assistant-ui/react";
@@ -27,33 +28,106 @@ import {
 import { fmtInt, fmtMs, fmtNum, isNum } from "@/lib/format";
 import { useLatest } from "@/lib/use-latest";
 
+/** Not re-exported by the react package under its own name. */
+type RunConfig = ChatModelRunOptions["runConfig"];
+
 export type Sampling = {
   system: string;
   temperature: number;
   topP: number;
-  maxTokens: number;
+  /**
+   * `null` sends no `max_tokens` at all, and the server then bounds the
+   * answer by the context window alone -- llama.cpp's `n_predict: -1`,
+   * and what its own web UI defaults to.
+   *
+   * This used to be 512. That is a decode-era number: a reasoning model
+   * spends more than that THINKING on an ordinary question, the budget
+   * runs out inside the thought, and the server correctly returns
+   * `finish_reason: "length"` with no answer at all. OpenAI's semantics
+   * count reasoning inside the completion budget, so the accounting was
+   * right and the number was wrong. There is no number that is right
+   * for every model, which is why the default is now no number: the
+   * context is the only limit that is always true.
+   */
+  maxTokens: number | null;
 };
 
 export const DEFAULT_SAMPLING: Sampling = {
   system: "",
   temperature: 0.7,
   topP: 0.95,
-  maxTokens: 512,
+  maxTokens: null,
 };
+
+/** The `max_tokens` the previous default sent. A saved settings blob
+ * still carrying it was never a choice, so it is not kept. */
+export const LEGACY_MAX_TOKENS = 512;
 
 /**
  * What the UI prints under an answer.
  *
  * `line` is the server's `usage`, formatted. `outcome` says how the
- * generation ended when that is not simply "it finished" — a short
- * answer and a truncated one look identical otherwise.
+ * generation ended when that is not simply "it finished" -- a short
+ * answer and a truncated one look identical otherwise, and `length` is
+ * the one that used to render as silence: the model was cut off, most
+ * often inside its own thinking, and nothing said so.
  */
 export type AnswerStats = {
   line: string;
   requestId: string | null;
-  outcome: "ok" | "stopped-by-you" | "stopped-by-server" | "error";
+  outcome: "ok" | "length" | "stopped-by-you" | "stopped-by-server" | "error";
   usage: Usage | null;
 };
+
+/** Whether an answer with this outcome can be picked up where it stopped. */
+export function canContinue(outcome: AnswerStats["outcome"]): boolean {
+  return (
+    outcome === "length" ||
+    outcome === "stopped-by-you" ||
+    outcome === "stopped-by-server"
+  );
+}
+
+/**
+ * A partial turn to carry on from: what the cut-off message already
+ * holds, so the continuation starts from it rather than from nothing.
+ */
+export type ContinueFrom = { reasoning: string; text: string };
+
+const CONTINUE_KEY = "continueFrom";
+
+/**
+ * The run config that turns a reload into a continuation.
+ *
+ * The parts ride in `runConfig.custom` because that is the one channel
+ * assistant-ui carries from the button that starts a run to the adapter
+ * that serves it. Written here and read by `readContinuation` below, so
+ * the key is spelled once.
+ */
+export function continuationRun(from: ContinueFrom): RunConfig {
+  return { custom: { [CONTINUE_KEY]: from } };
+}
+
+function readContinuation(runConfig: RunConfig): ContinueFrom | null {
+  const value = runConfig.custom?.[CONTINUE_KEY] as Partial<ContinueFrom> | undefined;
+  if (!value || typeof value !== "object") return null;
+  return {
+    reasoning: typeof value.reasoning === "string" ? value.reasoning : "",
+    text: typeof value.text === "string" ? value.text : "",
+  };
+}
+
+/** The reasoning and text parts of a message, concatenated by kind. */
+export function partsText(
+  content: readonly { type: string; text?: string }[],
+): ContinueFrom {
+  const pick = (kind: string) =>
+    content
+      .filter((part) => part.type === kind && typeof part.text === "string")
+      .map((part) => part.text as string)
+      .join("");
+  return { reasoning: pick("reasoning"), text: pick("text") };
+}
 
 /** Turns the server's `usage` into one line, omitting anything absent. */
 export function statLine(
@@ -93,10 +167,10 @@ function toWire(messages: readonly ThreadMessage[]): ChatMessage[] {
     // A message that failed carries no answer worth replaying.
     if (message.status?.type === "incomplete" && message.status.reason === "error")
       continue;
-    const text = message.content
-      .filter((part): part is { type: "text"; text: string } => part.type === "text")
-      .map((part) => part.text)
-      .join("");
+    // History carries the answer only. A turn that was cut off inside
+    // its thought has no answer and is not replayed; `Continue` on that
+    // turn is the path that sends the thought back.
+    const { text } = partsText(message.content);
     if (!text) continue;
     wire.push({ role: message.role, content: text });
   }
@@ -148,12 +222,26 @@ export type ChatDeps = {
 
 function makeAdapter(deps: ChatDeps): ChatModelAdapter {
   return {
-    async *run({ messages, abortSignal }) {
+    async *run({ messages, abortSignal, runConfig }) {
       const sampling = deps.sampling();
       const wire: ChatMessage[] = [];
       if (sampling.system.trim())
         wire.push({ role: "system", content: sampling.system.trim() });
       wire.push(...toWire(messages));
+
+      // A continuation: the cut-off turn goes back as the trailing
+      // assistant message, thought and all, and the server is asked to
+      // keep writing it rather than to open a new one. The new message
+      // starts out holding what the old one had, so the stream appends
+      // to a visible answer rather than replaying it.
+      const resume = readContinuation(runConfig);
+      if (resume) {
+        wire.push({
+          role: "assistant",
+          content: resume.text,
+          ...(resume.reasoning ? { reasoning_content: resume.reasoning } : {}),
+        });
+      }
 
       // ONE pump, carrying tagged chunks, rather than one per kind.
       // Two queues drained in sequence would be two structures that
@@ -178,7 +266,10 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
           messages: wire,
           temperature: sampling.temperature,
           top_p: sampling.topP,
-          max_tokens: sampling.maxTokens,
+          ...(sampling.maxTokens !== null
+            ? { max_tokens: sampling.maxTokens }
+            : {}),
+          ...(resume ? { continue_final_message: true } : {}),
         },
         {
           signal: abortSignal,
@@ -207,8 +298,8 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
           tokens.end();
         });
 
-      let text = "";
-      let reasoning = "";
+      let text = resume?.text ?? "";
+      let reasoning = resume?.reasoning ?? "";
       // Thinking is shown ABOVE the answer, which is also the order it
       // arrives in. An empty part is never emitted: a model that does
       // not think must not grow an empty block, and an answer that has
@@ -238,10 +329,16 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
         // than as an AbortError. Saying so is the difference between a
         // short answer and a truncated one, which look identical.
         const cancelled = finished?.finishReason === "cancelled";
+        // `length` is the server saying the budget ran out, not the
+        // model saying it was done. For a reasoning model that most
+        // often happens INSIDE the thought, so the message has thinking
+        // and no answer -- which, marked complete, looked like a model
+        // that chose to say nothing.
+        const cutOff = finished?.finishReason === "length";
         const stats: AnswerStats = {
           line: statLine(finished?.usage, id),
           requestId: id,
-          outcome: cancelled ? "stopped-by-server" : "ok",
+          outcome: cancelled ? "stopped-by-server" : cutOff ? "length" : "ok",
           usage: finished?.usage ?? null,
         };
         yield {
@@ -251,7 +348,9 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
           content: parts(),
           status: cancelled
             ? { type: "incomplete", reason: "cancelled" }
-            : { type: "complete", reason: "stop" },
+            : cutOff
+              ? { type: "incomplete", reason: "length" }
+              : { type: "complete", reason: "stop" },
           metadata: { custom: { stats } },
         } satisfies ChatModelRunResult;
         return;

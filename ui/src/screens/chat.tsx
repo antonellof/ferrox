@@ -30,6 +30,7 @@ import { cn } from "@/lib/utils";
 import { Thread } from "@/screens/chat/thread";
 import {
   DEFAULT_SAMPLING,
+  LEGACY_MAX_TOKENS,
   useFerroxRuntime,
   type Sampling,
 } from "@/screens/chat/runtime";
@@ -41,14 +42,23 @@ import { conversationLabel } from "@/lib/conversations";
 import { describeAway, RESUME_WINDOW_MS } from "@/lib/entry-state";
 import { useTabActivity } from "@/lib/use-tab-activity";
 
-const SETTINGS_KEY = "ferrox.studio.sampling.v1";
+const SETTINGS_KEY = "ferrox.studio.sampling.v2";
+/** The shape whose default `maxTokens` was 512. */
+const LEGACY_SETTINGS_KEY = "ferrox.studio.sampling.v1";
 
 function loadSampling(): Sampling {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    return raw
-      ? { ...DEFAULT_SAMPLING, ...JSON.parse(raw) }
-      : { ...DEFAULT_SAMPLING };
+    if (raw) return { ...DEFAULT_SAMPLING, ...JSON.parse(raw) };
+    // A v1 blob was written on every change, so nearly every one of
+    // them carries the old default of 512 without the user ever having
+    // chosen it. That number is the bug this migration exists for: it
+    // is dropped, and any other value is kept as the choice it was.
+    const legacy = localStorage.getItem(LEGACY_SETTINGS_KEY);
+    if (!legacy) return { ...DEFAULT_SAMPLING };
+    const parsed = JSON.parse(legacy) as Partial<Sampling>;
+    if (parsed.maxTokens === LEGACY_MAX_TOKENS) delete parsed.maxTokens;
+    return { ...DEFAULT_SAMPLING, ...parsed };
   } catch {
     return { ...DEFAULT_SAMPLING };
   }
@@ -289,21 +299,27 @@ function SamplingPanel({
               />
             </Field>
             <Field label="max_tokens">
+              {/* Empty is a value: no cap, the context is the limit. A
+                  reasoning model counts its thinking against this
+                  number, and a cap that fits an answer rarely fits the
+                  thought that precedes it. */}
               <Input
                 type="number"
                 min="1"
-                max="32768"
                 step="1"
-                value={value.maxTokens}
-                onChange={(e) =>
-                  set(
-                    "maxTokens",
-                    Math.max(1, Math.round(Number(e.target.value) || 1)),
-                  )
-                }
+                placeholder="no cap"
+                value={value.maxTokens ?? ""}
+                onChange={(e) => {
+                  const n = Math.round(Number(e.target.value));
+                  set("maxTokens", e.target.value === "" || n < 1 ? null : n);
+                }}
               />
             </Field>
           </div>
+          <p className="text-2xs text-faint">
+            With no cap, an answer runs until the model stops or the context
+            fills; Stop cancels it on the server. A cap counts thinking too.
+          </p>
           <Field
             label="system prompt"
             hint="Sent as the first message of every request, not stored on the server."
