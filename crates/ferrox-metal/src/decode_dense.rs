@@ -5,7 +5,7 @@
 //! host-side cost of encoding this stack is the whole remaining Metal
 //! decode gap, so the encode loop needs to live somewhere it can be read
 //! and changed in full. Per-token GPU/host accounting is in
-//! `crate::gpu::gpu_timing_note` and `crate::mem_ranges`.
+//! `crate::timing::gpu_timing_note` and `crate::mem_ranges`.
 
 use crate::attn::{
     assert_freq_factors_len, borrow_decode_scratch, copy_f32_into, encode_attn_extras,
@@ -578,7 +578,7 @@ pub fn launch_decode_dense_stack(
     encoder.endEncoding();
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
-    crate::gpu::gpu_timing_note(&cmd_buf, "dense-decode/tok", 32);
+    crate::timing::gpu_timing_note(&cmd_buf, "dense-decode/tok", 32);
 
     for kv in kvs.iter_mut() {
         kv.seq_len = pos + 1;

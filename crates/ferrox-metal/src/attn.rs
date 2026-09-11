@@ -5478,7 +5478,7 @@ pub fn launch_moe_decode_stack(
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
-        crate::gpu::gpu_timing_note(&cmd_buf, "moe-decode/tok", 32);
+        crate::timing::gpu_timing_note(&cmd_buf, "moe-decode/tok", 32);
 
         for kv in kvs.iter_mut() {
             kv.seq_len = pos + 1;
@@ -6369,7 +6369,7 @@ pub fn launch_prefill_dense_stack(
     cmd_buf.commit();
     cmd_buf.waitUntilCompleted();
     let gpu_us = t_gpu.elapsed().as_micros();
-    crate::gpu::gpu_timing_note(&cmd_buf, "prefill-dense-stack", 1);
+    crate::timing::gpu_timing_note(&cmd_buf, "prefill-dense-stack", 1);
 
     for kv in kvs.iter_mut() {
         kv.seq_len += batch;
@@ -6381,7 +6381,7 @@ pub fn launch_prefill_dense_stack(
         std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, batch * hidden_dim).to_vec()
     };
     if timing {
-        crate::gpu::mm_timing_add(setup_us, gpu_us, t_read.elapsed().as_micros());
+        crate::timing::mm_timing_add(setup_us, gpu_us, t_read.elapsed().as_micros());
     }
     Ok(out)
 }
@@ -6895,7 +6895,7 @@ mod tests {
     #[test]
     fn metal_mm_timing_env_is_optional() {
         // Documented hook for [`launch_prefill_dense_layer`]: when set, setup/gpu/readback
-        // microseconds accumulate via [`crate::gpu::mm_timing_add`].
+        // microseconds accumulate via [`crate::timing::mm_timing_add`].
         let enabled = std::env::var_os("FERROX_METAL_MM_TIMING").is_some();
         let _ = enabled;
     }
