@@ -10,7 +10,7 @@ breaking first and showing you.
 
 ## Screens
 
-Captured at 3200 by 2000 from a real `ferrox-server` on Apple Metal,
+Captured in the dark theme at 2160 by 1350 from a real `ferrox-server` on Apple Metal,
 serving Llama-3.2-3B-Instruct Q4_K_M. Nothing is mocked; the timings
 under each answer are the server's own usage numbers.
 
