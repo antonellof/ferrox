@@ -36,8 +36,26 @@ fn f16_buf(device: &ProtocolObject<dyn MTLDevice>, n: usize) -> Result<Buf, Meta
         .ok_or(MetalError::BufferAllocFailed)
 }
 
-/// GPU microseconds per dispatch of `encode`, serialized `n` deep.
+/// GPU microseconds per dispatch of `encode`, serialized `n` deep: the
+/// MINIMUM over `REPEATS` command buffers, because this host is never
+/// quiet and interference only ever adds time.
+const REPEATS: usize = 7;
+
 fn serialized_us(
+    shared: &Arc<SharedMetal>,
+    n: usize,
+    mut encode: impl FnMut(
+        &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    ) -> Result<(), MetalError>,
+) -> Result<f64, MetalError> {
+    let mut best = f64::INFINITY;
+    for _ in 0..REPEATS {
+        best = best.min(serialized_us_once(shared, n, &mut encode)?);
+    }
+    Ok(best)
+}
+
+fn serialized_us_once(
     shared: &Arc<SharedMetal>,
     n: usize,
     mut encode: impl FnMut(
@@ -217,7 +235,7 @@ fn serialized_small_kernel_costs() {
         }),
     );
 
-    eprintln!("serialized GPU us per dispatch, {N} deep, barrier between each:");
+    eprintln!("serialized GPU us per dispatch, {N} deep, barrier between each, min of {REPEATS}:");
     for (name, us) in &rows {
         eprintln!("  {name:<36} {us:>8.2} us");
     }

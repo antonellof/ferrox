@@ -15,146 +15,6 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLDevice, MTLSize};
 use std::ptr::NonNull;
 
-/// llama.cpp-style FA-vec decode for **head_dim=128**, f16 KV, NE=1, C=32.
-/// One TG per head; NSG simdgroups each own every NSG-th KV tile, then
-/// online-softmax merge. Replaces the old FA_VEC that recomputed V ×32.
-const GQA_DECODE_FA_VEC_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void gqa_decode_fa_vec(
-    device const float* q [[buffer(0)]],
-    device const half* k_cache [[buffer(1)]],
-    device const half* v_cache [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant uint& n_heads [[buffer(4)]],
-    constant uint& n_kv_heads [[buffer(5)]],
-    constant uint& head_dim [[buffer(6)]],
-    constant uint& seq_len [[buffer(7)]],
-    constant uint& kv_start [[buffer(8)]],
-    constant float& softcap [[buffer(9)]],
-    uint h [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg [[threads_per_threadgroup]],
-    threadgroup float* shared [[threadgroup(0)]]
-) {
-    // Specialized for D=128 (host only dispatches when head_dim==128).
-    constexpr uint D = 128u;
-    constexpr uint D4 = 32u;
-    constexpr uint C = 32u;
-    constexpr uint NW = 32u;
-    // Per-SG floats: C scores + D output.
-    constexpr uint SG_F = C + D;
-
-    if (h >= n_heads || seq_len == 0u || head_dim != D) return;
-
-    const uint tiisg = tid % NW;
-    const uint sgitg = tid / NW;
-    const uint nsg = tg / NW;
-
-    threadgroup float4* sq4 = (threadgroup float4*)shared;
-    threadgroup float* ss = shared + D + sgitg * SG_F;
-    threadgroup float4* so4 = (threadgroup float4*)(ss + C);
-
-    uint group_size = n_heads / max(n_kv_heads, 1u);
-    uint kv_h = h / max(group_size, 1u);
-    float scale = 1.0f / sqrt(float(D));
-
-    device const float4* q4 = (device const float4*)(q + h * D);
-    for (uint i = tid; i < D4; i += tg) {
-        sq4[i] = q4[i];
-    }
-    so4[tiisg] = float4(0.0f);
-    ss[tiisg] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float S = 0.0f;
-    float M = -INFINITY;
-
-    // Each SG walks KV tiles: ic0 = sgitg, sgitg+nsg, ...
-    for (uint ic0 = sgitg; ; ic0 += nsg) {
-        uint ic = kv_start + ic0 * C;
-        if (ic >= seq_len) break;
-        uint chunk = min(C, seq_len - ic);
-
-        // Q·K for all C positions: lane `ii` owns float4-slice `ii` of the head;
-        // after simd_sum, every lane holds the full score for each cc.
-        float scores[C];
-        for (uint cc = 0; cc < C; cc++) {
-            scores[cc] = -INFINITY;
-        }
-        for (uint cc = 0; cc < chunk; cc++) {
-            device const half4* k4 =
-                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-            float partial = dot(sq4[tiisg], float4(k4[tiisg]));
-            float sc = simd_sum(partial) * scale;
-            if (softcap > 0.0f) {
-                sc = softcap * tanh(sc / softcap);
-            }
-            scores[cc] = sc;
-        }
-
-        // Online softmax over this tile (one score per lane).
-        float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
-        float M2 = simd_max(max(M, s_lane));
-        float ms = (M == -INFINITY) ? 0.0f : exp(M - M2);
-        float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
-        S = S * ms + simd_sum(vs);
-        ss[tiisg] = vs;
-        so4[tiisg] *= ms;
-        M = M2;
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
-        // O += P · V  (lane owns float4-slice tiisg of the output)
-        float4 lo = float4(0.0f);
-        for (uint cc = 0; cc < chunk; cc++) {
-            device const half4* v4 =
-                (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-            lo += float4(v4[tiisg]) * ss[cc];
-        }
-        so4[tiisg] += lo;
-    }
-
-    // Publish S,M for cross-SG reduce (reuse ss[0], ss[1]).
-    if (tiisg == 0u) {
-        ss[0] = S;
-        ss[1] = M;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Cross-SG online-softmax merge.
-    for (uint r = nsg >> 1; r > 0u; r >>= 1) {
-        if (sgitg < r) {
-            threadgroup float* ss0 = shared + D + sgitg * SG_F;
-            threadgroup float* ss1 = shared + D + (sgitg + r) * SG_F;
-            threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
-            threadgroup float4* so1 = (threadgroup float4*)(ss1 + C);
-            float S0 = ss0[0];
-            float S1 = ss1[0];
-            float M0 = ss0[1];
-            float M1 = ss1[1];
-            float Mn = max(M0, M1);
-            float a0 = (M0 == -INFINITY) ? 0.0f : exp(M0 - Mn);
-            float a1 = (M1 == -INFINITY) ? 0.0f : exp(M1 - Mn);
-            if (tiisg == 0u) {
-                ss0[0] = S0 * a0 + S1 * a1;
-                ss0[1] = Mn;
-            }
-            so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (sgitg == 0u) {
-        threadgroup float* ss0 = shared + D;
-        threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
-        float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
-        device float4* out4 = (device float4*)(out + h * D);
-        out4[tiisg] = so0[tiisg] * inv;
-    }
-}
-"#;
-
 /// llama.cpp-style FA-vec decode for **head_dim=64**, f16 KV, NE=2, C=32.
 /// Same tile/merge structure as the d=128 kernel, but D4=16 float4
 /// slices only cover half a simdgroup — so each warp processes **two**
@@ -456,14 +316,35 @@ kernel void gqa_decode_fa_vec_d96(
 }
 "#;
 
-/// FA-vec decode for **head_dim=256** (Gemma-3). D4=64 float4 slices —
-/// each warp lane owns two slices (`tiisg` and `tiisg+32`) so the simd
-/// reduce still covers the full head.
-const GQA_DECODE_FA_VEC_D256_KERNEL_SRC: &str = r#"
+/// FA-vec decode for the two head widths a lane can own whole float4
+/// slices of: **128** (one slice per lane) and **256** (two). f16 KV,
+/// NE=1 (one key per simdgroup at a time, `simd_sum` per key), C=32
+/// keys per tile. One TG per head; NSG simdgroups each own every
+/// NSG-th tile, then an online-softmax merge across simdgroups.
+///
+/// The tile loops are COMPILE-TIME. The previous kernels walked
+/// `cc < chunk` with `chunk` a runtime value, and kept the tile's
+/// scores in a register array indexed by that runtime `cc`; an Apple
+/// GPU then issues each key's loads only after the previous key's
+/// `simd_sum`, so a tile of 32 keys was 32 memory latencies in a row
+/// twice, once for K and once for V. Measured serialized
+/// (`crate::kernel_bench`): 38.9 us for Gemma-2-2B's 8 heads of 256 at
+/// 96 keys, against llama.cpp's 13.4 us for the same op, and the
+/// difference is that its `FOR_UNROLL` tile loop lets every key's
+/// loads go out together. Here the loop is unrolled over all C keys;
+/// a key past the tile's valid count reads the tile's last valid row
+/// (always in bounds) and scores -INF, so its softmax weight is
+/// exactly zero and it adds exactly `v * 0.0f` to the output. The
+/// arithmetic order for every valid key is unchanged, so the result
+/// is bit-identical to the loop it replaces.
+const GQA_DECODE_FA_VEC_WIDE_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void gqa_decode_fa_vec_d256(
+#define FOR_UNROLL _Pragma("clang loop unroll(full)") for
+
+template <uint D>
+kernel void gqa_decode_fa_vec_wide(
     device const float* q [[buffer(0)]],
     device const half* k_cache [[buffer(1)]],
     device const half* v_cache [[buffer(2)]],
@@ -479,10 +360,13 @@ kernel void gqa_decode_fa_vec_d256(
     uint tg [[threads_per_threadgroup]],
     threadgroup float* shared [[threadgroup(0)]]
 ) {
-    constexpr uint D = 256u;
-    constexpr uint D4 = 64u;
+    constexpr uint D4 = D / 4u;
     constexpr uint C = 32u;
     constexpr uint NW = 32u;
+    // float4 slices of the head each lane owns: lane t owns slices
+    // t, t + 32, ... so the simd reduce covers the whole head.
+    constexpr uint SL = D4 / NW;
+    // Per-SG floats: C scores + D output.
     constexpr uint SG_F = C + D;
 
     if (h >= n_heads || seq_len == 0u || head_dim != D) return;
@@ -498,13 +382,16 @@ kernel void gqa_decode_fa_vec_d256(
     uint group_size = n_heads / max(n_kv_heads, 1u);
     uint kv_h = h / max(group_size, 1u);
     float scale = 1.0f / sqrt(float(D));
+    // float4 stride from one cached token's row of this kv head to the next.
+    const uint row4 = n_kv_heads * D4;
 
     device const float4* q4 = (device const float4*)(q + h * D);
     for (uint i = tid; i < D4; i += tg) {
         sq4[i] = q4[i];
     }
-    so4[tiisg] = float4(0.0f);
-    so4[tiisg + NW] = float4(0.0f);
+    FOR_UNROLL (uint sl = 0; sl < SL; sl++) {
+        so4[tiisg + sl * NW] = float4(0.0f);
+    }
     ss[tiisg] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -516,53 +403,72 @@ kernel void gqa_decode_fa_vec_d256(
         if (ic >= seq_len) break;
         uint chunk = min(C, seq_len - ic);
 
-        float scores[C];
-        for (uint cc = 0; cc < C; cc++) {
-            scores[cc] = -INFINITY;
-        }
-        for (uint cc = 0; cc < chunk; cc++) {
-            device const half4* k4 =
-                (device const half4*)(k_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
+        device const half4* k4 = (device const half4*)(k_cache + (ic * n_kv_heads + kv_h) * D);
+        device const half4* v4 = (device const half4*)(v_cache + (ic * n_kv_heads + kv_h) * D);
+
+        // Q.K for all C keys of the tile, every key's loads independent
+        // of the previous key's reduce. Lane `cc` keeps key `cc`'s
+        // score; a key past `chunk` reads the last valid row and is
+        // masked to -INF.
+        float s_lane = -INFINITY;
+        FOR_UNROLL (uint cc = 0; cc < C; cc++) {
+            const uint r = min(cc, chunk - 1u);
+            device const half4* kr = k4 + r * row4;
             float partial = 0.0f;
-            for (uint i = tiisg; i < D4; i += NW) {
-                partial += dot(sq4[i], float4(k4[i]));
+            FOR_UNROLL (uint sl = 0; sl < SL; sl++) {
+                partial += dot(sq4[tiisg + sl * NW], float4(kr[tiisg + sl * NW]));
             }
             float sc = simd_sum(partial) * scale;
-            if (softcap > 0.0f) {
-                sc = softcap * tanh(sc / softcap);
+            if (tiisg == cc) {
+                s_lane = (cc < chunk) ? sc : -INFINITY;
             }
-            scores[cc] = sc;
+        }
+        // Softcap once per lane on the score it kept, not 32 times per
+        // lane on every key's broadcast score: the same expression on
+        // the same value, so the same result.
+        if (softcap > 0.0f && s_lane != -INFINITY) {
+            s_lane = softcap * tanh(s_lane / softcap);
         }
 
-        float s_lane = (tiisg < chunk) ? scores[tiisg] : -INFINITY;
+        // Online softmax over this tile (one score per lane).
         float M2 = simd_max(max(M, s_lane));
         float ms = (M == -INFINITY) ? 0.0f : exp(M - M2);
         float vs = (s_lane == -INFINITY) ? 0.0f : exp(s_lane - M2);
         S = S * ms + simd_sum(vs);
         ss[tiisg] = vs;
-        so4[tiisg] *= ms;
-        so4[tiisg + NW] *= ms;
+        FOR_UNROLL (uint sl = 0; sl < SL; sl++) {
+            so4[tiisg + sl * NW] *= ms;
+        }
         M = M2;
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        float4 lo0 = float4(0.0f);
-        float4 lo1 = float4(0.0f);
-        for (uint cc = 0; cc < chunk; cc++) {
-            device const half4* v4 =
-                (device const half4*)(v_cache + ((ic + cc) * n_kv_heads + kv_h) * D);
-            lo0 += float4(v4[tiisg]) * ss[cc];
-            lo1 += float4(v4[tiisg + NW]) * ss[cc];
+        // O += P . V, again over all C keys: a masked key's weight is
+        // exactly zero, and its clamped row is finite, so it adds 0.
+        float4 lo[SL];
+        FOR_UNROLL (uint sl = 0; sl < SL; sl++) {
+            lo[sl] = float4(0.0f);
         }
-        so4[tiisg] += lo0;
-        so4[tiisg + NW] += lo1;
+        FOR_UNROLL (uint cc = 0; cc < C; cc++) {
+            const uint r = min(cc, chunk - 1u);
+            device const half4* vr = v4 + r * row4;
+            const float p = ss[cc];
+            FOR_UNROLL (uint sl = 0; sl < SL; sl++) {
+                lo[sl] += float4(vr[tiisg + sl * NW]) * p;
+            }
+        }
+        FOR_UNROLL (uint sl = 0; sl < SL; sl++) {
+            so4[tiisg + sl * NW] += lo[sl];
+        }
     }
 
+    // Publish S,M for cross-SG reduce (reuse ss[0], ss[1]).
     if (tiisg == 0u) {
         ss[0] = S;
         ss[1] = M;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Cross-SG online-softmax merge.
     for (uint r = nsg >> 1; r > 0u; r >>= 1) {
         if (sgitg < r) {
             threadgroup float* ss0 = shared + D + sgitg * SG_F;
@@ -580,8 +486,9 @@ kernel void gqa_decode_fa_vec_d256(
                 ss0[0] = S0 * a0 + S1 * a1;
                 ss0[1] = Mn;
             }
-            so0[tiisg] = so0[tiisg] * a0 + so1[tiisg] * a1;
-            so0[tiisg + NW] = so0[tiisg + NW] * a0 + so1[tiisg + NW] * a1;
+            FOR_UNROLL (uint sl = 0; sl < SL; sl++) {
+                so0[tiisg + sl * NW] = so0[tiisg + sl * NW] * a0 + so1[tiisg + sl * NW] * a1;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -591,10 +498,15 @@ kernel void gqa_decode_fa_vec_d256(
         threadgroup float4* so0 = (threadgroup float4*)(ss0 + C);
         float inv = (ss0[0] == 0.0f) ? 0.0f : (1.0f / ss0[0]);
         device float4* out4 = (device float4*)(out + h * D);
-        out4[tiisg] = so0[tiisg] * inv;
-        out4[tiisg + NW] = so0[tiisg + NW] * inv;
+        FOR_UNROLL (uint sl = 0; sl < SL; sl++) {
+            out4[tiisg + sl * NW] = so0[tiisg + sl * NW] * inv;
+        }
     }
 }
+
+typedef decltype(gqa_decode_fa_vec_wide<128>) gqa_decode_fa_vec_wide_t;
+template [[host_name("gqa_decode_fa_vec_d128")]] kernel gqa_decode_fa_vec_wide_t gqa_decode_fa_vec_wide<128>;
+template [[host_name("gqa_decode_fa_vec_d256")]] kernel gqa_decode_fa_vec_wide_t gqa_decode_fa_vec_wide<256>;
 "#;
 
 /// TG size for FA-vec decode (d=64/96/128/256): NSG=8 × NW=32.
@@ -625,10 +537,14 @@ pub(crate) fn encode_gqa_fa_vec(
     let pipe = match head_dim {
         256 => ensure_pipeline(
             device,
-            GQA_DECODE_FA_VEC_D256_KERNEL_SRC,
+            GQA_DECODE_FA_VEC_WIDE_KERNEL_SRC,
             "gqa_decode_fa_vec_d256",
         )?,
-        128 => ensure_pipeline(device, GQA_DECODE_FA_VEC_KERNEL_SRC, "gqa_decode_fa_vec")?,
+        128 => ensure_pipeline(
+            device,
+            GQA_DECODE_FA_VEC_WIDE_KERNEL_SRC,
+            "gqa_decode_fa_vec_d128",
+        )?,
         96 => ensure_pipeline(
             device,
             GQA_DECODE_FA_VEC_D96_KERNEL_SRC,
