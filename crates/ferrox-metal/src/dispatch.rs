@@ -1,12 +1,17 @@
 //! The one place this crate encodes a compute dispatch, and the counters
 //! that measure what a decode token costs the host.
 //!
-//! GitHub issue #149 measured that ferrox's Metal kernels already finish
-//! faster than llama.cpp's whole token, and that 26-29% of decode wall
-//! time is host-side command encoding: `dispatchThreadgroups`,
-//! `emitComputeProgramVariantAndArguments`, `memoryBarrierWithResources`.
-//! The lever is FEWER ENCODED DISPATCHES AND FEWER BARRIERS per token,
-//! which is only actionable if both are counted.
+//! GitHub issue #149 measured that 26-29% of Metal decode wall time was
+//! not GPU time, and read that as host-side command encoding:
+//! `dispatchThreadgroups`, `emitComputeProgramVariantAndArguments`,
+//! `memoryBarrierWithResources`. Counting was the first step, and the
+//! count retired that reading in two stages: PR #156 removed 13% of the
+//! dispatches for 2.3% of the host time, and `crate::timing` then
+//! clocked the encode phase directly at 0.15 ms per token on
+//! Llama-3.2-1B and 0.4 ms on Gemma-2-2B, about 2% of wall. Most of
+//! the 26% was a second, untimed command buffer executing on the GPU.
+//! The counters stay because a claim about encode work still needs
+//! them to be checked.
 //!
 //! So every `dispatchThreadgroups_threadsPerThreadgroup` in the crate
 //! goes through [`dispatch_counted`], and every barrier through
@@ -109,6 +114,7 @@ mod tests {
             ("lib.rs", include_str!("lib.rs")),
             ("mem_ranges.rs", include_str!("mem_ranges.rs")),
             ("moe_ids.rs", include_str!("moe_ids.rs")),
+            ("timing.rs", include_str!("timing.rs")),
         ];
         // This file holds the wrapper (the one legitimate caller of the
         // raw dispatch method) and the patterns this test searches for,

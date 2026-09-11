@@ -39,6 +39,9 @@ mod dispatch;
 mod mem_ranges;
 
 #[cfg(feature = "metal")]
+pub(crate) mod timing;
+
+#[cfg(feature = "metal")]
 mod moe_ids;
 
 #[cfg(feature = "metal")]
