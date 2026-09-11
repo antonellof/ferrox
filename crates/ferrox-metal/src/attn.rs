@@ -2484,7 +2484,7 @@ impl MetalGraph {
             }
         }
 
-        let (rope_src, rope_name) = crate::rope::rope_batch_kernel(params.rope_layout.layout);
+        let (rope_src, rope_name) = crate::rope::rope_kernel(params.rope_layout.layout);
         ensure_pipeline(device, rope_src, rope_name)?;
         mark(rope_name);
 

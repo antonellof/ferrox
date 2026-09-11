@@ -123,120 +123,39 @@ pub struct LayerRope<'a> {
 /// questions and only the outer one decides whether a dispatch happens.
 pub(crate) type EncodedRope<'a> = Option<(f32, Option<&'a ProtocolObject<dyn MTLBuffer>>)>;
 
-// Norm (interleaved) and NeoX (split-half) kernels share the same buffer
-// layout so `encode_rope` only swaps the entry point. Math mirrors
-// `ferrox_core::attention::{apply_rope_interleaved, apply_rope}` —
-// no Candle / third-party RoPE dependency.
+// Norm (interleaved) and NeoX (split-half) pairing are one templated
+// kernel, instantiated twice, so `encode_rope` only swaps the entry
+// point. Math mirrors `ferrox_core::attention::{apply_rope_interleaved,
+// apply_rope}` -- no Candle / third-party RoPE dependency.
 //
-// Both take TWO destinations (buffers 0/1 and 9/10) because every decode
-// call site ropes Q and then K with the same theta, position and freq
-// factors, and RoPE touches each head independently, so the two are one
-// dispatch. GitHub issue #149: 26-29% of Metal decode wall time is host
-// command encoding, and this pair was 16 of the 242 dispatches a
-// Llama-3.2-1B token encoded. A caller with one destination passes
-// `n_heads2 = 0`, which makes the second range empty.
-const ROPE_NORM_KERNEL_SRC: &str = r#"
+// ONE THREAD PER ROTARY PAIR. The previous kernels dispatched one thread
+// per head -- threadgroups of width 1 -- and looped over every pair
+// inside it, `pow` + `sin` + `cos` per iteration: 128 serial
+// transcendentals per thread on a 256-wide head, on 1/32 of each SIMD
+// unit. Measured serialized (`crate::kernel_bench`) that was 61.6 us
+// for Gemma-2-2B's 8+4 heads and 21.4 us for Llama-3.2-3B's 24+8,
+// against llama.cpp's 2 x 2.8 us for the same rotation. The per-pair
+// arithmetic is unchanged, expression for expression, so the result
+// is the same; only the thread it runs on differs.
+//
+// Two destinations (buffers 0 and 9) because every decode call site
+// ropes Q and then K with the same theta, position and freq factors,
+// and RoPE touches each head independently, so the two are one
+// dispatch (GitHub issue #149). A caller with one destination passes
+// `n_heads2 = 0`. `n_tokens > 1` is the prefill shape, heads packed
+// `[token][head][head_dim]` from `base_pos`; decode is `n_tokens = 1`.
+const ROPE_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void rope_interleaved_heads(
-    device float* vecs [[buffer(0)]],
-    constant uint& n_heads [[buffer(1)]],
-    constant uint& head_dim [[buffer(2)]],
-    constant float& theta [[buffer(3)]],
-    constant uint& pos [[buffer(4)]],
-    device const float* freq_factors [[buffer(5)]],
-    constant uint& use_freq_factors [[buffer(6)]],
-    constant uint& rot_dim [[buffer(7)]],
-    constant float& mscale [[buffer(8)]],
-    device float* vecs2 [[buffer(9)]],
-    constant uint& n_heads2 [[buffer(10)]],
-    uint h [[thread_position_in_grid]]
-) {
-    if (h >= n_heads + n_heads2) return;
-    // Heads [0, n_heads) rotate `vecs`; [n_heads, n_heads + n_heads2)
-    // rotate `vecs2`. Distinct buffers, one head each, so the two
-    // ranges never alias.
-    device float* base = (h < n_heads) ? vecs : vecs2;
-    uint head = (h < n_heads) ? h : (h - n_heads);
-    device float* vec = base + head * head_dim;
-    // ggml `n_dims`: the rotary width. `kernel_rope_norm` rotates
-    // `[0, n_dims)` and copies `[n_dims, ne0)` straight through, and the
-    // frequency exponent is `-i0/n_dims`, not `-i0/head_dim`.
-    uint rot = (rot_dim == 0u || rot_dim > head_dim) ? head_dim : rot_dim;
-    uint half_dim = rot / 2u;
-    for (uint i = 0; i < half_dim; i++) {
-        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
-        float angle = float(pos) * freq;
-        if (use_freq_factors != 0u) {
-            angle /= freq_factors[i];
-        }
-        // ggml folds `attn_factor` into cos/sin inside `rope_yarn`, so
-        // it reaches the ROTATED channels only; the pass-through tail
-        // above must come out bit-identical.
-        float s = sin(angle) * mscale;
-        float c = cos(angle) * mscale;
-        float a = vec[2u * i];
-        float b = vec[2u * i + 1u];
-        vec[2u * i] = a * c - b * s;
-        vec[2u * i + 1u] = a * s + b * c;
-    }
-}
-"#;
-
-const ROPE_NEOX_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void rope_neox_heads(
-    device float* vecs [[buffer(0)]],
-    constant uint& n_heads [[buffer(1)]],
-    constant uint& head_dim [[buffer(2)]],
-    constant float& theta [[buffer(3)]],
-    constant uint& pos [[buffer(4)]],
-    device const float* freq_factors [[buffer(5)]],
-    constant uint& use_freq_factors [[buffer(6)]],
-    constant uint& rot_dim [[buffer(7)]],
-    constant float& mscale [[buffer(8)]],
-    device float* vecs2 [[buffer(9)]],
-    constant uint& n_heads2 [[buffer(10)]],
-    uint h [[thread_position_in_grid]]
-) {
-    if (h >= n_heads + n_heads2) return;
-    // Heads [0, n_heads) rotate `vecs`; [n_heads, n_heads + n_heads2)
-    // rotate `vecs2`. Distinct buffers, one head each, so the two
-    // ranges never alias.
-    device float* base = (h < n_heads) ? vecs : vecs2;
-    uint head = (h < n_heads) ? h : (h - n_heads);
-    device float* vec = base + head * head_dim;
-    // `kernel_rope_neox` pairs `ic` with `ic + n_dims/2` — the split is
-    // over the ROTARY width, not the head, so partial rotary changes
-    // which channel each one is paired with, not just how many rotate.
-    uint rot = (rot_dim == 0u || rot_dim > head_dim) ? head_dim : rot_dim;
-    uint half_dim = rot / 2u;
-    for (uint i = 0; i < half_dim; i++) {
-        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
-        float angle = float(pos) * freq;
-        if (use_freq_factors != 0u) {
-            angle /= freq_factors[i];
-        }
-        // `mscale` folded into cos/sin (ggml `rope_yarn`): rotated
-        // channels only, never the `[n_rot, head_dim)` tail.
-        float s = sin(angle) * mscale;
-        float c = cos(angle) * mscale;
-        float a = vec[i];
-        float b = vec[i + half_dim];
-        vec[i] = a * c - b * s;
-        vec[i + half_dim] = a * s + b * c;
-    }
-}
-"#;
-
-const ROPE_NORM_BATCH_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void rope_interleaved_heads_batch(
+// NEOX = false: adjacent pairs `(2i, 2i+1)`, ggml `kernel_rope_norm`.
+// NEOX = true: split-half pairs `(i, i + n_dims/2)`, `kernel_rope_neox`.
+// ggml `n_dims` (`rot_dim`) scopes both the pairing and the frequency
+// exponent: channels `[n_dims, head_dim)` pass through untouched, and
+// `mscale` (ggml `rope_yarn`'s attn_factor) is folded into cos/sin so
+// it reaches the rotated channels only.
+template <bool NEOX>
+kernel void rope_pairs(
     device float* vecs [[buffer(0)]],
     constant uint& n_heads [[buffer(1)]],
     constant uint& head_dim [[buffer(2)]],
@@ -244,93 +163,67 @@ kernel void rope_interleaved_heads_batch(
     constant uint& base_pos [[buffer(4)]],
     device const float* freq_factors [[buffer(5)]],
     constant uint& use_freq_factors [[buffer(6)]],
-    constant uint& n_tokens [[buffer(7)]],
-    constant uint& rot_dim [[buffer(8)]],
-    constant float& mscale [[buffer(9)]],
-    uint2 gid [[thread_position_in_grid]]
+    constant uint& rot_dim [[buffer(7)]],
+    constant float& mscale [[buffer(8)]],
+    device float* vecs2 [[buffer(9)]],
+    constant uint& n_heads2 [[buffer(10)]],
+    constant uint& n_tokens [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]]
 ) {
-    uint h = gid.x;
-    uint t = gid.y;
-    if (h >= n_heads || t >= n_tokens) return;
-    uint pos = base_pos + t;
-    device float* vec = vecs + (t * n_heads + h) * head_dim;
-    // See `rope_interleaved_heads`: ggml `n_dims` scopes both the loop
-    // and the frequency exponent; `mscale` never leaves it.
+    const uint i = gid.x;
+    const uint h = gid.y;
+    const uint t = gid.z;
     uint rot = (rot_dim == 0u || rot_dim > head_dim) ? head_dim : rot_dim;
     uint half_dim = rot / 2u;
-    for (uint i = 0; i < half_dim; i++) {
-        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
-        float angle = float(pos) * freq;
-        if (use_freq_factors != 0u) {
-            angle /= freq_factors[i];
-        }
-        float s = sin(angle) * mscale;
-        float c = cos(angle) * mscale;
-        float a = vec[2u * i];
-        float b = vec[2u * i + 1u];
-        vec[2u * i] = a * c - b * s;
-        vec[2u * i + 1u] = a * s + b * c;
+    if (i >= half_dim || h >= n_heads + n_heads2 || t >= n_tokens) return;
+    // Heads [0, n_heads) rotate `vecs`; [n_heads, n_heads + n_heads2)
+    // rotate `vecs2`. Distinct buffers, so the two ranges never alias.
+    const bool second = h >= n_heads;
+    device float* base = second ? vecs2 : vecs;
+    const uint head = second ? (h - n_heads) : h;
+    const uint heads_here = second ? n_heads2 : n_heads;
+    device float* vec = base + (t * heads_here + head) * head_dim;
+    const uint pos = base_pos + t;
+    float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
+    float angle = float(pos) * freq;
+    if (use_freq_factors != 0u) {
+        angle /= freq_factors[i];
     }
+    float s = sin(angle) * mscale;
+    float c = cos(angle) * mscale;
+    const uint ia = NEOX ? i : 2u * i;
+    const uint ib = NEOX ? (i + half_dim) : (2u * i + 1u);
+    float a = vec[ia];
+    float b = vec[ib];
+    vec[ia] = a * c - b * s;
+    vec[ib] = a * s + b * c;
 }
+
+template [[host_name("rope_norm_pairs")]] kernel void rope_pairs<false>(
+    device float*, constant uint&, constant uint&, constant float&, constant uint&,
+    device const float*, constant uint&, constant uint&, constant float&, device float*,
+    constant uint&, constant uint&, uint3);
+template [[host_name("rope_neox_pairs")]] kernel void rope_pairs<true>(
+    device float*, constant uint&, constant uint&, constant float&, constant uint&,
+    device const float*, constant uint&, constant uint&, constant float&, device float*,
+    constant uint&, constant uint&, uint3);
 "#;
 
-const ROPE_NEOX_BATCH_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void rope_neox_heads_batch(
-    device float* vecs [[buffer(0)]],
-    constant uint& n_heads [[buffer(1)]],
-    constant uint& head_dim [[buffer(2)]],
-    constant float& theta [[buffer(3)]],
-    constant uint& base_pos [[buffer(4)]],
-    device const float* freq_factors [[buffer(5)]],
-    constant uint& use_freq_factors [[buffer(6)]],
-    constant uint& n_tokens [[buffer(7)]],
-    constant uint& rot_dim [[buffer(8)]],
-    constant float& mscale [[buffer(9)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    uint h = gid.x;
-    uint t = gid.y;
-    if (h >= n_heads || t >= n_tokens) return;
-    uint pos = base_pos + t;
-    device float* vec = vecs + (t * n_heads + h) * head_dim;
-    // See `rope_neox_heads`: the split-half pairing is over `n_dims`.
-    uint rot = (rot_dim == 0u || rot_dim > head_dim) ? head_dim : rot_dim;
-    uint half_dim = rot / 2u;
-    for (uint i = 0; i < half_dim; i++) {
-        float freq = 1.0f / pow(theta, (2.0f * float(i)) / float(rot));
-        float angle = float(pos) * freq;
-        if (use_freq_factors != 0u) {
-            angle /= freq_factors[i];
-        }
-        float s = sin(angle) * mscale;
-        float c = cos(angle) * mscale;
-        float a = vec[i];
-        float b = vec[i + half_dim];
-        vec[i] = a * c - b * s;
-        vec[i + half_dim] = a * s + b * c;
-    }
-}
-"#;
-
-/// The decode kernel (source, entry point) for a pairing convention.
-/// One table, read by the encoder and by the prefill pipeline warm-up.
+/// The kernel (source, entry point) for a pairing convention. One
+/// table, read by both encoders and by the prefill pipeline warm-up;
+/// one kernel serves decode (`n_tokens = 1`) and prefill.
 pub(crate) fn rope_kernel(layout: MetalRopeLayout) -> (&'static str, &'static str) {
     match layout {
-        MetalRopeLayout::Norm => (ROPE_NORM_KERNEL_SRC, "rope_interleaved_heads"),
-        MetalRopeLayout::Neox => (ROPE_NEOX_KERNEL_SRC, "rope_neox_heads"),
+        MetalRopeLayout::Norm => (ROPE_KERNEL_SRC, "rope_norm_pairs"),
+        MetalRopeLayout::Neox => (ROPE_KERNEL_SRC, "rope_neox_pairs"),
     }
 }
 
-/// The prefill (many positions) kernel for a pairing convention.
-pub(crate) fn rope_batch_kernel(layout: MetalRopeLayout) -> (&'static str, &'static str) {
-    match layout {
-        MetalRopeLayout::Norm => (ROPE_NORM_BATCH_KERNEL_SRC, "rope_interleaved_heads_batch"),
-        MetalRopeLayout::Neox => (ROPE_NEOX_BATCH_KERNEL_SRC, "rope_neox_heads_batch"),
-    }
-}
+/// Threads per threadgroup along the rotary-pair axis. Pairs per head
+/// are 32 (d=64) to 128 (d=256), so 32 keeps every threadgroup full
+/// for every head width the kernels serve and never idles a lane on a
+/// partial-rotary width such as Phi-3's 48.
+const ROPE_PAIRS_PER_THREADGROUP: usize = 32;
 
 /// ggml sizes `rope_freqs` (`src2` in `kernel_rope_norm`) by the ROTARY
 /// width: it is indexed `[i0/2]` for `i0 < n_dims`, so it carries
@@ -375,6 +268,68 @@ pub(crate) fn encode_rope(
     pos: u32,
     freq_factors: Option<&ProtocolObject<dyn MTLBuffer>>,
 ) -> Result<(), MetalError> {
+    encode_rope_grid(
+        encoder,
+        device,
+        rope,
+        first,
+        second,
+        head_dim,
+        theta,
+        pos,
+        1,
+        freq_factors,
+    )
+}
+
+/// RoPE `n_tokens` consecutive positions from `base_pos` in one
+/// dispatch: `vecs` is `[n_tokens, n_heads, head_dim]`. The prefill
+/// shape of [`encode_rope`], on the same kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_rope_batch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    rope: MetalRope,
+    vecs: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    head_dim: u32,
+    theta: f32,
+    base_pos: u32,
+    n_tokens: u32,
+    freq_factors: Option<&ProtocolObject<dyn MTLBuffer>>,
+) -> Result<(), MetalError> {
+    if n_tokens == 0 {
+        return Ok(());
+    }
+    encode_rope_grid(
+        encoder,
+        device,
+        rope,
+        RopeTarget { vecs, n_heads },
+        None,
+        head_dim,
+        theta,
+        base_pos,
+        n_tokens,
+        freq_factors,
+    )
+}
+
+/// The one encoder behind [`encode_rope`] and [`encode_rope_batch`]:
+/// a grid of (rotary pair, head across both destinations, token).
+#[allow(clippy::too_many_arguments)]
+fn encode_rope_grid(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    rope: MetalRope,
+    first: RopeTarget<'_>,
+    second: Option<RopeTarget<'_>>,
+    head_dim: u32,
+    theta: f32,
+    base_pos: u32,
+    n_tokens: u32,
+    freq_factors: Option<&ProtocolObject<dyn MTLBuffer>>,
+) -> Result<(), MetalError> {
     let vecs = first.vecs;
     let n_heads = first.n_heads;
     // With no second destination the kernel's `h < n_heads` branch is the
@@ -407,7 +362,7 @@ pub(crate) fn encode_rope(
             4,
             3,
         );
-        let mut pos_u = pos;
+        let mut pos_u = base_pos;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut pos_u as *mut u32 as *mut _).unwrap(),
             4,
@@ -455,118 +410,26 @@ pub(crate) fn encode_rope(
             4,
             10,
         );
+        let mut n_tokens_u = n_tokens;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_tokens_u as *mut u32 as *mut _).unwrap(),
+            4,
+            11,
+        );
     }
+    // The pair axis is sized from the HEAD width, an upper bound on the
+    // rotary width; the kernel derives the rotary width from `rot_dim`
+    // and exits past it, so the rule lives in one place.
+    let pairs_upper = (head_dim as usize).div_ceil(2);
     dispatch_counted(
         encoder,
         MTLSize {
-            width: (n_heads + n_heads2) as usize,
-            height: 1,
-            depth: 1,
+            width: pairs_upper.div_ceil(ROPE_PAIRS_PER_THREADGROUP),
+            height: (n_heads + n_heads2) as usize,
+            depth: n_tokens as usize,
         },
         MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_rope_batch(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    rope: MetalRope,
-    vecs: &ProtocolObject<dyn MTLBuffer>,
-    n_heads: u32,
-    head_dim: u32,
-    theta: f32,
-    base_pos: u32,
-    n_tokens: u32,
-    freq_factors: Option<&ProtocolObject<dyn MTLBuffer>>,
-) -> Result<(), MetalError> {
-    if n_tokens == 0 {
-        return Ok(());
-    }
-    let (src, name) = rope_batch_kernel(rope.layout);
-    let pipe = ensure_pipeline(device, src, name)?;
-    encoder.setComputePipelineState(&pipe.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(vecs), 0, 0);
-        let mut n_heads_u = n_heads;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_heads_u as *mut u32 as *mut _).unwrap(),
-            4,
-            1,
-        );
-        let mut head_dim_u = head_dim;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut head_dim_u as *mut u32 as *mut _).unwrap(),
-            4,
-            2,
-        );
-        let mut theta_f = theta;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut theta_f as *mut f32 as *mut _).unwrap(),
-            4,
-            3,
-        );
-        let mut base_pos_u = base_pos;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut base_pos_u as *mut u32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        if let Some(ff) = freq_factors {
-            encoder.setBuffer_offset_atIndex(Some(ff), 0, 5);
-            let mut use_ff = 1u32;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut use_ff as *mut u32 as *mut _).unwrap(),
-                4,
-                6,
-            );
-        } else {
-            let mut scratch = [0u8; 4];
-            encoder.setBytes_length_atIndex(
-                NonNull::new(scratch.as_mut_ptr() as *mut _).unwrap(),
-                4,
-                5,
-            );
-            let mut use_ff = 0u32;
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&mut use_ff as *mut u32 as *mut _).unwrap(),
-                4,
-                6,
-            );
-        }
-        let mut n_tok = n_tokens;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_tok as *mut u32 as *mut _).unwrap(),
-            4,
-            7,
-        );
-        let mut rot_dim_u = rope.rot_dim_uniform();
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut rot_dim_u as *mut u32 as *mut _).unwrap(),
-            4,
-            8,
-        );
-        let mut mscale_f = rope.attn_factor;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut mscale_f as *mut f32 as *mut _).unwrap(),
-            4,
-            9,
-        );
-    }
-    dispatch_counted(
-        encoder,
-        MTLSize {
-            width: n_heads as usize,
-            height: n_tokens as usize,
-            depth: 1,
-        },
-        MTLSize {
-            width: 1,
+            width: ROPE_PAIRS_PER_THREADGROUP,
             height: 1,
             depth: 1,
         },
