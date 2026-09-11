@@ -25,6 +25,7 @@ pub mod admin;
 pub mod cancel;
 pub mod health;
 pub mod lifecycle;
+pub mod lora;
 pub mod progress;
 pub mod request_id;
 pub mod routes;
@@ -38,6 +39,7 @@ pub use admin::{
 pub use cancel::{CancelGenerationRequest, CancelGenerationResponse};
 pub use health::{Capability, HealthResponse, HealthState};
 pub use lifecycle::{ServerReady, READY_EVENT};
+pub use lora::{LoraAdapterInfo, LoraApplyResponse, LoraScaleRequest};
 pub use progress::{RateEstimator, RateReport};
 pub use request_id::next_request_id;
 pub use usage::{CompletionTokensDetails, Usage};

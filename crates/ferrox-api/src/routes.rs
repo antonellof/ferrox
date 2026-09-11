@@ -195,6 +195,12 @@ pub const V1_CACHE_REBUILD: &str = "/v1/cache/rebuild";
 /// cannot race the last sampled token.
 pub const ADMIN_PREPARE_STOP: &str = "/v1/admin/prepare-stop";
 
+/// The loaded LoRA adapters, llama.cpp's `GET /lora-adapters` (the
+/// list with each adapter's current scale) and `POST /lora-adapters`
+/// (set the scales; an adapter not named goes to 0). See
+/// [`crate::lora`].
+pub const LORA_ADAPTERS: &str = "/lora-adapters";
+
 /// Save or restore one slot's KV state, llama.cpp's
 /// `POST /slots/:id_slot?action=save|restore`.
 ///
@@ -260,6 +266,7 @@ pub const ALL: &[&str] = &[
     V1_CACHE_STATUS,
     V1_CACHE_REBUILD,
     ADMIN_PREPARE_STOP,
+    LORA_ADAPTERS,
 ];
 
 #[cfg(test)]

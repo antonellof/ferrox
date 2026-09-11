@@ -24,6 +24,8 @@ namespaces, and the prefix tells you which:
 | `FERROX_MODEL_DIR` | Extra directory `GET /admin/models` scans, and the one `POST /admin/download` writes into. Without it, the directory holding `FERROX_MODEL_PATH` is used; with neither, downloads are refused (`412`) rather than guessing a location |
 | `FERROX_ADDR` | Bind address, e.g. `127.0.0.1:8383` |
 | `FERROX_API_KEY` | Require `Authorization: Bearer <key>`. Also gates the whole `/admin` control surface, which can swap models and write files |
+| `FERROX_LORA` | Comma-separated `path:scale` LoRA adapter specs, what `--lora` / `--lora-scaled` lower to. Read at every model load, so a hot-swapped checkpoint gets the same adapters or is refused by name |
+| `FERROX_LORA_INIT_WITHOUT_APPLY` | `1`, load the adapters at scale 0 until `POST /lora-adapters` sets them (`--lora-init-without-apply`) |
 
 ## Hugging Face
 

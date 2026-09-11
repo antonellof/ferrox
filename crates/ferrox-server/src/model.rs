@@ -424,12 +424,15 @@ fn load_gguf_file(path: &str) -> anyhow::Result<LoadedModel> {
             return load_encoder_checkpoint(path).map(LoadedModel::Encoder);
         }
         if is_glm52_arch(arch) {
+            crate::lora::refuse_env_for_engine("GLM-5.2")?;
             return load_glm52_checkpoint(path, &file).map(LoadedModel::Glm52);
         }
         if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Mla)) {
+            crate::lora::refuse_env_for_engine("MLA")?;
             return load_mla_checkpoint(path, &file).map(LoadedModel::Mla);
         }
         if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Gemma4)) {
+            crate::lora::refuse_env_for_engine("Gemma-4")?;
             return load_gemma4_checkpoint(path, &file).map(LoadedModel::Gemma4);
         }
     }
@@ -637,7 +640,10 @@ fn load_real_gguf_checkpoint(path: &str, file: &ShardedGguf) -> anyhow::Result<G
     // automatic decision needs and why it cannot be made without a path.
     let weight_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let expert_cache_bytes = expert_cache_bytes_for(weight_bytes)?;
-    let decoder = Decoder::from_gguf_with_expert_cache(path, config, expert_cache_bytes)?;
+    let mut decoder = Decoder::from_gguf_with_expert_cache(path, config, expert_cache_bytes)?;
+    // After the base, before it becomes the active model: an adapter the
+    // checkpoint does not fit fails the load by name.
+    crate::lora::attach_from_env(&mut decoder, file)?;
 
     Ok(GgufLoaded {
         decoder,
@@ -831,6 +837,7 @@ fn build_synthetic_decoder(preset: &str) -> anyhow::Result<Decoder> {
 pub fn load_from_path(path: &str) -> anyhow::Result<LoadedModel> {
     let path = ferrox_models::hf_pull::resolve_model_path(path)?;
     if Path::new(&path).is_dir() {
+        crate::lora::refuse_env_for_engine("Kimi")?;
         load_real_kimi_checkpoint(&path).map(LoadedModel::Kimi)
     } else {
         load_gguf_file(&path)

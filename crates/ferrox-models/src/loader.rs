@@ -2776,6 +2776,7 @@ impl Decoder {
             execution_plan,
             kv_window: crate::decoder::KvWindowPolicy::from_env(),
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            lora_adapters: Vec::new(),
         };
         // Resolve every kernel the model will need while we still have a
         // load-time error path to report it on, then seal: from here a

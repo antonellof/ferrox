@@ -480,6 +480,11 @@ pub struct Decoder {
     /// rather than a cached global so a test can run both arms in one
     /// process and compare tokens.
     pub kv_window: KvWindowPolicy,
+    /// LoRA adapters attached after load, by id. Each one's deltas
+    /// live INSIDE the `WeightMatrix` values above
+    /// (`WeightMatrix::Adapted`); this list is what a server lists and
+    /// rescales. See [`crate::lora_attach`].
+    pub lora_adapters: Vec<crate::lora_attach::LoraAttached>,
     /// Cache key hit → fused caps last used for that geometry (enables
     /// decode/prefill plan reuse without rebuilding residency).
     pub plan_cache: std::sync::Mutex<
@@ -738,6 +743,7 @@ impl Decoder {
             execution_plan,
             kv_window: KvWindowPolicy::from_env(),
             plan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            lora_adapters: Vec::new(),
         }
     }
 
@@ -799,7 +805,10 @@ impl Decoder {
                     rows_per_tg,
                 })
             }
-            _ => None,
+            // No fused kernel adds a LoRA delta, and the safetensors
+            // MXFP4 pair has no Metal matvec. Spelled out rather than
+            // `_` so a fifth storage has to answer here.
+            WeightMatrix::Mxfp4 { .. } | WeightMatrix::Adapted { .. } => None,
         }
     }
 
@@ -837,9 +846,19 @@ impl Decoder {
     /// router's eligibility check has already drifted four ways in this
     /// file -- prefill tested three conditions, fused decode two, and
     /// the whole-stack decode NONE.
+    ///
+    /// `lora_attached` is the fifth fact, and the first that is not a
+    /// property of the file: a LoRA delta lives inside a
+    /// `WeightMatrix::Adapted` and is served by that type's methods,
+    /// while every fused stack takes its weights as raw bytes through
+    /// `metal_matvec_launch` / `mul_mm_sg_launch` (both answer `None`
+    /// for an adapted matrix). Fencing the whole model here, too, is
+    /// what keeps a model with an adapter on one layer from being served
+    /// half by a stack and half by the host.
     #[cfg(feature = "metal")]
-    fn metal_can_serve_model(config: &ModelConfig) -> bool {
-        config.residual_scale.is_none()
+    fn metal_can_serve_model(config: &ModelConfig, lora_attached: bool) -> bool {
+        !lora_attached
+            && config.residual_scale.is_none()
             && config.clamp_kqv.is_none()
             && config.attn_temperature.is_none()
             // `model_ffn_act` is `None` for an activation that varies
@@ -865,7 +884,7 @@ impl Decoder {
     #[cfg(feature = "metal")]
     fn layer_supports_metal_attn(&self, layer: &LayerWeights) -> bool {
         use crate::config::RopeLayout;
-        if !Self::metal_can_serve_model(&self.config) {
+        if !Self::metal_can_serve_model(&self.config, self.lora_attached()) {
             return false;
         }
         // gpt-oss: no Metal kernel adds the `o_bias` or runs the biased
@@ -1129,8 +1148,12 @@ impl Decoder {
     /// QKV bias / QK-norm are applied on-GPU via [`AttnExtras`] (same as
     /// decode); SWA fit is checked separately.
     #[cfg(feature = "metal")]
-    fn metal_prefill_dense_layer_eligible(layer: &LayerWeights, config: &ModelConfig) -> bool {
-        Self::is_dense_layer(layer) && Self::metal_can_serve_model(config)
+    fn metal_prefill_dense_layer_eligible(
+        layer: &LayerWeights,
+        config: &ModelConfig,
+        lora_attached: bool,
+    ) -> bool {
+        Self::is_dense_layer(layer) && Self::metal_can_serve_model(config, lora_attached)
     }
 
     #[cfg(feature = "metal")]
@@ -1156,8 +1179,9 @@ impl Decoder {
     fn metal_prefill_moe<'a>(
         layer: &'a LayerWeights,
         config: &ModelConfig,
+        lora_attached: bool,
     ) -> Option<ferrox_metal::gpu::PrefillMoeMetal<'a>> {
-        if !Self::metal_can_serve_model(config)
+        if !Self::metal_can_serve_model(config, lora_attached)
             || Self::is_dense_layer(layer)
             || !layer.moe.shared_experts.is_empty()
             || !config.model_ffn_act().is_some_and(GluAct::is_swiglu)
@@ -1186,8 +1210,9 @@ impl Decoder {
     fn metal_prefill_ffn<'a>(
         layer: &'a LayerWeights,
         config: &ModelConfig,
+        lora_attached: bool,
     ) -> Option<ferrox_metal::attn::PrefillFfnMetal<'a>> {
-        if let Some(moe) = Self::metal_prefill_moe(layer, config) {
+        if let Some(moe) = Self::metal_prefill_moe(layer, config, lora_attached) {
             return Some(ferrox_metal::attn::PrefillFfnMetal::Moe(moe));
         }
         if !Self::is_dense_layer(layer) {
@@ -1236,7 +1261,7 @@ impl Decoder {
                 && layer.attn.k_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.v_proj.mul_mm_sg_launch().is_some()
                 && layer.attn.o_proj.mul_mm_sg_launch().is_some()
-                && Self::metal_prefill_ffn(layer, &self.config).is_some();
+                && Self::metal_prefill_ffn(layer, &self.config, self.lora_attached()).is_some();
             if !ok {
                 break;
             }
@@ -1271,7 +1296,7 @@ impl Decoder {
         let mut prefill_layers = Vec::with_capacity(run_len);
         for li in start..start + run_len {
             let layer = &self.layers[li];
-            let ffn = Self::metal_prefill_ffn(layer, &self.config)?;
+            let ffn = Self::metal_prefill_ffn(layer, &self.config, self.lora_attached())?;
             if matches!(ffn, ferrox_metal::attn::PrefillFfnMetal::Dense { .. }) {
                 layer.moe.record_activations(&[0]);
             }
@@ -1364,8 +1389,12 @@ impl Decoder {
     /// experts, Resident expert backing, Metal router/QKV/O, and a
     /// routing decision the GPU router reproduces exactly.
     #[cfg(feature = "metal")]
-    fn layer_supports_metal_moe_resident(layer: &LayerWeights, config: &ModelConfig) -> bool {
-        Self::metal_can_serve_model(config)
+    fn layer_supports_metal_moe_resident(
+        layer: &LayerWeights,
+        config: &ModelConfig,
+        lora_attached: bool,
+    ) -> bool {
+        Self::metal_can_serve_model(config, lora_attached)
             && !Self::is_dense_layer(layer)
             && layer.moe.shared_experts.is_empty()
             && Self::gpu_router_matches_host_routing(layer, config)
@@ -2076,7 +2105,7 @@ impl Decoder {
                 // Latent today because OLMoE and Qwen3-MoE ship none
                 // of the four, which is exactly how `attention_scale`
                 // stayed latent.
-                Self::layer_supports_metal_moe_resident(l, &self.config)
+                Self::layer_supports_metal_moe_resident(l, &self.config, self.lora_attached())
                     && !self.layer_needs_metal_stack(l, i)
             })
             && !self.layers.iter().all(Self::layer_supports_metal_dense_ffn)
@@ -2467,8 +2496,11 @@ impl Decoder {
                 // --- attention block ---
                 #[cfg(feature = "metal")]
                 if metal_moe_resident
-                    && (!Self::layer_supports_metal_moe_resident(layer, &self.config)
-                        || self.layer_needs_metal_stack(layer, l))
+                    && (!Self::layer_supports_metal_moe_resident(
+                        layer,
+                        &self.config,
+                        self.lora_attached(),
+                    ) || self.layer_needs_metal_stack(layer, l))
                 {
                     if let Some(h) = ferrox_metal::attn::moe_decode_take_hidden() {
                         hidden = h;
@@ -2605,6 +2637,7 @@ impl Decoder {
                                         && Self::layer_supports_metal_moe_resident(
                                             layer,
                                             &self.config,
+                                            self.lora_attached(),
                                         )
                                     {
                                         if let Some(router_l) =
@@ -3940,7 +3973,11 @@ impl Decoder {
             #[cfg(feature = "metal")]
             if use_metal_attn
                 && batch_size >= 4
-                && Self::metal_prefill_dense_layer_eligible(layer, &self.config)
+                && Self::metal_prefill_dense_layer_eligible(
+                    layer,
+                    &self.config,
+                    self.lora_attached(),
+                )
             {
                 let swa_fits = self.metal_prefill_dense_swa_fits(l, start_pos, batch_size);
                 if swa_fits {
@@ -6775,11 +6812,11 @@ mod metal_rope_tests {
             "a residual multiplier no Metal kernel applies must refuse the fused attention"
         );
         assert!(
-            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &scaled),
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &scaled, false),
             "...and the prefill dense stack"
         );
         assert!(
-            !Decoder::metal_can_serve_model(&scaled),
+            !Decoder::metal_can_serve_model(&scaled, false),
             "the shared predicate is what all four read"
         );
     }
@@ -6812,10 +6849,10 @@ mod metal_rope_tests {
             "a clamp no Metal kernel applies must refuse the fused attention"
         );
         assert!(
-            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &clamped),
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &clamped, false),
             "...and the prefill dense stack"
         );
-        assert!(!Decoder::metal_can_serve_model(&clamped));
+        assert!(!Decoder::metal_can_serve_model(&clamped, false));
     }
 
     /// Per-layer shapes keep every fused Metal path off the model,
@@ -6855,10 +6892,10 @@ mod metal_rope_tests {
              refuse the fused attention: the stacks hold one geometry"
         );
         assert!(
-            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &shaped),
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &shaped, false),
             "...and the prefill dense stack"
         );
-        assert!(!Decoder::metal_can_serve_model(&shaped));
+        assert!(!Decoder::metal_can_serve_model(&shaped, false));
     }
 
     /// A per-position attention temperature keeps every fused Metal
@@ -6895,10 +6932,10 @@ mod metal_rope_tests {
             "a per-position Q scale no Metal kernel applies must refuse the fused attention"
         );
         assert!(
-            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &tempered),
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &tempered, false),
             "...and the prefill dense stack"
         );
-        assert!(!Decoder::metal_can_serve_model(&tempered));
+        assert!(!Decoder::metal_can_serve_model(&tempered, false));
     }
 
     /// An FFN activation no fused kernel spells keeps the model off
@@ -6924,9 +6961,10 @@ mod metal_rope_tests {
         assert!(!d.layer_supports_metal_attn(&d.layers[0]));
         assert!(!Decoder::metal_prefill_dense_layer_eligible(
             &d.layers[0],
-            &ungated
+            &ungated,
+            false
         ));
-        assert!(!Decoder::metal_can_serve_model(&ungated));
+        assert!(!Decoder::metal_can_serve_model(&ungated, false));
         assert_eq!(
             ungated
                 .model_ffn_act()
@@ -6946,7 +6984,7 @@ mod metal_rope_tests {
                 xielu.n_layers
             ]));
         assert_eq!(xielu.model_ffn_act(), None);
-        assert!(!Decoder::metal_can_serve_model(&xielu));
+        assert!(!Decoder::metal_can_serve_model(&xielu, false));
         let mut clamped = ungated.clone();
         clamped.ffn_activation =
             crate::config::FfnActivation::SwigluClamped(crate::act_layers::SwigluClamps::new(
@@ -6954,16 +6992,16 @@ mod metal_rope_tests {
                 vec![7.0; clamped.n_layers],
             ));
         assert_eq!(clamped.model_ffn_act(), None);
-        assert!(!Decoder::metal_can_serve_model(&clamped));
+        assert!(!Decoder::metal_can_serve_model(&clamped, false));
         let mut two_widths = ungated;
         two_widths.ffn_activation = crate::config::FfnActivation::Swiglu;
-        assert!(Decoder::metal_can_serve_model(&two_widths));
+        assert!(Decoder::metal_can_serve_model(&two_widths, false));
         two_widths.sliding_window = Some(4);
         two_widths.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
         two_widths.n_layers = 2;
         two_widths.rope_dim_swa = Some(two_widths.head_dim / 2);
         assert!(two_widths.rope_dim_varies_by_layer());
-        assert!(!Decoder::metal_can_serve_model(&two_widths));
+        assert!(!Decoder::metal_can_serve_model(&two_widths, false));
     }
 
     /// An attention output gate or a set of attention sinks keeps THAT
@@ -7017,6 +7055,75 @@ mod metal_rope_tests {
             "sinks are refused by the tensor, not by the gpt-oss name"
         );
         assert!(d.metal_attn_view(&d.layers[1]).is_none());
+    }
+
+    /// A LoRA adapter keeps the WHOLE model off every fused Metal
+    /// launch, through the shared predicate, and an adapted matrix has
+    /// no raw-bytes Metal descriptor at all -- so a stack that somehow
+    /// asked for one anyway could not build it. The delta lives inside
+    /// `WeightMatrix::Adapted` and is served by that type's methods;
+    /// the stacks read weight bytes past those methods.
+    /// Only reachable in a `--features metal` build.
+    #[test]
+    fn a_lora_adapter_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let mut d = Decoder::new_random_small(plain.clone(), 2, 32);
+        assert!(Decoder::metal_can_serve_model(&plain, false));
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+        assert!(Decoder::metal_matvec_launch(&d.layers[0].attn.q_proj).is_some());
+
+        // The fact the predicate reads.
+        assert!(!Decoder::metal_can_serve_model(&plain, true));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &plain,
+            true
+        ));
+
+        // The variant, on one matrix: no descriptor, so no launch.
+        let (rows, cols) = (
+            d.layers[0].attn.q_proj.rows(),
+            d.layers[0].attn.q_proj.cols(),
+        );
+        let scale = ferrox_core::weight_matrix::LoraScale::new(1.0);
+        d.layers[0].attn.q_proj.attach_lora(
+            ferrox_core::weight_matrix::LoraDelta::new(
+                vec![0.01; 2 * cols],
+                vec![0.01; rows * 2],
+                2,
+                rows,
+                cols,
+                0.0,
+                scale.clone(),
+            )
+            .unwrap(),
+        );
+        assert!(Decoder::metal_matvec_launch(&d.layers[0].attn.q_proj).is_none());
+        assert!(d.layers[0].attn.q_proj.mul_mm_sg_launch().is_none());
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a layer whose projection has no Metal descriptor is not served"
+        );
+
+        // The list, on the decoder: what every eligibility check asks.
+        d.lora_adapters.push(crate::lora_attach::LoraAttached {
+            path: "x.gguf".into(),
+            alpha: 0.0,
+            task_name: String::new(),
+            prompt_prefix: String::new(),
+            scale,
+            n_tensors: 1,
+        });
+        assert!(d.lora_attached());
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[1]),
+            "the fence is the whole model, not the adapted layer alone"
+        );
     }
 
     /// A Gemma-3-4B-shaped config: `rope_scaling {linear, factor 8}`

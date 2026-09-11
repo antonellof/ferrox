@@ -234,6 +234,17 @@ the same stack machine the HTTP `grammar` field does. `--ctk` selects a
 KV dtype on Metal only; the CPU and CUDA KV cache is the host `Vec<f32>`
 and the startup banner says so when the flag is being ignored.
 
+`--lora` / `--lora-scaled` load a LoRA adapter GGUF
+(`convert_lora_to_gguf.py`'s format) on the CLI and the server, applied
+inside every projection it names as llama.cpp's `build_lora_mm` applies
+it and checked against libllama with the same adapter (KL under 5e-13 on
+the fixture, 5.2e-4 on Llama-3.2-1B Q8_0 with a rank-8 adapter). The
+server lists and rescales them through `GET`/`POST /lora-adapters` and
+the per-request `lora` field. Routed-expert adapters, activated LoRAs
+and the dedicated engines refuse by name; on Metal an adapted model runs
+on the per-matrix path rather than the fused stacks. See
+[`CLI.md`](CLI.md#lora-adapters) and [`API.md`](API.md#lora-adapters).
+
 `ferrox perplexity` is the quality axis: corpus evaluation using
 llama.cpp's method, agreeing with `llama-perplexity` to within a fifth
 of one standard error on five checkpoints. Where the two differ, the gap

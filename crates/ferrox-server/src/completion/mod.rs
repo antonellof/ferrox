@@ -204,7 +204,6 @@ const UNSUPPORTED: &[Unsupported] = &[
         "this server has no slots to pin a request to; concurrency is per request, not per \
          slot",
     ),
-    off_when_empty("lora", "LoRA adapters are not implemented"),
     off_when_empty(
         "response_fields",
         "response field projection is not implemented; the whole object is returned",
@@ -247,6 +246,11 @@ pub(crate) struct CompletionRequest {
     n_predict: Option<i64>,
     #[serde(default)]
     stream: Option<bool>,
+    /// llama.cpp's per-request `lora: [{id, scale}]`; see
+    /// `ChatCompletionRequest::lora`. Typed rather than in the
+    /// `UNSUPPORTED` table now that adapters are served.
+    #[serde(default)]
+    lora: Option<Vec<ferrox_api::LoraScaleRequest>>,
     /// llama.cpp takes an array here and nothing else.
     #[serde(default)]
     stop: Option<Vec<String>>,
@@ -550,6 +554,7 @@ pub(crate) async fn completion(
         // A raw completion has no reasoning format (`reasoning: None`
         // above), so there is no block for a budget to bound.
         reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+        lora: crate::lora::resolve_request(handles.model(), req.lora.as_deref())?,
     };
     params.max_tokens = match req.budget()? {
         Budget::Fixed(n) => n,
@@ -852,7 +857,6 @@ mod tests {
             "n_cache_reuse": 0,
             "t_max_predict_ms": 0,
             "id_slot": -1,
-            "lora": [],
             "response_fields": [],
             "return_progress": false,
             "timings_per_token": false,
@@ -960,7 +964,6 @@ mod tests {
             ("n_cache_reuse", json!(256)),
             ("t_max_predict_ms", json!(5000)),
             ("id_slot", json!(3)),
-            ("lora", json!([{"id": 0, "scale": 0.5}])),
             ("response_fields", json!(["content"])),
             ("return_progress", json!(true)),
             ("timings_per_token", json!(true)),

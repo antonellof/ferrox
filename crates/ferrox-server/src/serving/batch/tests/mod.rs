@@ -62,6 +62,7 @@ fn greedy_params(max_tokens: usize, seed: u64) -> GenerationParams {
         cancel: None,
         ignore_eos: false,
         reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+        lora: None,
     }
 }
 

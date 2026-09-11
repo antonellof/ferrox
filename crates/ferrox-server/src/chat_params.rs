@@ -103,6 +103,10 @@ impl ChatCompletionRequest {
             reasoning_budget: reasoning_budget::ReasoningBudget::from_tokens(
                 reasoning_budget::BudgetTokens::effective(self.reasoning_budget_tokens),
             ),
+            // Resolved by the handler against the loaded adapters
+            // (`crate::lora::resolve_request`), which the request body
+            // cannot see.
+            lora: None,
         })
     }
 

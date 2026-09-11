@@ -282,6 +282,7 @@ mod tests {
             cancel: None,
             ignore_eos: false,
             reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         }
     }
 

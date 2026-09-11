@@ -750,6 +750,7 @@ fn prepare_prompt(
         grammar: None,
         // Not on the Anthropic wire.
         logit_bias: None,
+        lora: None,
         // A serving-benchmark knob on the OpenAI surface only; this
         // protocol has no spelling for it.
         ignore_eos: None,

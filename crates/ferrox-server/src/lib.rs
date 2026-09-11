@@ -53,6 +53,7 @@ mod journal;
 mod json_mode;
 mod limits;
 mod loaded;
+mod lora;
 mod mcp;
 mod model;
 mod openai_extra;
@@ -992,6 +993,11 @@ struct ChatCompletionRequest {
     /// the bias honoured.
     #[serde(default)]
     logit_bias: Option<serde_json::Value>,
+    /// llama.cpp's per-request `lora: [{id, scale}]`: the scale of every
+    /// loaded adapter for THIS request, unnamed adapters at 0. Resolved
+    /// against the loaded adapters by `crate::lora::resolve_request`.
+    #[serde(default)]
+    lora: Option<Vec<ferrox_api::LoraScaleRequest>>,
     /// llama.cpp's `samplers`: the ORDER the sampler chain runs in,
     /// either a list of names or the one `;`-separated string
     /// `--samplers` takes.
@@ -2165,6 +2171,11 @@ fn run_generation_emit(
     mut emit: impl FnMut(&str),
 ) -> Result<(FinishReason, generate::Usage, String), generate::DecodeError> {
     let synthetic = model.is_synthetic();
+    // Held for the whole generation: a `POST /lora-adapters`, or a
+    // request whose `lora` field overrides the scales, waits for this
+    // one to finish rather than changing the weights under it. See
+    // `crate::lora`.
+    let _lora_lease = lora::lease(model, params.lora.as_deref());
     let mut chunks = Vec::new();
     // Layer 1 of the stop machinery is resolved exactly here, because
     // this is the one place that has both the request's stop strings
@@ -2674,8 +2685,9 @@ async fn chat_completions_full(
     // completion (#35). It also means an unparseable grammar is a 400
     // for the second caller too, rather than a 200 carrying prose
     // generated under no grammar at all.
-    let params =
+    let mut params =
         req.generation_params_for_template(&template, active.name(), active.sampler_model())?;
+    params.lora = lora::resolve_request(active.generative()?, req.lora.as_deref())?;
     let key = req.is_cacheable().then(|| req.cache_key(&prompt, &params));
 
     let (completion, cache_status) = if let Some(cached) = key
@@ -2805,6 +2817,7 @@ async fn chat_completions_stream(
     let metal_private_decode_gate = state.metal_private_decode_gate.clone();
     let mut params =
         req.generation_params_for_template(&template, active.name(), active.sampler_model())?;
+    params.lora = lora::resolve_request(active.generative()?, req.lora.as_deref())?;
     let stats_state = Arc::clone(&state);
     // Read now, off the handle this stream will decode against. Read
     // later it would name whatever a swap had made current by then.
@@ -3275,6 +3288,10 @@ fn protected_routes() -> Router<Arc<AppState>> {
         .route(routes::V1_CACHE_STATUS, get(cache_admin::cache_status))
         .route(routes::V1_CACHE_REBUILD, post(cache_admin::cache_rebuild))
         .route(routes::ADMIN_PREPARE_STOP, post(cache_admin::prepare_stop))
+        .route(
+            routes::LORA_ADAPTERS,
+            get(lora::get_lora_adapters).post(lora::post_lora_adapters),
+        )
         .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
         // Behind the same key as the endpoint that started the work:
         // an unauthenticated caller must not be able to stop someone
@@ -4622,7 +4639,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ferrox_models::config::test_dense_fixture;
 
@@ -4665,6 +4682,7 @@ mod tests {
             cancel: None,
             ignore_eos: false,
             reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         }
     }
 
@@ -4697,7 +4715,7 @@ mod tests {
     /// One `AppState` for the HTTP-level tests, so a new field on the
     /// struct is added in one place rather than in every test that
     /// builds one.
-    fn test_state(model: Model, response_cache: ResponseCache) -> AppState {
+    pub(crate) fn test_state(model: Model, response_cache: ResponseCache) -> AppState {
         AppState {
             embedding: None,
             paged_kv: None,
@@ -4752,7 +4770,7 @@ mod tests {
 
     /// [`test_app`] over a caller-owned state, so a test can reach in
     /// and swap or unload the model behind a live router.
-    fn test_app_with_state(state: Arc<AppState>) -> Router {
+    pub(crate) fn test_app_with_state(state: Arc<AppState>) -> Router {
         // The SAME route list the server builds, not a hand-written
         // copy of it. The copy that used to live here had drifted from
         // the real one, which is the failure mode that makes an HTTP
@@ -6213,7 +6231,7 @@ mod tests {
         );
     }
 
-    async fn post_json_uri(
+    pub(crate) async fn post_json_uri(
         app: &Router,
         uri: &str,
         body: serde_json::Value,
@@ -7053,7 +7071,7 @@ mod tests {
         );
     }
 
-    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    pub(crate) async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
