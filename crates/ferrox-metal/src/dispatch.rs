@@ -110,6 +110,7 @@ mod tests {
             ("dispatch.rs", include_str!("dispatch.rs")),
             ("elem.rs", include_str!("elem.rs")),
             ("embd.rs", include_str!("embd.rs")),
+            ("fa_vec_decode.rs", include_str!("fa_vec_decode.rs")),
             ("gpu.rs", include_str!("gpu.rs")),
             ("kernel_bench.rs", include_str!("kernel_bench.rs")),
             ("kernel_timing.rs", include_str!("kernel_timing.rs")),

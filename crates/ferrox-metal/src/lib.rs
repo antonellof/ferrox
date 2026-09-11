@@ -24,6 +24,9 @@ pub mod attn;
 pub mod rope;
 
 #[cfg(feature = "metal")]
+mod fa_vec_decode;
+
+#[cfg(feature = "metal")]
 pub mod decode_dense;
 
 #[cfg(feature = "metal")]
