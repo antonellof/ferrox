@@ -42,6 +42,12 @@ mod mem_ranges;
 pub(crate) mod timing;
 
 #[cfg(feature = "metal")]
+pub(crate) mod kernel_timing;
+
+#[cfg(all(test, feature = "metal"))]
+mod kernel_bench;
+
+#[cfg(feature = "metal")]
 mod moe_ids;
 
 #[cfg(feature = "metal")]

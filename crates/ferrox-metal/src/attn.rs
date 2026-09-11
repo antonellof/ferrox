@@ -3903,6 +3903,40 @@ fn encode_gqa_fa_vec(
     Ok(())
 }
 
+/// [`encode_gqa`] for `crate::kernel_bench`, which times the kernel the
+/// decode stack picks for a shape without a `MetalKvBuffers`.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gqa_for_bench(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    q: &ProtocolObject<dyn MTLBuffer>,
+    k: &ProtocolObject<dyn MTLBuffer>,
+    v: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    kv_start: u32,
+    attn_softcap: Option<f32>,
+) -> Result<(), MetalError> {
+    encode_gqa(
+        encoder,
+        device,
+        q,
+        k,
+        v,
+        out,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        seq_len,
+        kv_start,
+        attn_softcap,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_gqa(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,

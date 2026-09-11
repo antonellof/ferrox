@@ -111,6 +111,8 @@ mod tests {
             ("elem.rs", include_str!("elem.rs")),
             ("embd.rs", include_str!("embd.rs")),
             ("gpu.rs", include_str!("gpu.rs")),
+            ("kernel_bench.rs", include_str!("kernel_bench.rs")),
+            ("kernel_timing.rs", include_str!("kernel_timing.rs")),
             ("lib.rs", include_str!("lib.rs")),
             ("mem_ranges.rs", include_str!("mem_ranges.rs")),
             ("moe_ids.rs", include_str!("moe_ids.rs")),

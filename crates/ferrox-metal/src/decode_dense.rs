@@ -21,6 +21,7 @@ use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, resident_f32_buffer, resident_weight_buffer,
     shared_metal, MatvecLaunch, MetalError,
 };
+use crate::kernel_timing::SpanClock;
 use crate::mem_ranges::MemRanges;
 use crate::timing::{commit_wait_note, SubmitClock};
 use objc2::runtime::ProtocolObject;
@@ -241,10 +242,18 @@ pub fn launch_decode_dense_stack(
     // Measured on an M2 Pro, interleaved, GPU-clock: Gemma-2-2B Q4_K_M decode
     // 13.23 -> 12.20 ms/token, and greedy output stays byte-identical to the
     // serial encoder across Gemma-2 and Gemma-3 on every prompt tried.
-    let (encoder, mut mrs) = (compute_encoder_concurrent(&cmd_buf)?, MemRanges::new());
+    let (mut encoder, mut mrs) = (compute_encoder_concurrent(&cmd_buf)?, MemRanges::new());
+    // `FERROX_METAL_KERNEL_TIMING=1`: one sampled encoder per op group,
+    // so the report says which KIND of dispatch the GPU time went to.
+    // A no-op otherwise. 18 groups per layer is the ceiling below.
+    let mut spans = SpanClock::begin(device, 18 * layers.len() + 8);
+    // Calibration: an encoder with nothing in it measures the boundary
+    // cost the instrument adds to every span below.
+    spans.span(&cmd_buf, &mut encoder, "(empty encoder)")?;
 
     let embd_resident = if let Some(e) = embd {
         let w = resident_weight_buffer(device, e.weights)?;
+        spans.span(&cmd_buf, &mut encoder, "embd_gather")?;
         mrs.begin_op(&encoder, &[], &[h_buf]);
         encode_get_rows(
             &encoder,
@@ -293,6 +302,7 @@ pub fn launch_decode_dense_stack(
         // previous FFN residual into attn_norm (non-sandwich) or just
         // RMSNorm (sandwich already applied `h += down` eagerly).
         if layer_idx == 0 || sandwich {
+            spans.span(&cmd_buf, &mut encoder, "attn_norm")?;
             mrs.begin_op(&encoder, &[h_buf], &[x_buf]);
             encode_rms_norm(
                 &encoder,
@@ -305,6 +315,7 @@ pub fn launch_decode_dense_stack(
             )?;
             mrs.end_op(&[h_buf], &[x_buf]);
         } else {
+            spans.span(&cmd_buf, &mut encoder, "add_attn_norm")?;
             mrs.begin_op(&encoder, &[h_buf, down_buf], &[h_buf, x_buf]);
             encode_add_rms_norm(
                 &encoder,
@@ -319,6 +330,7 @@ pub fn launch_decode_dense_stack(
             mrs.end_op(&[h_buf, down_buf], &[h_buf, x_buf]);
         }
         // Q∥K∥V
+        spans.span(&cmd_buf, &mut encoder, "qkv")?;
         mrs.begin_op(&encoder, &[x_buf], &[q_buf, k_buf, v_buf]);
         encode_matvec(&encoder, device, &layer.q, &q_w, x_buf, q_buf)?;
         encode_matvec(&encoder, device, &layer.k, &k_w, x_buf, k_buf)?;
@@ -329,6 +341,7 @@ pub fn launch_decode_dense_stack(
         // the hazard check around zero dispatches is still a real
         // barrier. See `AttnExtras::encodes_anything`.
         if layer.extras.encodes_anything() {
+            spans.span(&cmd_buf, &mut encoder, "attn_extras")?;
             mrs.begin_op(&encoder, &[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
             encode_attn_extras(
                 &encoder,
@@ -358,6 +371,7 @@ pub fn launch_decode_dense_stack(
             let ff_buf = ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref());
             // Q and K in one dispatch: same theta, position and freq
             // factors, different buffers, and RoPE is per-head independent.
+            spans.span(&cmd_buf, &mut encoder, "rope")?;
             mrs.begin_op(&encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
             encode_rope(
                 &encoder,
@@ -381,6 +395,7 @@ pub fn launch_decode_dense_stack(
 
         let token_elems = (n_kv_heads * head_dim) as u32;
         let offset = (pos * n_kv_heads * head_dim) as u32;
+        spans.span(&cmd_buf, &mut encoder, "kv_append")?;
         mrs.begin_op(&encoder, &[k_buf, v_buf], &[kv_k, kv_v]);
         // K and V in one dispatch: same offset, same length, disjoint
         // destinations.
@@ -394,6 +409,7 @@ pub fn launch_decode_dense_stack(
             Some(w) => (pos + 1).saturating_sub(w) as u32,
             None => 0,
         };
+        spans.span(&cmd_buf, &mut encoder, "gqa")?;
         // Self-tracking: with a quantized KV cache this also writes a shared
         // f16 dequant scratch that no caller can name.
         encode_gqa_with_kv(
@@ -411,6 +427,7 @@ pub fn launch_decode_dense_stack(
             layer.extras.attn_logit_softcap,
         )?;
 
+        spans.span(&cmd_buf, &mut encoder, "o_proj")?;
         mrs.begin_op(&encoder, &[attn_buf], &[o_buf]);
         encode_matvec(&encoder, device, &layer.o, &o_w, attn_buf, o_buf)?;
         mrs.end_op(&[attn_buf], &[o_buf]);
@@ -421,6 +438,7 @@ pub fn launch_decode_dense_stack(
         if let Some(post) = layer.post_attn_norm {
             assert_eq!(post.len(), hidden_dim);
             let pw = resident_f32_buffer(device, post)?;
+            spans.span(&cmd_buf, &mut encoder, "post_attn_norm")?;
             mrs.begin_op(&encoder, &[o_buf], &[o_buf]);
             encode_rms_norm(
                 &encoder,
@@ -441,6 +459,7 @@ pub fn launch_decode_dense_stack(
         // compute `h += o` then `x2 = rms_norm(h)`. The split was a leftover
         // from the serial-encoder era -- `encode_add_rms_norm` writes `h`
         // itself, so the residual is just as eager as the two-dispatch form.
+        spans.span(&cmd_buf, &mut encoder, "add_ffn_norm")?;
         mrs.begin_op(&encoder, &[h_buf, o_buf], &[h_buf, x2_buf]);
         encode_add_rms_norm(
             &encoder,
@@ -454,11 +473,13 @@ pub fn launch_decode_dense_stack(
         )?;
         mrs.end_op(&[h_buf, o_buf], &[h_buf, x2_buf]);
         // gate ∥ up (llama concurrent)
+        spans.span(&cmd_buf, &mut encoder, "gate_up")?;
         mrs.begin_op(&encoder, &[x2_buf], &[gate_buf, up_buf]);
         encode_matvec(&encoder, device, &layer.gate, &gate_w, x2_buf, gate_buf)?;
         encode_matvec(&encoder, device, &layer.up, &up_w, x2_buf, up_buf)?;
         mrs.end_op(&[x2_buf], &[gate_buf, up_buf]);
 
+        spans.span(&cmd_buf, &mut encoder, "glu")?;
         mrs.begin_op(&encoder, &[gate_buf, up_buf], &[act_buf]);
         if gelu_ffn {
             encode_gelu_mul(
@@ -481,6 +502,7 @@ pub fn launch_decode_dense_stack(
         }
         mrs.end_op(&[gate_buf, up_buf], &[act_buf]);
 
+        spans.span(&cmd_buf, &mut encoder, "down")?;
         mrs.begin_op(&encoder, &[act_buf], &[down_buf]);
         encode_matvec(&encoder, device, &layer.down, &down_w, act_buf, down_buf)?;
         mrs.end_op(&[act_buf], &[down_buf]);
@@ -488,6 +510,7 @@ pub fn launch_decode_dense_stack(
         if let Some(post) = layer.post_ffn_norm {
             assert_eq!(post.len(), hidden_dim);
             let pw = resident_f32_buffer(device, post)?;
+            spans.span(&cmd_buf, &mut encoder, "post_ffn_norm")?;
             mrs.begin_op(&encoder, &[down_buf], &[down_buf]);
             encode_rms_norm(
                 &encoder,
@@ -501,6 +524,7 @@ pub fn launch_decode_dense_stack(
             mrs.end_op(&[down_buf], &[down_buf]);
         }
         if sandwich {
+            spans.span(&cmd_buf, &mut encoder, "residual_add")?;
             // Eager FFN residual — next layer attn_norm is plain RMSNorm.
             mrs.begin_op(&encoder, &[h_buf, down_buf], &[h_buf]);
             encode_vec_add(&encoder, device, h_buf, down_buf, hidden_dim as u32)?;
@@ -518,6 +542,7 @@ pub fn launch_decode_dense_stack(
         assert_eq!(fnw.len(), hidden_dim);
         let fn_buf = resident_f32_buffer(device, fnw)?;
         if sandwich {
+            spans.span(&cmd_buf, &mut encoder, "final_norm")?;
             mrs.begin_op(&encoder, &[h_buf], &[x_buf]);
             encode_rms_norm(
                 &encoder,
@@ -530,6 +555,7 @@ pub fn launch_decode_dense_stack(
             )?;
             mrs.end_op(&[h_buf], &[x_buf]);
         } else {
+            spans.span(&cmd_buf, &mut encoder, "add_final_norm")?;
             mrs.begin_op(&encoder, &[h_buf, down_buf], &[h_buf, x_buf]);
             encode_add_rms_norm(
                 &encoder,
@@ -550,11 +576,13 @@ pub fn launch_decode_dense_stack(
             // small hiddens (SmolLM2 h=576) and produce garbage logits /
             // greedy tokens while host lm_head after wait looks fine — the
             // tracker sees `x_buf` as src-after-dst and barriers.
+            spans.span(&cmd_buf, &mut encoder, "lm_head")?;
             mrs.begin_op(&encoder, &[x_buf], &[logits.as_ref()]);
             let out_w = resident_weight_buffer(device, out_l.weights)?;
             encode_matvec(&encoder, device, out_l, &out_w, x_buf, logits)?;
             mrs.end_op(&[x_buf], &[logits.as_ref()]);
             if argmax_only {
+                spans.span(&cmd_buf, &mut encoder, "argmax")?;
                 mrs.begin_op(&encoder, &[logits.as_ref()], &[argmax_idx_buf]);
                 encode_argmax(&encoder, device, logits, argmax_idx_buf, out_l.rows as u32)?;
                 mrs.end_op(&[logits.as_ref()], &[argmax_idx_buf]);
@@ -570,6 +598,7 @@ pub fn launch_decode_dense_stack(
     } else if sandwich {
         (hidden_dim, false)
     } else {
+        spans.span(&cmd_buf, &mut encoder, "residual_add")?;
         // No final_norm: still apply the deferred last-layer FFN residual.
         mrs.begin_op(&encoder, &[h_buf, down_buf], &[h_buf]);
         encode_vec_add(&encoder, device, h_buf, down_buf, hidden_dim as u32)?;
@@ -579,6 +608,7 @@ pub fn launch_decode_dense_stack(
 
     encoder.endEncoding();
     commit_wait_note(&cmd_buf, "dense-decode/tok", 32, clock);
+    spans.finish(&cmd_buf, "dense-decode/tok", 32);
 
     for kv in kvs.iter_mut() {
         kv.seq_len = pos + 1;
