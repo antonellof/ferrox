@@ -77,6 +77,16 @@ pub enum DecodeError {
     /// is carried in `detail`.
     #[error("grammar-constrained decoding stopped: {detail}")]
     GrammarConstraint { detail: String },
+    /// A reasoning budget reached the sampler that it could not
+    /// enforce: unresolved (a path skipped the tokenizer seam that
+    /// turns the caller's number into token sequences) or asked of a
+    /// family whose closer cannot be forced. Either way the only
+    /// alternative is an unbounded thought served as a bounded one, so
+    /// this stops instead. Both causes are meant to be caught earlier
+    /// -- the route refuses the family with a 501 -- which is why this
+    /// is an error and not a fallback.
+    #[error("reasoning budget could not be enforced: {detail}")]
+    ReasoningBudget { detail: String },
 }
 
 impl DecodeError {
@@ -88,6 +98,7 @@ impl DecodeError {
             // The same grammar against the same vocabulary fails the
             // same way on every retry.
             DecodeError::GrammarConstraint { .. } => None,
+            DecodeError::ReasoningBudget { .. } => None,
             // Retrying an over-budget request changes nothing: the
             // ceiling it hit is the whole server, not the current load.
             DecodeError::KvBudgetExceeded { .. } => None,
@@ -1103,6 +1114,14 @@ pub struct GenerationParams {
     /// ignore the model's opinion about length is not the caller
     /// withdrawing their own fence.
     pub ignore_eos: bool,
+    /// llama.cpp's `reasoning_budget_tokens`: a token budget for the
+    /// chain of thought, enforced in the sampler by forcing the closer
+    /// once it is spent. `Unrestricted` (llama.cpp's `-1`) is no
+    /// machine at all. A `Requested` number becomes an `Armed` plan at
+    /// the same seam that resolves `stop_token_ids`, because both need
+    /// the tokenizer -- and the sampler refuses a `Requested` budget
+    /// rather than run without it. See [`crate::reasoning_budget`].
+    pub reasoning_budget: crate::reasoning_budget::ReasoningBudget,
 }
 
 impl GenerationParams {
@@ -1167,7 +1186,10 @@ impl GenerationParams {
     /// `frequency_penalty` therefore needs the vocabulary even at
     /// `temperature: 0`.
     pub(crate) fn needs_vocab_logits(&self) -> bool {
-        self.json_object || self.grammar.is_some() || !self.sampling.greedy_equals_raw_argmax()
+        self.json_object
+            || self.grammar.is_some()
+            || self.reasoning_budget.needs_vocab_logits()
+            || !self.sampling.greedy_equals_raw_argmax()
     }
 }
 
@@ -1967,6 +1989,7 @@ mod tests {
             grammar: None,
             cancel: None,
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
         }
     }
 
@@ -2345,6 +2368,7 @@ mod tests {
                 grammar: None,
                 cancel: None,
                 ignore_eos: false,
+                reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
             },
             None,
             None,
@@ -2507,6 +2531,7 @@ mod tests {
             grammar: None,
             cancel: None,
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
         }
     }
 
@@ -2802,6 +2827,7 @@ mod tests {
                 grammar: None,
                 cancel: None,
                 ignore_eos: false,
+                reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
             },
             None,
             None,

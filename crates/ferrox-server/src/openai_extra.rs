@@ -510,6 +510,9 @@ pub async fn completions(
         stop_token_ids: Vec::new(),
         cancel: None,
         ignore_eos: req.ignore_eos.unwrap_or(false),
+        // A raw completion has no reasoning format (`reasoning: None`
+        // above), so there is no block for a budget to bound.
+        reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
     };
     let (chunks, finish, usage) = crate::decode_task::buffered(
         crate::decode_task::DecodeHandles::take(&state, &active)?,

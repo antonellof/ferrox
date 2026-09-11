@@ -39,6 +39,7 @@ import {
   type Transcript,
 } from "@/screens/chat/persistence";
 import { conversationLabel } from "@/lib/conversations";
+import { parseReasoningBudget } from "@/lib/sampling-wire";
 import { describeAway, RESUME_WINDOW_MS } from "@/lib/entry-state";
 import { useTabActivity } from "@/lib/use-tab-activity";
 
@@ -320,6 +321,28 @@ function SamplingPanel({
             With no cap, an answer runs until the model stops or the context
             fills; Stop cancels it on the server. A cap counts thinking too.
           </p>
+          <Field
+            label="reasoning_budget_tokens"
+            hint="Tokens of thinking allowed before the server closes the thought and the answer begins. Empty is unrestricted; 0 skips thinking."
+          >
+            {/* Empty is unrestricted (llama.cpp's -1, which the box folds
+                onto empty). Unlike max_tokens this never cuts the
+                answer: once the budget is spent the server forces the
+                closing tag and the model answers with whatever is left. */}
+            <Input
+              type="number"
+              min="0"
+              step="1"
+              placeholder="unrestricted"
+              value={value.reasoningBudget ?? ""}
+              onChange={(e) =>
+                set(
+                  "reasoningBudget",
+                  parseReasoningBudget(e.target.value, value.reasoningBudget),
+                )
+              }
+            />
+          </Field>
           <Field
             label="system prompt"
             hint="Sent as the first message of every request, not stored on the server."

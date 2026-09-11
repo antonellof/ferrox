@@ -219,6 +219,37 @@ pub struct ServerArgs {
     /// `FERROX_ALLOW_MULTIPLE_INSTANCES=1` does the same.
     #[arg(long = "allow-multiple-instances", default_value_t = false)]
     pub(crate) allow_multiple_instances: bool,
+
+    /// Token budget for thinking, llama.cpp's `--reasoning-budget`: -1
+    /// for unrestricted, 0 for immediate end, N>0 for a token budget
+    /// (default: -1). The server default a request's
+    /// `reasoning_budget_tokens` falls back to when it is absent or -1;
+    /// sets `FERROX_REASONING_BUDGET`. Enforced in the sampler: once N
+    /// tokens of thought have followed the opener, the closer is forced
+    /// so the answer still arrives.
+    #[arg(
+        long = "reasoning-budget",
+        value_name = "N",
+        allow_hyphen_values = true
+    )]
+    reasoning_budget: Option<i64>,
+
+    /// Continue a trailing assistant message instead of starting a new
+    /// turn, llama.cpp's `--prefill-assistant` (the default). A request
+    /// can still say `continue_final_message: false`.
+    #[arg(long = "prefill-assistant", default_value_t = false)]
+    prefill_assistant: bool,
+
+    /// Treat a trailing assistant message as a complete turn,
+    /// llama.cpp's `--no-prefill-assistant`. Sets
+    /// `FERROX_PREFILL_ASSISTANT=0`; a request's own
+    /// `continue_final_message` still wins.
+    #[arg(
+        long = "no-prefill-assistant",
+        default_value_t = false,
+        conflicts_with = "prefill_assistant"
+    )]
+    no_prefill_assistant: bool,
 }
 
 impl ServerArgs {
@@ -589,6 +620,27 @@ pub(crate) fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(budget) = args.reasoning_budget {
+        // The same range check the request field applies, so the flag
+        // and the field cannot admit different values.
+        crate::reasoning_budget::BudgetTokens::parse(budget)
+            .map_err(|why| anyhow::anyhow!("--reasoning-budget: {why}"))?;
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe {
+            std::env::set_var(
+                crate::reasoning_budget::SERVER_DEFAULT_ENV,
+                budget.to_string(),
+            )
+        };
+    }
+    if args.prefill_assistant {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var(crate::continuation::PREFILL_ASSISTANT_ENV, "1") };
+    } else if args.no_prefill_assistant {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var(crate::continuation::PREFILL_ASSISTANT_ENV, "0") };
+    }
+
     if args.cont_batching {
         // SAFETY: called before the runtime starts worker threads.
         unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
@@ -717,6 +769,61 @@ mod tests {
             std::env::var("FERROX_SLOT_SAVE_PATH").is_err(),
             "a refused path must not have been lowered to the environment first"
         );
+    }
+
+    /// llama.cpp's spelling and range (`common/arg.cpp:3608-3614`):
+    /// `-1`, `0` and `N` parse -- `-1` needs `allow_hyphen_values`, or
+    /// clap reads it as a flag -- and anything below `-1` is refused by
+    /// name before it is lowered to the environment.
+    #[test]
+    fn reasoning_budget_parses_llama_cpps_range_and_refuses_the_rest() {
+        for (value, expect) in [("-1", -1), ("0", 0), ("2000", 2000)] {
+            let args = ServerArgs::try_parse_from(
+                ["ferrox-server", "--reasoning-budget", value]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            assert_eq!(args.reasoning_budget, Some(expect), "{value}");
+        }
+        let args = ServerArgs::try_parse_from(
+            ["ferrox-server", "--reasoning-budget", "-2"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        let err = apply_cli_overrides(&args).unwrap_err().to_string();
+        assert!(err.contains("--reasoning-budget"), "{err}");
+    }
+
+    /// Both spellings of llama.cpp's prefill switch parse, and they
+    /// conflict rather than letting the last one win silently.
+    #[test]
+    fn prefill_assistant_has_both_of_llama_cpps_spellings() {
+        let on = ServerArgs::try_parse_from(
+            ["ferrox-server", "--prefill-assistant"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(on.prefill_assistant && !on.no_prefill_assistant);
+        let off = ServerArgs::try_parse_from(
+            ["ferrox-server", "--no-prefill-assistant"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(off.no_prefill_assistant && !off.prefill_assistant);
+        assert!(ServerArgs::try_parse_from(
+            [
+                "ferrox-server",
+                "--prefill-assistant",
+                "--no-prefill-assistant"
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .is_err());
     }
 
     #[test]

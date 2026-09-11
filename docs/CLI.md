@@ -1002,6 +1002,8 @@ parse identical arguments through the same code.
 | `-cb` / `--cont-batching`, `-np` / `--parallel` | Continuous batching and its sequence cap. Read back as `ferrox_scheduler_max_seqs` on `GET /metrics` |
 | `-b` / `--batch-size`, `-ub` / `--ubatch-size` | Prompt tokens per forward pass, on both decode paths. Resolved to one number the way llama.cpp does (the smaller of whichever was named); read back as `ferrox_scheduler_prefill_chunk` |
 | `--slot-save-path DIR` | Directory for `POST /slots/{id}?action=save\|restore`. Refused at startup when it is not a directory; without it the route answers 501 naming this flag, as llama.cpp does. Slots restore into the prefix cache, so `FERROX_PREFIX_CACHE_ENTRIES` must be set too |
+| `--reasoning-budget N` | Token budget for thinking, llama.cpp's flag and range: `-1` unrestricted (default), `0` immediate end, `N>0` a budget. The server default a request's `reasoning_budget_tokens` falls back to when absent or `-1`. Enforced in the sampler: after N tokens of thought the closing tag is forced, so the answer still arrives. Sets `FERROX_REASONING_BUDGET` |
+| `--prefill-assistant` / `--no-prefill-assistant` | Whether a trailing assistant message is continued rather than closed, llama.cpp's flag; on by default. A request's own `continue_final_message` (including `false`) still wins. Sets `FERROX_PREFILL_ASSISTANT` |
 | `--jinja` | Accepted, and already the default: ferrox always compiles and evaluates the GGUF's own `tokenizer.chat_template` |
 | `--no-warmup` | Accepted; there is no warm-up pass to skip |
 | `--flash-attn` / `-fa` | Accepted. Fused attention is a backend property here, not a per-run switch |
@@ -1073,8 +1075,9 @@ that asks for it and keeps the pipe open.
 The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
 `-dev/--device`, `-ngl/--n-gpu-layers`, `--cont-batching` / `-cb`,
 `--no-cont-batching`, `-np` / `--parallel N`, `-b` / `--batch-size N`,
-`-ub` / `--ubatch-size N`, `--slot-save-path DIR`,
-`--exit-on-stdin-close`, and `--list-devices`. Existing
+`-ub` / `--ubatch-size N`, `--slot-save-path DIR`, `--reasoning-budget N`,
+`--prefill-assistant` / `--no-prefill-assistant`, `--exit-on-stdin-close`,
+and `--list-devices`. Existing
 `FERROX_MODEL_PATH`, `FERROX_ADDR`, and the backend environment
 variables all still work. Command-line values win over them. Keep
 secrets such as `FERROX_API_KEY` in the environment.

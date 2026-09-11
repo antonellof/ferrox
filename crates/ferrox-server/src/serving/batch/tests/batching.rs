@@ -70,6 +70,7 @@ fn continuous_batching_composes_with_paged_kv() {
             grammar: None,
             cancel: params[i].cancel.clone(),
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
         };
         threads.push(thread::spawn(move || {
             barrier.wait();
@@ -254,6 +255,7 @@ fn continuous_batch_matches_sequential_generate_token_ids() {
             grammar: None,
             cancel: params[i].cancel.clone(),
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
         };
         threads.push(thread::spawn(move || {
             barrier.wait();

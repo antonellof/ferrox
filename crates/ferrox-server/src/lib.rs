@@ -38,6 +38,7 @@ mod attribution;
 mod budget;
 mod cache_admin;
 mod cancel;
+mod chat_params;
 mod chat_template;
 mod cli;
 mod completion;
@@ -58,6 +59,7 @@ mod openai_extra;
 mod output;
 mod policy;
 mod prefill_batch;
+mod reasoning_budget;
 mod reasoning_tokens;
 mod rerank;
 mod response_cache;
@@ -108,7 +110,7 @@ use generate::{FinishReason, GenerationParams};
 pub(crate) use loaded::{ActiveModel, Loaded};
 use model::ServerTokenizer;
 use rerank::encoder_endpoints;
-use response_cache::{CacheKey, ResponseCache};
+use response_cache::ResponseCache;
 use sampling_knobs::SamplingKnobs;
 
 /// The loaded model: immutable once built, so it needs no lock at all --
@@ -954,17 +956,21 @@ struct ChatCompletionRequest {
     /// llama.cpp's `continue_final_message`: render the LAST message,
     /// which must be an assistant turn, as a turn still being written
     /// rather than a closed one, so the model carries on from where
-    /// it stopped. `true`, `"reasoning_content"` or `"content"`; the
-    /// whole rule, its refusals included, is [`continuation`].
-    #[serde(default, deserialize_with = "continuation::deserialize_optional")]
-    continue_final_message: Option<continuation::Continuation>,
-    /// llama.cpp's reasoning budget, declared ONLY so it can be refused
-    /// by name -- see
-    /// [`crate::unsupported_sampling::refuse_reasoning_budget`].
-    /// Undeclared, serde would drop it and a caller who asked for a
-    /// 2,000-token thought would get an unbounded one with a 200.
+    /// it stopped. `true`, `"reasoning_content"`, `"content"`, or
+    /// `false`; unset, a trailing assistant message is continued by
+    /// default, as llama.cpp's server does. The whole rule, its
+    /// refusals included, is [`continuation`].
+    #[serde(default, deserialize_with = "continuation::deserialize")]
+    continue_final_message: continuation::ContinueFinalMessage,
+    /// llama.cpp's `reasoning_budget_tokens` (alias
+    /// `thinking_budget_tokens`): a token budget for the chain of
+    /// thought, enforced in the sampler. `-1` or absent takes the
+    /// server's `--reasoning-budget`; `0` closes the block the moment it
+    /// opens; `N` allows N tokens of thought and then forces the closer.
+    /// The range is checked at deserialization, so an out-of-range
+    /// value is a 400 naming the field. See [`crate::reasoning_budget`].
     #[serde(default, alias = "thinking_budget_tokens")]
-    reasoning_budget_tokens: Option<serde_json::Value>,
+    reasoning_budget_tokens: Option<reasoning_budget::BudgetTokens>,
     /// OpenAI fields we explicitly reject rather than silently ignore.
     #[serde(default)]
     logprobs: Option<bool>,
@@ -1104,35 +1110,6 @@ impl ChatCompletionRequest {
     /// the client hasn't explicitly disabled it via `tool_choice:
     /// "none"` -- see `ToolChoice`'s doc comment for what the other
     /// values do (nothing different from `"auto"`).
-    /// The prompt this request decodes from: the history rendered
-    /// whole, or continued from its last message when the caller asked
-    /// for that. ONE call for both the buffered and the streaming
-    /// handler, so the two cannot disagree about what a trailing
-    /// assistant message means.
-    ///
-    /// `served_model` is the name `OutputPosture::resolve` will read the
-    /// output with, so the continuation is written in the same family's
-    /// markers the parser will look for.
-    fn render_prompt(
-        &self,
-        history: &[ChatMessage],
-        template: &chat_template::PromptTemplate,
-        kwargs: serde_json::Map<String, serde_json::Value>,
-        served_model: &str,
-    ) -> Result<String, ApiError> {
-        match self.continue_final_message {
-            None => prompt_from_messages(history, template, &self.tools, kwargs),
-            Some(mode) => continuation::prompt_continuing_final_message(
-                history,
-                template,
-                &self.tools,
-                kwargs,
-                crate::policy::parser::ReasoningFormat::infer(served_model),
-                mode,
-            ),
-        }
-    }
-
     fn tools_active(&self) -> bool {
         !self.tools.is_empty()
             && !matches!(&self.tool_choice, Some(ToolChoice::Mode(m)) if m == "none")
@@ -1350,10 +1327,6 @@ impl ChatCompletionRequest {
             ));
         }
         unsupported_sampling::refuse_logit_bias(self.logit_bias.as_ref(), "/v1/chat/completions")?;
-        unsupported_sampling::refuse_reasoning_budget(
-            self.reasoning_budget_tokens.as_ref(),
-            "/v1/chat/completions",
-        )?;
         // Parsed here as well as in `sampling_knobs` so a bad chain is
         // a 400/501 before any prompt is rendered. The same function
         // both times, so there is no second opinion to drift from.
@@ -1445,125 +1418,6 @@ impl ChatCompletionRequest {
             .and_then(|v| v.get("type"))
             .and_then(|v| v.as_str())
             == Some("json_object")
-    }
-
-    /// Fallible because a constraint is compiled here: an unparseable
-    /// grammar, or a `response_format` this server cannot honour, is a
-    /// refusal rather than a request served without the constraint it
-    /// asked for.
-    fn generation_params(
-        &self,
-        model: crate::sampling_knobs::SamplerModel<'_>,
-    ) -> Result<GenerationParams, ApiError> {
-        Ok(GenerationParams {
-            // Set by `generation_params_for_template`, which is the only
-            // caller that knows the SERVED model name. Left `None` here
-            // so a path that never resolves it reports the field absent
-            // rather than claiming the model did not think.
-            reasoning: None,
-            max_tokens: self.max_tokens,
-            sampling: self.sampling_params(model)?,
-            seed: self.resolved_seed(),
-            stop: self.effective_stop_sequences(),
-            // Resolved by `run_generation_emit`, the layer that holds a
-            // tokenizer: a request body names stop strings, and only
-            // the model can say which of them are single tokens.
-            stop_token_ids: Vec::new(),
-            json_object: self.json_object_mode(),
-            grammar: grammar_request::for_request(
-                self.grammar.as_deref(),
-                self.response_format.as_ref(),
-            )?,
-            // Filled in by the handler that owns the request id --
-            // the request body cannot name its own cancel token.
-            cancel: None,
-            ignore_eos: self.ignore_eos.unwrap_or(false),
-        })
-    }
-
-    /// Like [`Self::generation_params`], plus architecture-default stop
-    /// strings (Gemma IT emits `<end_of_turn>` before `<eos>`) and, for a
-    /// forced `tool_choice`, the grammar that makes it forced.
-    ///
-    /// `served_model` is the name of the checkpoint this generation will
-    /// actually run against -- `active.name()`, the same string
-    /// [`output::OutputPosture::resolve`] reads the answer back with, and
-    /// NOT the `model` field of the request. The two can differ, and a
-    /// grammar built for one wire format while the response is parsed in
-    /// another would force a call this server then cannot read.
-    fn generation_params_for_template(
-        &self,
-        template: &chat_template::PromptTemplate,
-        served_model: &str,
-        model: crate::sampling_knobs::SamplerModel<'_>,
-    ) -> Result<GenerationParams, ApiError> {
-        let mut params = self.generation_params(model)?;
-        // The served model, not the request's `model` field -- see this
-        // function's doc. Same name `OutputPosture::resolve` reads the
-        // answer back with, so the count and the split cannot disagree
-        // about which family this checkpoint is.
-        params.reasoning = crate::policy::parser::ReasoningFormat::infer(served_model);
-        if let Some(stop) = template.end_of_turn() {
-            if !params.stop.iter().any(|s| s == stop) {
-                params.stop.push(stop.to_string());
-            }
-        }
-        if let Some(forced) = self.forced_tool_choice()? {
-            // `validate_supported_fields` has already refused the
-            // combinations that would put two constraints on one
-            // generation, so there is nothing here to overwrite.
-            params.grammar = Some(tool_grammar::build(
-                forced,
-                &self.tool_specs(),
-                policy::parser::ToolCallFormat::infer(served_model),
-            )?);
-        }
-        Ok(params)
-    }
-
-    /// A request only has a deterministic outcome -- and therefore is
-    /// only safe to serve from or populate into the whole-response
-    /// cache -- when it's plain greedy decode (temperature <= 0) or an
-    /// explicit seed was given. Anything else must always regenerate:
-    /// a "cache hit" for an unseeded sampled request would silently
-    /// replay one random draw forever, defeating the purpose of
-    /// sampling and surprising any client expecting fresh output per
-    /// call.
-    fn is_cacheable(&self) -> bool {
-        self.temperature.unwrap_or(0.0) <= 0.0 || self.seed.is_some()
-    }
-
-    /// The cache key for this request under the parameters it will
-    /// actually be generated with.
-    ///
-    /// `params` is taken rather than rebuilt because the RESOLVED
-    /// parameters are the only honest thing to key on: this function
-    /// used to re-state a handful of the request's fields, complete with
-    /// its own copy of every `unwrap_or` default, and then keyed on a
-    /// configuration that was only nearly the one that ran. Three fields
-    /// of that hand-written list were simply missing (#35).
-    ///
-    /// `params` must be the ones from
-    /// [`Self::generation_params_for_template`], not
-    /// [`Self::generation_params`]: the template's end-of-turn stop and
-    /// a forced `tool_choice`'s grammar are added there, and both change
-    /// the answer.
-    fn cache_key(&self, prompt: &str, params: &GenerationParams) -> CacheKey {
-        CacheKey {
-            model: self.model.clone(),
-            prompt: prompt.to_string(),
-            generation: response_cache::generation_key(params),
-            seed: self.seed,
-        }
-    }
-
-    fn resolved_seed(&self) -> u64 {
-        self.seed.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0xDEFA017)
-        })
     }
 }
 
@@ -2243,6 +2097,10 @@ pub(crate) fn decode_error_response(e: generate::DecodeError) -> ApiError {
         // nothing about the server's load: the same body fails the same
         // way on an idle box, so 400 rather than 503.
         generate::DecodeError::GrammarConstraint { .. } => StatusCode::BAD_REQUEST,
+        // Meant to be unreachable -- the route refuses the family with
+        // a 501 before rendering -- and a 500 when it is not, because
+        // then it is this server's decode path that skipped a seam.
+        generate::DecodeError::ReasoningBudget { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     tracing::warn!("decode error: {e}");
     let mut body = serde_json::json!({"error": {"message": e.to_string()}});
@@ -2318,6 +2176,17 @@ fn run_generation_emit(
         resolved.stop_token_ids = crate::stop::resolve_stop_tokens(&resolved.stop, |text| {
             model.encode(text, SpecialTokens::Parse)
         });
+        // The reasoning budget's markers, for the same reason and at
+        // the same seam: `<think>` is a token id only to this model,
+        // and whether the prompt already opened the block is a fact
+        // about the rendered prompt, which this is the last place to
+        // hold beside the tokenizer.
+        resolved.reasoning_budget = resolved
+            .reasoning_budget
+            .armed(resolved.reasoning, prompt, |text| {
+                model.encode(text, SpecialTokens::Parse)
+            })
+            .map_err(|detail| generate::DecodeError::ReasoningBudget { detail })?;
         resolved
     };
     let used_batcher = matches!((model, continuous_batcher), (Model::Gguf(_), Some(_)));
@@ -2797,7 +2666,7 @@ async fn chat_completions_full(
     let history = resolve_history(&state, &req);
     let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
-    let prompt = req.render_prompt(&history, &template, kwargs, active.name())?;
+    let prompt = req.render_prompt(&history, &template, &req.tools, kwargs, active.name())?;
     // Resolved BEFORE the lookup, because the constraint is part of the
     // key: a grammar, JSON mode and `ignore_eos` all change the answer
     // and none of them changes the prompt, so a cache consulted first
@@ -2922,7 +2791,7 @@ async fn chat_completions_stream(
     let history = resolve_history(&state, &req);
     let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
-    let prompt = req.render_prompt(&history, &template, kwargs, active.name())?;
+    let prompt = req.render_prompt(&history, &template, &req.tools, kwargs, active.name())?;
     let model_name = req.model.clone();
     let session_id = req.session_id.clone();
     let sessions = state.sessions.clone();
@@ -4795,6 +4664,7 @@ mod tests {
             grammar: None,
             cancel: None,
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
         }
     }
 
@@ -7779,48 +7649,6 @@ mod tests {
         serde_json::from_value(value).expect("request")
     }
 
-    /// The reasoning split is resolved from the SERVED model, and it is
-    /// what decides whether `usage.completion_tokens_details` exists at
-    /// all. Resolved from the request's `model` field instead, a client
-    /// naming an alias would silently get no count -- and `None` here is
-    /// indistinguishable on the wire from "this model did not think",
-    /// which is the confusion #120 is about.
-    #[test]
-    fn the_reasoning_split_is_resolved_from_the_served_model_not_the_request() {
-        let req = chat_request(serde_json::json!({
-            // Deliberately a name that infers NOTHING, so a pass can only
-            // come from the served name below.
-            "model": "some-alias",
-            "messages": [{"role": "user", "content": "hi"}],
-        }));
-        let template = chat_template::PromptTemplate::plain();
-
-        let thinks = req
-            .generation_params_for_template(
-                &template,
-                "Qwen3-8B",
-                crate::sampling_knobs::SamplerModel::absent(),
-            )
-            .expect("params");
-        assert!(
-            thinks.reasoning.is_some(),
-            "a thinking checkpoint must carry its format into generation"
-        );
-
-        let plain = req
-            .generation_params_for_template(
-                &template,
-                "Llama-3.2-1B-Instruct",
-                crate::sampling_knobs::SamplerModel::absent(),
-            )
-            .expect("params");
-        assert!(
-            plain.reasoning.is_none(),
-            "a checkpoint with no reasoning format must carry none, so the \
-             usage field stays absent rather than becoming a zero"
-        );
-    }
-
     /// The wire field reaches the sampler, compiled.
     ///
     /// Serde is the failure mode here, not the grammar engine: an
@@ -8478,77 +8306,6 @@ mod tests {
             "stop",
         );
         assert_eq!(message.reasoning_content, None);
-    }
-
-    /// The request-level half of `continuation`: the field reaches the
-    /// render, and the family is taken from the SERVED model, the same
-    /// name the output parser reads. A trailing assistant turn without
-    /// the field still renders as history plus a fresh turn.
-    #[test]
-    fn continue_final_message_reaches_the_render_under_the_served_models_family() {
-        let r1 = chat_template::PromptTemplate::from_gguf_metadata(
-            Some("{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}{% if add_generation_prompt %}<|assistant|><think>\n{% endif %}"),
-            Some("qwen2"),
-            false,
-            true,
-            None,
-            None,
-        );
-        let body = serde_json::json!({
-            "model": "m",
-            "messages": [
-                {"role": "user", "content": "why"},
-                {"role": "assistant", "content": "", "reasoning_content": "Let me"},
-            ],
-        });
-        let plain = chat_request(body.clone());
-        let prompt = plain
-            .render_prompt(
-                &plain.messages,
-                &r1,
-                serde_json::Map::new(),
-                "DeepSeek-R1-Distill",
-            )
-            .expect("renders");
-        assert_eq!(prompt, "<|user|>why<|assistant|><|assistant|><think>\n");
-
-        let mut continued = body;
-        continued["continue_final_message"] = serde_json::json!(true);
-        let req = chat_request(continued);
-        let prompt = req
-            .render_prompt(
-                &req.messages,
-                &r1,
-                serde_json::Map::new(),
-                "DeepSeek-R1-Distill",
-            )
-            .expect("renders");
-        assert_eq!(prompt, "<|user|>why<|assistant|><think>Let me");
-        // Under a served model with no reasoning family the same body
-        // is a refusal, not a guess.
-        let (status, _) = req
-            .render_prompt(&req.messages, &r1, serde_json::Map::new(), "Llama-3.2-3B")
-            .expect_err("no family to write the thought in");
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    }
-
-    /// llama.cpp's budget field, under both of its spellings, is a 501
-    /// before any prompt is rendered.
-    #[test]
-    fn a_reasoning_budget_is_refused_by_name_under_both_spellings() {
-        for key in ["reasoning_budget_tokens", "thinking_budget_tokens"] {
-            let req = chat_request(serde_json::json!({
-                "model": "m",
-                "messages": [{"role": "user", "content": "hi"}],
-                key: 2000,
-            }));
-            let (status, body) = req.validate_supported_fields().expect_err(key);
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{key}");
-            assert!(body.0["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("reasoning_budget_tokens"));
-        }
     }
 
     #[test]

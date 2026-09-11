@@ -26,6 +26,7 @@ import {
   type Usage,
 } from "@/lib/api";
 import { fmtInt, fmtMs, fmtNum, isNum } from "@/lib/format";
+import { samplingToWire } from "@/lib/sampling-wire";
 import { useLatest } from "@/lib/use-latest";
 
 /** Not re-exported by the react package under its own name. */
@@ -50,6 +51,15 @@ export type Sampling = {
    * context is the only limit that is always true.
    */
   maxTokens: number | null;
+  /**
+   * llama.cpp's `reasoning_budget_tokens`: how many tokens the model
+   * may think for before the server forces the closing tag and the
+   * answer begins. `null` sends nothing and the server's own default
+   * applies (unrestricted unless it was started with
+   * `--reasoning-budget`). Unlike `max_tokens`, this never cuts the
+   * answer: it moves the model out of its thought and into one.
+   */
+  reasoningBudget: number | null;
 };
 
 export const DEFAULT_SAMPLING: Sampling = {
@@ -57,6 +67,7 @@ export const DEFAULT_SAMPLING: Sampling = {
   temperature: 0.7,
   topP: 0.95,
   maxTokens: null,
+  reasoningBudget: null,
 };
 
 /** The `max_tokens` the previous default sent. A saved settings blob
@@ -264,11 +275,7 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
         {
           model: deps.modelId() || "ferrox",
           messages: wire,
-          temperature: sampling.temperature,
-          top_p: sampling.topP,
-          ...(sampling.maxTokens !== null
-            ? { max_tokens: sampling.maxTokens }
-            : {}),
+          ...samplingToWire(sampling),
           ...(resume ? { continue_final_message: true } : {}),
         },
         {

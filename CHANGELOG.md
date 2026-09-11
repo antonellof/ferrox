@@ -38,11 +38,23 @@ are the ones worth reading twice.
   and value set (`true`, `"reasoning_content"`, `"content"`): the
   trailing assistant message renders as a turn still being written, its
   thought re-opened in the family's own markers, so the model continues
-  rather than starting over. Default off; the channel-grammar families
-  and a content continuation for an always-open family are 501 by name.
-- `reasoning_budget_tokens` / `thinking_budget_tokens` are refused by
-  name (501) except `-1`, rather than silently dropped. llama.cpp
-  enforces the budget in its sampler; ferrox has no such sampler yet.
+  rather than starting over. **Default on, as llama.cpp's server**: a
+  trailing assistant message is continued unless the request says
+  `false` or the server was started with `--no-prefill-assistant`
+  (llama.cpp's flag). `/v1/messages` and `/v1/responses` render through
+  the same function, so the three routes hold one default rather than
+  three literals. The channel-grammar families and a content
+  continuation for an always-open family are 501 by name.
+- `reasoning_budget_tokens` / `thinking_budget_tokens`, llama.cpp's
+  sampler-level thinking budget (`common/reasoning-budget.cpp`), on
+  `/v1/chat/completions`, `/v1/responses` and, as `thinking.budget_tokens`,
+  `/v1/messages`; `--reasoning-budget N` is the server default. After N
+  tokens of thought the closing tag is forced one token per step, so the
+  answer still arrives with `finish_reason: "stop"`; `0` closes the
+  block the moment it opens; `-1` is unrestricted. Measured
+  token-for-token against llama.cpp master on DeepSeek-R1-Distill at
+  temperature 0. Studio's sampling panel carries the field. Replaces the
+  501 that refused the field by name.
 
 ## [0.20.0] - 2026-09-11
 

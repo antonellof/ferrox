@@ -24,6 +24,7 @@
 mod greedy_equivalence;
 mod params;
 mod penalties;
+pub mod reasoning_budget;
 mod recommended;
 mod rng;
 

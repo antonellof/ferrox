@@ -72,6 +72,9 @@ pub struct GenerationKey {
     pub json_object: bool,
     pub grammar: Option<GrammarKey>,
     pub ignore_eos: bool,
+    /// The requested reasoning budget, `None` when unrestricted. A
+    /// budget cuts the thought and so changes the answer.
+    pub reasoning_budget: Option<u32>,
 }
 
 /// A compiled grammar, in a form a hashed cache key can hold.
@@ -113,7 +116,7 @@ impl Hash for GrammarKey {
 /// The destructure below is exhaustive ON PURPOSE, for the same reason
 /// [`sampling_key`]'s is: a field added to `GenerationParams` stops this
 /// crate compiling, HERE, until someone decides whether it belongs in
-/// the cache key. Three of the ten fields are deliberately NOT keyed and
+/// the cache key. Three of the eleven fields are deliberately NOT keyed and
 /// each says why at its `_` binding -- an exclusion on the record is a
 /// decision; a field nobody looked at is the bug in #35.
 pub fn generation_key(params: &GenerationParams) -> GenerationKey {
@@ -153,6 +156,7 @@ pub fn generation_key(params: &GenerationParams) -> GenerationKey {
         // this cache is correct.
         cancel: _,
         ignore_eos,
+        reasoning_budget,
     } = params;
     GenerationKey {
         max_tokens: *max_tokens,
@@ -168,6 +172,9 @@ pub fn generation_key(params: &GenerationParams) -> GenerationKey {
         json_object: *json_object,
         grammar: grammar.clone().map(GrammarKey),
         ignore_eos: *ignore_eos,
+        // The number, not the plan: the plan is derived from the number,
+        // the model and the prompt, all three already keyed.
+        reasoning_budget: reasoning_budget.key(),
     }
 }
 
@@ -492,6 +499,7 @@ mod tests {
             grammar: None,
             cancel: None,
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
         }
     }
 

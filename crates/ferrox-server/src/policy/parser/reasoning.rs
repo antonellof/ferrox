@@ -210,6 +210,16 @@ impl ReasoningFormat {
         }
     }
 
+    /// The tool-call opener that can arrive INSIDE the block for this
+    /// family, ending the thought without a closer. Beside
+    /// [`Self::continuation_markers`] because the token budget needs
+    /// both: the closer it forces, and every sequence that ends a
+    /// thought naturally (`common/chat.cpp:1135,2142` list the tool
+    /// opener as a second end tag for the same reason).
+    pub fn tool_marker(self) -> Option<&'static str> {
+        self.markers().tool_start
+    }
+
     /// Whether the parser reads every generation as starting INSIDE the
     /// block regardless of what the prompt says. A prompt that closes
     /// the block itself cannot tell such a parser so, which is why a

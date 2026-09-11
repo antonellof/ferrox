@@ -93,9 +93,9 @@ use serde_json::{json, Value};
 use crate::generate::Usage;
 use crate::output::{OutputPosture, ParsedOutput};
 use crate::{
-    attribution, decode_error_response, output, prompt_from_messages, run_generation_emit, sse,
-    stats, ApiError, AppState, ChatCompletionRequest, ChatMessage, MessageContent, StopParam,
-    ThinkingSwitch, ToolCallFunctionIn, ToolCallIn, ToolDef, ToolFunctionDef,
+    attribution, decode_error_response, output, run_generation_emit, sse, stats, ApiError,
+    AppState, ChatCompletionRequest, ChatMessage, MessageContent, StopParam, ThinkingSwitch,
+    ToolCallFunctionIn, ToolCallIn, ToolDef, ToolFunctionDef,
 };
 use ferrox_models::tokenizer::SpecialTokens;
 
@@ -242,13 +242,63 @@ struct PromptFields {
     #[serde(default)]
     tool_choice: Option<ToolChoiceIn>,
     /// Anthropic's extended-thinking toggle, `{"type": "enabled" |
-    /// "disabled"}`. The same wire shape the chat surface already reads
-    /// (`budget_tokens` is accepted and ignored -- this server has no
-    /// thinking budget to enforce), so it is handed straight to
-    /// [`crate::ChatCompletionRequest::resolve_template_kwargs`] and
-    /// goes through the one thinking-resolution path.
+    /// "disabled", "budget_tokens": N}`. The switch half is the same
+    /// wire shape the chat surface already reads, so it is handed
+    /// straight to [`crate::ChatCompletionRequest::resolve_template_kwargs`]
+    /// and goes through the one thinking-resolution path; the budget
+    /// half becomes llama.cpp's `thinking_budget_tokens` exactly as
+    /// llama.cpp's own Anthropic lowering does it
+    /// (`tools/server/server-chat.cpp:585-591`).
     #[serde(default)]
-    thinking: Option<ThinkingSwitch>,
+    thinking: Option<AnthropicThinking>,
+}
+
+/// Anthropic's `thinking` object. Its own struct rather than the shared
+/// [`ThinkingSwitch`] because `budget_tokens` is this wire's field and
+/// not the DeepSeek wire's: declared on the shared switch it would be
+/// read on `/v1/chat/completions` too, where llama.cpp does not read
+/// it.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicThinking {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    budget_tokens: Option<i64>,
+}
+
+/// llama.cpp's default when `thinking.type` is `enabled` and the
+/// request names no `budget_tokens` (`server-chat.cpp:590`). Anthropic's
+/// API makes the field mandatory, so a real client always sends one;
+/// the number exists for the client that does not.
+const DEFAULT_ANTHROPIC_THINKING_BUDGET: i64 = 10_000;
+
+impl AnthropicThinking {
+    fn switch(&self) -> ThinkingSwitch {
+        ThinkingSwitch {
+            kind: self.kind.clone(),
+        }
+    }
+
+    /// The budget this object asks for, llama.cpp's way: only an
+    /// `enabled` switch carries one, and one without a number gets
+    /// [`DEFAULT_ANTHROPIC_THINKING_BUDGET`]. A `disabled` switch has
+    /// no thought to bound, and is resolved by the shared switch.
+    fn budget(&self) -> Result<Option<crate::reasoning_budget::BudgetTokens>, ApiError> {
+        if self.kind != "enabled" {
+            return Ok(None);
+        }
+        let value = self
+            .budget_tokens
+            .unwrap_or(DEFAULT_ANTHROPIC_THINKING_BUDGET);
+        crate::reasoning_budget::BudgetTokens::parse(value)
+            .map(Some)
+            .map_err(|why| {
+                crate::invalid_request(
+                    &why.replace("reasoning_budget_tokens", "thinking.budget_tokens"),
+                    "thinking.budget_tokens",
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -621,7 +671,18 @@ struct Prepared {
 /// The prompt half of the conversion, shared by both endpoints so a
 /// counted prompt is the prompt a generation of the same body renders
 /// (rule 7).
-fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Prepared {
+fn prepare_prompt(
+    prompt: &PromptFields,
+    model: String,
+    max_tokens: usize,
+) -> Result<Prepared, ApiError> {
+    let reasoning_budget_tokens = prompt
+        .thinking
+        .as_ref()
+        .map(AnthropicThinking::budget)
+        .transpose()
+        .map_err(anthropic_shape)?
+        .flatten();
     let all = tool_defs(prompt.tools.as_deref().unwrap_or_default());
     let choice = prompt.tool_choice.as_ref();
     let (template_tools, parser_tools) = if choice.is_some_and(|c| c.kind == "none") {
@@ -668,13 +729,14 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
         tool_choice: None,
         chat_template_kwargs: None,
         reasoning_effort: None,
-        thinking: prompt.thinking.clone(),
+        thinking: prompt.thinking.as_ref().map(AnthropicThinking::switch),
         // Stateless surface: Claude Code resends the whole conversation.
         session_id: None,
-        // Anthropic's API prefills a trailing assistant turn; this lowering
-        // does not ask for that yet -- see `continuation`.
-        continue_final_message: None,
-        reasoning_budget_tokens: None,
+        // Anthropic's API prefills a trailing assistant turn, and so does
+        // the shared renderer by default now (`continuation`): this
+        // lowering says nothing and gets the one rule every route gets.
+        continue_final_message: Default::default(),
+        reasoning_budget_tokens,
         logprobs: None,
         top_logprobs: None,
         n: None,
@@ -692,12 +754,12 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
         // protocol has no spelling for it.
         ignore_eos: None,
     };
-    Prepared { chat, parser_tools }
+    Ok(Prepared { chat, parser_tools })
 }
 
 /// The whole request conversion for `/v1/messages`.
 fn to_chat_request(req: &MessagesRequest) -> Result<Prepared, ApiError> {
-    let mut prepared = prepare_prompt(&req.prompt, req.model.clone(), req.max_tokens);
+    let mut prepared = prepare_prompt(&req.prompt, req.model.clone(), req.max_tokens)?;
     prepared.chat.temperature = req.temperature;
     prepared.chat.top_p = req.top_p;
     prepared.chat.top_k = req.top_k;
@@ -1402,7 +1464,14 @@ async fn messages_full(
         .map_err(anthropic_shape)?
         .chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
-    let prompt = prompt_from_messages(&chat.messages, &template, &chat.tools, kwargs)
+    let prompt = chat
+        .render_prompt(
+            &chat.messages,
+            &template,
+            &chat.tools,
+            kwargs,
+            active.name(),
+        )
         .map_err(anthropic_shape)?;
     let posture = OutputPosture::resolve(active.name(), &prompt);
     // The client's own list, kept apart from `params.stop`, which the
@@ -1461,9 +1530,16 @@ async fn messages_stream(
         .map_err(anthropic_shape)?
         .chat_template();
     let kwargs = chat.resolve_template_kwargs(&template);
-    let prompt = prompt_from_messages(&chat.messages, &template, &chat.tools, kwargs)
-        .map_err(anthropic_shape)?;
     let served_model = active.name().to_string();
+    let prompt = chat
+        .render_prompt(
+            &chat.messages,
+            &template,
+            &chat.tools,
+            kwargs,
+            &served_model,
+        )
+        .map_err(anthropic_shape)?;
     let posture = OutputPosture::resolve(&served_model, &prompt);
     // See `messages_full`: the client's list, not the template's.
     let caller_stops = chat.stop_sequences();
@@ -1705,13 +1781,18 @@ pub(crate) async fn count_tokens(
         // A template that refuses *this conversation* -- a tool result
         // with no call before it, a role order it forbids -- is a client
         // error, the same 400 `/v1/messages` answers for the same body.
-        let prompt = prompt_from_messages(
-            &prepared.chat.messages,
-            &template,
-            &prepared.chat.tools,
-            kwargs,
-        )
-        .map_err(anthropic_shape)?;
+        // Through the same renderer as the generation, so a trailing
+        // assistant turn is counted as the continuation it will be.
+        let prompt = prepared
+            .chat
+            .render_prompt(
+                &prepared.chat.messages,
+                &template,
+                &prepared.chat.tools,
+                kwargs,
+                state.active_model_name().as_deref().unwrap_or_default(),
+            )
+            .map_err(anthropic_shape)?;
         // The count a generation would report is the encoded prompt
         // plus whatever BOS the decode path prepends
         // (`generate::generate` calls `prepend_bos`). `Model` exposes no
@@ -1765,7 +1846,7 @@ fn countable_prompt(req: &CountTokensRequest) -> Result<Prepared, ApiError> {
     // `max_tokens: 1` is a placeholder: this endpoint has no output
     // budget, nothing here decodes, and the shared request type requires
     // a positive one.
-    let prepared = prepare_prompt(&req.prompt, req.model.clone(), 1);
+    let prepared = prepare_prompt(&req.prompt, req.model.clone(), 1)?;
     if prepared.chat.messages.is_empty() {
         return Err(anthropic_error(
             StatusCode::BAD_REQUEST,
@@ -2275,6 +2356,61 @@ mod tests {
         assert_eq!(
             off.chat.thinking.as_ref().map(|t| t.kind.as_str()),
             Some("disabled")
+        );
+    }
+
+    /// The budget half of `thinking`, llama.cpp's way
+    /// (`server-chat.cpp:585-591`): `enabled` carries `budget_tokens`
+    /// into `thinking_budget_tokens`, an `enabled` with no number gets
+    /// 10,000, and `disabled` carries none.
+    #[test]
+    fn thinking_budget_tokens_becomes_the_reasoning_budget() {
+        use crate::reasoning_budget::BudgetTokens;
+        let on = converted(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(
+            on.chat.reasoning_budget_tokens,
+            Some(BudgetTokens::Tokens(1024))
+        );
+        let unnumbered = converted(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "thinking": {"type": "enabled"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(
+            unnumbered.chat.reasoning_budget_tokens,
+            Some(BudgetTokens::Tokens(10_000))
+        );
+        let off = converted(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "thinking": {"type": "disabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(off.chat.reasoning_budget_tokens, None);
+        let bad: MessagesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "thinking": {"type": "enabled", "budget_tokens": -5},
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        let Err((status, body)) = to_chat_request(&bad) else {
+            panic!("out of range");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.0["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("thinking.budget_tokens"),
+            "{}",
+            body.0
         );
     }
 
