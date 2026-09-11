@@ -27,6 +27,7 @@
 
 use ferrox_models::grammar_sampler::{ConstraintError, GrammarSampler, MaskOutcome};
 use ferrox_models::penalty_window::PenaltyWindow;
+use ferrox_models::sampling::reasoning_budget::{lossy_piece_is_complete, ReasoningBudget};
 use ferrox_models::sampling::Sampler;
 use ferrox_models::tokenizer::StopTokens;
 
@@ -43,6 +44,11 @@ pub(crate) struct SampleState {
     /// vector has said how big the vocabulary is, and the batcher builds
     /// its rows before it has ever decoded one.
     grammar: Option<GrammarSampler>,
+    /// The reasoning budget machine, built on the first step from the
+    /// armed plan on the params -- the same lazy shape as `grammar`,
+    /// and for the same reason: the batcher builds its rows before it
+    /// has a step to hand them.
+    budget: Option<ReasoningBudget>,
 }
 
 impl SampleState {
@@ -50,7 +56,17 @@ impl SampleState {
         Self {
             sampler: Sampler::new(seed),
             grammar: None,
+            budget: None,
         }
+    }
+
+    /// The budget machine's state, for tests: `None` before the first
+    /// step and for a request without a budget.
+    #[cfg(test)]
+    pub(crate) fn budget_state(
+        &self,
+    ) -> Option<ferrox_models::sampling::reasoning_budget::BudgetState> {
+        self.budget.as_ref().map(ReasoningBudget::state)
     }
 
     /// Whether a grammar is being applied. For tests and diagnostics;
@@ -139,12 +155,36 @@ pub(crate) fn sample_next(
             ));
         }
     }
+    if state.budget.is_none() {
+        match &params.reasoning_budget {
+            crate::reasoning_budget::ReasoningBudget::Unrestricted => {}
+            crate::reasoning_budget::ReasoningBudget::Armed(plan) => {
+                state.budget = Some(ReasoningBudget::new(plan));
+            }
+            // A number nobody tokenized. The seam that turns it into a
+            // plan (`run_generation_emit`) was skipped, and running on
+            // would serve an unbounded thought as a bounded one.
+            crate::reasoning_budget::ReasoningBudget::Requested(n) => {
+                return Err(DecodeError::ReasoningBudget {
+                    detail: format!(
+                        "a budget of {n} tokens reached the sampler unresolved; the decode \
+                         path did not tokenize the reasoning markers"
+                    ),
+                });
+            }
+        }
+    }
 
     // Destructured so the sampler can be borrowed mutably while the
-    // grammar is read by the mask closure it is handed.
-    let SampleState { sampler, grammar } = state;
+    // grammar and the budget are read by the mask closure it is handed.
+    let SampleState {
+        sampler,
+        grammar,
+        budget,
+    } = state;
     let json_object = params.json_object;
     let grammar_ref = grammar.as_ref();
+    let budget_ref = budget.as_ref();
     // The mask cannot return an error through a callback the sampler
     // calls, so it parks one here and the token is discarded below. It
     // must be discarded: a mask that failed left every logit at `-inf`,
@@ -154,9 +194,14 @@ pub(crate) fn sample_next(
     let mut outcome = MaskOutcome::Allowed;
     let next = {
         let mut mask = |scores: &mut [f32]| {
-            // Order does not matter and must not: neither mask ever
+            // Order does not matter and must not: no mask here ever
             // clears a `-inf`, so the result is the intersection either
-            // way. JSON mode first only because it is the cheaper one.
+            // way. The budget goes first only because llama.cpp applies
+            // it first (`common/sampling.cpp:616-620`), and JSON mode
+            // next because it is the cheaper of the other two.
+            if let Some(b) = budget_ref {
+                b.mask(scores);
+            }
             if json_object {
                 mask_logits_for_json(scores, decode_token);
             }
@@ -193,6 +238,14 @@ pub(crate) fn sample_next(
             detail: e.to_string(),
         })?;
     }
+    // And the budget's: every generated token, the forced ones
+    // included, walks the machine (`common/sampling.cpp:482-483`
+    // accepts each into `rbudget` the same way). The piece decides
+    // whether the closer may be forced yet, or must wait for the byte
+    // that finishes a character.
+    if let Some(b) = budget.as_mut() {
+        b.accept(next, lossy_piece_is_complete(&decode_token(next)));
+    }
     Ok(Step::Token(next))
 }
 
@@ -228,6 +281,7 @@ mod tests {
             grammar: None,
             cancel: None,
             ignore_eos: false,
+            reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
         }
     }
 
@@ -717,5 +771,113 @@ mod tests {
             1,
             "a token in the prompt must be penalised on its FIRST generated occurrence"
         );
+    }
+
+    /// A five-token vocabulary with an opener and a closer, for the
+    /// budget tests: 0..=2 are words, 3 opens the block, 4 closes it.
+    fn think_vocab(id: usize) -> String {
+        match id {
+            3 => "<think>".to_string(),
+            4 => "</think>".to_string(),
+            other => format!("w{other}"),
+        }
+    }
+    const OPEN: usize = 3;
+    const CLOSE: usize = 4;
+
+    fn with_budget(mut p: GenerationParams, budget: u32, prefill: &[usize]) -> GenerationParams {
+        use ferrox_models::sampling::reasoning_budget::ReasoningBudgetPlan;
+        p.reasoning_budget =
+            crate::reasoning_budget::ReasoningBudget::Armed(Arc::new(ReasoningBudgetPlan {
+                start_seqs: vec![vec![OPEN]],
+                end_seqs: vec![vec![CLOSE]],
+                forced: vec![CLOSE],
+                budget,
+                prefill: prefill.to_vec(),
+            }));
+        p
+    }
+
+    /// The whole hook under a budget, at temperature 0 with the closer
+    /// the LEAST likely token every step: the model opens the block,
+    /// spends its budget on its own argmax, and the next draw is the
+    /// closer whatever the logits say. Then the mask is gone and the
+    /// argmax is back. This is the property both decode loops get by
+    /// calling here: a loop that kept its own `Sampler` would think
+    /// forever.
+    #[test]
+    fn the_budget_forces_the_closer_after_n_tokens_of_thought_on_both_loops_path() {
+        use ferrox_models::sampling::reasoning_budget::BudgetState;
+        // Argmax is the opener first, then word 1 forever; the closer
+        // is always last.
+        let opener_first = vec![1.0, 5.0, 0.5, 9.0, -9.0];
+        let words = vec![1.0, 5.0, 0.5, 0.2, -9.0];
+        let p = with_budget(params(false, 0.0), 2, &[]);
+        let mut state = SampleState::new(7);
+        let stops = StopTokens::default();
+        let mut out = Vec::new();
+        let mut draw = |state: &mut SampleState, logits: &[f32]| {
+            let id = token(step(state, logits, &p, &out, &stops, &think_vocab).expect("draws"));
+            out.push(id);
+            id
+        };
+        assert_eq!(draw(&mut state, &opener_first), OPEN);
+        assert_eq!(state.budget_state(), Some(BudgetState::Counting));
+        assert_eq!(draw(&mut state, &words), 1, "first of two");
+        assert_eq!(
+            draw(&mut state, &words),
+            1,
+            "second of two, still the model's own"
+        );
+        assert_eq!(state.budget_state(), Some(BudgetState::Forcing));
+        assert_eq!(
+            draw(&mut state, &words),
+            CLOSE,
+            "the least likely token, forced over the argmax"
+        );
+        assert_eq!(state.budget_state(), Some(BudgetState::Done));
+        assert_eq!(draw(&mut state, &words), 1, "the answer is unconstrained");
+    }
+
+    /// Sampled rather than greedy, and the budget still lands: the
+    /// mask leaves one finite logit, so the draw has one candidate.
+    #[test]
+    fn the_forced_closer_survives_sampling_at_temperature_one() {
+        let words = vec![1.0, 5.0, 0.5, 0.2, -9.0];
+        for seed in 0..8u64 {
+            let p = with_budget(params(false, 1.0), 0, &[OPEN]);
+            let mut state = SampleState::new(seed);
+            let chosen = token(
+                step(
+                    &mut state,
+                    &words,
+                    &p,
+                    &[],
+                    &StopTokens::default(),
+                    &think_vocab,
+                )
+                .expect("draws"),
+            );
+            assert_eq!(chosen, CLOSE, "seed {seed}");
+        }
+    }
+
+    /// A budget nobody tokenized is a refusal at the sampler, not a
+    /// thought served unbounded: the seam that arms it was skipped.
+    #[test]
+    fn a_requested_budget_that_was_never_armed_is_an_error_not_a_passthrough() {
+        let mut p = params(false, 0.0);
+        p.reasoning_budget = crate::reasoning_budget::ReasoningBudget::Requested(5);
+        let mut state = SampleState::new(7);
+        let err = step(
+            &mut state,
+            &[1.0, 5.0, 0.5, 0.2, -9.0],
+            &p,
+            &[],
+            &StopTokens::default(),
+            &think_vocab,
+        )
+        .expect_err("unresolved");
+        assert!(matches!(err, DecodeError::ReasoningBudget { .. }), "{err}");
     }
 }

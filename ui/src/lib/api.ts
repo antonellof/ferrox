@@ -350,9 +350,16 @@ export type ChatRequest = {
   /** Omitted, the server bounds the answer by the context alone. */
   max_tokens?: number;
   /**
+   * llama.cpp's field: tokens of thinking allowed before the server
+   * forces the closing tag. Omitted, the server's `--reasoning-budget`
+   * default applies; `0` ends the thought as soon as it opens.
+   */
+  reasoning_budget_tokens?: number;
+  /**
    * llama.cpp's field: render the trailing assistant message as a turn
    * still being written, so the model carries on from where it stopped
-   * rather than starting a new one.
+   * rather than starting a new one. The server does this by default
+   * for a trailing assistant message; Studio still says so explicitly.
    */
   continue_final_message?: boolean;
 };

@@ -26,13 +26,25 @@
 //! the model is inside the block, which is the same fact it reads for
 //! every other request.
 //!
-//! **Default off.** llama.cpp's server treats ANY trailing assistant
-//! message as a continuation unless `--no-prefill-assistant` is given.
-//! OpenAI's API does not (a trailing assistant message there gets a new
-//! turn), and `/v1/responses` and `/v1/messages` render through the
-//! same function this one wraps, so flipping that default is a change
-//! to what three routes mean and is not made here. A caller asks for it
-//! by name.
+//! **Default ON, llama.cpp's way.** Its server treats ANY trailing
+//! assistant message as a continuation unless started with
+//! `--no-prefill-assistant` (`tools/server/server-common.cpp:1046-1056`:
+//! a body that does not set the field, on a server whose
+//! `prefill_assistant` is true, with an assistant message last, gets
+//! `AUTO`). Anthropic's API prefills a trailing assistant turn too.
+//! That rule is [`ContinueFinalMessage::resolve`], and it is applied in
+//! exactly ONE place -- `ChatCompletionRequest::render_prompt` -- which
+//! `/v1/chat/completions`, `/v1/messages` and `/v1/responses` all render
+//! through, so the three routes cannot hold three copies of the
+//! default. The server flag is `--prefill-assistant` /
+//! `--no-prefill-assistant`, llama.cpp's spelling, lowered to
+//! [`PREFILL_ASSISTANT_ENV`].
+//!
+//! One deliberate difference from upstream: there, `false` parses to
+//! the same thing as absence (`common/chat.cpp:567-581`), so a single
+//! request cannot opt out of the server default. Here `false` is an
+//! explicit "render it closed", because a client that spells the
+//! opt-out meant it.
 //!
 //! **Refused by name, not approximated:** a channel grammar (harmony,
 //! ATEM) has no marker pair to write a thought back between; an
@@ -46,15 +58,73 @@ use serde::Deserialize;
 use crate::policy::parser::ReasoningFormat;
 use crate::{chat_template, invalid_request, unsupported_feature, ApiError, ChatMessage, ToolDef};
 
-/// The wire value: `true`, `"reasoning_content"` or `"content"`.
-///
-/// `false` deserializes to the same thing as absence, because a client
-/// that spells "do not continue" explicitly meant exactly that.
+/// A continuation mode: `true`, `"reasoning_content"` or `"content"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Continuation {
     Auto,
     Reasoning,
     Content,
+}
+
+/// The `continue_final_message` field in its three states.
+///
+/// `Unset` is the shape every route's lowering leaves it in when the
+/// caller said nothing, and it is the ONLY state the server default
+/// applies to; a route that wanted a different default would have to
+/// spell a different variant, and there is none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ContinueFinalMessage {
+    /// The caller said nothing: llama.cpp's server default decides.
+    #[default]
+    Unset,
+    /// `false`: render the trailing assistant message as a closed turn.
+    Off,
+    /// A mode the caller asked for by name.
+    Mode(Continuation),
+}
+
+/// Env var `--prefill-assistant` / `--no-prefill-assistant` lowers to.
+/// Unset is on, as upstream's `prefill_assistant = true`
+/// (`common/common.h:642`).
+pub(crate) const PREFILL_ASSISTANT_ENV: &str = "FERROX_PREFILL_ASSISTANT";
+
+fn prefill_assistant_enabled() -> bool {
+    prefill_assistant_from_env(std::env::var(PREFILL_ASSISTANT_ENV).ok().as_deref())
+}
+
+fn prefill_assistant_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
+impl ContinueFinalMessage {
+    /// llama.cpp's rule (`server-common.cpp:1046-1056`): an explicit
+    /// mode stands; an explicit `false` renders the turn closed; a
+    /// request that said nothing continues a trailing assistant
+    /// message when the server's prefill is on, and otherwise does not.
+    ///
+    /// The `bool` says whether the mode was IMPLIED by the default, so
+    /// a refusal downstream can tell the caller what to turn off.
+    pub(crate) fn resolve(self, history: &[crate::ChatMessage]) -> Option<(Continuation, bool)> {
+        self.resolve_with(prefill_assistant_enabled(), history)
+    }
+
+    fn resolve_with(
+        self,
+        prefill_assistant: bool,
+        history: &[crate::ChatMessage],
+    ) -> Option<(Continuation, bool)> {
+        match self {
+            ContinueFinalMessage::Mode(mode) => Some((mode, false)),
+            ContinueFinalMessage::Off => None,
+            ContinueFinalMessage::Unset => {
+                let trailing_assistant = history.last().is_some_and(|m| m.role == "assistant");
+                (prefill_assistant && trailing_assistant).then_some((Continuation::Auto, true))
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -64,46 +134,43 @@ enum ContinueWire {
     Mode(String),
 }
 
-/// An `Option<Continuation>` field: `false` and absent both mean none,
-/// so the outer `Option` cannot deserialize `false` to `Some`.
-pub(crate) fn deserialize_optional<'de, D>(
-    deserializer: D,
-) -> Result<Option<Continuation>, D::Error>
+/// The field's deserializer: absent and `null` are `Unset`, `false` is
+/// `Off`, everything else is a named mode or a parse error.
+pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<ContinueFinalMessage, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let Some(wire) = Option::<ContinueWire>::deserialize(deserializer)? else {
-        return Ok(None);
+        return Ok(ContinueFinalMessage::Unset);
     };
     match wire {
-        ContinueWire::Flag(false) => Ok(None),
-        wire => Continuation::try_from(wire)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
+        ContinueWire::Flag(false) => Ok(ContinueFinalMessage::Off),
+        ContinueWire::Flag(true) => Ok(ContinueFinalMessage::Mode(Continuation::Auto)),
+        ContinueWire::Mode(mode) => match mode.as_str() {
+            "reasoning_content" => Ok(ContinueFinalMessage::Mode(Continuation::Reasoning)),
+            "content" => Ok(ContinueFinalMessage::Mode(Continuation::Content)),
+            other => Err(serde::de::Error::custom(format!(
+                "continue_final_message must be true, false, \"reasoning_content\" or \
+                 \"content\", not {other:?}"
+            ))),
+        },
     }
 }
 
-impl TryFrom<ContinueWire> for Continuation {
-    type Error = String;
-
-    fn try_from(wire: ContinueWire) -> Result<Self, String> {
-        match wire {
-            ContinueWire::Flag(true) => Ok(Continuation::Auto),
-            ContinueWire::Flag(false) => Err(
-                "continue_final_message: false is the same as omitting it; pass true, \
-                 \"reasoning_content\" or \"content\""
-                    .to_string(),
-            ),
-            ContinueWire::Mode(mode) => match mode.as_str() {
-                "reasoning_content" => Ok(Continuation::Reasoning),
-                "content" => Ok(Continuation::Content),
-                other => Err(format!(
-                    "continue_final_message must be true, \"reasoning_content\" or \
-                     \"content\", not {other:?}"
-                )),
-            },
-        }
+/// A refusal of a continuation nobody asked for by name, with the two
+/// ways to make the request render the turn closed instead.
+pub(crate) fn implied_by_default(error: ApiError) -> ApiError {
+    let (status, mut body) = error;
+    if let Some(message) = body.0["error"]["message"].as_str() {
+        let message = format!(
+            "{message} (This continuation was implied by the server default: a trailing \
+             assistant message is continued, as llama.cpp's --prefill-assistant does. Send \
+             `continue_final_message: false` to render it as a closed turn, or start the \
+             server with --no-prefill-assistant.)"
+        );
+        body.0["error"]["message"] = serde_json::Value::String(message);
     }
+    (status, body)
 }
 
 impl Continuation {
@@ -279,11 +346,11 @@ mod tests {
         )
     }
 
-    fn parse(value: serde_json::Value) -> Result<Option<Continuation>, String> {
+    fn parse(value: serde_json::Value) -> Result<ContinueFinalMessage, String> {
         #[derive(Deserialize)]
         struct Body {
-            #[serde(default, deserialize_with = "deserialize_optional")]
-            continue_final_message: Option<Continuation>,
+            #[serde(default, deserialize_with = "deserialize")]
+            continue_final_message: ContinueFinalMessage,
         }
         serde_json::from_value::<Body>(serde_json::json!({ "continue_final_message": value }))
             .map(|b| b.continue_final_message)
@@ -463,25 +530,83 @@ mod tests {
         assert_eq!(empty.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
-    /// llama.cpp's value set, and nothing else: `false` is absence, an
-    /// unknown mode is a parse error rather than a guess.
+    /// llama.cpp's value set plus an explicit off: `false` is `Off`,
+    /// absence and `null` are `Unset`, an unknown mode is a parse error
+    /// rather than a guess.
     #[test]
-    fn the_wire_value_set_is_llama_cpps() {
+    fn the_wire_value_set_is_llama_cpps_plus_an_explicit_off() {
         assert_eq!(
             parse(serde_json::json!(true)).unwrap(),
-            Some(Continuation::Auto)
+            ContinueFinalMessage::Mode(Continuation::Auto)
         );
-        assert_eq!(parse(serde_json::json!(false)).unwrap(), None);
-        assert_eq!(parse(serde_json::json!(null)).unwrap(), None);
+        assert_eq!(
+            parse(serde_json::json!(false)).unwrap(),
+            ContinueFinalMessage::Off
+        );
+        assert_eq!(
+            parse(serde_json::json!(null)).unwrap(),
+            ContinueFinalMessage::Unset
+        );
         assert_eq!(
             parse(serde_json::json!("reasoning_content")).unwrap(),
-            Some(Continuation::Reasoning)
+            ContinueFinalMessage::Mode(Continuation::Reasoning)
         );
         assert_eq!(
             parse(serde_json::json!("content")).unwrap(),
-            Some(Continuation::Content)
+            ContinueFinalMessage::Mode(Continuation::Content)
         );
         assert!(parse(serde_json::json!("auto")).is_err());
         assert!(parse(serde_json::json!(1)).is_err());
+        assert_eq!(ContinueFinalMessage::default(), ContinueFinalMessage::Unset);
+    }
+
+    /// llama.cpp's server default (`server-common.cpp:1046-1056`): a
+    /// request that said nothing continues a trailing assistant
+    /// message, and only one, and only while the server's prefill is
+    /// on. An explicit mode or `false` is never overridden.
+    #[test]
+    fn a_trailing_assistant_message_is_continued_by_default() {
+        let trailing = [msg("user", "why", None), msg("assistant", "Because", None)];
+        let no_trailing = [msg("user", "why", None)];
+        assert_eq!(
+            ContinueFinalMessage::Unset.resolve_with(true, &trailing),
+            Some((Continuation::Auto, true)),
+            "implied, and marked as implied"
+        );
+        assert_eq!(
+            ContinueFinalMessage::Unset.resolve_with(true, &no_trailing),
+            None
+        );
+        assert_eq!(
+            ContinueFinalMessage::Unset.resolve_with(false, &trailing),
+            None,
+            "--no-prefill-assistant"
+        );
+        assert_eq!(
+            ContinueFinalMessage::Off.resolve_with(true, &trailing),
+            None,
+            "false opts out of the default"
+        );
+        assert_eq!(
+            ContinueFinalMessage::Mode(Continuation::Content).resolve_with(false, &trailing),
+            Some((Continuation::Content, false)),
+            "a named mode stands whatever the server flag says"
+        );
+        assert!(prefill_assistant_from_env(None), "unset is on, as upstream");
+        assert!(prefill_assistant_from_env(Some("1")));
+        assert!(!prefill_assistant_from_env(Some("0")));
+        assert!(!prefill_assistant_from_env(Some("false")));
+    }
+
+    /// The refusal a caller gets for a continuation they never asked
+    /// for names both ways out.
+    #[test]
+    fn an_implied_refusal_says_how_to_turn_the_default_off() {
+        let (status, body) = implied_by_default(unsupported_feature("not for this family"));
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        let message = body.0["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("not for this family"));
+        assert!(message.contains("continue_final_message: false"));
+        assert!(message.contains("--no-prefill-assistant"));
     }
 }
