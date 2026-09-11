@@ -168,9 +168,11 @@ pub fn check_prefill_after(
     Ok(())
 }
 
-/// The decode equivalent: one priming token plus `n_gen` steps must
-/// leave exactly `n_gen + 1` positions in every layer's cache. A short
-/// cache means steps were skipped, which inflates the rate.
+/// The decode equivalent: `n_primed` positions already in the cache
+/// (one priming token for a `tg<N>` row, the whole prompt for a
+/// batched-bench row) plus `n_gen` steps must leave exactly
+/// `n_primed + n_gen` positions in every layer's cache. A short cache
+/// means steps were skipped, which inflates the rate.
 ///
 /// Only meaningful when the HOST cache is the record. With GPU offload
 /// the KV lives in device memory and the host `KvCache` is never
@@ -185,6 +187,7 @@ pub fn check_prefill_after(
 /// different facts and a receipt that conflates them is worth less.
 pub fn check_decode_after(
     test: &str,
+    n_primed: usize,
     n_gen: usize,
     caches: &[CacheProbe],
     host_kv_is_the_record: bool,
@@ -193,7 +196,7 @@ pub fn check_decode_after(
         // The device holds the KV. There is nothing here to count.
         return Ok(false);
     }
-    let expected = n_gen + 1;
+    let expected = n_primed + n_gen;
     if let Some((layer, c)) = caches
         .iter()
         .enumerate()
@@ -201,8 +204,8 @@ pub fn check_decode_after(
     {
         anyhow::bail!(
             "{test}: layer {layer} advanced the KV cache to {} positions, expected \
-             {expected} (one prime + {n_gen} decode steps) -- decode steps were \
-             skipped and the rate would count them anyway",
+             {expected} ({n_primed} primed + {n_gen} decode steps) -- decode steps \
+             were skipped and the rate would count them anyway",
             c.seq_len
         );
     }
@@ -226,7 +229,7 @@ mod decode_guard_tests {
             };
             4
         ];
-        let ran = check_decode_after("tg128", 128, &empty, false)
+        let ran = check_decode_after("tg128", 1, 128, &empty, false)
             .expect("a device-resident cache must not refuse the run");
         assert!(
             !ran,
@@ -243,7 +246,7 @@ mod decode_guard_tests {
             k_len: 3,
             v_len: 3,
         }];
-        let err = check_decode_after("tg128", 128, &short, true)
+        let err = check_decode_after("tg128", 1, 128, &short, true)
             .expect_err("a short host cache means skipped decode steps");
         assert!(err.to_string().contains("expected 129"));
     }
@@ -255,7 +258,7 @@ mod decode_guard_tests {
             k_len: 129,
             v_len: 129,
         }];
-        assert!(check_decode_after("tg128", 128, &good, true).expect("must pass"));
+        assert!(check_decode_after("tg128", 1, 128, &good, true).expect("must pass"));
     }
 }
 
@@ -560,12 +563,25 @@ mod tests {
 
     #[test]
     fn skipped_decode_steps_are_caught_by_the_final_cache_length() {
-        assert!(check_decode_after("tg128", 128, &filled(4, 129, 64), true).is_ok());
-        let err = check_decode_after("tg128", 128, &filled(4, 65, 64), true)
+        assert!(check_decode_after("tg128", 1, 128, &filled(4, 129, 64), true).is_ok());
+        let err = check_decode_after("tg128", 1, 128, &filled(4, 65, 64), true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected 129"), "{err}");
         assert!(err.contains("decode steps were skipped"), "{err}");
+    }
+
+    /// A batched-bench row primes with the whole prompt, not one
+    /// token, so the expected length is `pp + tg`. Pinned so the prime
+    /// count cannot quietly go back to being a constant.
+    #[test]
+    fn a_prompt_primed_cache_is_expected_to_hold_prompt_plus_decode_positions() {
+        assert!(check_decode_after("pp128 tg64", 128, 64, &filled(4, 192, 64), true).is_ok());
+        let err = check_decode_after("pp128 tg64", 128, 64, &filled(4, 129, 64), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected 192"), "{err}");
+        assert!(err.contains("128 primed + 64"), "{err}");
     }
 
     #[test]

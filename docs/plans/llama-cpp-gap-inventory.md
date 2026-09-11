@@ -671,7 +671,7 @@ ferrox ships two binaries. Subcommands: `crates/ferrox-cli/src/main.rs:43-393`.
 | `tools/mtmd` (multimodal) | NONE | medium | XL |
 | `tools/tokenize` | Partial: `ferrox parity tokenize` (`main.rs:202`) is a comparison harness, not a dump | low | S |
 | `tools/rpc`, `tools/tts`, `tools/cvector-generator` | NONE | low | XL |
-| `tools/batched-bench` | `ferrox serve-bench` (`main.rs:88`) covers it over HTTP; no HTTP-free equivalent | low | M |
+| `tools/batched-bench` | `ferrox batched-bench` (HTTP-free, drives `forward_multi_seq`; ported 2026-09-11); `ferrox serve-bench` covers the HTTP side | — | done |
 | `tools/fit-params` | `ferrox inspect-plan` (`main.rs:102-127`) is a genuine equivalent, arguably richer | -- | -- |
 | `tools/llama-bench` | `ferrox bench` (`main.rs:289`), an explicit work-alike with `--compare` | -- | -- |
 
