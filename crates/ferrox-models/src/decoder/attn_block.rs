@@ -125,7 +125,7 @@ impl Decoder {
         // `Decoder::qk_norm_after_rope` for why the norm has two homes.
         let (q_width, kv_width) = (q.len(), k.len());
         self.apply_qk_norms_pre_rope(layer, &mut q, &mut k, q_width, kv_width);
-        self.apply_rope_attn_factor(&mut q, &mut k);
+        self.apply_rope_attn_factor(&mut q, &mut k, layer_idx);
 
         for h in 0..n_heads {
             self.apply_rope_head_layer(&mut q[h * head_dim..(h + 1) * head_dim], pos, layer_idx);

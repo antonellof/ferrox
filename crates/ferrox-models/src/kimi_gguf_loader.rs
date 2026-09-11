@@ -902,6 +902,9 @@ mod tests {
         // 0), 1 = MoE+MLA -- covering every real attention/FFN
         // combination `load_kimi_gguf_layer` must dispatch correctly.
         let model_cfg = crate::config::ModelConfig {
+            // Kimi's stack has no per-layer RoPE gate; llama.cpp writes
+            // no `use_rope` for it (`crate::rope_layers`).
+            rope_layers: crate::rope_layers::RopeLayers::All,
             name: "synthetic-kimi-gguf-test",
             n_layers: 2,
             hidden_dim: d.hidden_dim,

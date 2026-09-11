@@ -202,7 +202,7 @@ fn gpt_oss_loader_wires_the_whole_graph() {
     // `rope_freq_base_train_swa` default of 10000.
     assert_eq!(
         decoder.config.layer_rope_theta(0),
-        decoder.config.rope_theta
+        Some(decoder.config.rope_theta)
     );
 }
 

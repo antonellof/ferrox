@@ -8732,6 +8732,7 @@ mod tests {
         let mla_v_head_dim = 2;
 
         let model_cfg = ferrox_models::ModelConfig {
+            rope_layers: ferrox_models::rope_layers::RopeLayers::All,
             name: "synthetic-kimi-server-test",
             n_layers: 1,
             hidden_dim,

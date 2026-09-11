@@ -278,6 +278,15 @@ pub struct ModelConfig {
     /// speed. `capability::default_swa_layout` carries the per-arch
     /// value, transcribed from llama.cpp.
     pub swa_dense_first: bool,
+    /// WHICH LAYERS ROTATE -- llama.cpp's per-layer `use_rope`.
+    ///
+    /// [`crate::rope_layers::RopeLayers::All`] for every architecture
+    /// that writes no gate, which is 134 of llama.cpp's 140. The rule
+    /// and the table that assigns it live in [`crate::rope_layers`];
+    /// nothing else in this crate may branch on an architecture name to
+    /// decide it, and [`Self::layer_rope`] returning `None` is the only
+    /// way a call site learns of it.
+    pub rope_layers: crate::rope_layers::RopeLayers,
     /// Attention logit soft-capping (Gemma 2+). Applied as
     /// `softcap * tanh(score / softcap)` before softmax.
     pub attn_logit_softcap: Option<f32>,
@@ -543,30 +552,51 @@ impl ModelConfig {
     /// `rope_freqs` was one global vector, so Gemma-3 4B/12B/27B roped
     /// their sliding layers at scaled positions llama.cpp leaves
     /// unscaled.
-    pub fn layer_rope(&self, layer_idx: usize) -> (f32, Option<&[f32]>) {
+    ///
+    /// **`None` means this layer does not rotate at all**, which is
+    /// llama.cpp's per-layer `use_rope` gate --
+    /// [`crate::rope_layers`] holds the rule and the six architectures
+    /// that have one. It is an `Option` rather than a separate
+    /// predicate beside the pair precisely so that a call site cannot
+    /// take the base and the divisors without also answering "does this
+    /// layer rotate": that is the third thing the three had to agree
+    /// about, and two of them were already one value for this reason.
+    pub fn layer_rope(&self, layer_idx: usize) -> Option<(f32, Option<&[f32]>)> {
         let sliding = self.layer_sliding_window(layer_idx).is_some();
+        if !self.rope_layers.rotates(layer_idx, sliding) {
+            return None;
+        }
         let theta = match (sliding, self.rope_theta_swa) {
             (true, Some(theta)) => theta,
             _ => self.rope_theta,
         };
-        (
+        Some((
             theta,
             self.rope_freqs.as_ref().map(|f| f.for_layer(sliding)),
-        )
+        ))
     }
 
-    /// RoPE frequency base for layer `il` (SWA layers may differ).
+    /// Does layer `il` rotate at all? Derived from [`Self::layer_rope`]
+    /// rather than restated beside it, so the two can never disagree.
+    pub fn layer_rotates(&self, layer_idx: usize) -> bool {
+        self.layer_rope(layer_idx).is_some()
+    }
+
+    /// True when at least one layer of this model gets no rotation --
+    /// the whole-model question, for the eligibility checks and the
+    /// receipts that want it once rather than per layer.
+    pub fn any_layer_unrotated(&self) -> bool {
+        (0..self.n_layers).any(|il| !self.layer_rotates(il))
+    }
+
+    /// RoPE frequency base for layer `il` (SWA layers may differ), or
+    /// `None` where the layer does not rotate.
     ///
     /// Prefer [`Self::layer_rope`] anywhere the divisors are needed too,
     /// which is every site that actually rotates something. This one is
     /// for the callers that only report or compare the base.
-    pub fn layer_rope_theta(&self, layer_idx: usize) -> f32 {
-        self.layer_rope(layer_idx).0
-    }
-
-    /// Per-band RoPE divisors for layer `il`; see [`Self::layer_rope`].
-    pub fn layer_rope_freqs(&self, layer_idx: usize) -> Option<&[f32]> {
-        self.layer_rope(layer_idx).1
+    pub fn layer_rope_theta(&self, layer_idx: usize) -> Option<f32> {
+        self.layer_rope(layer_idx).map(|(theta, _)| theta)
     }
 
     /// True when the sliding layers need different per-band divisors
@@ -686,6 +716,7 @@ pub fn glm_5_2() -> ModelConfig {
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
         swa_dense_first: false,
+        rope_layers: crate::rope_layers::RopeLayers::All,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -767,6 +798,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
         swa_dense_first: false,
+        rope_layers: crate::rope_layers::RopeLayers::All,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -880,6 +912,7 @@ pub fn kimi_k3() -> ModelConfig {
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
         swa_dense_first: false,
+        rope_layers: crate::rope_layers::RopeLayers::All,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -939,6 +972,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
         swa_dense_first: false,
+        rope_layers: crate::rope_layers::RopeLayers::All,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -993,6 +1027,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
         swa_dense_first: false,
+        rope_layers: crate::rope_layers::RopeLayers::All,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -1050,6 +1085,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
         swa_pattern: None,
         swa_dense_first: false,
+        rope_layers: crate::rope_layers::RopeLayers::All,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,

@@ -84,7 +84,10 @@ pub struct DenseLayerMetal<'a> {
     /// Gemma-3 SWA layer differs from its full-attention neighbours in
     /// both (`rope_theta_swa`, and no linear scale folded into the
     /// divisors). See [`LayerRope`].
-    pub rope: LayerRope<'a>,
+    ///
+    /// `None` = this layer does not rotate at all (llama.cpp's
+    /// per-layer `use_rope`, `ferrox_models::rope_layers`).
+    pub rope: Option<LayerRope<'a>>,
     /// Sliding-window size for this layer (`None` = full causal).
     pub window: Option<usize>,
     /// Gemma post-attention / post-FFN sandwich norms, applied to the
@@ -147,7 +150,11 @@ pub fn launch_decode_dense_stack(
         }
     }
     for layer in layers.iter() {
-        assert_freq_factors_len(layer.rope.freq_factors, rope_layout, head_dim);
+        assert_freq_factors_len(
+            layer.rope.and_then(|r| r.freq_factors),
+            rope_layout,
+            head_dim,
+        );
     }
 
     let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
@@ -204,7 +211,7 @@ pub fn launch_decode_dense_stack(
     // get out of step with.
     let ff_resident = layers
         .iter()
-        .map(|l| match l.rope.freq_factors {
+        .map(|l| match l.rope.and_then(|r| r.freq_factors) {
             Some(ff) => resident_f32_buffer(device, ff).map(Some),
             None => Ok(None),
         })
@@ -339,29 +346,36 @@ pub fn launch_decode_dense_stack(
             mrs.end_op(&[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
         }
 
-        let layer_theta = layer.rope.theta;
-        let ff_buf = ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref());
-        // Q and K in one dispatch: same theta, position and freq
-        // factors, different buffers, and RoPE is per-head independent.
-        mrs.begin_op(&encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
-        encode_rope(
-            &encoder,
-            device,
-            rope_layout,
-            RopeTarget {
-                vecs: q_buf,
-                n_heads: n_heads as u32,
-            },
-            Some(RopeTarget {
-                vecs: k_buf,
-                n_heads: n_kv_heads as u32,
-            }),
-            head_dim as u32,
-            layer_theta,
-            pos as u32,
-            ff_buf,
-        )?;
-        mrs.end_op(&[q_buf, k_buf], &[q_buf, k_buf]);
+        // `None` = this layer does not rotate, and then there is no
+        // dispatch at all: q and k reach the KV store and the attention
+        // exactly as the projections left them, which is what ggml does
+        // when the graph never builds the `ggml_rope_ext` node. Writing
+        // the RoPE in unconditionally is how the fused stacks lost the
+        // final norm for OLMo-1, one layer of indirection away.
+        if let Some(layer_rope) = layer.rope {
+            let ff_buf = ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref());
+            // Q and K in one dispatch: same theta, position and freq
+            // factors, different buffers, and RoPE is per-head independent.
+            mrs.begin_op(&encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
+            encode_rope(
+                &encoder,
+                device,
+                rope_layout,
+                RopeTarget {
+                    vecs: q_buf,
+                    n_heads: n_heads as u32,
+                },
+                Some(RopeTarget {
+                    vecs: k_buf,
+                    n_heads: n_kv_heads as u32,
+                }),
+                head_dim as u32,
+                layer_rope.theta,
+                pos as u32,
+                ff_buf,
+            )?;
+            mrs.end_op(&[q_buf, k_buf], &[q_buf, k_buf]);
+        }
 
         let token_elems = (n_kv_heads * head_dim) as u32;
         let offset = (pos * n_kv_heads * head_dim) as u32;

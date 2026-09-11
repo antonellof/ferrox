@@ -37,24 +37,33 @@ What differs from `olmo2`, and why this row needs its own fixture:
   * NEOX RoPE (`LLM_ARCH_EXAONE4` is in `llama_model_rope_type`'s NEOX
     group, llama-model.cpp).
 
-**THIRTY LAYERS ARE NOT AN ACCIDENT, and neither is "not 64".**
-:4-14 switches the whole SWA machinery on off the LAYER COUNT with no
-GGUF key involved: `if (hparams.n_layer() == 64)` sets
-`swa_type = LLAMA_SWA_TYPE_STANDARD`, and :116 then makes RoPE
-conditional -- `use_rope = hparams.is_swa(il) || swa_type == NONE`, i.e.
-in a 64-layer EXAONE-4 the FULL-ATTENTION layers get **no rotation at
-all**. That is the same NoPE class as `exaone-moe` and `smollm3`, ferrox
-has no expression for it, and no metadata gate could see it. So the
-32B is refused by name on `block_count == 64` in `loader.rs` -- the
-`baichuan` precedent, where llama.cpp likewise picks a different graph
-off the layer count -- and this file is deliberately on the other side
-of that line. A 64-layer fixture would be refused before it was read.
+**THE LAYER COUNT IS THE ARGUMENT**, because llama.cpp switches the
+whole SWA machinery on off it with no GGUF key involved: `:4-14` is
+`if (hparams.n_layer() == 64)` around `swa_type =
+LLAMA_SWA_TYPE_STANDARD`, `n_swa`, `set_swa_pattern(4)` and both SWA
+RoPE fields, and `:116` then makes RoPE conditional --
+`use_rope = hparams.is_swa(il) || swa_type == NONE`. So a 64-layer
+EXAONE-4 (the 32B) gives its FULL-ATTENTION layers **no rotation at
+all**, and a 30-layer one (the 1.2B) rotates everything and ignores any
+window its file declares.
+
+That is TWO GRAPHS behind one architecture string, so this script emits
+both from ONE body rather than growing a copy per size: `--layers 30`
+is the 1.2B and `--layers 64` the 32B, and the 32B also gets
+`{arch}.attention.sliding_window` -- which the 30-layer file
+deliberately does NOT carry, so the pair separates "llama.cpp ignores
+the key below 64 layers" from "the key was absent". The 32B's window is
+deliberately NARROWER than the six-token prompt, so the mask is
+exercised too rather than being a no-op at this size.
+
+The rule itself is `ferrox-models/src/rope_layers.rs`, shared with
+`exaone-moe`, `smollm3`, `smallthinker`, `afmoe` and `llama4`.
 
 Weights are pseudo-random from a fixed seed so the file is byte-stable.
 
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
-        python3 scripts/make_exaone4_fixture.py OUT.gguf
+        python3 scripts/make_exaone4_fixture.py OUT.gguf [--layers 30|64]
 
 The golden values that go with it are produced by llama.cpp itself
 (see `scripts/gptoss_reference_logits.cpp`), not by this script.
@@ -68,24 +77,56 @@ import gguf
 
 ARCH = "exaone4"
 
-# NOT 64. See the module docstring: 64 is EXAONE-4 32B, where llama.cpp
-# switches SWA on and stops rotating the full-attention layers.
-N_LAYER = 2
-N_EMBD = 32
-N_HEAD = 4
-N_HEAD_KV = 2
-# exaone4.cpp:54 sizes `wo` `{n_embd, n_embd}` and :92 asserts
-# `n_embd_head_k == n_rot`, so head_dim * n_head must be n_embd.
-HEAD_DIM = N_EMBD // N_HEAD  # 8
-N_FF = 48
-N_VOCAB = 48
+# The 1.2B's layer count, and the default. 64 is EXAONE-4 32B, where
+# llama.cpp switches SWA on and stops rotating the full-attention
+# layers; see the module docstring.
+DEFAULT_N_LAYER = 2
+# exaone4.cpp:4 -- equality, not a threshold.
+SWA_N_LAYER = 64
+# exaone4.cpp:6 hardcodes 4096; this fixture declares a window narrower
+# than GRAPH_PROMPT so the mask is not a no-op over six tokens. The key
+# is read at :16, but only a 64-layer file ever reaches
+# `set_swa_pattern`, so only the 64-layer fixture carries it.
+SWA_WINDOW = 3
 CTX = 64
 ROPE_BASE = 10000.0
 RMS_EPS = 1e-5
 
 
-def main(out_path: str) -> None:
+def widths(n_layer: int) -> dict:
+    """Per-layer shapes.
+
+    The 32B fixture has to be exactly 64 layers -- `exaone4.cpp:4` tests
+    EQUALITY, so no smaller file is that graph -- and 64 layers at the
+    1.2B fixture's widths is a 2 MB checked-in file, seven times the
+    largest fixture in the tree. So the deep one is drawn narrower. It
+    is the same body either way; only the shapes differ, and the graph
+    the fixture exercises does not depend on them.
+    """
+    n_embd, n_head, n_ff, n_vocab = (
+        (16, 2, 16, 32) if n_layer == SWA_N_LAYER else (32, 4, 48, 48)
+    )
+    return {
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "n_head_kv": n_head // 2,
+        # exaone4.cpp:54 sizes `wo` `{n_embd, n_embd}` and :92 asserts
+        # `n_embd_head_k == n_rot`, so head_dim * n_head must be n_embd.
+        "head_dim": n_embd // n_head,
+        "n_ff": n_ff,
+        "n_vocab": n_vocab,
+    }
+
+
+def main(out_path: str, n_layer: int = DEFAULT_N_LAYER) -> None:
     rng = np.random.default_rng(0x0E4A04)
+    shapes = widths(n_layer)
+    N_EMBD = shapes["n_embd"]
+    N_HEAD = shapes["n_head"]
+    N_HEAD_KV = shapes["n_head_kv"]
+    HEAD_DIM = shapes["head_dim"]
+    N_FF = shapes["n_ff"]
+    N_VOCAB = shapes["n_vocab"]
 
     def rnd(*shape: int) -> np.ndarray:
         # Small magnitudes keep the synthetic values in a range where a
@@ -95,7 +136,7 @@ def main(out_path: str) -> None:
 
     w = gguf.GGUFWriter(out_path, ARCH)
     w.add_name("ferrox-exaone4-fixture")
-    w.add_block_count(N_LAYER)
+    w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
     w.add_feed_forward_length(N_FF)
@@ -106,6 +147,8 @@ def main(out_path: str) -> None:
     w.add_layer_norm_rms_eps(RMS_EPS)
     w.add_rope_freq_base(ROPE_BASE)
     w.add_rope_dimension_count(HEAD_DIM)
+    if n_layer == SWA_N_LAYER:
+        w.add_sliding_window(SWA_WINDOW)
     w.add_file_type(gguf.LlamaFileType.ALL_F32)
 
     # Minimal SPM-flavoured vocab: llama.cpp needs tokens/scores/types to
@@ -129,7 +172,7 @@ def main(out_path: str) -> None:
     n_embd_q = N_HEAD * HEAD_DIM
     n_embd_kv = N_HEAD_KV * HEAD_DIM
 
-    for il in range(N_LAYER):
+    for il in range(n_layer):
         p = f"blk.{il}."
 
         # NO `attn_norm` and NO `ffn_norm`. See the module docstring.
@@ -164,4 +207,10 @@ def main(out_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "exaone4-fixture.gguf")
+    args = sys.argv[1:]
+    n_layer = DEFAULT_N_LAYER
+    if "--layers" in args:
+        i = args.index("--layers")
+        n_layer = int(args[i + 1])
+        del args[i : i + 2]
+    main(args[0] if args else "exaone4-fixture.gguf", n_layer)

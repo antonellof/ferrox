@@ -54,9 +54,26 @@ is faster.
   ONE residual topology rather than two: neither has an `attn_norm` or
   an `ffn_norm` tensor, both sublayers read the raw residual, and each
   branch's output is normed before its residual add
-  (`ferrox_models::norm`). Two sub-cases stay refused by name -- an
-  `olmo2` carrying both a sliding window and a RoPE scaling (Olmo-3),
-  and EXAONE-4 32B, whose full-attention layers get no RoPE at all.
+  (`ferrox_models::norm`). One sub-case stays refused by name -- an
+  `olmo2` carrying both a sliding window and a RoPE scaling (Olmo-3).
+  EXAONE-4 32B was the other and runs since 2026-09-11 (next item).
+- **Per-layer RoPE: EXAONE-4 32B, EXAONE-MoE and SmolLM3**, audited
+  against libllama on 2026-09-11 as ONE rule. llama.cpp gates rotation
+  per layer in six architectures and ferrox could not say so, which
+  cost `exaone-moe` and `smollm3` an outright refusal and EXAONE-4 32B
+  a refusal by name. `exaone4.cpp:116` and `exaone-moe.cpp:136,155-161`
+  are the same predicate (`exaone-moe.cpp:4` pins `swa_type` to
+  STANDARD, which makes `exaone4`'s `|| swa_type == NONE` vacuous);
+  `smollm3.cpp:5,69` is `(il + 1) % 4 != 0`. `ferrox_models::rope_layers`
+  holds the table for all six, `ModelConfig::layer_rope` answers `None`
+  for an unrotated layer so no rotation site can take the base and the
+  divisors without answering the third question, and both fused Metal
+  stacks take an `Option<LayerRope>` per layer. A 64-layer fixture is
+  what evidences the 32B, because `exaone4.cpp:4` tests equality.
+  `smallthinker`, `afmoe` and `llama4` are in the same table and still
+  refuse for other things. Found on the way: EXAONE-4 1.2B must ignore a
+  window its file declares, and `nextn_predict_layers` (MTP blocks
+  inside `block_count`) was refused nowhere and is now.
 - **OLMo-1**, the third norm shape and a third variant of that same
   enum. It is pre-norm like llama, but `olmo.cpp:65-67,104-106,128-130`
   normalise with a null weight and a null bias -- a non-parametric

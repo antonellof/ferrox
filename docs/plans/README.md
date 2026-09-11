@@ -60,9 +60,9 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **35** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **37** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 21 |
+| Refuses as **unaudited**, now triaged | 20 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 91 (59 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
@@ -78,8 +78,8 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 21 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-20 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 20 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+19 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
 refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
@@ -88,10 +88,13 @@ seven fixture-away rows on 2026-09-03, `gemma`, `hunyuan-dense` and
 `ernie4_5-moe` after them, and on 2026-09-10 `olmo2` and `exaone4`
 (below) plus `chatglm` -- the last one-match-arm row -- and `qwen`,
 which the same arm turned out to close only halfway, the three
-Granite rows and `olmo` (both below). Each with a libllama-golden
-fixture. `minicpm` closed the same day and is not in that arithmetic: it
-was refused BY NAME rather than as unaudited, so it raises the audited
-count without lowering the refusing one.
+Granite rows and `olmo` (both below), and on 2026-09-11 `exaone-moe`
+(below). Each with a libllama-golden fixture. `minicpm` closed on
+2026-09-10 and is not in that arithmetic: it was refused BY NAME rather
+than as unaudited, so it raises the audited count without lowering the
+refusing one; `smollm3` and EXAONE-4 32B closed with `exaone-moe` on
+2026-09-11 and are the same case, one a DedicatedOnly refusal and the
+other a refusal by name.
 
 The three UNKNOWN rows `mistral`, `mixtral` and `yi` closed the same
 day by turning out not to be architectures: libllama refuses all three
@@ -100,9 +103,11 @@ strings outright and every real checkpoint of all three declares
 graphs. `phi4` is the one UNKNOWN left.
 
 **The NEW CODE column moved for the first time on 2026-09-10**, three
-times: 26 to 24, 24 to 21, then 21 to 20. The first two took several
-rows at once for the same reason -- each found ONE cause behind several
-refusals.
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 a fourth
+time, 20 to 19. The first two took several rows at once for the same
+reason -- each found ONE cause behind several refusals. The fourth did
+too and the count hides it: the per-layer RoPE gate closed three
+refusals, and only `exaone-moe` was in this column.
 
 `olmo` is the one that did not, and it is worth reading for the way the
 question was settled rather than for the row. "What else shares this
@@ -126,10 +131,11 @@ branch's output before its residual add (`olmo2.cpp:45-52,92,160-182`,
 `exaone4.cpp:60-67,118,152-169`, line for line the same graph).
 `ferrox_models::norm` is the one implementation and
 `tests/post_norm_only_graphs.rs` the evidence, a libllama-golden fixture
-each. Two sub-cases stay refused BY NAME rather than being swept in: an
+each. One sub-case stays refused BY NAME rather than being swept in: an
 `olmo2` carrying both a sliding window and a RoPE scaling (Olmo-3) ropes
-its two kinds of layer differently, and EXAONE-4 32B
-(`block_count == 64`) gives its full-attention layers no RoPE at all.
+its two kinds of layer differently. EXAONE-4 32B (`block_count == 64`),
+whose full-attention layers get no RoPE at all, was the other and is
+closed (next paragraph but one).
 `olmo` (OLMo-1) is a THIRD shape -- pre-norm with a non-parametric
 LayerNorm at all three sites, `olmo.cpp:65-67,104-106,128-130` -- and
 closed as a third variant of the same enum
@@ -145,6 +151,32 @@ config carries a `clip_qkv` -- OLMo-7B-Twin-2T and OLMo-1.7-7B do, the
 original OLMo-7B does not. A second fixture measures that llama.cpp's
 own logits move when the key is present, so it is not a no-op that
 could be ignored.
+
+`exaone-moe`, `smollm3` and EXAONE-4 32B closed TOGETHER on 2026-09-11,
+on the per-layer RoPE gate, and the pairing was CHECKED before it was
+assumed: `exaone4.cpp:116` is `use_rope = is_swa(il) || swa_type ==
+NONE`, `exaone-moe.cpp:136,155-161` is `is_swa(il)` around the same two
+`ggml_rope_ext` calls, and `exaone-moe.cpp:4` pins `swa_type` to
+`STANDARD`, which nails the second disjunct false. Identical, not
+similar. `smollm3.cpp:5,69` is a different variant of the same enum
+(`(il + 1) % 4 != 0`, no window). `ferrox_models::rope_layers` is one
+table for all six architectures llama.cpp gates this way, with
+`smallthinker`, `afmoe` and `llama4` in it and still refused for other
+things. The durable part is the type: `ModelConfig::layer_rope` returns
+`Option<(base, divisors)>`, so a rotation site cannot take the pair
+without answering whether to rotate, and the Metal stacks take an
+`Option<LayerRope>` per layer -- their RoPE dispatch had been written in
+unconditionally, the OLMo-1 final-norm shape again -- while the four
+per-layer Metal launches lost their loose base/divisor parameter pair
+for one `LayerRope`. `tests/no_rope_layer_graphs.rs`: KL 2.05e-12 on a
+64-layer EXAONE-4 fixture (64 because `exaone4.cpp:4` tests equality),
+1.43e-14 on `exaone-moe`, 5.29e-15 on `smollm3`. Found on the way:
+EXAONE-4 1.2B must IGNORE a window its file declares
+(`exaone4.cpp:4-14` reaches `set_swa_pattern` only at 64 layers), now
+in `capability::swa_disabled_by_arch` beside `phi3`; and
+`nextn_predict_layers` -- MTP blocks INSIDE `block_count`, which
+llama.cpp skips -- was refused nowhere, so a real EXAONE-MoE export
+with an MTP head would have run it as two extra decoder layers.
 
 `minicpm` was never an unaudited row: it was refused BY NAME, because
 `minicpm.cpp:5-7` assigns an embedding multiplier of 12.0, a residual
@@ -174,7 +206,7 @@ declaring it false runs unrotated, which ferrox cannot express.
 
 | | llama.cpp | ferrox |
 |---|---|---|
-| Per-architecture graphs | 140 hand-written | 150 catalog rows, **35 proven** |
+| Per-architecture graphs | 140 hand-written | 150 catalog rows, **37 proven** |
 | Metal `pp512` | baseline | 0.98x-1.10x, at parity |
 | Metal `tg128` | baseline | **8 of 12 rows faster** |
 | CPU, all rows | baseline | **1.41x-5.06x slower** |
