@@ -15,6 +15,7 @@
 // byte-identical.
 
 import { getJson, postJson, routes } from "./api.ts";
+import { readThought, THOUGHT_KEY, type Thought } from "./thought.ts";
 
 export type ConversationRole = "user" | "assistant" | "system";
 
@@ -30,6 +31,14 @@ export type StoredMessage = {
    * field, and on every turn that did not think.
    */
   reasoning_content?: string | null;
+  /**
+   * How long the model thought, in milliseconds, measured by the
+   * client between the first reasoning delta and the first content
+   * delta. Beside `reasoning_content` and never without it. Absent on
+   * records from before it was stored, which then show their thought
+   * with no time.
+   */
+  reasoning_ms?: number | null;
   created_at: number;
   metadata?: Record<string, unknown> | null;
 };
@@ -71,6 +80,7 @@ export type NewMessage = {
   role: ConversationRole;
   content: string;
   reasoning_content?: string;
+  reasoning_ms?: number;
   metadata?: Record<string, unknown>;
 };
 
@@ -239,13 +249,15 @@ export function pendingAppend(
     if (parentId !== null && !reachable.has(parentId)) continue;
     reachable.add(message.id);
     const reasoning = plainReasoning(message.content);
+    const { metadata, thoughtMs } = liftThought(message.metadata);
     messages.push({
       id: message.id,
       parent_id: parentId,
       role: message.role as ConversationRole,
       content: plainText(message.content),
       ...(reasoning ? { reasoning_content: reasoning } : {}),
-      ...(message.metadata ? { metadata: message.metadata } : {}),
+      ...(reasoning && thoughtMs !== undefined ? { reasoning_ms: thoughtMs } : {}),
+      ...(metadata ? { metadata } : {}),
     });
   }
 
@@ -264,6 +276,33 @@ export function pendingAppend(
 export function hasWork(pending: Pending, storedHead: string | null): boolean {
   if (pending.messages.length > 0) return true;
   return pending.headId !== null && pending.headId !== storedHead;
+}
+
+/**
+ * The thought's duration, taken OUT of the metadata it rides on.
+ *
+ * The store keeps `metadata` byte-identical, so leaving
+ * `custom.thought` in it would store the duration twice -- once as
+ * the typed `reasoning_ms` column and once inside an opaque blob --
+ * and a reload would then have two numbers to choose between. It is
+ * stored once, as the column, and `toBranchable` puts it back under
+ * the same key. A thought still marked as running is not a duration
+ * and is dropped rather than stored.
+ */
+function liftThought(metadata: Record<string, unknown> | undefined): {
+  metadata: Record<string, unknown> | undefined;
+  thoughtMs: number | undefined;
+} {
+  const thought = metadata && readThought(metadata);
+  if (!metadata || !thought) return { metadata, thoughtMs: undefined };
+  const { [THOUGHT_KEY]: _thought, ...custom } = metadata.custom as Record<
+    string,
+    unknown
+  >;
+  return {
+    metadata: { ...metadata, custom },
+    thoughtMs: thought.state === "done" ? thought.ms : undefined,
+  };
 }
 
 /** The status an assistant node gets back, from the outcome its own
@@ -293,6 +332,31 @@ export function restoredStatus(
 }
 
 /**
+ * The metadata a restored node carries: what was stored, with the
+ * thought's duration put back where the runtime writes it, so the
+ * Thinking block reads one shape whether the turn is fresh or
+ * reloaded. `null` when there is nothing to carry.
+ */
+export function restoredMetadata(
+  node: Pick<StoredMessage, "metadata" | "reasoning_content" | "reasoning_ms">,
+): Record<string, unknown> | null {
+  const ms = node.reasoning_ms;
+  const thought: Thought | undefined =
+    node.reasoning_content && typeof ms === "number" && Number.isFinite(ms)
+      ? { state: "done", ms: Math.max(0, ms) }
+      : undefined;
+  if (!thought) return node.metadata ?? null;
+  const custom = node.metadata?.custom;
+  return {
+    ...node.metadata,
+    custom: {
+      ...(custom && typeof custom === "object" ? custom : {}),
+      [THOUGHT_KEY]: thought,
+    },
+  };
+}
+
+/**
  * The stored tree, in the shape `ExportedMessageRepository
  * .fromBranchableArray` takes.
  *
@@ -317,24 +381,27 @@ export function toBranchable(conversation: Conversation): {
   headId: string | null;
 } {
   return {
-    items: conversation.messages.map((node) => ({
-      parentId: node.parent_id,
-      message: {
-        id: node.id,
-        role: node.role,
-        content: [
-          ...(node.reasoning_content
-            ? [{ type: "reasoning" as const, text: node.reasoning_content }]
-            : []),
-          { type: "text" as const, text: node.content },
-        ],
-        createdAt: new Date(node.created_at * 1000),
-        ...(node.role === "assistant"
-          ? { status: restoredStatus(node.metadata) }
-          : {}),
-        ...(node.metadata ? { metadata: node.metadata } : {}),
-      },
-    })),
+    items: conversation.messages.map((node) => {
+      const metadata = restoredMetadata(node);
+      return {
+        parentId: node.parent_id,
+        message: {
+          id: node.id,
+          role: node.role,
+          content: [
+            ...(node.reasoning_content
+              ? [{ type: "reasoning" as const, text: node.reasoning_content }]
+              : []),
+            { type: "text" as const, text: node.content },
+          ],
+          createdAt: new Date(node.created_at * 1000),
+          ...(node.role === "assistant"
+            ? { status: restoredStatus(node.metadata) }
+            : {}),
+          ...(metadata ? { metadata } : {}),
+        },
+      };
+    }),
     headId: conversation.head_id,
   };
 }

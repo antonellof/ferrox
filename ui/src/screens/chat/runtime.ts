@@ -4,9 +4,12 @@
 // assistant-ui owns the transcript, the composer, autoscroll, branching
 // and the abort signal. This file owns exactly one thing: turning a run
 // into an SSE request and turning the server's answer back into message
-// parts. Nothing here measures time — every number the UI prints comes
-// from the server's own `usage` block, carried on the message as
-// `metadata.custom`.
+// parts. Every speed the UI prints comes from the server's own `usage`
+// block, carried on the message as `metadata.custom.stats`. The one
+// clock this file holds is the thought's (`lib/thought.ts`): how long
+// the model reasoned before it began to answer is the gap between two
+// deltas of the stream, which `usage` does not measure and only the
+// stream's consumer can.
 
 import { useState } from "react";
 import {
@@ -27,6 +30,7 @@ import {
 } from "@/lib/api";
 import { fmtInt, fmtMs, fmtNum, isNum } from "@/lib/format";
 import { samplingToWire } from "@/lib/sampling-wire";
+import { THOUGHT_KEY, type Thought } from "@/lib/thought";
 import { useLatest } from "@/lib/use-latest";
 
 /** Not re-exported by the react package under its own name. */
@@ -102,8 +106,17 @@ export function canContinue(outcome: AnswerStats["outcome"]): boolean {
 /**
  * A partial turn to carry on from: what the cut-off message already
  * holds, so the continuation starts from it rather than from nothing.
+ *
+ * `thoughtMs` is how long the first attempt thought. A continuation
+ * that resumes inside the thought adds to it rather than restarting
+ * the clock, so the summary at the end counts the whole thought and
+ * not the second half of it.
  */
-export type ContinueFrom = { reasoning: string; text: string };
+export type ContinueFrom = {
+  reasoning: string;
+  text: string;
+  thoughtMs?: number;
+};
 
 const CONTINUE_KEY = "continueFrom";
 
@@ -125,6 +138,7 @@ function readContinuation(runConfig: RunConfig): ContinueFrom | null {
   return {
     reasoning: typeof value.reasoning === "string" ? value.reasoning : "",
     text: typeof value.text === "string" ? value.text : "",
+    ...(isNum(value.thoughtMs) ? { thoughtMs: value.thoughtMs } : {}),
   };
 }
 
@@ -315,14 +329,47 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
         ...(reasoning ? [{ type: "reasoning" as const, text: reasoning }] : []),
         ...(text ? [{ type: "text" as const, text }] : []),
       ];
+
+      // The thought clock. It starts on the first reasoning delta and
+      // stops on the first content delta, or on the end of the stream
+      // when no answer ever came (cut off inside the thought, or
+      // stopped). A continuation inherits the earlier attempt's time
+      // and, if it is still thinking, resumes the clock BEHIND `now` by
+      // that much, so one running total covers both halves.
+      let thought: Thought | undefined = isNum(resume?.thoughtMs)
+        ? { state: "done", ms: resume.thoughtMs }
+        : undefined;
+      const thoughtStarts = () => {
+        if (thought?.state === "thinking") return;
+        const before = thought?.ms ?? 0;
+        thought = { state: "thinking", startedAt: Date.now() - before };
+      };
+      const thoughtEnds = () => {
+        if (thought?.state !== "thinking") return;
+        thought = { state: "done", ms: Math.max(0, Date.now() - thought.startedAt) };
+      };
+      // Every yield carries the whole `custom` block: assistant-ui
+      // replaces it per yield rather than merging key by key, so a
+      // yield that named only `stats` would drop the thought.
+      const custom = (rest: Record<string, unknown> = {}) => ({
+        ...(thought ? { [THOUGHT_KEY]: thought } : {}),
+        ...rest,
+      });
+
       try {
         for await (const chunk of tokens.drain()) {
-          if (chunk.kind === "reasoning") reasoning += chunk.text;
-          else text += chunk.text;
-          yield { content: parts() };
+          if (chunk.kind === "reasoning") {
+            reasoning += chunk.text;
+            thoughtStarts();
+          } else {
+            text += chunk.text;
+            thoughtEnds();
+          }
+          yield { content: parts(), metadata: { custom: custom() } };
         }
         await task;
       } finally {
+        thoughtEnds();
         abortSignal.removeEventListener("abort", onAbort);
       }
 
@@ -358,7 +405,7 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
             : cutOff
               ? { type: "incomplete", reason: "length" }
               : { type: "complete", reason: "stop" },
-          metadata: { custom: { stats } },
+          metadata: { custom: custom({ stats }) },
         } satisfies ChatModelRunResult;
         return;
       }
@@ -378,14 +425,14 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
           ],
           status: { type: "incomplete", reason: "cancelled" },
           metadata: {
-            custom: {
+            custom: custom({
               stats: {
                 line: "",
                 requestId,
                 outcome: "stopped-by-you",
                 usage: null,
               } satisfies AnswerStats,
-            },
+            }),
           },
         } satisfies ChatModelRunResult;
         return;

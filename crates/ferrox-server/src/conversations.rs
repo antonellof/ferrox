@@ -219,6 +219,17 @@ pub(crate) struct MessageNode {
     /// key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_content: Option<String>,
+    /// How long the model thought, in milliseconds: the wall-clock
+    /// between the first `reasoning_content` delta and the first
+    /// `content` delta, as the client that consumed the stream saw it.
+    /// Stored here rather than derived from `usage` because usage
+    /// measures decode, and a thought's length in seconds is not a
+    /// decode figure. Only ever beside a `reasoning_content`; a
+    /// duration for a turn that did not think is dropped on append.
+    /// Absent on records from before it existed (`default`), which
+    /// then show their thought with no time on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_ms: Option<u64>,
     /// Stamped by the server on append. A client-supplied time would be
     /// a claim; this is a fact about when the server was told.
     pub(crate) created_at: u64,
@@ -341,6 +352,10 @@ pub(crate) struct NewMessage {
     /// empty thought is no thought.
     #[serde(default)]
     pub(crate) reasoning_content: Option<String>,
+    /// See [`MessageNode::reasoning_ms`]. Kept only when the turn has a
+    /// thought to attach it to.
+    #[serde(default)]
+    pub(crate) reasoning_ms: Option<u64>,
     #[serde(default)]
     pub(crate) metadata: Option<serde_json::Value>,
 }
@@ -839,6 +854,10 @@ fn append_messages(
         // unstorable, and vice versa. The conversation-wide byte
         // ceiling still bounds the two together.
         let reasoning_content = message.reasoning_content.filter(|r| !r.is_empty());
+        // The clock goes with the thought. A duration on a turn with
+        // no reasoning is a number about nothing, and storing it would
+        // make a reload show "Thought for 15 seconds" over no thought.
+        let reasoning_ms = message.reasoning_ms.filter(|_| reasoning_content.is_some());
         if reasoning_content
             .as_ref()
             .is_some_and(|r| r.len() > MAX_CONTENT_BYTES)
@@ -868,6 +887,7 @@ fn append_messages(
             role: message.role,
             content: message.content,
             reasoning_content,
+            reasoning_ms,
             created_at: now,
             metadata: message.metadata,
         });
@@ -1087,6 +1107,7 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
             reasoning_content: None,
+            reasoning_ms: None,
             metadata: None,
         }
     }
@@ -1456,6 +1477,55 @@ mod tests {
         );
     }
 
+    /// The thought's clock is stored beside the thought and only there:
+    /// a `reasoning_ms` on a turn with no `reasoning_content` is dropped
+    /// on append rather than stored, and the key is written only where
+    /// there is a duration.
+    #[test]
+    fn a_thoughts_duration_survives_a_restart_and_never_without_a_thought() {
+        let dir = TempDir::new("reasoning-ms");
+        let id = {
+            let store = store(&dir);
+            let mut timed = msg("a1", Some("u1"), "assistant", "answer");
+            timed.reasoning_content = Some("Let me think".to_string());
+            timed.reasoning_ms = Some(15_250);
+            let mut untimed = msg("a2", Some("a1"), "assistant", "again");
+            untimed.reasoning_content = Some("Hmm".to_string());
+            let mut thoughtless = msg("a3", Some("a2"), "assistant", "plain");
+            thoughtless.reasoning_ms = Some(3_000);
+            let mut blank = msg("a4", Some("a3"), "assistant", "blank");
+            blank.reasoning_content = Some(String::new());
+            blank.reasoning_ms = Some(4_000);
+            store
+                .create(created(vec![
+                    msg("u1", None, "user", "why"),
+                    timed,
+                    untimed,
+                    thoughtless,
+                    blank,
+                ]))
+                .unwrap()
+                .id
+        };
+        let conversation = store(&dir).get(&id).unwrap();
+        assert_eq!(conversation.messages[1].reasoning_ms, Some(15_250));
+        assert_eq!(conversation.messages[2].reasoning_ms, None);
+        assert_eq!(
+            conversation.messages[3].reasoning_ms, None,
+            "a duration with no thought beside it is a number about nothing"
+        );
+        assert_eq!(
+            conversation.messages[4].reasoning_ms, None,
+            "an empty thought is no thought, so it has no duration either"
+        );
+        let on_disk = std::fs::read_to_string(dir.0.join(format!("{id}.json"))).unwrap();
+        assert_eq!(
+            on_disk.matches("reasoning_ms").count(),
+            1,
+            "the key is written only where there is a duration: {on_disk}"
+        );
+    }
+
     /// A file written before the field existed carries no
     /// `reasoning_content` at all, and must load as it did then.
     #[test]
@@ -1473,6 +1543,7 @@ mod tests {
         assert_eq!(conversation.messages.len(), 2);
         assert_eq!(conversation.messages[1].content, "hello");
         assert_eq!(conversation.messages[1].reasoning_content, None);
+        assert_eq!(conversation.messages[1].reasoning_ms, None);
     }
 
     #[test]

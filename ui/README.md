@@ -66,7 +66,7 @@ npm run check       # typecheck + lint + test
 
 `npm test` runs `node --test` over `src/lib/*.test.ts`, node strips the
 types itself, so there is no test framework in the dependency tree and
-nothing for the licence check to weigh. It covers three things a browser
+nothing for the licence check to weigh. It covers four things a browser
 cannot show you:
 
 - the stream recovery paths in `lib/api.ts`, the half of SSE hardening
@@ -79,7 +79,18 @@ cannot show you:
   getting "which nodes are new" wrong duplicates or drops a message;
 - the entry rule in `lib/entry-state.ts` (below), where being too eager
   throws away the conversation you were in and being too lazy resurrects
-  one for ever. Both failures are silent.
+  one for ever. Both failures are silent;
+- the thought clock in `lib/thought.ts`: the words a duration turns
+  into ("Thought for 15 seconds", "1 min 20 s"), that a running clock
+  ticks from its stamp rather than freezing at the last delta, and
+  that the duration is stored ONCE, as `reasoning_ms` beside
+  `reasoning_content`, rather than twice -- once as that column and
+  once inside the opaque `metadata` blob the server hands back
+  byte-identical. This is the one client-side stopwatch in the app:
+  every speed under an answer is the server's `usage`, but how long
+  the model THOUGHT is the gap between the first reasoning delta and
+  the first content delta, which `usage` does not measure and only the
+  stream's consumer can.
 
 CI runs `npm run licenses`, `npm run typecheck`, `npm run lint` and
 `npm run build`. It does not run `npm test`, so run `npm run check`
