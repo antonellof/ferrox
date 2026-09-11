@@ -1910,6 +1910,7 @@ mod tests {
             layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
             name: "synthetic-kimi-test",
             n_layers: 3,
+            n_mtp_blocks: 0,
             hidden_dim: d.hidden_dim,
             n_heads: 1,
             n_kv_heads: 1,
@@ -1962,8 +1963,8 @@ mod tests {
             rope_orig_ctx: None,
             rope_layout: crate::config::RopeLayout::Neox,
             qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-            swa_pattern: None,
-            swa_dense_first: false,
+            swa_layers: crate::swa_layers::SwaLayers::All,
+
             attn_logit_softcap: None,
             final_logit_softcap: None,
             embedding_scale: None,

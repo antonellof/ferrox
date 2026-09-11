@@ -1,0 +1,355 @@
+//! The per-layer sliding-window ARRAY and the NextN/MTP blocks, checked
+//! against llama.cpp itself: two seams (`ferrox_models::swa_layers`,
+//! `ferrox_models::mtp_blocks`) that three refusals named and every
+//! real EXAONE-4 32B, EXAONE-MoE, Olmo-3, MiMo-V2, Step-3.5 and Mellum
+//! export carries.
+//!
+//! # The array
+//!
+//! `{arch}.attention.sliding_window_pattern` is read upstream with
+//! `get_key_or_arr`, and that name hides three behaviours decided by
+//! which overload each graph's `load_arch_hparams` calls:
+//!
+//! | mode | arrays are | scalars are | rows |
+//! |---|---|---|---|
+//! | scalar overload, `required = false` | **IGNORED** (returns false, seed stands; `llama-model-loader.cpp:502-507`) | the period | `exaone4`, `exaone-moe`, `olmo2`, `gemma3`, ... (15) |
+//! | array overload | the per-layer truth, length = `n_layer()` at the time, which is `block_count` | broadcast as a BOOL | `mimo2`, `step35`, `gemma4`, `gemma4-assistant`, `dflash` |
+//! | scalar then array | the per-layer truth | the period | `mellum`, `cohere2moe` |
+//!
+//! ferrox refused the array form for every architecture. Three fixtures
+//! evidence the two branches a generic-path row can reach:
+//!
+//! - `exaone_moe_array`: the base `exaone_moe` fixture plus the array
+//!   `conversion/exaone.py:84` writes ([T, T, T, F], the seeded
+//!   period). **libllama's logits are byte-identical to the base's.**
+//! - `exaone_moe_array_flipped`: the same with the array INVERTED.
+//!   **libllama's logits are STILL byte-identical to the base's**,
+//!   which is the measurement that upstream never reads it; ferrox
+//!   answers the seeded period for both.
+//! - `mellum`: the one generic-path graph that HONOURS the array. Its
+//!   array [T, T, F, T] disagrees with the seeded period-4 [T, T, T, F]
+//!   on two layers, the window is narrower than the prompt, and the
+//!   golden is the file's layout: `load_tensors` reports `is_swa =
+//!   1, 1, 0, 1`.
+//!
+//! # The MTP block
+//!
+//! `exaone_moe_mtp` is the base fixture with ONE NextN block appended
+//! inside `block_count` (5 blocks, `nextn_predict_layers = 1`), the
+//! shape of every K-EXAONE export (`exaone.py:132,146`). llama.cpp
+//! reports `n_layer = 4, n_layer_all = 5` and "model has unused
+//! tensor blk.4.*" fifteen times; its trunk is the same graph as the
+//! base with the output head redrawn, and the golden is that. The
+//! block's weights are drawn 8x wider than the trunk's, so a loader
+//! that ran it as a fifth layer would not be a near miss -- and the
+//! two sabotages below show that no config reaches that: counting it
+//! as a layer asks it for experts a dense NextN block does not have,
+//! and skipping it without saying so leaves fifteen tensors for the
+//! consumption gate to name.
+//!
+//! **Where the numbers come from.** Each golden was produced by running
+//! llama.cpp's own graph over its fixture through
+//! `scripts/gptoss_reference_logits.cpp` linked against a real
+//! `libllama` built from `.scratch/llama.cpp`.
+//!
+//! Regenerating:
+//!
+//! ```text
+//! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_exaone_moe_fixture.py \
+//!     crates/ferrox-models/tests/fixtures/exaone_moe_array_tiny.gguf --window-array agree
+//! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_exaone_moe_fixture.py \
+//!     crates/ferrox-models/tests/fixtures/exaone_moe_array_flipped_tiny.gguf --window-array disagree
+//! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_exaone_moe_fixture.py \
+//!     crates/ferrox-models/tests/fixtures/exaone_moe_mtp_tiny.gguf --window-array agree --mtp
+//! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_mellum_fixture.py \
+//!     crates/ferrox-models/tests/fixtures/mellum_tiny.gguf
+//! /tmp/ref_logits <fixture> 3 7 11 19 23 5
+//! ```
+
+mod common;
+use common::{
+    assert_all_three_paths_match, graph_caches, graph_fixture_path, kl_vs_golden,
+    load_graph_fixture, worst_vs, EXAONE_MOE_GOLDEN, GRAPH_PROMPT,
+};
+use ferrox_models::loader::LoadError;
+use ferrox_models::swa_layers::SwaLayers;
+use ferrox_models::{Decoder, ModelConfig};
+
+const EXAONE_MOE_MTP_GOLDEN: [f32; 48] = [
+    -0.0399573,
+    -0.26254788,
+    0.112740405,
+    -0.45957953,
+    0.20378731,
+    0.09908521,
+    0.0650342,
+    0.03963881,
+    0.027113974,
+    0.04426959,
+    0.2971161,
+    0.44927487,
+    -0.08063339,
+    -0.31896305,
+    0.12336944,
+    -0.26059663,
+    0.23168293,
+    -0.07957372,
+    -0.041728646,
+    -0.06822635,
+    -0.012256693,
+    -0.06147337,
+    0.058683395,
+    0.018150419,
+    0.34285027,
+    -0.17899069,
+    0.35574993,
+    0.005653359,
+    0.21688741,
+    0.18249817,
+    0.015758194,
+    0.19431275,
+    -0.5292666,
+    0.089496456,
+    -0.27419174,
+    0.6649489,
+    -0.22339234,
+    -0.28366813,
+    0.23308644,
+    0.13166983,
+    -0.035332873,
+    -0.45804775,
+    0.030781724,
+    0.18007353,
+    0.16690017,
+    -0.18101907,
+    -0.04980211,
+    -0.14753367,
+];
+
+const MELLUM_GOLDEN: [f32; 48] = [
+    0.060756013,
+    -0.023824722,
+    0.20276277,
+    -0.08673769,
+    -0.17752253,
+    0.16671993,
+    -0.049065586,
+    -0.14727482,
+    -0.23216516,
+    0.018855155,
+    -0.15827064,
+    -0.13220614,
+    0.017678097,
+    0.44898403,
+    0.18785386,
+    -0.060248606,
+    0.18946445,
+    0.09642051,
+    0.009634852,
+    -0.22297539,
+    -0.1649667,
+    0.3061224,
+    -0.31932747,
+    -0.063845895,
+    -0.42996672,
+    -0.00028830767,
+    0.4683508,
+    -0.33105162,
+    0.21087095,
+    -0.16849121,
+    -0.39124924,
+    0.124670506,
+    0.019993221,
+    -0.48215437,
+    -0.43157175,
+    -0.56464714,
+    0.34288388,
+    0.11505209,
+    0.18613203,
+    -0.30828017,
+    0.1446941,
+    -0.335675,
+    -0.043562084,
+    -0.14170834,
+    0.27802056,
+    0.03002052,
+    0.1744021,
+    -0.067254916,
+];
+
+/// Every (fixture, golden) pair this suite audits, for the KL report.
+const ROWS: [(&str, &[f32]); 4] = [
+    ("exaone_moe_array", &EXAONE_MOE_GOLDEN),
+    ("exaone_moe_array_flipped", &EXAONE_MOE_GOLDEN),
+    ("exaone_moe_mtp", &EXAONE_MOE_MTP_GOLDEN),
+    ("mellum", &MELLUM_GOLDEN),
+];
+
+fn prefill(decoder: &Decoder) -> Vec<f32> {
+    let mut kv = graph_caches(decoder);
+    decoder.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv)
+}
+
+// --- the array, ignored where llama.cpp ignores it -------------------
+
+/// The array a real converter writes, on a graph that reads the scalar
+/// overload: the same golden as the base fixture, on all three paths.
+#[test]
+fn exaone_moe_with_the_converter_array_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("exaone_moe_array", &EXAONE_MOE_GOLDEN);
+    let d = load_graph_fixture("exaone_moe_array");
+    assert_eq!(
+        d.config.swa_layers,
+        SwaLayers::period(4, false),
+        "exaone-moe.cpp:6-8 seeds 4 and :7's scalar overload returns false on an array"
+    );
+}
+
+/// The INVERTED array: llama.cpp's logits do not move, so neither may
+/// ferrox's. This is the over-refusal, lifted, and the proof that
+/// lifting it by IGNORING rather than by honouring is llama.cpp's
+/// answer and not a guess.
+#[test]
+fn exaone_moe_with_a_disagreeing_array_is_still_the_seeded_period() {
+    assert_all_three_paths_match("exaone_moe_array_flipped", &EXAONE_MOE_GOLDEN);
+    let d = load_graph_fixture("exaone_moe_array_flipped");
+    assert_eq!(d.config.swa_layers, SwaLayers::period(4, false));
+    // The file says [F, F, F, T]; the graph runs [T, T, T, F].
+    assert_eq!(d.config.layer_sliding_window(0), Some(3));
+    assert_eq!(d.config.layer_sliding_window(3), None);
+}
+
+// --- the array, honoured where llama.cpp honours it ------------------
+
+/// `mellum.cpp:12-17`: the array is the layout, and it is NOT the
+/// seeded period.
+#[test]
+fn mellum_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("mellum", &MELLUM_GOLDEN);
+    let d = load_graph_fixture("mellum");
+    assert_eq!(
+        d.config.swa_layers,
+        SwaLayers::PerLayer(vec![true, true, false, true].into())
+    );
+    assert_eq!(d.config.sliding_window, Some(3));
+    let windowed: Vec<bool> = (0..4)
+        .map(|il| d.config.layer_sliding_window(il).is_some())
+        .collect();
+    assert_eq!(
+        windowed,
+        [true, true, false, true],
+        "libllama's load_tensors reports is_swa = 1, 1, 0, 1"
+    );
+}
+
+/// Sabotage: keeping the seeded period-4 layout in place of the file's
+/// array -- what `exaone-moe` correctly does and `mellum` must not --
+/// windows layer 2 and unwindows layer 3, and the logits see it.
+#[test]
+fn mellum_with_the_seeded_period_instead_of_its_array_diverges_from_llama_cpp() {
+    let path = graph_fixture_path("mellum");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.swa_layers = SwaLayers::period(4, false);
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    assert_eq!(d.config.layer_sliding_window(2), Some(3), "sabotage landed");
+    assert_eq!(d.config.layer_sliding_window(3), None, "sabotage landed");
+    let worst = worst_vs(&prefill(&d), &MELLUM_GOLDEN);
+    assert!(
+        worst > 1e-2,
+        "the seeded period must be visible against a 3-token window: {worst}"
+    );
+}
+
+/// Sabotage: windowing every layer -- the answer a missing array used
+/// to fall through to -- diverges too.
+#[test]
+fn mellum_windowing_every_layer_diverges_from_llama_cpp() {
+    let path = graph_fixture_path("mellum");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.swa_layers = SwaLayers::All;
+    let d = Decoder::from_gguf(&path, config).expect("loads");
+    let worst = worst_vs(&prefill(&d), &MELLUM_GOLDEN);
+    assert!(worst > 1e-2, "windowing layer 2 must be visible: {worst}");
+}
+
+// --- the MTP block -----------------------------------------------------
+
+/// One NextN block inside `block_count`: the trunk runs, the block does
+/// not, and the golden is llama.cpp's over the same file.
+#[test]
+fn exaone_moe_with_an_mtp_block_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("exaone_moe_mtp", &EXAONE_MOE_MTP_GOLDEN);
+    let d = load_graph_fixture("exaone_moe_mtp");
+    assert_eq!(
+        (d.config.n_layers, d.config.n_mtp_blocks),
+        (4, 1),
+        "llama.cpp: n_layer = 4, n_layer_all = 5"
+    );
+    assert_eq!(d.layers.len(), 4, "the block is not a layer");
+    // The trunk still has its window and its NoPE layer: the block
+    // did not shift either rule.
+    assert_eq!(d.config.layer_sliding_window(3), None);
+    assert!(!d.config.layer_rotates(3));
+}
+
+/// Sabotage: a config that counts the block as a fifth layer cannot
+/// load at all. A NextN block is DENSE upstream (`exaone-moe.cpp:73`
+/// takes the dense branch for `i >= n_layer`) while the trunk's rule
+/// makes every layer past the leading one MoE, so the loader asks the
+/// block for expert tensors it does not have and stops there -- before
+/// the consumption gate would have named the unread `nextn.*` head
+/// (the test below shows that gate firing on its own). Running the
+/// block is therefore not reachable by any config, which is stronger
+/// than "diverges".
+#[test]
+fn counting_the_mtp_block_as_a_layer_cannot_load() {
+    let path = graph_fixture_path("exaone_moe_mtp");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.n_layers = 5;
+    config.n_mtp_blocks = 0;
+    match Decoder::from_gguf(&path, config) {
+        Err(LoadError::Gguf(ferrox_gguf::GgufError::TensorNotFound(name))) => {
+            assert!(
+                name.starts_with("blk.4.ffn_") && name.contains("_exps"),
+                "the block has no experts: {name}"
+            );
+        }
+        Err(other) => panic!("the block is not a layer, got {other:?}"),
+        Ok(_) => panic!("the block is not a layer, yet it loaded as one"),
+    }
+}
+
+/// Sabotage the other way: a config that skips the block but marks
+/// nothing as skipped trips the same gate on all fifteen tensors. The
+/// mark and the layer loop take their range from the same two config
+/// fields, so this is the shape that CANNOT happen from the loader; it
+/// is here to show the gate sees a skipped block that nobody declared.
+#[test]
+fn an_undeclared_skip_is_refused_by_the_consumption_gate() {
+    let path = graph_fixture_path("exaone_moe_mtp");
+    let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
+    let mut config = ModelConfig::from_gguf(&file).expect("parses");
+    config.n_mtp_blocks = 0;
+    match Decoder::from_gguf(&path, config) {
+        Err(LoadError::UnconsumedTensors(n, _)) => assert_eq!(n, 15),
+        Err(other) => panic!("fifteen unread tensors must refuse, got {other:?}"),
+        Ok(_) => panic!("fifteen unread tensors must refuse, yet it loaded"),
+    }
+}
+
+// --- the number this suite speaks in ------------------------------------
+
+#[test]
+fn report_kl_against_llama_cpp() {
+    for (name, want) in ROWS {
+        let d = load_graph_fixture(name);
+        let got = prefill(&d);
+        let kl = kl_vs_golden(&got, want);
+        let worst = worst_vs(&got, want);
+        eprintln!("{name}: KL(llama.cpp || ferrox) = {kl:.3e} nats, max |delta| = {worst:.3e}");
+        assert!(kl < 1e-8, "{name}: KL {kl}");
+    }
+}

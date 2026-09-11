@@ -73,7 +73,22 @@ is faster.
   `smallthinker`, `afmoe` and `llama4` are in the same table and still
   refuse for other things. Found on the way: EXAONE-4 1.2B must ignore a
   window its file declares, and `nextn_predict_layers` (MTP blocks
-  inside `block_count`) was refused nowhere and is now.
+  inside `block_count`) was refused nowhere and was then refused
+  everywhere; it is SKIPPED now, as llama.cpp skips it, for the
+  seventeen graphs that read the key (`ferrox_models::mtp_blocks`), on
+  the generic path and all four dedicated loaders, and still refused by
+  name elsewhere.
+- **The per-layer sliding-window ARRAY.** `attention.sliding_window_
+  pattern` is read upstream with `get_key_or_arr`, three ways: ignored
+  where a graph reads the scalar overload (`exaone4`, `exaone-moe`,
+  `olmo2`, twelve more), honoured where it reads the array overload
+  (`mimo2`, `step35`, `gemma4`; a scalar there is a broadcast bool, not
+  a period), and scalar-then-array for `mellum` / `cohere2moe`.
+  `ferrox_models::swa_layers` is one table and one enum behind
+  `ModelConfig::layer_sliding_window(il)`. Every real EXAONE-4 32B,
+  EXAONE-MoE and Olmo-3 export carries the array and was refused over a
+  value llama.cpp never reads; `mellum` is audited on it, with its
+  window-plus-YaRN case (every real Mellum2) refused by name.
 - **OLMo-1**, the third norm shape and a third variant of that same
   enum. It is pre-norm like llama, but `olmo.cpp:65-67,104-106,128-130`
   normalise with a null weight and a null bias -- a non-parametric

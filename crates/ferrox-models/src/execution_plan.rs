@@ -18,10 +18,10 @@ pub struct FusedOpCaps {
 }
 
 /// Memory layout chosen once from the architecture profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryPlan {
     pub kind: MemoryKind,
-    pub swa_pattern: Option<usize>,
+    pub swa_layers: crate::swa_layers::SwaLayers,
     pub sliding_window: Option<usize>,
 }
 
@@ -65,7 +65,7 @@ impl ExecutionPlan {
             ffn_activation: config.ffn_activation,
             memory: MemoryPlan {
                 kind: memory_kind,
-                swa_pattern: config.swa_pattern,
+                swa_layers: config.swa_layers.clone(),
                 sliding_window: config.sliding_window,
             },
             fused,

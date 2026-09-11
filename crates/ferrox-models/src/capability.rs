@@ -651,6 +651,21 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // from `rope.dimension_count`, a second rotary width no host body
     // takes yet. NEOX RoPE (llama-model.cpp:2676-2677).
     "laguna",
+    // `mellum` (mellum.cpp:12-17,45-68,108-197): the per-layer
+    // sliding-window ARRAY, honoured -- the scalar overload of
+    // `get_key_or_arr` first, the array overload on its `false`, and
+    // `conversion/mellum.py:28` always writes the array. The one
+    // generic-path graph that honours it, so the fixture's array
+    // [T, T, F, T] deliberately disagrees with the seeded period-4
+    // [T, T, T, F] on two layers and the golden is the file's layout,
+    // not the seed's. Everything else is machinery it already had: NEOX
+    // RoPE (llama-model.cpp:2682), per-head QK norm before RoPE
+    // (`:50-51,120-124`), softmax top-k renormalised (`:186`), the
+    // expert width from its own key (`:5`). A window together with a
+    // RoPE scaling -- `:128-142`, the Olmo-3 rule, and what every real
+    // Mellum2 export declares -- stays refused by name
+    // (`crate::swa_geometry`).
+    "mellum",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1050,20 +1065,18 @@ const UNGATED_RELU_SQR: &str =
 /// Triaged rows of the generic **NEOX**-RoPE group. Same rules as
 /// [`NORM_ROPE_TRIAGED`].
 const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
-    (
-        "mellum",
-        TriageClass::NewCode,
-        "two per-layer RoPE variants in one model. src/models/mellum.cpp:128-142 runs the \
-         SWA layers' RoPE with YaRN switched off -- freq_scale = 1.0, ext_factor = 0.0, \
-         attn_factor = 1.0 -- while the full-attention layers use the model's own YaRN \
-         (:143-154). ferrox carries one YaRN configuration for the whole model (it has \
-         `rope_theta_swa` for the BASE only) and cannot express a per-layer ext_factor. \
-         Second, smaller hazard on the same architecture: :12-17 accepts the sliding-window \
-         pattern as a scalar OR as a per-layer ARRAY, and ferrox reads it only as a scalar \
-         (`GgufValue::as_u64` returns None for an array), so an array-valued file falls back \
-         to `default_swa_layout`'s period of 4 with nothing saying it substituted its own \
-         layout for the file's. The tensor set and residual (:45-68, :169-197) are generic",
-    ),
+    // `mellum` was HERE, NEW CODE on two things. The first -- its
+    // sliding layers roped with the model's YaRN switched OFF
+    // (`mellum.cpp:128-142`), the Olmo-3 rule -- is a REFUSAL BY NAME
+    // in `crate::swa_geometry` for a file declaring both a window and
+    // a RoPE scaling, which every real Mellum2 export does. The second
+    // -- the per-layer sliding-window ARRAY that `:12-17` honour and
+    // `conversion/mellum.py:28` always writes -- is `crate::swa_layers`
+    // now, and `mellum` is the ONE generic-path architecture whose
+    // graph honours the array, so it is the row that evidences that
+    // branch against libllama (`tests/window_array_graphs.rs`). A
+    // Mellum without a scaling runs; a Mellum2 stops on the first
+    // thing, by name.
     (
         "talkie",
         TriageClass::NewCode,
@@ -1081,27 +1094,30 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     (
         "mimo2",
         TriageClass::NewCode,
-        "NEXTN/MTP layers that every export carries, and a per-layer sliding-window ARRAY. \
-         NO LONGER a blocker: the attention sinks -- src/models/mimo2.cpp:58 creates \
-         `attn_sinks` `{n_head}` and :177 passes it into the SAME `build_attn_mha` \
-         (`ggml_soft_max_add_sinks`, llama-graph.cpp:2600) that `openai-moe.cpp:115` does, \
-         and `AttnWeights::sinks` is loaded by tensor presence on the generic path now \
-         rather than by the gpt-oss name (CPU; the fused Metal launches refuse a layer with \
-         sinks, as they did for gpt-oss). NO LONGER a blocker: the per-layer shapes -- \
-         :47-49 and :111-112 read n_head / n_head_kv PER LAYER, which `crate::layer_shapes` \
-         carries. What remains, and it is what a REAL MiMo-V2 file looks like: \
-         conversion/mimo.py:22,27,167 ALWAYS appends three NEXTN blocks inside block_count \
-         and writes `nextn_predict_layers = 3`, which `unsupported_feature_keys` refuses \
-         (:19,:75-83 load them with a `layer_out_norm`); mimo.py:148-153 ALWAYS writes \
-         `attention.sliding_window_pattern` as the per-layer `hybrid_layer_pattern` ARRAY \
-         (:12 `get_key_or_arr(..., is_swa_impl, n_layer)`, :6 SWA unconditional), which \
-         ferrox refuses as an array and would misread as a period if scalar; :14-17 and \
-         :180-183 scale the attention output by `{arch}.attention.value_scale` when the \
-         config sets `attention_value_scale` (mimo.py:163-165), a key ferrox neither reads \
-         nor gates; and mimo.py:154 writes `attention.value_length` from `v_head_dim` \
-         separately from the key width, which ferrox refuses when the two differ. The \
-         dense-or-MoE-per-layer choice at :200-223 and the fused-or-split QKV at :127-155 \
-         ferrox already has",
+        "a V head width that differs from the K head width, in every real export. \
+         conversion/mimo.py:154 writes `attention.value_length` from `v_head_dim` separately \
+         from `attention.key_length`, and MiMo-V2-Flash's config.json is `head_dim: 192, \
+         v_head_dim: 128` (`swa_v_head_dim: 128` too), so src/models/mimo2.cpp:47-48 sizes K \
+         and V per layer from two widths and :132-140,152-154 view Q/K at `n_embd_head_k` \
+         and V at `n_embd_head_v`; ferrox's KV cache, attention kernels and every fused Metal \
+         launch take ONE head width, and the loader refuses a file whose two differ \
+         (`split K/V head dims`). Second, small: :14-17 and :180-183 scale the attention \
+         output by `{arch}.attention.value_scale` after `wo` when the config sets \
+         `attention_value_scale` (mimo.py:163-165; MiMo-V2-Flash sets 0.707), a key ferrox \
+         neither reads nor gates. NO LONGER a blocker: the NEXTN blocks -- every export \
+         appends three inside block_count (mimo.py:22,27,167; :19-20, :31-37,51-52 create \
+         them TENSOR_SKIP), and `crate::mtp_blocks` skips them as llama.cpp does. NO \
+         LONGER a blocker: the per-layer sliding-window ARRAY -- mimo.py:148-153 writes \
+         `hybrid_layer_pattern` at block_count length, :12 `get_key_or_arr(..., \
+         is_swa_impl, n_layer())` BEFORE :19 reads nextn so the length is n_layer_all, and \
+         `crate::swa_layers` honours the array for this architecture and broadcasts a \
+         scalar as a bool rather than a period. NO LONGER a blocker: the attention sinks \
+         -- :58 creates `attn_sinks` `{n_head}` and :177 passes it into the SAME \
+         `build_attn_mha` as `openai-moe.cpp:115`, and `AttnWeights::sinks` loads by \
+         tensor presence. NO LONGER a blocker: the per-layer shapes -- :47-49 and \
+         :111-112 read n_head / n_head_kv PER LAYER, which `crate::layer_shapes` carries. \
+         The dense-or-MoE-per-layer choice at :200-223 \
+         and the fused-or-split QKV at :127-155 ferrox already has",
     ),
     // `afmoe` was HERE, NEW CODE on the gated attention (`afmoe.cpp:73`)
     // and the `sqrt(n_embd)` embedding scale (`:120`). Both are
@@ -1161,29 +1177,30 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     (
         "step35",
         TriageClass::NewCode,
-        "per-layer SwiGLU clamp arrays and a per-layer sliding-window ARRAY. NO LONGER a \
-         blocker: the gated attention -- src/models/step35.cpp:96 creates `wqkv_gate` `{n_embd, n_head_l}`, \
-         OPTIONAL, and :268-284 multiply the attention output by `sigmoid(gate)` per head \
-         before `wo`; `crate::attn_gate` carries step35 as exactly that (sigmoid, per head, \
-         optional), the sigmoid corner audited on `afmoe` and the per-head corner on \
-         `laguna`. NO LONGER a blocker: the per-layer head counts -- :76-78,122-124 (loader) \
-         and :208-209,388-389 (graph) read n_head / the KV widths PER LAYER, which \
-         `crate::layer_shapes` carries (audited on `deci` and `openelm`). What remains, and \
-         every real Step-3.5 export has all of it: per-layer SwiGLU clamp arrays for the \
-         routed and the shared experts (:28-29, LLM_KV_SWIGLU_CLAMP_EXP / _SHEXP; \
-         conversion/step3.py:207-220 writes both), applied at llama-graph.cpp:2146-2164 \
-         (routed) and :1751-1768 (shared AND the dense layers, which share `build_ffn`) as \
-         `clamp(up, -l, l)` times `min(silu(gate), l)`, where ferrox's only clamp is the \
-         gpt-oss scalar with a different formula; `attention.sliding_window_pattern` as a \
-         PER-LAYER BOOL ARRAY (:26 `get_key_or_arr(..., is_swa_impl, n_layer)`; step3.py:172, \
-         179 always writes the array), which ferrox refuses when it is an array and would \
-         misread as a PERIOD if it were a scalar -- for this architecture a scalar 1 means \
-         every layer slides, not every layer is full; the full-attention layers rotating HALF \
-         the declared width (:9 halves `n_rot_full` AFTER llama-model.cpp:1222 seeded \
-         `n_rot_swa` from it, so `n_rot(il)` is the full width on sliding layers and half on \
-         the rest, `crate::swa_geometry`'s refusal from the other direction); and NEXTN/MTP \
-         layers (:32-49, step3.py:222-223), which `unsupported_feature_keys` refuses. The \
-         SIGMOID default for expert_gating_func (:19-20) is in SIGMOID_GATING_ARCHITECTURES",
+        "per-layer SwiGLU clamp arrays, and a half-width RoPE on the full-attention layers. \
+         Every real Step-3.5 export has both (Step-3.5-Flash: `swiglu_limits`, \
+         `swiglu_limits_shared`, `partial_rotary_factors` 0.5 on full / 1.0 on sliding, 45 \
+         trunk layers plus 3 MTP): the clamp arrays for the routed and the shared experts \
+         (src/models/step35.cpp:28-29, LLM_KV_SWIGLU_CLAMP_EXP / _SHEXP; \
+         conversion/step3.py:207-220 writes both at block_count length), applied at \
+         llama-graph.cpp:2146-2164 (routed) and :1751-1768 (shared AND the dense layers, \
+         which share `build_ffn`) as `clamp(up, -l, l)` times `min(silu(gate), l)`, where \
+         ferrox's only clamp is the gpt-oss scalar with a different formula; and :9 halving \
+         `n_rot_full` AFTER llama-model.cpp:1222 seeded `n_rot_swa` from it, so `n_rot(il)` \
+         is the full width on sliding layers and half on the rest \
+         (`crate::swa_geometry`'s refusal from the other direction). NO LONGER a blocker: \
+         the NEXTN blocks (:32-55, step3.py:117-119,222-223), skipped by \
+         `crate::mtp_blocks`. NO LONGER a blocker: the per-layer sliding-window BOOL ARRAY \
+         -- :26 `get_key_or_arr(..., is_swa_impl, n_layer())` before :32 reads nextn, so at \
+         block_count length, and step3.py:173,179 always writes it; `crate::swa_layers` \
+         honours it here and broadcasts a scalar as a bool, since for this architecture a \
+         scalar 1 means every layer slides, not every layer is full. NO LONGER a blocker: \
+         the gated attention -- :96 creates `wqkv_gate` OPTIONAL and :268-284 multiply the \
+         attention output by `sigmoid(gate)` per head before `wo`; `crate::attn_gate` \
+         carries exactly that. NO LONGER a blocker: the per-layer head counts -- \
+         :76-78,122-124 and :208-209,388-389 read n_head / the KV widths PER LAYER, which \
+         `crate::layer_shapes` carries. The SIGMOID default \
+         for expert_gating_func (:19-20) is in SIGMOID_GATING_ARCHITECTURES",
     ),
     // `mistral`, `mixtral` and `yi` were HERE, UNKNOWN on
     // NO_UPSTREAM_ARCH. The question that verdict asked -- "is there a
@@ -1397,9 +1414,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // needed (leading dense, `exp_probs_b`, shared expert,
             // sigmoid gating from metadata, a per-head QK-norm) ferrox
             // already had, and its fixture carries all of it rather
-            // than asserting so. A file declaring a nonzero
-            // `nextn_predict_layers` is refused by
-            // `unsupported_feature_keys`.
+            // than asserting so. The two things a REAL export carries
+            // on top -- K-EXAONE's one NextN block inside `block_count`
+            // (`exaone.py:132,146`) and the window pattern as a bool
+            // ARRAY (`:84`) that `exaone-moe.cpp:7` never reads -- are
+            // `crate::mtp_blocks` and `crate::swa_layers`, with a
+            // fixture carrying both (`tests/window_array_graphs.rs`).
             "exaone-moe",
             // Was a `DedicatedOnly` bias refusal, not an unaudited row:
             // its only dropped bias was the FUSED `attn_qkv.bias`, which
@@ -1429,6 +1449,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // llama-model.cpp:2676-2677.
             "afmoe",
             "laguna",
+            // Was NEW CODE in `NEOX_ROPE_TRIAGED` on the sliding-window
+            // ARRAY (`mellum.cpp:12-17`), audited now on
+            // `crate::swa_layers` (`tests/window_array_graphs.rs`); its
+            // window-with-YaRN half stays refused by name. NEOX RoPE:
+            // llama-model.cpp:2682.
+            "mellum",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2604,29 +2630,15 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
             "final logit soft-capping (Gemma 2+); not implemented in the generic decoder",
         ));
     }
-    out.push(
-        // NextN / MTP layers are INSIDE `block_count`, and llama.cpp
-        // does not run them: `hparams.n_layer()` is
-        // `n_layer_all - n_layer_nextn` and every architecture that
-        // reads this key creates its last `n_layer_nextn` blocks with
-        // `TENSOR_SKIP` (`exaone-moe.cpp:52-57`, `exaone4.cpp:44-49`,
-        // `glm4-moe.cpp`). ferrox's `n_layers` IS `block_count`, so it
-        // would run the speculative-decoding head as if it were two more
-        // decoder layers, on top of a residual the checkpoint never
-        // sends through them.
-        //
-        // Reachable, and checked: `conversion/exaone.py:146` and
-        // `:229-231` write the key, so a real EXAONE-4.5 or EXAONE-MoE
-        // export carries it -- as `0` for the sizes that have no MTP
-        // head, which is why the gate must read the VALUE and the
-        // `> 0` test above is load-bearing rather than defensive.
-        (
-            key("nextn_predict_layers"),
-            "NextN/MTP prediction layers are counted in block_count and llama.cpp skips \
-             them (n_layer = n_layer_all - n_layer_nextn); the generic decoder would run \
-             them as ordinary decoder layers",
-        ),
-    );
+    // `{arch}.nextn_predict_layers` WAS refused here, for every
+    // architecture, with the reason that ferrox's `n_layers` IS
+    // `block_count` and it would run the MTP head as decoder layers.
+    // `crate::mtp_blocks::trunk_layers` subtracts the blocks now for
+    // exactly the seventeen graphs whose `load_arch_hparams` reads the
+    // key (`NEXTN_READERS`, measured) and still refuses a nonzero value
+    // on any other -- where llama.cpp itself would run every block and
+    // then fail on the unread `nextn.*` tensors. One place decides both
+    // halves, so the reader table and the refusal cannot drift apart.
     // `{arch}.attention.sliding_window_pattern` WAS refused here,
     // with the reason "not implemented in the generic decoder".
     // That reason was false, and had been for some time: the
@@ -2646,12 +2658,12 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
     // all three forward paths, with the phase and the window
     // sabotaged separately.
     //
-    // The real gap the key can hide is NOT the pattern: it is that
-    // llama.cpp accepts the value as a scalar OR an n_layer-long
-    // ARRAY (`ml.get_key_or_arr`), and ferrox carries one scalar
-    // period. `loader.rs` refuses an array-valued pattern by name,
-    // where the value can actually be inspected, instead of
-    // refusing every file that has the key at all.
+    // The real gap the key could hide was NOT the pattern: it was
+    // that llama.cpp accepts the value as a scalar OR an n_layer-long
+    // ARRAY (`ml.get_key_or_arr`), and ferrox carried one scalar
+    // period. The array is `crate::swa_layers` now, read the way each
+    // graph reads it -- ignored, honoured, or broadcast -- so neither
+    // shape is refused here or anywhere else.
     out
 }
 
@@ -2913,7 +2925,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 13,
+            seen == 12,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2958,12 +2970,20 @@ mod audit_tests {
              -- one op with two free parameters behind three verdicts, read side by side \
              before being called one cause; `step35` keeps its clamp arrays and window \
              array and says the gate is done, and `mimo2`'s sinks moved off the gpt-oss \
-             name onto the tensor without closing it. What is left is 12 NEW CODE and one \
-             UNKNOWN (`phi4`). The NEW CODE rows that have closed are `olmo2`, `exaone4`, \
-             the three Granite rows, `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`, \
-             `openelm`, `afmoe` and `laguna`, and each closure but `olmo`'s and `arcee`'s \
-             took more than one row at a time because each found ONE cause behind several \
-             refusals"
+             name onto the tensor without closing it, and 13 until `mellum` closed on the \
+             per-layer sliding-window ARRAY (`crate::swa_layers`, \
+             tests/window_array_graphs.rs) -- the seam three verdicts named, and `mellum` \
+             is the one generic-path graph that HONOURS the array; the same seam lifted the \
+             over-refusal of every real EXAONE-4 32B / EXAONE-MoE / Olmo-3 export, whose \
+             array llama.cpp IGNORES (measured: libllama's logits do not move when it is \
+             inverted), and `crate::mtp_blocks` landed beside it and skips the NextN \
+             blocks `mimo2` and `step35` named, so both lead with what is left. What is \
+             left is 11 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
+             `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna` and `mellum`, and each \
+             closure but `olmo`'s, `arcee`'s and `mellum`'s took more than one row at a \
+             time because each found ONE cause behind several refusals; `mellum`'s cause \
+             IS shared and moved three verdicts, but only one of them was closable by it"
         );
     }
 
@@ -3036,7 +3056,7 @@ mod audit_tests {
     #[test]
     fn an_unchecked_architecture_is_not_audited() {
         assert!(!is_audited_generic("smallthinker"));
-        assert!(!is_audited_generic("mellum"));
+        assert!(!is_audited_generic("talkie"));
         assert!(!is_audited_generic("an-arch-that-does-not-exist"));
     }
 }
@@ -3234,9 +3254,13 @@ mod tests {
                 "{softcap} must not refuse grok"
             );
         }
+        // `nextn_predict_layers` used to be the "non-softcap gate still
+        // applies" witness here. It is `crate::mtp_blocks` now, keyed by
+        // which graphs read it, and `grok` is not one: its refusal
+        // there is `a_non_reader_with_a_nonzero_count_is_refused_and_zero_is_not`.
         assert!(
-            keys.iter().any(|k| k == "grok.nextn_predict_layers"),
-            "the non-softcap gates still apply: {keys:?}"
+            !keys.iter().any(|k| k.ends_with("nextn_predict_layers")),
+            "nextn_predict_layers is decided by mtp_blocks::trunk_layers, not here: {keys:?}"
         );
         let llama: Vec<String> = unsupported_feature_keys("llama")
             .into_iter()
@@ -3383,9 +3407,8 @@ mod tests {
         // implemented (`ModelConfig::layer_sliding_window`, both
         // phases), so refusing it was a gate with a false reason that
         // also made the loader's own read of the key unreachable. See
-        // the comment where it used to be. The array-valued case, which
-        // ferrox genuinely cannot express, is refused in `loader.rs`
-        // where the value can be inspected.
+        // the comment where it used to be. The array-valued case is
+        // `crate::swa_layers` (`tests/window_array_graphs.rs`).
         for real in [
             "llama.attn_logit_softcapping",
             "llama.final_logit_softcapping",

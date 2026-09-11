@@ -72,7 +72,11 @@ pub fn read_gemma4_hparams(file: &impl TensorSource) -> Result<Gemma4Hparams, Lo
         return Err(LoadError::UnsupportedArchitecture(arch));
     }
     let p = |suffix: &str| format!("{arch}.{suffix}");
-    let n_layer = meta_u64(file, &p("block_count"))? as usize;
+    // The trunk: `block_count` minus the NextN/MTP blocks llama.cpp
+    // never runs, decided once for every loader in `crate::mtp_blocks`.
+    let n_layer =
+        crate::mtp_blocks::trunk_layers(file, &arch, meta_u64(file, &p("block_count"))? as usize)?
+            .n_layers;
     let hidden_dim = meta_u64(file, &p("embedding_length"))? as usize;
     let ffn_dims = meta_usize_array(file, &p("feed_forward_length"))
         .ok_or_else(|| LoadError::MissingHparam(p("feed_forward_length")))?;

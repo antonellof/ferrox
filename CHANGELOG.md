@@ -17,6 +17,20 @@ are the ones worth reading twice.
 
 ### Fixed
 
+- **The GLM, MLA and hybrid dedicated loaders would have run a
+  checkpoint's MTP block as one more decoder layer.** `glm4moe`,
+  `glm-dsa`, `glm4`, `deepseek2`, `qwen3next`, `qwen35` and `qwen35moe`
+  all subtract `nextn_predict_layers` from `block_count` in llama.cpp,
+  and their converters append the block INSIDE `block_count`
+  (`conversion/glm.py:99`, `deepseek.py:457`); the three loaders read
+  `block_count` verbatim and no gate stood in front of them, so a real
+  GLM-4.5 or DeepSeek-V3 export would have loaded, run its NextN block
+  as a 47th or 62nd layer, and left the `nextn.*` tensors silently
+  unread. All four dedicated loaders take their layer count from
+  `ferrox_models::mtp_blocks::trunk_layers` now; the MLA loader has a
+  trunk-only fixture that fails without it. Not observed on a
+  checkpoint: found by reading the seventeen graphs that read the key
+  against the loaders that own them.
 - **A reasoning model that ran out of `max_tokens` inside its thought
   showed thinking and then nothing.** Studio sent `max_tokens: 512` on
   every request, DeepSeek-R1-Distill spends about 900 tokens thinking
@@ -43,6 +57,34 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`mellum` is audited, and every real EXAONE-4 32B, EXAONE-MoE and
+  Olmo-3 export loads.** `{arch}.attention.sliding_window_pattern` as a
+  per-layer bool ARRAY was refused for every architecture; llama.cpp
+  reads it through `get_key_or_arr`, which for fifteen graphs
+  (`exaone4`, `exaone-moe`, `olmo2`, ...) IGNORES the array and keeps
+  the seeded period, for `mimo2` / `step35` / `gemma4` honours it and
+  broadcasts a scalar as a bool, and for `mellum` / `cohere2moe` tries
+  the scalar then the array. `ferrox_models::swa_layers` carries the
+  three modes as one table and one enum (`All`, `Period`, `PerLayer`)
+  behind `ModelConfig::layer_sliding_window(il)`, which every backend
+  already asked per layer. Fixtures with the EXAONE array agreeing with
+  and INVERTED against the period measure that libllama's logits do not
+  move (KL 1.43e-14 both), and a Mellum whose array disagrees with the
+  seed on two layers is honoured (KL 1.02e-14); a Mellum with a window
+  AND a RoPE scaling, which every real Mellum2 is, stays refused by
+  name. 45 architectures audited, 12 refuse, 11 of them NEW CODE.
+- **NextN / MTP blocks are skipped, as llama.cpp skips them.**
+  `nextn_predict_layers` was refused for every architecture on any
+  nonzero value. `ferrox_models::mtp_blocks` subtracts the blocks from
+  `block_count` for the seventeen graphs that read the key (measured),
+  keeps refusing it elsewhere, marks the skipped tensors deliberately
+  unread so the consumption gate still sees a missing term, and hands
+  `block_count` rather than the trunk to the two things llama.cpp
+  decides before reading the key (`exaone4.cpp:4`'s 64-layer gate, the
+  per-layer shape array lengths). K-EXAONE's shape, one block after the
+  trunk, has a fixture (KL 1.09e-14). `mimo2` and `step35` verdicts
+  now lead with what is left: a V head width differing from K's, and
+  per-layer SwiGLU clamp arrays with a half-width rotary.
 - `continue_final_message` on `/v1/chat/completions`, llama.cpp's field
   and value set (`true`, `"reasoning_content"`, `"content"`): the
   trailing assistant message renders as a turn still being written, its

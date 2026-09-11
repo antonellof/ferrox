@@ -193,7 +193,10 @@ EXAONE-4 1.2B must IGNORE a window its file declares
 in `capability::swa_disabled_by_arch` beside `phi3`; and
 `nextn_predict_layers` -- MTP blocks INSIDE `block_count`, which
 llama.cpp skips -- was refused nowhere, so a real EXAONE-MoE export
-with an MTP head would have run it as two extra decoder layers.
+with an MTP head would have run it as two extra decoder layers. (Since
+2026-09-11 the blocks are skipped as llama.cpp skips them,
+`ferrox_models::mtp_blocks`, and the per-layer window array that the
+same exports carry is `ferrox_models::swa_layers`.)
 
 `minicpm` was never an unaudited row: it was refused BY NAME, because
 `minicpm.cpp:5-7` assigns an embedding multiplier of 12.0, a residual

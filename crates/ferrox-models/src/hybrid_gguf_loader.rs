@@ -79,7 +79,11 @@ pub fn read_hybrid_hparams(file: &impl TensorSource) -> Result<HybridHparams, Lo
     }
     let p = |suffix: &str| format!("{arch}.{suffix}");
 
-    let n_layer = meta_u64(file, &p("block_count"))? as usize;
+    // The trunk: `block_count` minus the NextN/MTP blocks llama.cpp
+    // never runs, decided once for every loader in `crate::mtp_blocks`.
+    let n_layer =
+        crate::mtp_blocks::trunk_layers(file, &arch, meta_u64(file, &p("block_count"))? as usize)?
+            .n_layers;
     let hidden_dim = meta_u64(file, &p("embedding_length"))? as usize;
     let ffn_dim = meta_u64(file, &p("feed_forward_length"))? as usize;
     let n_heads = meta_u64(file, &p("attention.head_count"))? as usize;

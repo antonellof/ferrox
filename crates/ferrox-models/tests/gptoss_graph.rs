@@ -184,7 +184,10 @@ fn gpt_oss_loader_wires_the_whole_graph() {
     // llama.cpp `openai-moe.cpp`: period 2, dense_first = false, so the
     // even layers are windowed and the odd ones are full.
     assert_eq!(decoder.config.sliding_window, Some(4));
-    assert_eq!(decoder.config.swa_pattern, Some(2));
+    assert_eq!(
+        decoder.config.swa_layers,
+        ferrox_models::swa_layers::SwaLayers::period(2, false)
+    );
     assert_eq!(decoder.config.layer_sliding_window(0), Some(4));
     assert_eq!(decoder.config.layer_sliding_window(1), None);
 
@@ -287,7 +290,7 @@ fn gpt_oss_golden_is_not_vacuous() {
     //    `default_swa_pattern`: a missing pattern key meant "all SWA").
     {
         let mut decoder = load();
-        decoder.config.swa_pattern = None;
+        decoder.config.swa_layers = ferrox_models::swa_layers::SwaLayers::All;
         let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let broken = decoder.forward_batch_last(&PROMPT, 0, &mut caches);
         assert!(

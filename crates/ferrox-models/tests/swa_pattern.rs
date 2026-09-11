@@ -33,6 +33,7 @@
 
 use ferrox_models::capability::{default_swa_layout, resolve_profile, SwaPattern};
 use ferrox_models::config::test_dense_fixture;
+use ferrox_models::swa_layers::SwaLayers;
 
 /// `(gguf arch, period, dense_first, citation)`.
 ///
@@ -179,8 +180,7 @@ fn the_period_lands_on_the_layers_llama_cpp_windows() {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 64;
         cfg.sliding_window = Some(WINDOW);
-        cfg.swa_pattern = default_swa_layout(arch).map(|p| p.period);
-        cfg.swa_dense_first = default_swa_layout(arch).is_some_and(|p| p.dense_first);
+        cfg.swa_layers = SwaLayers::from_default(default_swa_layout(arch));
         for il in 0..cfg.n_layers {
             let want = llama_layer_is_swa(il, period, dense_first);
             let got = cfg.layer_sliding_window(il).is_some();
@@ -224,8 +224,7 @@ fn the_two_phases_are_not_the_same_answer() {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 32;
         cfg.sliding_window = Some(WINDOW);
-        cfg.swa_pattern = Some(period);
-        cfg.swa_dense_first = true;
+        cfg.swa_layers = SwaLayers::period(period, true);
         let differs = (0..cfg.n_layers)
             .filter(|&il| {
                 cfg.layer_sliding_window(il).is_some() != llama_layer_is_swa(il, period, false)
@@ -260,9 +259,7 @@ fn period_one_windows_nothing_and_period_zero_windows_everything() {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 8;
         cfg.sliding_window = Some(WINDOW);
-        cfg.swa_dense_first = dense_first;
-
-        cfg.swa_pattern = Some(1);
+        cfg.swa_layers = SwaLayers::period(1, dense_first);
         for il in 0..cfg.n_layers {
             assert_eq!(
                 cfg.layer_sliding_window(il),
@@ -271,7 +268,7 @@ fn period_one_windows_nothing_and_period_zero_windows_everything() {
             );
         }
 
-        cfg.swa_pattern = Some(0);
+        cfg.swa_layers = SwaLayers::period(0, dense_first);
         for il in 0..cfg.n_layers {
             assert_eq!(
                 cfg.layer_sliding_window(il),

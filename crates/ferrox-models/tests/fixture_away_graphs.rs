@@ -113,6 +113,7 @@ use common::{
     graph_fixture_path, load_graph_fixture, worst_vs, GELU_TABLE_TOL, GRAPH_PROMPT, GRAPH_TOL,
 };
 use ferrox_models::capability::QkNormStyle;
+use ferrox_models::swa_layers::SwaLayers;
 use ferrox_models::{Decoder, ModelConfig, RopeLayout};
 use ferrox_moe::GatingFunction;
 
@@ -1133,9 +1134,9 @@ fn dropping_either_of_plamo3s_post_norms_diverges_from_llama_cpp() {
 fn plamo3_reads_its_window_period_and_phase_and_the_window_actually_bites() {
     let d = load_graph_fixture("plamo3");
     assert_eq!(d.config.sliding_window, Some(3));
-    assert_eq!(d.config.swa_pattern, Some(2));
-    assert!(
-        !d.config.swa_dense_first,
+    assert_eq!(
+        d.config.swa_layers,
+        SwaLayers::period(2, false),
         "set_swa_pattern's dense_first defaults to false and plamo3.cpp:11 does not pass it"
     );
     assert_eq!(d.config.layer_sliding_window(0), Some(3));
@@ -1182,7 +1183,7 @@ fn inverting_plamo3s_swa_phase_diverges_from_llama_cpp() {
     let path = graph_fixture_path("plamo3");
     let file = ferrox_gguf::GgufFile::open(&path).expect("opens");
     let mut config = ModelConfig::from_gguf(&file).expect("parses");
-    config.swa_dense_first = true;
+    config.swa_layers = SwaLayers::period(2, true);
     let d = Decoder::from_gguf(&path, config).expect("loads");
     assert_eq!(
         d.config.layer_sliding_window(0),

@@ -193,16 +193,16 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **44** do
+   logit comparison against real `libllama`, or a fixture; **45** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
    `ernie4_5-moe`, `internlm2`, `xverse`, `baichuan`, `exaone`,
    `exaone4`, `exaone-moe`, `smollm3`, `plamo3`, `granite`, `granitemoe`,
    `granite-moe`, `minicpm`, `olmo`, `dbrx`, `grok`, `arcee`, `deci`,
-   `openelm`, `afmoe`, `laguna`,
+   `openelm`, `afmoe`, `laguna`, `mellum`,
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **13** stop with `UnauditedArchitecture`.
+   **12** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
@@ -246,7 +246,7 @@ unmeasured, because measuring it needs a quiet host.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. None of the 15 is a fixture or a single
+"Unaudited" is not one thing. None of the 12 is a fixture or a single
 match arm away any more: they need an attention implementation or a
 reading nobody has done, and the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
@@ -413,13 +413,67 @@ rule is "the tensor is present", not "the architecture is gpt-oss":
 gpt-oss loader checks it was (the tensor is REQUIRED there), and the
 fused Metal launches refuse a layer with sinks by the same exhaustive
 destructure -- by the tensor, on a model that is not gpt-oss, which a
-test pins. What stops `mimo2` is what every real export carries:
-`conversion/mimo.py` ALWAYS appends three NEXTN blocks inside
+test pins. What stopped `mimo2` next was what every real export
+carries: `conversion/mimo.py` ALWAYS appends three NEXTN blocks inside
 `block_count` and writes `nextn_predict_layers = 3`, and ALWAYS writes
 `attention.sliding_window_pattern` as the per-layer `hybrid_layer_pattern`
 ARRAY, which for this architecture is a per-layer bool even as a scalar
 (`get_key_or_arr(..., is_swa_impl, n_layer)` broadcasts it) and not a
-period.
+period. Both closed on 2026-09-11 (below) and the row still refuses:
+MiMo-V2-Flash's `head_dim` is 192 and its `v_head_dim` 128, a V width
+that differs from K's on every layer, which no ferrox KV cache or
+attention kernel takes.
+
+**The per-layer window ARRAY and the NextN blocks** are two seams that
+landed together on 2026-09-11, because two verdicts named both and a
+third row (`exaone-moe`) was over-refused on both. llama.cpp reads
+`attention.sliding_window_pattern` with `get_key_or_arr`, and that name
+hides three behaviours decided by which overload each graph calls:
+the scalar overload, non-required, IGNORES an array and keeps the
+seeded period (`llama-model-loader.cpp:502-507`; `exaone4.cpp:8`,
+`exaone-moe.cpp:7`, `olmo2.cpp:10`, fifteen graphs); the array overload
+honours it at `block_count` length and BROADCASTS a scalar as a bool
+(`:474-478`; `mimo2.cpp:12`, `step35.cpp:26`, `gemma4`, `dflash`); and
+`mellum.cpp:12-17` / `cohere2moe.cpp:32-36` try the first then the
+second. `ferrox_models::swa_layers` is one enum (`All`, `Period`,
+`PerLayer`) behind the one accessor every backend already asked,
+`ModelConfig::layer_sliding_window(il)`, so the fused Metal stacks did
+not need touching: they ask per layer. Every real EXAONE-4 32B,
+EXAONE-MoE and Olmo-3 export carries the array (`conversion/exaone.py
+:84`, `olmo.py:59-66`) and was refused over a value upstream never
+reads; a fixture with the array INVERTED measures that libllama's
+logits do not move, and ferrox matches both (KL 1.43e-14). `mellum` is
+the one generic-path graph that honours the array, so it is the row
+that evidences that branch -- its fixture's [T, T, F, T] disagrees with
+the seeded period-4 [T, T, T, F] on two layers, KL 1.02e-14 -- and it
+closed, with its window-plus-YaRN half (every real Mellum2) refused by
+name as before.
+
+The NextN blocks: `llama-model.cpp:1092` reads `block_count` into
+`n_layer_all`, `llama-hparams.cpp:280-282` defines `n_layer()` as
+`n_layer_all - n_layer_nextn`, `llama-graph.cpp:1433` builds every
+graph over `n_layer()`, and each tensor loader creates the trailing
+blocks `TENSOR_SKIP`. Only the SEVENTEEN graphs that read the key
+subtract (measured; `ferrox_models::mtp_blocks::NEXTN_READERS`); for
+any other a nonzero key stays refused, as upstream would fail on the
+unread `nextn.*` tensors. `ModelConfig::n_layers` is the trunk now and
+`n_mtp_blocks` the rest; the loader marks the skipped blocks' tensors
+as deliberately unread so `assert_every_tensor_consumed` can tell
+"skipped as llama.cpp does" from "missing from the graph". Two orderings
+in llama.cpp were copied rather than tidied: `exaone4.cpp:4` tests
+`n_layer() == 64` BEFORE `:18` reads the key, so a 64-trunk EXAONE-4
+with a block appended gets NO window there and gets none here; and the
+per-layer shape arrays are read at `block_count` length
+(`llama-model.cpp:1148-1156` run before `load_arch_hparams`). Building
+it found the GLM (`glm4moe`, `glm-dsa`, `glm4`), MLA (`deepseek2`) and
+hybrid (`qwen3next`, `qwen35`, `qwen35moe`) dedicated loaders taking
+`block_count` verbatim while every one of those graphs subtracts
+upstream and their converters append the block inside `block_count`
+(`glm.py:99`, `deepseek.py:457`): a real GLM-4.5 or DeepSeek-V3 file
+would have run its MTP block as one more decoder layer with the
+`nextn.*` tensors silently unread. All four dedicated loaders take the
+trunk from the same function now. K-EXAONE's shape -- one block after
+the trunk, the array at trunk length -- has a fixture, KL 1.09e-14.
 
 `olmo2` and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and
 no `ffn_norm` at all, both sublayers reading the raw residual, each
@@ -644,10 +698,12 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 | Hardcoded scales applied even when the GGUF carries no key | `mistral3` (`grok` was here and is CLOSED on the MiniCPM defaults hook) |
 | A gated attention tensor (`wqkv_gate`) | CLOSED (`ferrox_models::attn_gate`): `afmoe` and `laguna` run on it; `step35` still refuses for the rows below and its verdict says so |
 | Attention sinks outside gpt-oss | CLOSED as a tensor-presence fact (`AttnWeights::sinks`, CPU; the fused Metal launches refuse the layer); `mimo2` still refuses for the rows below |
-| A per-layer sliding-window ARRAY (`is_swa_impl`), and NEXTN/MTP blocks inside `block_count` that every export carries | `mimo2`, `step35` |
-| Per-layer SwiGLU clamp arrays (`swiglu_clamp_exp` / `_shexp`) | `step35` |
+| A per-layer sliding-window ARRAY (`is_swa_impl`) | CLOSED (`ferrox_models::swa_layers`): `mellum` runs on it and the EXAONE / Olmo-3 over-refusal is lifted; `mimo2` and `step35` still refuse for the rows below and their verdicts say so |
+| NEXTN/MTP blocks inside `block_count` | CLOSED (`ferrox_models::mtp_blocks`) for the seventeen graphs that read the key, on the generic path and all four dedicated loaders; refused by name elsewhere |
+| A V head width that differs from the K head width | `mimo2` (every real export: `head_dim: 192, v_head_dim: 128`) |
+| Per-layer SwiGLU clamp arrays (`swiglu_clamp_exp` / `_shexp`), and a half-width RoPE on the full-attention layers | `step35` |
 | An ungated or non-SwiGLU FFN | CLOSED for the ungated ReLU-squared form (`FfnActivation::ReluSqr`): `arcee` runs on it; `plm` shares the FFN and refuses on MLA attention; `apertus` is xIELU |
-| Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature), `plm` (MLA attention on a dense model) |
+| Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mistral3` (per-position attention temperature), `plm` (MLA attention on a dense model); `mellum` was here on "two per-layer RoPE variants", which is the Olmo-3 rule refused by name, and is CLOSED |
 
 **Unknown (1).** `phi4` is the only row left here. It is not in
 llama.cpp's `LLM_ARCH_NAMES` -- `src/llama-arch.cpp` carries `phi3` and

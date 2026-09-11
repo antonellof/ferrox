@@ -122,7 +122,7 @@ fn a_window_model_slides_while_continuously_batched() {
     let block_size = 4;
     let mut cfg = test_dense_fixture();
     cfg.sliding_window = Some(window);
-    cfg.swa_pattern = None;
+    cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::All;
     let vocab = cfg.vocab_size;
     let decoder = Arc::new(Decoder::new_random_small(cfg, 2, vocab));
     assert_eq!(decoder.config.uniform_sliding_window(), Some(window));
