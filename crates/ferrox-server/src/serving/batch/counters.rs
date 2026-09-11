@@ -53,4 +53,15 @@ pub struct BatcherStats {
     /// Requests the scheduler actually stopped because they were
     /// cancelled.
     pub aborted: u64,
+    /// The configured cap on in-flight sequences (llama.cpp `-np` /
+    /// `FERROX_CB_MAX_SEQS`), or 0 when unlimited.
+    ///
+    /// Reported because a knob nobody can read back is a knob nobody
+    /// can verify: `-np` set an environment variable that no route
+    /// echoed, so "the flag is wired" and "the flag is documented"
+    /// were separate claims with nothing joining them.
+    pub max_seqs: usize,
+    /// Prompt tokens per prefill chunk (llama.cpp `-ub`), for the same
+    /// reason.
+    pub prefill_chunk: usize,
 }

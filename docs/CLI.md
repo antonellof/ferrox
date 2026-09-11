@@ -806,7 +806,9 @@ parse identical arguments through the same code.
 | `--ctk` / `--cache-type-k` | KV dtype. **Metal only**, the CPU and CUDA cache is the host `Vec<f32>` |
 | `--host`, `--port` | `--port 0` asks the kernel for a free one and announces it on stdout |
 | `-t`, `-ngl`, `-dev` | Threads, GPU layers, device |
-| `-cb` / `--cont-batching`, `-np` / `--parallel` | Continuous batching and its sequence cap |
+| `-cb` / `--cont-batching`, `-np` / `--parallel` | Continuous batching and its sequence cap. Read back as `ferrox_scheduler_max_seqs` on `GET /metrics` |
+| `-b` / `--batch-size`, `-ub` / `--ubatch-size` | Prompt tokens per forward pass, on both decode paths. Resolved to one number the way llama.cpp does (the smaller of whichever was named); read back as `ferrox_scheduler_prefill_chunk` |
+| `--slot-save-path DIR` | Directory for `POST /slots/{id}?action=save\|restore`. Refused at startup when it is not a directory; without it the route answers 501 naming this flag, as llama.cpp does. Slots restore into the prefix cache, so `FERROX_PREFIX_CACHE_ENTRIES` must be set too |
 | `--jinja` | Accepted, and already the default: ferrox always compiles and evaluates the GGUF's own `tokenizer.chat_template` |
 | `--no-warmup` | Accepted; there is no warm-up pass to skip |
 | `--flash-attn` / `-fa` | Accepted. Fused attention is a backend property here, not a per-run switch |
@@ -877,8 +879,9 @@ that asks for it and keeps the pipe open.
 
 The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
 `-dev/--device`, `-ngl/--n-gpu-layers`, `--cont-batching` / `-cb`,
-`--no-cont-batching`, `-np` / `--parallel N`, `--exit-on-stdin-close`,
-and `--list-devices`. Existing
+`--no-cont-batching`, `-np` / `--parallel N`, `-b` / `--batch-size N`,
+`-ub` / `--ubatch-size N`, `--slot-save-path DIR`,
+`--exit-on-stdin-close`, and `--list-devices`. Existing
 `FERROX_MODEL_PATH`, `FERROX_ADDR`, and the backend environment
 variables all still work. Command-line values win over them. Keep
 secrets such as `FERROX_API_KEY` in the environment.

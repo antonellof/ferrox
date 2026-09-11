@@ -1200,10 +1200,12 @@ pub(crate) fn greedy_gpu_fold_allowed(params: &GenerationParams) -> bool {
 }
 
 fn chunked_prefill_tokens() -> Option<usize> {
-    std::env::var("FERROX_CHUNKED_PREFILL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
+    std::env::var(
+        crate::prefill_batch::PREFILL_CHUNK_ENV_KEYS[crate::prefill_batch::PRIVATE_PATH_KEY],
+    )
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .filter(|&n| n > 0)
 }
 
 #[cfg(feature = "metal")]
@@ -1225,7 +1227,7 @@ fn cpu_kv_offload_enabled() -> bool {
 /// request restoring it answered fluent nonsense. Paid for only when a
 /// prefix cache is configured, because it costs one KV download per
 /// layer and nothing else in this path reads the rows back.
-fn forward_prompt_batch(
+pub(crate) fn forward_prompt_batch(
     decoder: &Decoder,
     tokens: &[usize],
     start_pos: usize,

@@ -91,7 +91,10 @@ impl BatcherConfig {
     pub fn from_env() -> Self {
         BatcherConfig {
             max_seqs: env_positive("FERROX_CB_MAX_SEQS").unwrap_or(usize::MAX),
-            prefill_chunk: env_positive("FERROX_CB_PREFILL_CHUNK").unwrap_or(DEFAULT_PREFILL_CHUNK),
+            prefill_chunk: env_positive(
+                crate::prefill_batch::PREFILL_CHUNK_ENV_KEYS[crate::prefill_batch::BATCH_PATH_KEY],
+            )
+            .unwrap_or(DEFAULT_PREFILL_CHUNK),
             max_queue: env_positive("FERROX_CB_MAX_QUEUE").unwrap_or(DEFAULT_MAX_QUEUE),
             kv_block_size: env_positive("FERROX_CB_KV_BLOCK_SIZE").unwrap_or(DEFAULT_KV_BLOCK_SIZE),
             kv_blocks: env_positive("FERROX_CB_KV_BLOCKS"),

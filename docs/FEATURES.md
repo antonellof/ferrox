@@ -299,7 +299,14 @@ OpenAI-compatible HTTP API:
   ~118 ms mean TTFT sequential. CLI: `-cb`, `-np` / `--parallel N`,
   `--no-cont-batching` for the serialized private path. See
   [`plans/metal-parallel-concurrency.md`](plans/metal-parallel-concurrency.md)
-- Chunked prefill (same scheduler as continuous batching)
+- Chunked prefill (same scheduler as continuous batching). `-b` /
+  `-ub` set the chunk on both decode paths from one number
+- **Slot save/restore** (llama.cpp's `POST /slots/{id}?action=save|restore`):
+  a prompt prefix's KV written to `--slot-save-path` and restored into
+  the prefix cache after a restart, so a long system prompt is prefilled
+  once per file rather than once per process. The file carries a
+  checkpoint fingerprint, and a restore under another model or another
+  quantisation is refused by name. See [`API.md`](API.md#slot-save-and-restore)
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so
   conversations off one system prompt share its KV rather than each

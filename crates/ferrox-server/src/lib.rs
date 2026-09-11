@@ -39,6 +39,7 @@ mod budget;
 mod cache_admin;
 mod cancel;
 mod chat_template;
+mod cli;
 mod completion;
 mod conversations;
 mod decode_task;
@@ -55,6 +56,7 @@ mod model;
 mod openai_extra;
 mod output;
 mod policy;
+mod prefill_batch;
 mod reasoning_tokens;
 mod rerank;
 mod response_cache;
@@ -65,6 +67,7 @@ mod sampling_knobs;
 mod security;
 mod serving;
 mod session;
+mod slots;
 mod sse;
 mod stats;
 mod stop;
@@ -76,11 +79,9 @@ mod utf8_stream;
 
 use std::cell::RefCell;
 use std::convert::Infallible;
-use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -92,8 +93,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
+
+use cli::{apply_cli_overrides, print_available_devices};
+pub use cli::{ServerArgs, BUILT_WITH_CUDA, BUILT_WITH_METAL};
 
 use ferrox_core::cache::KvBlockPool;
 use ferrox_models::kimi_tokenizer::KimiTokenizer;
@@ -106,534 +109,6 @@ use model::ServerTokenizer;
 use rerank::encoder_endpoints;
 use response_cache::{CacheKey, ResponseCache};
 use sampling_knobs::SamplingKnobs;
-
-// `PartialEq` so ferrox-cli's serve tests can assert that both front
-// ends parse a command line into the SAME arguments, rather than
-// asserting field by field and missing whichever one is added next.
-#[derive(Parser, Debug, PartialEq)]
-// No `version` here on purpose. This struct is both `ferrox-server`'s
-// own argv and the body of ferrox-cli's `serve` subcommand, and clap
-// gives an embedded subcommand its own `--version` derived from the
-// variant name: `ferrox serve --version` printed `ferrox-serve 0.10.0`,
-// naming a binary nobody ships. The front end's own `--version` is the
-// truth, and both report the same workspace version anyway.
-#[command(
-    name = "ferrox-server",
-    about = "OpenAI-compatible Ferrox inference server"
-)]
-pub struct ServerArgs {
-    /// Model path (GGUF file or Kimi checkpoint directory).
-    #[arg(short = 'm', long = "model", value_name = "FILE")]
-    model: Option<String>,
-
-    /// Hugging Face repo to serve, `user/repo[:QUANT]`, llama.cpp's
-    /// `-hf`.
-    ///
-    /// Downloads into the ferrox cache on first use and reuses it
-    /// after, so `-hf TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF:Q4_K_M`
-    /// is the whole command. The tag after the colon is a QUANT LABEL,
-    /// not a git revision, and it matches without regard to case.
-    #[arg(
-        long = "hf-repo",
-        visible_alias = "hf",
-        value_name = "REPO[:QUANT]",
-        conflicts_with = "model"
-    )]
-    hf_repo: Option<String>,
-
-    /// Exact filename inside `--hf-repo`, llama.cpp's `-hff`.
-    ///
-    /// For a repo whose quant labels do not disambiguate, or a file
-    /// whose name carries no quant at all.
-    #[arg(long = "hf-file", value_name = "FILE", requires = "hf_repo")]
-    hf_file: Option<String>,
-
-    /// Context size, llama.cpp's `-c`. Sets `FERROX_CB_MAX_CONTEXT`.
-    ///
-    /// Unset means the ceiling is derived at load from the weights and
-    /// the per-token KV against the device budget, capped at the
-    /// model's trained context, which is usually what you want.
-    #[arg(short = 'c', long = "ctx-size", value_name = "N")]
-    ctx_size: Option<usize>,
-
-    /// Require `Authorization: Bearer <key>`, llama.cpp's `--api-key`.
-    /// Sets `FERROX_API_KEY`, which also gates `/admin`.
-    #[arg(long = "api-key", value_name = "KEY")]
-    api_key: Option<String>,
-
-    /// Read the API key from a file, llama.cpp's `--api-key-file`.
-    ///
-    /// Preferred over `--api-key` on a shared host: an argument is
-    /// visible in `ps` to every user on the machine.
-    #[arg(long = "api-key-file", value_name = "PATH", conflicts_with = "api_key")]
-    api_key_file: Option<std::path::PathBuf>,
-
-    /// Name this model answers to in `/v1/models` and in responses,
-    /// llama.cpp's `--alias`. Sets `FERROX_MODEL_NAME`.
-    #[arg(long = "alias", visible_alias = "model-alias", value_name = "NAME")]
-    alias: Option<String>,
-
-    /// KV cache dtype, llama.cpp's `--cache-type-k`. Metal only; the
-    /// CPU and CUDA KV cache is the host `Vec<f32>`.
-    #[arg(long = "ctk", visible_alias = "cache-type-k", value_name = "TYPE")]
-    ctk: Option<String>,
-
-    /// Accepted and already the default: ferrox always compiles and
-    /// evaluates the GGUF's own `tokenizer.chat_template`. llama.cpp
-    /// needs `--jinja` to do that, so a command copied from there
-    /// carries it, and dying on an unknown flag would be a worse answer
-    /// than saying "yes, always".
-    #[arg(long = "jinja", default_value_t = false)]
-    jinja: bool,
-
-    /// Refused rather than ignored: ferrox has no
-    /// template-free/sniffing mode to fall back to. See `--jinja`.
-    #[arg(long = "no-jinja", default_value_t = false)]
-    no_jinja: bool,
-
-    /// Accepted; ferrox does no warm-up pass, so there is none to skip.
-    #[arg(long = "no-warmup", default_value_t = false)]
-    no_warmup: bool,
-
-    /// Accepted. Fused attention is a backend decision here, not a
-    /// request-time one: it is on wherever the Metal kernels support
-    /// the shape (`FERROX_METAL_ATTN`).
-    #[arg(long = "flash-attn", visible_alias = "fa", value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
-    flash_attn: Option<String>,
-
-    /// IP address to listen on.
-    #[arg(long, value_name = "HOST")]
-    host: Option<IpAddr>,
-
-    /// Port to listen on. `0` asks the kernel for a free one; the
-    /// actually-bound address is then announced on stdout (see
-    /// [`announce_ready`]), which is how a supervising process is meant
-    /// to learn it.
-    #[arg(long, value_name = "PORT")]
-    port: Option<u16>,
-
-    /// CPU threads (sets FERROX_CPU_THREADS and RAYON_NUM_THREADS).
-    #[arg(short = 't', long = "threads", value_name = "N")]
-    threads: Option<usize>,
-
-    /// Device used for offloading (`none` disables GPU use).
-    #[arg(
-        long = "device",
-        visible_alias = "dev",
-        value_name = "DEVICE",
-        ignore_case = true
-    )]
-    device: Option<OffloadDevice>,
-
-    /// Print available offload devices and exit.
-    #[arg(long = "list-devices", default_value_t = false)]
-    list_devices: bool,
-
-    /// GPU layers: `0`, a positive number, `auto`, or `all`.
-    ///
-    /// Partial placement is not implemented yet; any value above zero
-    /// currently enables all supported operations on the selected backend.
-    #[arg(
-        long = "n-gpu-layers",
-        visible_aliases = ["gpu-layers", "ngl"],
-        value_name = "N"
-    )]
-    n_gpu_layers: Option<GpuLayers>,
-
-    /// MCP tool-server config JSON (stub: listed in `/v1/models` metadata).
-    #[arg(long = "mcp-config", value_name = "PATH")]
-    mcp_config: Option<PathBuf>,
-
-    /// Exit when stdin reaches EOF (for a supervising parent process).
-    ///
-    /// Opt-in on purpose: a server started with stdin redirected from
-    /// `/dev/null` -- systemd, cron, `nohup` -- sees EOF immediately,
-    /// and making this the default would turn those into a server that
-    /// exits the moment it starts. A parent that *wants* the guarantee
-    /// (the desktop shell) passes the flag and keeps the pipe open.
-    #[arg(long = "exit-on-stdin-close", default_value_t = false)]
-    exit_on_stdin_close: bool,
-
-    /// Share one batched decode worker across concurrent requests
-    /// (llama.cpp `-cb`). Also sets `FERROX_CONTINUOUS_BATCHING=1`.
-    #[arg(
-        long = "cont-batching",
-        visible_aliases = ["continuous-batching", "cb"],
-        default_value_t = false
-    )]
-    cont_batching: bool,
-
-    /// Disable auto continuous batching on Metal
-    /// (`FERROX_CONTINUOUS_BATCHING=0`).
-    #[arg(
-        long = "no-cont-batching",
-        default_value_t = false,
-        conflicts_with = "cont_batching"
-    )]
-    no_cont_batching: bool,
-
-    /// Max concurrent sequences under continuous batching (llama.cpp
-    /// `-np`). Sets `FERROX_CB_MAX_SEQS`; implies `--cont-batching`
-    /// unless `--no-cont-batching` is set.
-    #[arg(long = "parallel", visible_alias = "np", value_name = "N")]
-    parallel: Option<usize>,
-
-    /// Start even though another ferrox process is already holding a
-    /// model. Off by default: two models on one box do not share it,
-    /// they thrash it, and both serve slower than either would alone.
-    /// `FERROX_ALLOW_MULTIPLE_INSTANCES=1` does the same.
-    #[arg(long = "allow-multiple-instances", default_value_t = false)]
-    allow_multiple_instances: bool,
-}
-
-impl ServerArgs {
-    /// Parses `ferrox-server`'s own argv, including the llama.cpp-style
-    /// multi-character short options (`-ngl`, `-dev`) that clap cannot
-    /// express and which are rewritten to their long forms first.
-    ///
-    /// Public because ferrox-cli's `serve` subcommand hands the same
-    /// arguments to the same parser rather than reimplementing it.
-    pub fn parse_llama_style<I>(argv: I) -> Self
-    where
-        I: IntoIterator<Item = String>,
-    {
-        Self::parse_from(rewrite_llama_style_argv(argv.into_iter().collect()))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum OffloadDevice {
-    Auto,
-    None,
-    Cpu,
-    Metal,
-    Cuda,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GpuLayers {
-    Auto,
-    All,
-    Count(u32),
-}
-
-impl GpuLayers {
-    fn offload_enabled(self) -> bool {
-        !matches!(self, Self::Count(0))
-    }
-}
-
-impl FromStr for GpuLayers {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "auto" => Ok(Self::Auto),
-            "all" => Ok(Self::All),
-            _ => value
-                .parse::<u32>()
-                .map(Self::Count)
-                .map_err(|_| "expected 0, a positive integer, 'auto', or 'all'".into()),
-        }
-    }
-}
-
-impl fmt::Display for GpuLayers {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Auto => f.write_str("auto"),
-            Self::All => f.write_str("all"),
-            Self::Count(value) => value.fmt(f),
-        }
-    }
-}
-
-/// Whether this build of the server has the Metal kernels compiled in.
-///
-/// Exists for the front ends that link this library: ferrox-cli's
-/// `metal` feature has to forward into ferrox-server
-/// (`ferrox-server?/metal`) or `ferrox serve --device metal` refuses on
-/// a Metal host while `ferrox run` on the same binary uses it. That
-/// mismatch is one Cargo manifest edit away and compiles cleanly, so
-/// ferrox-cli asserts on this constant at compile time.
-pub const BUILT_WITH_METAL: bool = cfg!(feature = "metal");
-
-/// Whether this build of the server has the CUDA kernels compiled in.
-/// See [`BUILT_WITH_METAL`].
-pub const BUILT_WITH_CUDA: bool = cfg!(feature = "cuda");
-
-fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
-    args.into_iter()
-        .map(|arg| match arg.as_str() {
-            "-ngl" => "--n-gpu-layers".into(),
-            "-dev" => "--device".into(),
-            "-cb" => "--cont-batching".into(),
-            "-np" => "--parallel".into(),
-            // One token in llama.cpp's hand-written parser. clap sees
-            // `-h` followed by `f` and prints help, which is what
-            // `ferrox serve -hf repo:Q4_K_M` did: the flag looked
-            // absent rather than mis-spelled.
-            "-hf" => "--hf-repo".into(),
-            "-hff" => "--hf-file".into(),
-            _ => arg,
-        })
-        .collect()
-}
-
-fn print_available_devices() {
-    println!("Available devices:");
-    println!("  CPU");
-
-    let metal = ferrox_metal::MetalProfile::detect();
-    if let Some(name) = metal.device_name {
-        println!("  Metal: {name}");
-    }
-
-    let cuda = ferrox_cuda::HardwareProfile::detect();
-    if cuda.cuda_available {
-        let name = cuda.cuda_device_name.as_deref().unwrap_or("unknown device");
-        println!("  CUDA: {name}");
-        if cuda.cuda_device_count > 1 {
-            println!("        ({} devices detected)", cuda.cuda_device_count);
-        }
-    }
-}
-
-fn cli_bind_addr(args: &ServerArgs, env_addr: Option<&str>) -> Option<String> {
-    if args.host.is_none() && args.port.is_none() {
-        return None;
-    }
-
-    let existing = env_addr.and_then(|value| value.parse::<SocketAddr>().ok());
-    let host = args
-        .host
-        .or_else(|| existing.map(|addr| addr.ip()))
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    let port = args
-        .port
-        .or_else(|| existing.map(|addr| addr.port()))
-        .unwrap_or(8383);
-    Some(SocketAddr::new(host, port).to_string())
-}
-
-/// Resolves a `-hf` reference to a local path, downloading it once.
-///
-/// Progress goes to STDERR, not stdout: stdout carries the
-/// `ferrox.server.ready` line a supervising process parses, and a
-/// progress bar in the middle of it would break that contract.
-fn resolve_hf_repo(spec: &str, file: Option<&str>) -> anyhow::Result<String> {
-    let mut hf = ferrox_models::hub::HfRef::parse(spec);
-    if let Some(f) = file {
-        hf.file = Some(f.to_string());
-    }
-    eprintln!(
-        "ferrox: resolving {} on the Hub{}",
-        hf.repo,
-        hf.quant
-            .as_deref()
-            .map(|q| format!(" ({q})"))
-            .unwrap_or_default()
-    );
-
-    let mut last = std::time::Instant::now();
-    let mut draw = move |done: u64, total: Option<u64>| {
-        if last.elapsed() < std::time::Duration::from_millis(200) {
-            return;
-        }
-        last = std::time::Instant::now();
-        let mib = done as f64 / 1024.0 / 1024.0;
-        match total {
-            Some(t) if t > 0 => {
-                eprint!(
-                    "\r  {mib:>9.1} MiB  {:5.1}%",
-                    (done as f64 / t as f64) * 100.0
-                )
-            }
-            _ => eprint!("\r  {mib:>9.1} MiB"),
-        }
-    };
-
-    let (path, downloaded) = hf
-        .ensure_local(&mut draw)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    if downloaded {
-        eprintln!();
-        eprintln!("ferrox: downloaded {}", path.display());
-    } else {
-        eprintln!("ferrox: using cached {}", path.display());
-    }
-    Ok(path.to_string_lossy().into_owned())
-}
-
-fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
-    if let Some(model) = &args.model {
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_MODEL_PATH", model) };
-    }
-    if let Some(spec) = &args.hf_repo {
-        let path = resolve_hf_repo(spec, args.hf_file.as_deref())?;
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_MODEL_PATH", &path) };
-    }
-    if let Some(n) = args.ctx_size {
-        if n == 0 {
-            anyhow::bail!("--ctx-size must be greater than zero");
-        }
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_CB_MAX_CONTEXT", n.to_string()) };
-    }
-    if let Some(key) = &args.api_key {
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_API_KEY", key) };
-    }
-    if let Some(path) = &args.api_key_file {
-        let key = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("reading --api-key-file {}: {e}", path.display()))?;
-        let key = key.trim();
-        if key.is_empty() {
-            anyhow::bail!(
-                "--api-key-file {} is empty: an empty key would leave every route open, \
-                 which is the opposite of what passing the flag asked for",
-                path.display()
-            );
-        }
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_API_KEY", key) };
-    }
-    if let Some(alias) = &args.alias {
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_MODEL_NAME", alias) };
-    }
-    if let Some(ctk) = &args.ctk {
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_CTK", ctk.trim()) };
-    }
-    // Refused by NAME rather than ignored. A prompt framed by a
-    // hand-written guess instead of the checkpoint's own template is
-    // the kind of wrong answer that reads as a model quality problem,
-    // so "ferrox cannot do that" is the honest reply.
-    if args.no_jinja {
-        anyhow::bail!(
-            "--no-jinja: ferrox has no template-free mode. It compiles and evaluates the GGUF's \
-             own tokenizer.chat_template, which is what llama.cpp's --jinja turns on, and there \
-             is no sniffing fallback to switch to. Use --no-cnv on `ferrox run` for a raw \
-             completion"
-        );
-    }
-    if let Some(mode) = &args.flash_attn {
-        let mode = mode.trim().to_ascii_lowercase();
-        if mode == "off" || mode == "disabled" || mode == "0" {
-            anyhow::bail!(
-                "--flash-attn off: fused attention is a backend property here, not a per-run \
-                 switch. Set FERROX_METAL_ATTN=0 to take the unfused Metal path, or --device cpu"
-            );
-        }
-    }
-
-    if let Some(addr) = cli_bind_addr(args, std::env::var("FERROX_ADDR").ok().as_deref()) {
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_ADDR", addr) };
-    }
-
-    if let Some(threads) = args.threads {
-        if threads == 0 {
-            anyhow::bail!("--threads must be greater than zero");
-        }
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe {
-            std::env::set_var("FERROX_CPU_THREADS", threads.to_string());
-            std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
-        }
-    }
-
-    if args.device.is_none() && args.n_gpu_layers.is_none() {
-        // device overrides skipped
-    } else {
-        let layers = args.n_gpu_layers.unwrap_or(GpuLayers::Auto);
-        let device = if layers.offload_enabled() {
-            args.device.unwrap_or(OffloadDevice::Auto)
-        } else {
-            OffloadDevice::None
-        };
-
-        match device {
-            OffloadDevice::None | OffloadDevice::Cpu => unsafe {
-                std::env::set_var("FERROX_METAL", "0");
-                std::env::set_var("FERROX_METAL_ATTN", "0");
-                std::env::set_var("FERROX_CUDA", "0");
-            },
-            OffloadDevice::Auto => unsafe {
-                std::env::set_var("FERROX_METAL", "auto");
-                std::env::set_var("FERROX_CUDA", "auto");
-                if std::env::var_os("FERROX_METAL_ATTN").is_none() {
-                    std::env::set_var("FERROX_METAL_ATTN", "1");
-                }
-            },
-            OffloadDevice::Metal => {
-                #[cfg(not(feature = "metal"))]
-                {
-                    anyhow::bail!(
-                        "Metal requested but this binary was built without --features metal"
-                    );
-                }
-                #[cfg(feature = "metal")]
-                {
-                    if !ferrox_metal::MetalProfile::detect().available {
-                        anyhow::bail!("Metal requested but no Metal device is available");
-                    }
-                    unsafe {
-                        std::env::set_var("FERROX_METAL", "1");
-                        if std::env::var_os("FERROX_METAL_ATTN").is_none() {
-                            std::env::set_var("FERROX_METAL_ATTN", "1");
-                        }
-                        std::env::set_var("FERROX_CUDA", "0");
-                    }
-                }
-            }
-            OffloadDevice::Cuda => {
-                #[cfg(not(feature = "cuda"))]
-                {
-                    anyhow::bail!(
-                        "CUDA requested but this binary was built without --features cuda"
-                    );
-                }
-                #[cfg(feature = "cuda")]
-                {
-                    if !ferrox_cuda::HardwareProfile::detect().cuda_available {
-                        anyhow::bail!("CUDA requested but no CUDA device is available");
-                    }
-                    unsafe {
-                        std::env::set_var("FERROX_CUDA", "1");
-                        std::env::set_var("FERROX_METAL", "0");
-                        std::env::set_var("FERROX_METAL_ATTN", "0");
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(n) = args.parallel {
-        if n == 0 {
-            anyhow::bail!("--parallel must be greater than zero");
-        }
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_CB_MAX_SEQS", n.to_string()) };
-    }
-
-    if args.cont_batching {
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
-    } else if args.no_cont_batching {
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "0") };
-    } else if args.parallel.is_some() {
-        // llama.cpp `-np` is only meaningful with continuous batching.
-        // SAFETY: called before the runtime starts worker threads.
-        unsafe { std::env::set_var("FERROX_CONTINUOUS_BATCHING", "1") };
-    }
-
-    Ok(())
-}
 
 /// The loaded model: immutable once built, so it needs no lock at all --
 /// just cheap `Arc` sharing across concurrent request tasks. Two real
@@ -808,6 +283,18 @@ impl Model {
                     .collect();
                 Some(m.decoder.forward_hidden_batch(tokens, 0, &mut caches))
             }
+            Model::Kimi(_) | Model::Mla(_) | Model::Gemma4(_) | Model::Glm52(_) => None,
+        }
+    }
+
+    /// The generic GGUF decoder, when that is what is loaded.
+    ///
+    /// `None` for the dedicated engines (Kimi, MLA, Gemma-4, GLM-5.2):
+    /// they hold their own KV in their own shape, and
+    /// [`crate::slots`]'s file format describes the generic one.
+    pub(crate) fn gguf_decoder(&self) -> Option<&Arc<Decoder>> {
+        match self {
+            Model::Gguf(m) => Some(&m.decoder),
             Model::Kimi(_) | Model::Mla(_) | Model::Gemma4(_) | Model::Glm52(_) => None,
         }
     }
@@ -2608,7 +2095,13 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                  ferrox_kv_rejected_context_length_total {}\n\
                  # HELP ferrox_scheduler_aborted_total Requests the batch scheduler stopped because they were cancelled.\n\
                  # TYPE ferrox_scheduler_aborted_total counter\n\
-                 ferrox_scheduler_aborted_total {}\n",
+                 ferrox_scheduler_aborted_total {}\n\
+                 # HELP ferrox_scheduler_max_seqs Cap on in-flight sequences (-np / FERROX_CB_MAX_SEQS); 0 when unlimited.\n\
+                 # TYPE ferrox_scheduler_max_seqs gauge\n\
+                 ferrox_scheduler_max_seqs {}\n\
+                 # HELP ferrox_scheduler_prefill_chunk Prompt tokens per prefill chunk (-b / -ub / FERROX_CB_PREFILL_CHUNK).\n\
+                 # TYPE ferrox_scheduler_prefill_chunk gauge\n\
+                 ferrox_scheduler_prefill_chunk {}\n",
                 sched.prefill_chunks,
                 sched.prefill_tokens,
                 sched.decode_steps,
@@ -2620,6 +2113,8 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                 sched.kv_rejected_too_large,
                 sched.kv_rejected_context_length,
                 sched.aborted,
+                sched.max_seqs,
+                sched.prefill_chunk,
             )
         }
         None => body,
@@ -3806,6 +3301,100 @@ async fn chat_completions_stream(
 /// handler's, and the one path that did match would have panicked on
 /// `MissingPathParams`. Anything with a placeholder must go through
 /// here.
+/// Every route that sits behind `FERROX_API_KEY`, as ONE list.
+///
+/// Extracted because there were two of these: this one and a
+/// hand-written copy in the test module, which had already drifted --
+/// the test router was missing `/metrics`, `/cache/stats`, both rerank
+/// spellings and half of `/admin`, so an HTTP test could pass against a
+/// route the real server does not serve, or 404 on one it does. That is
+/// this repo's dominant bug shape (two structures that must agree, with
+/// nothing enforcing it) sitting inside the test harness, where it is
+/// worst: it makes the tests agree with themselves.
+///
+/// `/health` is deliberately NOT here. It is the one route that must
+/// stay reachable without a key, and it is registered separately for
+/// that reason.
+fn protected_routes() -> Router<Arc<AppState>> {
+    use ferrox_api::routes;
+
+    Router::new()
+        .route(routes::V1_MODELS, get(list_models))
+        // The Responses surface decodes tokens, so it sits behind the
+        // same key as `/v1/chat/completions`: it must cost what
+        // decoding tokens costs.
+        .route(routes::V1_RESPONSES, post(responses::responses))
+        .route(
+            &axum_path(routes::V1_RESPONSE),
+            get(responses::responses_get),
+        )
+        .route(
+            &axum_path(routes::V1_RESPONSE_CANCEL),
+            post(responses::responses_cancel),
+        )
+        .route(&axum_path(routes::SLOTS_ID), post(slots::post_slot))
+        .route(routes::V1_STATS, get(serving_stats))
+        .route(routes::V1_REQUESTS, get(recent_requests))
+        .route(routes::V1_CACHE_STATUS, get(cache_admin::cache_status))
+        .route(routes::V1_CACHE_REBUILD, post(cache_admin::cache_rebuild))
+        .route(routes::ADMIN_PREPARE_STOP, post(cache_admin::prepare_stop))
+        .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
+        // Behind the same key as the endpoint that started the work:
+        // an unauthenticated caller must not be able to stop someone
+        // else's generation by guessing at request ids.
+        .route(routes::V1_CANCEL, post(cancel_generation))
+        // Reconnect and the polling fallback, both behind the same key
+        // as the request that filled the buffer: the replay window holds
+        // the model's output, so reading it must cost what producing it
+        // cost.
+        .route(&axum_path(routes::V1_STREAM), get(resume::resume))
+        .route(&axum_path(routes::V1_STREAM_POLL), get(resume::poll))
+        .route(routes::V1_MESSAGES, post(anthropic::messages))
+        .route(
+            routes::V1_MESSAGES_COUNT_TOKENS,
+            post(anthropic::count_tokens),
+        )
+        .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
+        // llama.cpp's NATIVE completion endpoint, under both spellings
+        // it mounts. Not an alias of the line above: different request
+        // fields, a different response object, and a stream that ends
+        // without `[DONE]`. See `crate::completion`.
+        .route(routes::COMPLETION, post(completion::completion))
+        .route(routes::COMPLETIONS, post(completion::completion))
+        .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
+        .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
+        // llama.cpp's unprefixed spelling of the same two, on the SAME
+        // handlers -- not copies. The `/v1/` prefix was ferrox's
+        // invention (OpenAI has no tokenize endpoint), so every
+        // llama.cpp client was getting a 404 that named nothing. Behind
+        // the key with their twins: they read the loaded vocabulary.
+        .route(routes::TOKENIZE, post(openai_extra::tokenize))
+        .route(routes::DETOKENIZE, post(openai_extra::detokenize))
+        .route(routes::V1_EMBEDDINGS, post(embeddings::embeddings))
+        // Cross-encoder reranking, under the `/v1` spelling Cohere and
+        // Jina clients use and the unprefixed one llama.cpp mounts.
+        // Same handler: this really is an alias, not a second dialect.
+        .route(routes::V1_RERANK, post(rerank::rerank))
+        .route(routes::RERANK, post(rerank::rerank))
+        .route(routes::CACHE_STATS, get(cache_stats))
+        .route(routes::METRICS, get(metrics))
+        // The control surface. Registered inside `protected` on
+        // purpose: these routes change what the server serves and write
+        // to disk, so they get the same FERROX_API_KEY gate as /v1/*
+        // and never the unauthenticated treatment /health has.
+        .route(routes::ADMIN_MODELS, get(admin::models))
+        .route(routes::ADMIN_MODELS_LOAD, post(admin::load_model))
+        .route(routes::ADMIN_MODELS_UNLOAD, post(admin::unload_model))
+        .route(routes::ADMIN_DOWNLOAD, post(admin::download))
+        .route(routes::ADMIN_TASKS, get(admin::tasks))
+        .route(&admin::cancel_route(), post(admin::cancel_task))
+        .route(routes::ADMIN_STATS, get(admin::stats))
+        // Server-side conversation storage, mounted here so it inherits
+        // the same key gate as the endpoint that generated the text it
+        // stores. Routes and store both live in `conversations`.
+        .merge(conversations::router())
+}
+
 fn axum_path(template: &str) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -4133,10 +3722,11 @@ fn build_app_state(
     detection: Arc<health::Detection>,
 ) -> AppState {
     let StartupModels { loaded, embedding } = models;
+    let configured_path = std::env::var("FERROX_MODEL_PATH").ok();
     let (loaded, batcher, ceiling) = activate_loaded_model(
         loaded,
         enable_continuous_batching,
-        std::env::var("FERROX_MODEL_PATH").ok().as_deref(),
+        configured_path.as_deref(),
         paged_kv.as_ref(),
     );
     // The startup model's admin id is whichever discovered entry sits
@@ -4162,6 +3752,7 @@ fn build_app_state(
             loaded,
             batcher,
             ceiling,
+            checkpoint_path: configured_path.as_deref().map(PathBuf::from),
         }))),
         paged_kv,
         load_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -4965,80 +4556,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
     // is nothing to mount here and `/` stays a 404.
     let public = Router::new().route(routes::HEALTH, get(health));
 
-    let mut protected = Router::new()
-        .route(routes::V1_MODELS, get(list_models))
-        // The Responses surface decodes tokens, so it sits behind the
-        // same key as `/v1/chat/completions`: it must cost what
-        // decoding tokens costs.
-        .route(routes::V1_RESPONSES, post(responses::responses))
-        .route(
-            &axum_path(routes::V1_RESPONSE),
-            get(responses::responses_get),
-        )
-        .route(
-            &axum_path(routes::V1_RESPONSE_CANCEL),
-            post(responses::responses_cancel),
-        )
-        .route(routes::V1_STATS, get(serving_stats))
-        .route(routes::V1_REQUESTS, get(recent_requests))
-        .route(routes::V1_CACHE_STATUS, get(cache_admin::cache_status))
-        .route(routes::V1_CACHE_REBUILD, post(cache_admin::cache_rebuild))
-        .route(routes::ADMIN_PREPARE_STOP, post(cache_admin::prepare_stop))
-        .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
-        // Behind the same key as the endpoint that started the work:
-        // an unauthenticated caller must not be able to stop someone
-        // else's generation by guessing at request ids.
-        .route(routes::V1_CANCEL, post(cancel_generation))
-        // Reconnect and the polling fallback, both behind the same key
-        // as the request that filled the buffer: the replay window holds
-        // the model's output, so reading it must cost what producing it
-        // cost.
-        .route(&axum_path(routes::V1_STREAM), get(resume::resume))
-        .route(&axum_path(routes::V1_STREAM_POLL), get(resume::poll))
-        .route(routes::V1_MESSAGES, post(anthropic::messages))
-        .route(
-            routes::V1_MESSAGES_COUNT_TOKENS,
-            post(anthropic::count_tokens),
-        )
-        .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
-        // llama.cpp's NATIVE completion endpoint, under both spellings
-        // it mounts. Not an alias of the line above: different request
-        // fields, a different response object, and a stream that ends
-        // without `[DONE]`. See `crate::completion`.
-        .route(routes::COMPLETION, post(completion::completion))
-        .route(routes::COMPLETIONS, post(completion::completion))
-        .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
-        .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
-        // llama.cpp's unprefixed spelling of the same two, on the SAME
-        // handlers -- not copies. The `/v1/` prefix was ferrox's
-        // invention (OpenAI has no tokenize endpoint), so every
-        // llama.cpp client was getting a 404 that named nothing. Behind
-        // the key with their twins: they read the loaded vocabulary.
-        .route(routes::TOKENIZE, post(openai_extra::tokenize))
-        .route(routes::DETOKENIZE, post(openai_extra::detokenize))
-        .route(routes::V1_EMBEDDINGS, post(embeddings::embeddings))
-        // Cross-encoder reranking, under the `/v1` spelling Cohere and
-        // Jina clients use and the unprefixed one llama.cpp mounts.
-        // Same handler: this really is an alias, not a second dialect.
-        .route(routes::V1_RERANK, post(rerank::rerank))
-        .route(routes::RERANK, post(rerank::rerank))
-        .route(routes::CACHE_STATS, get(cache_stats))
-        .route(routes::METRICS, get(metrics))
-        // The control surface. Registered inside `protected` on
-        // purpose: these routes change what the server serves and write
-        // to disk, so they get the same FERROX_API_KEY gate as /v1/*
-        // and never the unauthenticated treatment /health has.
-        .route(routes::ADMIN_MODELS, get(admin::models))
-        .route(routes::ADMIN_MODELS_LOAD, post(admin::load_model))
-        .route(routes::ADMIN_MODELS_UNLOAD, post(admin::unload_model))
-        .route(routes::ADMIN_DOWNLOAD, post(admin::download))
-        .route(routes::ADMIN_TASKS, get(admin::tasks))
-        .route(&admin::cancel_route(), post(admin::cancel_task))
-        .route(routes::ADMIN_STATS, get(admin::stats))
-        // Server-side conversation storage, mounted here so it inherits
-        // the same key gate as the endpoint that generated the text it
-        // stores. Routes and store both live in `conversations`.
-        .merge(conversations::router());
+    let mut protected = protected_routes();
 
     // Both off by default; set the corresponding env var to enable.
     // route_layer (not layer) so these apply only to the routes above,
@@ -5177,84 +4695,6 @@ mod tests {
     use ferrox_models::config::test_dense_fixture;
 
     #[test]
-    fn parses_llama_server_style_options() {
-        let argv = [
-            "ferrox-server",
-            "-m",
-            "model.gguf",
-            "--host",
-            "::1",
-            "--port",
-            "9000",
-            "-t",
-            "4",
-            "-dev",
-            "Metal",
-            "-ngl",
-            "all",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        let args = ServerArgs::try_parse_from(rewrite_llama_style_argv(argv)).unwrap();
-
-        assert_eq!(args.model.as_deref(), Some("model.gguf"));
-        assert_eq!(args.host, Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
-        assert_eq!(args.port, Some(9000));
-        assert_eq!(args.threads, Some(4));
-        assert_eq!(args.device, Some(OffloadDevice::Metal));
-        assert_eq!(args.n_gpu_layers, Some(GpuLayers::All));
-        assert_eq!(
-            cli_bind_addr(&args, Some("127.0.0.1:8383")).as_deref(),
-            Some("[::1]:9000")
-        );
-    }
-
-    #[test]
-    fn port_zero_survives_argument_parsing_as_a_real_request() {
-        // `--port 0` must reach the bind call intact: it is a request
-        // for a kernel-assigned port, not a missing value to default to
-        // 8383. The address it produces is deliberately provisional --
-        // the ready line reports what was actually bound.
-        let argv = ["ferrox-server", "--port", "0"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let args = ServerArgs::try_parse_from(rewrite_llama_style_argv(argv)).unwrap();
-        assert_eq!(args.port, Some(0));
-        assert_eq!(
-            cli_bind_addr(&args, Some("127.0.0.1:8383")).as_deref(),
-            Some("127.0.0.1:0")
-        );
-    }
-
-    #[test]
-    fn parallel_flag_parses_and_rewrites_np() {
-        let argv = ["ferrox-server", "-np", "4"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let args = ServerArgs::try_parse_from(rewrite_llama_style_argv(argv)).unwrap();
-        assert_eq!(args.parallel, Some(4));
-    }
-
-    #[test]
-    fn stdin_close_exit_is_opt_in() {
-        // Default off: a server whose stdin is /dev/null (systemd, cron,
-        // nohup) would otherwise exit the instant it started.
-        let args =
-            ServerArgs::try_parse_from(["ferrox-server"].into_iter().map(String::from)).unwrap();
-        assert!(!args.exit_on_stdin_close);
-        let args = ServerArgs::try_parse_from(
-            ["ferrox-server", "--exit-on-stdin-close"]
-                .into_iter()
-                .map(String::from),
-        )
-        .unwrap();
-        assert!(args.exit_on_stdin_close);
-    }
-
-    #[test]
     fn the_ready_line_round_trips_through_a_parent_reading_stdout() {
         let addr: SocketAddr = "127.0.0.1:51999".parse().unwrap();
         let ready = ferrox_api::ServerReady::new(addr, "http", "0.5.0", std::process::id());
@@ -5333,6 +4773,7 @@ mod tests {
                 loaded: Loaded::Generative(Arc::new(model)),
                 batcher: None,
                 ceiling: None,
+                checkpoint_path: None,
             }))),
             load_in_progress: std::sync::atomic::AtomicBool::new(false),
             tasks: Arc::new(tasks::TaskRegistry::new()),
@@ -5379,71 +4820,18 @@ mod tests {
     /// [`test_app`] over a caller-owned state, so a test can reach in
     /// and swap or unload the model behind a live router.
     fn test_app_with_state(state: Arc<AppState>) -> Router {
+        // The SAME route list the server builds, not a hand-written
+        // copy of it. The copy that used to live here had drifted from
+        // the real one, which is the failure mode that makes an HTTP
+        // test worthless: it can only ever confirm that the tests agree
+        // with the tests. See `protected_routes`.
+        //
+        // No auth, rate-limit or CORS layer: those are configured from
+        // the environment in `run`, and a test that set the environment
+        // would race every other test in the process.
         Router::new()
             .route(ferrox_api::routes::HEALTH, get(health))
-            .route(ferrox_api::routes::V1_MODELS, get(list_models))
-            .route(ferrox_api::routes::V1_RESPONSES, post(responses::responses))
-            .route(
-                &axum_path(ferrox_api::routes::V1_RESPONSE),
-                get(responses::responses_get),
-            )
-            .route(
-                &axum_path(ferrox_api::routes::V1_RESPONSE_CANCEL),
-                post(responses::responses_cancel),
-            )
-            .route(ferrox_api::routes::V1_STATS, get(serving_stats))
-            .route(ferrox_api::routes::V1_REQUESTS, get(recent_requests))
-            .route(
-                ferrox_api::routes::V1_CACHE_STATUS,
-                get(cache_admin::cache_status),
-            )
-            .route(
-                ferrox_api::routes::V1_CACHE_REBUILD,
-                post(cache_admin::cache_rebuild),
-            )
-            .route(
-                ferrox_api::routes::ADMIN_PREPARE_STOP,
-                post(cache_admin::prepare_stop),
-            )
-            .route("/v1/chat/completions", post(chat_completions))
-            .route(ferrox_api::routes::V1_MESSAGES, post(anthropic::messages))
-            .route(
-                ferrox_api::routes::V1_MESSAGES_COUNT_TOKENS,
-                post(anthropic::count_tokens),
-            )
-            .route("/v1/tokenize", post(openai_extra::tokenize))
-            .route("/v1/detokenize", post(openai_extra::detokenize))
-            // llama.cpp's unprefixed spelling, mounted here too so the
-            // tests below reach the alias through a real router rather
-            // than by calling the handler function directly.
-            .route(ferrox_api::routes::TOKENIZE, post(openai_extra::tokenize))
-            .route(
-                ferrox_api::routes::DETOKENIZE,
-                post(openai_extra::detokenize),
-            )
-            .route("/v1/embeddings", post(embeddings::embeddings))
-            .route("/v1/completions", post(openai_extra::completions))
-            // llama.cpp's native endpoint, under both of its spellings.
-            .route(ferrox_api::routes::COMPLETION, post(completion::completion))
-            .route(
-                ferrox_api::routes::COMPLETIONS,
-                post(completion::completion),
-            )
-            .route(
-                ferrox_api::routes::ADMIN_MODELS_UNLOAD,
-                post(admin::unload_model),
-            )
-            .route(ferrox_api::routes::ADMIN_TASKS, get(admin::tasks))
-            .route(ferrox_api::routes::ADMIN_STATS, get(admin::stats))
-            .route(ferrox_api::routes::V1_CANCEL, post(cancel_generation))
-            .route(
-                &axum_path(ferrox_api::routes::V1_STREAM),
-                get(resume::resume),
-            )
-            .route(
-                &axum_path(ferrox_api::routes::V1_STREAM_POLL),
-                get(resume::poll),
-            )
+            .merge(protected_routes())
             .with_state(state)
     }
 
@@ -5587,6 +4975,7 @@ mod tests {
             loaded: Loaded::Generative(Arc::new(named_test_model(name, 256))),
             batcher: None,
             ceiling: None,
+            checkpoint_path: None,
         })
         .tap_into(state)
     }
@@ -5659,6 +5048,7 @@ mod tests {
             loaded: Loaded::Generative(Arc::new(named_test_model("model-b", 256))),
             batcher: None,
             ceiling: None,
+            checkpoint_path: None,
         })));
         drop(previous);
         // The registry has let go; the in-flight request has not.
@@ -6859,6 +6249,37 @@ mod tests {
         assert_eq!(body["tasks"].as_array().unwrap().len(), 0);
     }
 
+    /// The slots route exists, is reachable, and refuses by naming the
+    /// flag that would turn it on -- rather than 404ing, which is what
+    /// an unregistered route would do and is indistinguishable from
+    /// "this build has no slots".
+    ///
+    /// The condition is reachable by default: `FERROX_SLOT_SAVE_PATH`
+    /// is unset unless an operator passes `--slot-save-path`, so this
+    /// is the answer every stock server gives.
+    #[tokio::test]
+    async fn the_slots_route_is_registered_and_refuses_by_naming_slot_save_path() {
+        assert!(
+            std::env::var("FERROX_SLOT_SAVE_PATH").is_err(),
+            "this test asserts the unconfigured behaviour"
+        );
+        let app = test_app();
+        let (status, body) = post_json_uri(
+            &app,
+            &format!("{}?action=save", ferrox_api::routes::slots_id(0)),
+            serde_json::json!({"filename": "sys.fslot", "prompt": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--slot-save-path"),
+            "{body}"
+        );
+    }
+
     async fn post_json_uri(
         app: &Router,
         uri: &str,
@@ -7245,6 +6666,7 @@ mod tests {
             loaded,
             batcher,
             ceiling,
+            checkpoint_path: None,
         })));
         let app = test_app_with_state(Arc::new(state));
 
