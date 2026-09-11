@@ -389,3 +389,105 @@ test("a stored thought reloads above its answer, and a cut-off turn offers the w
     reason: "stop",
   });
 });
+
+test("the thought's duration is stored once, as a column, and comes back where it was", () => {
+  // The runtime carries the clock as `metadata.custom.thought`, and the
+  // server stores `metadata` byte-identical. Left there, the duration
+  // would be stored twice and a reload would have two numbers to pick
+  // from; it is lifted out into `reasoning_ms` and put back on load.
+  const pending = pendingAppend(
+    repo([
+      {
+        parentId: null,
+        message: {
+          id: "a1",
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "Let me think" },
+            { type: "text", text: "hello" },
+          ],
+          status: { type: "complete", reason: "stop" },
+          metadata: {
+            custom: {
+              stats: { outcome: "ok" },
+              thought: { state: "done", ms: 15_250 },
+            },
+          },
+        },
+      },
+      {
+        // A thought whose clock never stopped is not a duration.
+        parentId: "a1",
+        message: {
+          id: "a2",
+          role: "assistant",
+          content: [{ type: "reasoning", text: "Hmm" }],
+          status: { type: "incomplete", reason: "cancelled" },
+          metadata: { custom: { thought: { state: "thinking", startedAt: 5 } } },
+        },
+      },
+      {
+        // A duration with no thought beside it is not stored either:
+        // the column means "this turn thought for", and there was none.
+        parentId: "a2",
+        message: {
+          id: "a3",
+          role: "assistant",
+          content: [{ type: "text", text: "plain" }],
+          status: { type: "complete", reason: "stop" },
+          metadata: { custom: { thought: { state: "done", ms: 3_000 } } },
+        },
+      },
+    ]),
+    new Set(),
+  );
+  const [thought, running, plain] = pending.messages;
+  assert.equal(thought.reasoning_ms, 15_250);
+  assert.deepEqual(thought.metadata, { custom: { stats: { outcome: "ok" } } });
+  assert.equal("reasoning_ms" in running, false);
+  assert.deepEqual(running.metadata, { custom: {} });
+  assert.equal("reasoning_ms" in plain, false);
+
+  const { items } = toBranchable({
+    ...CONVERSATION,
+    messages: [
+      {
+        id: "a1",
+        parent_id: null,
+        role: "assistant",
+        content: "hello",
+        reasoning_content: "Let me think",
+        reasoning_ms: 15_250,
+        created_at: 1,
+        metadata: { custom: { stats: { outcome: "ok" } } },
+      },
+      {
+        // Written before the column existed: the thought shows, with
+        // no time on it, rather than as "Thought for 0 seconds".
+        id: "a2",
+        parent_id: "a1",
+        role: "assistant",
+        content: "",
+        reasoning_content: "Hmm",
+        created_at: 2,
+        metadata: { custom: { stats: { outcome: "length" } } },
+      },
+    ],
+  });
+  assert.deepEqual(items[0].message.metadata, {
+    custom: { stats: { outcome: "ok" }, thought: { state: "done", ms: 15_250 } },
+  });
+  assert.deepEqual(items[1].message.metadata, {
+    custom: { stats: { outcome: "length" } },
+  });
+
+  // And the round trip is closed: what came back is not written again.
+  const again = pendingAppend(
+    repo(items.map((i) => ({ parentId: i.parentId, message: i.message }))),
+    new Set(),
+  );
+  assert.equal(again.messages[0].reasoning_ms, 15_250);
+  assert.deepEqual(again.messages[0].metadata, {
+    custom: { stats: { outcome: "ok" } },
+  });
+});

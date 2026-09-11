@@ -24,6 +24,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { FerroxMark } from "@/components/logo";
 import { fmtInt } from "@/lib/format";
+import { parseThought, THOUGHT_KEY } from "@/lib/thought";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/screens/chat/markdown";
 import { ReasoningPart } from "@/screens/chat/reasoning";
@@ -42,8 +43,10 @@ import {
 // Note what is NOT used: `useMessageTiming()`. assistant-ui measures its
 // own stream client-side and would happily hand over a `tokensPerSecond`.
 // That number cannot separate prefill from decode and would read a
-// 50 tok/s model as 5 on a long prompt. There is no client stopwatch in
-// this UI, by construction.
+// 50 tok/s model as 5 on a long prompt. No speed printed here comes from
+// a client clock, by construction. The one client clock there is
+// measures something `usage` cannot: how long the model THOUGHT, which
+// is the gap between two deltas of the stream (`lib/thought.ts`).
 
 function useStats(): AnswerStats | undefined {
   return useAuiState(
@@ -81,9 +84,17 @@ function CutOff() {
   const stats = useStats();
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const content = useAuiState((s) => s.message.content);
+  // The clock goes with the thought: a continuation that resumes
+  // inside it keeps counting from here rather than from zero.
+  const thought = parseThought(
+    useAuiState((s) => s.message.metadata.custom?.[THOUGHT_KEY]),
+  );
   if (!stats || !canContinue(stats.outcome)) return null;
 
-  const from = partsText(content);
+  const from = {
+    ...partsText(content),
+    ...(thought?.state === "done" ? { thoughtMs: thought.ms } : {}),
+  };
   const generated = stats.usage?.completion_tokens;
   const detail =
     stats.outcome === "length"
