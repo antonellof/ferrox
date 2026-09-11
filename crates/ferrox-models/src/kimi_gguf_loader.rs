@@ -956,6 +956,7 @@ mod tests {
             rope_freqs: None,
             rope_attn_factor: 1.0,
             rope_dim: None,
+            rope_dim_swa: None,
             rope_freqs_long: None,
             rope_freqs_short: None,
             rope_orig_ctx: None,

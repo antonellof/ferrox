@@ -31,7 +31,7 @@ use ferrox_moe::{ExpertWeights, GatingFunction, MoeLayerConfig};
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::config::{FfnActivation, ModelConfig};
+use crate::config::ModelConfig;
 #[cfg(feature = "metal")]
 use crate::decoder::MoePackedQ4Planes;
 use crate::decoder::{AttnWeights, Decoder, ExpertBacking, LayerWeights, MoeWeights};
@@ -895,6 +895,19 @@ impl ModelConfig {
             // `grok` is StandardGqa and passes `LLM_FFN_GELU`.
             _ if crate::capability::uses_geglu(&arch) => crate::config::FfnActivation::Gelu,
             _ if crate::capability::uses_relu_sqr(&arch) => crate::config::FfnActivation::ReluSqr,
+            // The four per-layer arrays travel IN the variant, read as
+            // `apertus.cpp:6-9` reads them (`crate::act_layers`).
+            _ if crate::act_layers::uses_xielu(&arch) => crate::config::FfnActivation::Xielu(
+                crate::act_layers::read_xielu_layers(file, trunk.n_layers)?,
+            ),
+            // The two clamp arrays, read as `step35.cpp:28-29` read them
+            // (optional; a file with neither is plain SwiGLU).
+            _ if crate::act_layers::reads_swiglu_clamps(&arch) => {
+                match crate::act_layers::read_swiglu_clamps(file, &arch, &trunk)? {
+                    Some(clamps) => crate::config::FfnActivation::SwigluClamped(clamps),
+                    None => crate::config::FfnActivation::Swiglu,
+                }
+            }
             crate::capability::DecoderFamily::GemmaFamily => crate::config::FfnActivation::Gelu,
             crate::capability::DecoderFamily::PhiFamily => {
                 crate::config::FfnActivation::SwigluFused
@@ -952,31 +965,48 @@ impl ModelConfig {
             (None, None) => None,
         };
 
-        // Partial rotary: only when the file says the rotary width is
-        // narrower than a head. Equal values mean "whole head", which is
-        // the same thing as `None` and stays `None` so nothing downstream
-        // has to special-case it.
-        let rope_dim = metadata_u64_any(file, &[key("rope.dimension_count")])
+        // Partial rotary: the file's `rope.dimension_count`, or the head
+        // width when absent -- llama.cpp's seeded `n_rot_full`
+        // (`llama-model.cpp:1200-1202`).
+        let rope_dim_seeded = metadata_u64_any(file, &[key("rope.dimension_count")])
             .map(|d| d as usize)
-            .filter(|d| *d > 0 && *d < head_dim);
+            .filter(|d| *d > 0)
+            .unwrap_or(head_dim);
 
         // The sliding layers' OWN rotary and head widths
-        // (`llama-model.cpp:1215-1223`), which ferrox has one of each
-        // for. Only a model with a sliding layer reads them; on one
-        // that has none the keys are dead metadata, as they are
-        // upstream (`n_rot(il)` never takes the `_swa` branch).
-        if sliding_window.is_some() {
-            let geometry = crate::swa_geometry::SwaGeometry {
-                rope_dim_swa: metadata_u64_any(file, &[key("rope.dimension_count_swa")]),
-                key_length_swa: metadata_u64_any(file, &[key("attention.key_length_swa")]),
-                value_length_swa: metadata_u64_any(file, &[key("attention.value_length_swa")]),
-                rope_dim_full: rope_dim.unwrap_or(head_dim) as u64,
-                head_dim: head_dim as u64,
-            };
+        // (`llama-model.cpp:1215-1223`). The rotary one is honoured --
+        // `crate::swa_geometry` resolves the key and step35's halving
+        // into the two widths `ModelConfig::layer_rope` hands out -- and
+        // the head ones are refused, since ferrox carries one head width
+        // in every cache. Only a model with a sliding layer reads the
+        // keys; on one that has none they are dead metadata, as they
+        // are upstream (`n_rot(il)` never takes the `_swa` branch). The
+        // halving is not a key and applies regardless.
+        let geometry = crate::swa_geometry::SwaGeometry {
+            rope_dim_swa: metadata_u64_any(file, &[key("rope.dimension_count_swa")]),
+            key_length_swa: metadata_u64_any(file, &[key("attention.key_length_swa")]),
+            value_length_swa: metadata_u64_any(file, &[key("attention.value_length_swa")]),
+            rope_dim_full: rope_dim_seeded as u64,
+            head_dim: head_dim as u64,
+        };
+        let widths = if sliding_window.is_some()
+            || crate::swa_geometry::full_layers_rotate_half(&arch).is_some()
+        {
             if let Some(reason) = crate::swa_geometry::swa_geometry_refusal(&arch, geometry) {
                 return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
             }
-        }
+            crate::swa_geometry::rotary_widths(&arch, geometry)
+        } else {
+            crate::swa_geometry::RotaryWidths {
+                full: Some(rope_dim_seeded).filter(|d| *d < head_dim),
+                swa: None,
+            }
+        };
+        // Equal values mean "whole head", which is the same thing as
+        // `None` and stays `None` so nothing downstream has to
+        // special-case it.
+        let rope_dim = widths.full;
+        let rope_dim_swa = widths.swa;
 
         // See `ModelConfig::rope_attn_factor`.
         let rope_attn_factor = metadata_f32_any(file, &[key("rope.scaling.attn_factor")])
@@ -1100,13 +1130,49 @@ impl ModelConfig {
         // "No scaling" is spelled as an all-ones divisor vector, which
         // is what dividing by nothing is, so the sliding layers need no
         // second code path anywhere downstream.
-        let rope_freqs = rope_freqs.map(|full| {
-            let swa = (sliding_window.is_some()
-                && !crate::capability::swa_rope_scale_follows_model(&arch))
-            .then(|| rope_freqs_unscaled.unwrap_or_else(|| vec![1.0; full.len()]))
-            .filter(|swa| *swa != full);
-            crate::config::RopeFreqs { full, swa }
-        });
+        // With TWO rotary widths, one divisor vector cannot serve both
+        // kinds of layer. `step35.cpp:247` passes NO factors to its
+        // sliding layers (`crate::swa_geometry::swa_layers_drop_rope_
+        // factors`), so for it the full layers take the first
+        // `rope_dim/2` bands of the tensor -- ggml reads only that many
+        // -- and the sliding layers divide by nothing at their own
+        // width; every other architecture is refused by name, because
+        // nothing upstream says which layers would take which.
+        if rope_freqs.is_some() {
+            if let Some(reason) =
+                crate::swa_geometry::two_widths_with_factors_refusal(&arch, widths)
+            {
+                return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
+            }
+        }
+        let rope_freqs = rope_freqs
+            .map(|full| -> Result<crate::config::RopeFreqs, LoadError> {
+                if let Some(swa_width) = rope_dim_swa {
+                    let full_width = rope_dim.unwrap_or(head_dim);
+                    if full.len() < full_width / 2 {
+                        return Err(LoadError::UnsupportedFeature(
+                            arch.clone(),
+                            format!(
+                                "rope_freqs.weight has {} bands; the full-attention layers rotate \
+                                 {full_width} dims and need {}",
+                                full.len(),
+                                full_width / 2
+                            ),
+                        ));
+                    }
+                    let full: Vec<f32> = full[..full_width / 2].to_vec();
+                    return Ok(crate::config::RopeFreqs {
+                        full,
+                        swa: Some(vec![1.0; swa_width / 2]),
+                    });
+                }
+                let swa = (sliding_window.is_some()
+                    && !crate::capability::swa_rope_scale_follows_model(&arch))
+                .then(|| rope_freqs_unscaled.unwrap_or_else(|| vec![1.0; full.len()]))
+                .filter(|swa| *swa != full);
+                Ok(crate::config::RopeFreqs { full, swa })
+            })
+            .transpose()?;
 
         // RoPE layout comes from the capability registry above (fail-
         // closed). Getting this wrong for `llama` (needs Norm) was the
@@ -1196,6 +1262,7 @@ impl ModelConfig {
             attention_scale,
             rope_attn_factor,
             rope_dim,
+            rope_dim_swa,
             rope_freqs_long,
             rope_freqs_short,
             rope_orig_ctx,
@@ -1544,17 +1611,19 @@ fn load_dense_expert(
     let gate_name = format!("blk.{layer}.ffn_gate.weight");
     let up_name = format!("blk.{layer}.ffn_up.weight");
     let down_name = format!("blk.{layer}.ffn_down.weight");
-    if config.ffn_activation == FfnActivation::ReluSqr {
-        // `arcee.cpp:39-40` creates `ffn_up` and `ffn_down` and no gate;
-        // a file carrying one describes a graph this architecture does
-        // not compute, and would otherwise be left as an unread tensor
-        // with a less specific message.
+    if config.ffn_is_ungated() {
+        // `arcee.cpp:39-40` and `apertus.cpp:45-46` create `ffn_up` and
+        // `ffn_down` and no gate; a file carrying one describes a graph
+        // this architecture does not compute, and would otherwise be
+        // left as an unread tensor with a less specific message.
         if file.find_tensor(&gate_name).is_some() {
             return Err(LoadError::UnsupportedFeature(
                 config.name.to_string(),
                 format!(
                     "{gate_name} is present but this architecture's FFN is ungated \
-                     (LLM_FFN_RELU_SQR under LLM_FFN_SEQ with a null gate, arcee.cpp:123-128)"
+                     ({:?}: LLM_FFN_RELU_SQR under LLM_FFN_SEQ with a null gate, \
+                     arcee.cpp:123-128, or ggml_xielu over ffn_up alone, apertus.cpp:129-142)",
+                    config.ffn_activation
                 ),
             ));
         }
@@ -2703,6 +2772,19 @@ impl Decoder {
                  llama.cpp does",
                 decoder.config.n_mtp_blocks,
                 decoder.config.n_layers - 1
+            );
+        }
+        // Slots llama.cpp creates and never reads (`crate::unread_tensors`):
+        // ignored as upstream ignores them, and said so.
+        let ignored =
+            crate::unread_tensors::note_unread_layer_tensors(&file, &arch, decoder.config.n_layers);
+        if !ignored.is_empty() {
+            eprintln!(
+                "ferrox: ignoring {} tensor(s) llama.cpp creates and never reads for `{}` \
+                 (first: {}), as llama.cpp does",
+                ignored.len(),
+                arch,
+                ignored[0]
             );
         }
         assert_every_tensor_consumed(&file)?;
@@ -5083,11 +5165,19 @@ mod tests {
         assert!(cfg.layer_sliding_window(5).is_none());
         assert_eq!(
             cfg.layer_rope(0),
-            Some((10_000.0, Some(&[1.0f32; 128][..])))
+            Some(crate::config::LayerRopeParams {
+                theta: 10_000.0,
+                freq_factors: Some(&[1.0f32; 128][..]),
+                rot_dim: None,
+            })
         );
         assert_eq!(
             cfg.layer_rope(5),
-            Some((1_000_000.0, Some(&[8.0f32; 128][..])))
+            Some(crate::config::LayerRopeParams {
+                theta: 1_000_000.0,
+                freq_factors: Some(&[8.0f32; 128][..]),
+                rot_dim: None,
+            })
         );
         assert!(
             cfg.rope_freqs_vary_by_layer(),

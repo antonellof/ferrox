@@ -57,6 +57,38 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`apertus` and `step35` are audited, on ONE seam with TWO
+  activation bodies.** An FFN activation whose parameters vary by
+  layer had no home: `FfnActivation` was a unit enum and every FFN
+  body converted the model-wide value to a `GluAct` without knowing
+  which layer it ran. `apertus.cpp:6-9` reads xIELU's `xielu.alpha_n` /
+  `.alpha_p` / `.beta` / `.eps` as `n_layer`-long arrays (or a scalar
+  broadcast) and `:132-138` hands layer `il`'s four to `ggml_xielu`;
+  `step35.cpp:28-29` reads `swiglu_clamp_exp` / `_shexp` the same way
+  and llama.cpp's generic `build_moe_ffn` / `build_ffn` clamp SwiGLU by
+  layer `il`'s entry, the routed experts from one array and the shared
+  experts AND the dense layers from the other. `ferrox_models::
+  act_layers` reads both families as `get_key_or_arr` does,
+  `FfnActivation::Xielu` / `::SwigluClamped` carry their tables,
+  `ferrox_moe::GluAct` gained the two bodies (and lost `gate_fn`, a
+  gate-only signature xIELU cannot fit), and `ModelConfig::
+  layer_ffn_acts(il)` answers a `routed` / `dense` pair at every FFN
+  body; no fused Metal kernel spells either, and both refuse through
+  the predicate the launches share. Step-3.5's other blocker, a rotary
+  width halved on the full layers with no key (`step35.cpp:9`), is
+  `ModelConfig::rope_dim_swa` -- the two-valued `n_rot(il)` llama.cpp
+  already had -- handed out per layer by `layer_rope`, which also
+  SERVES a `rope.dimension_count_swa` differing from the full width
+  (Laguna-XS.2's shape) where it used to refuse it; the two `_swa`
+  head-width keys stay refused. Five libllama-golden fixtures: apertus
+  KL 4.91e-14 (arrays) and 5.06e-14 (the scalar spelling llama.cpp
+  broadcasts); step35 KL 1.59e-13 (clamped), 2.59e-13 (neither key),
+  1.59e-13 (a NextN block inside `block_count`); the Laguna-XS.2
+  rotary-width fixture 7.29e-14. Building them found `apertus.cpp:93,96`
+  pass `NULL` for the QK-norm biases `:50,52` create, so a file
+  carrying them is served with them ignored, as libllama serves it
+  (measured byte-identical; `ferrox_models::unread_tensors`). 47
+  architectures audited, 10 refuse, 9 of them NEW CODE.
 - **`mellum` is audited, and every real EXAONE-4 32B, EXAONE-MoE and
   Olmo-3 export loads.** `{arch}.attention.sliding_window_pattern` as a
   per-layer bool ARRAY was refused for every architecture; llama.cpp
