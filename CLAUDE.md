@@ -473,3 +473,5 @@ GGUF or Kimi dir; generation on `spawn_blocking`.
 Presets `glm_5_2` / `deepseek_v4_pro` / `kimi_k3` are sketches,
 not proof of real-checkpoint support. `test_*_fixture` presets match
 Python test GGUFs only.
+
+Never add Co-Authored-By, Claude-Session, or Generated with Claude Code lines to commit messages or PR bodies.
