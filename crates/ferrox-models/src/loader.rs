@@ -494,16 +494,36 @@ impl ModelConfig {
         } else {
             1
         };
+        // Read here, ahead of the shared-expert inference below, because
+        // the tensor that inference probes lives on the first MoE
+        // layer, not on layer 0.
+        let n_dense_leading_layers = if LEADING_DENSE_KEY_IS_INERT.contains(&arch.as_str()) {
+            0
+        } else {
+            metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize
+        };
         // Prefer the GGUF hparam when present. Qwen2MoE (and some other
         // HF→GGUF exports) omit `expert_shared_count` but still ship
         // `blk.N.ffn_{gate,up,down}_shexp.weight` -- without a tensor-
         // presence fallback those weights are silently dropped and the
         // model runs with a large chunk of active FFN missing.
+        //
+        // The probe is the FIRST MoE LAYER, not `blk.0`: a leading-dense
+        // model has no shared expert on layer 0, and probing there
+        // answered 0 for every such file. `laguna` is the case that
+        // found it -- `laguna.cpp:20` assigns `n_expert_shared = 1`
+        // before reading the key, `conversion/laguna.py` never writes
+        // the key, and its layer 0 is dense (:105), so a real Laguna
+        // export loaded with its three REQUIRED `_shexp` tensors
+        // (:138-140) unread on every MoE layer.
+        let first_moe_layer = n_dense_leading_layers.min(n_layers.saturating_sub(1));
+        let shexp_probe = format!("blk.{first_moe_layer}.ffn_gate_shexp.weight");
         let n_shared_experts = match metadata_u64_any(file, &[key("expert_shared_count")]) {
             Some(n) => n as usize,
-            None if is_moe && file.find_tensor("blk.0.ffn_gate_shexp.weight").is_some() => {
+            None if is_moe && file.find_tensor(&shexp_probe).is_some() => {
                 best_effort_fields.push(
-                    "moe.n_shared_experts (no expert_shared_count; inferred 1 from blk.0.ffn_gate_shexp.weight)",
+                    "moe.n_shared_experts (no expert_shared_count; inferred 1 from the first \
+                     MoE layer's ffn_gate_shexp.weight)",
                 );
                 1
             }
@@ -549,11 +569,6 @@ impl ModelConfig {
             ffn_per_layer.as_deref(),
             expert_ffn_dim,
         )?;
-        let n_dense_leading_layers = if LEADING_DENSE_KEY_IS_INERT.contains(&arch.as_str()) {
-            0
-        } else {
-            metadata_u64_any(file, &[key("leading_dense_block_count")]).unwrap_or(0) as usize
-        };
         // The OTHER half of llama.cpp's dense-vs-MoE rule.
         // `ModelConfig::layer_is_dense` implements the leading-dense
         // prefix and not the `(il + 1) % n_moe_layer_step == 0` at
@@ -639,22 +654,23 @@ impl ModelConfig {
             // choosing a different one.
             .filter(|_| !crate::capability::swa_disabled_by_arch(&arch, n_layers));
 
-        // `olmo2` with a window AND a RoPE scaling is Olmo-3, and it
-        // ropes its two kinds of layer DIFFERENTLY. `olmo2.cpp:120-134`
-        // runs the sliding layers with YaRN switched off -- freq_scale
-        // = 1, ext_factor = 0, attn_factor = 1, and its own comment
-        // says so -- while the full-attention layers use the model's
-        // scaling (:136-146). ferrox carries one `rope.scaling.factor`
-        // and one `attn_factor` for the whole model
-        // (`rope_attn_factor`, and the ramp folded into `rope_freqs`),
-        // so honouring the file would mean rotating half the layers at
-        // a magnitude the checkpoint never trained at.
+        // Three graphs rope their SLIDING layers with the scaling
+        // switched off -- freq_scale = 1, ext_factor = 0, attn_factor =
+        // 1 -- while the full-attention layers use the model's:
+        // `olmo2` (Olmo-3), `mellum` and `laguna` (Laguna-XS.2), each
+        // at the lines `crate::swa_geometry` cites. ferrox's
+        // `RopeFreqs` already keeps their sliding layers' divisors
+        // unscaled, but `rope_attn_factor` is one value for the whole
+        // model, so honouring the file would mean rotating half the
+        // layers at a magnitude the checkpoint never trained at.
         //
         // A window with NO scaling is not this case and is not refused:
         // both branches then reduce to the same plain RoPE, and the
-        // difference is masking alone, which ferrox implements
-        // (`default_swa_layout` gives olmo2 a period of 4).
-        if arch == "olmo2" && sliding_window.is_some() {
+        // difference is masking alone, which ferrox implements.
+        if let (Some(lines), true) = (
+            crate::swa_geometry::swa_layers_unscaled_rope(&arch),
+            sliding_window.is_some(),
+        ) {
             let scaling_type = file
                 .metadata_str(&key("rope.scaling.type"))
                 .unwrap_or("none")
@@ -663,7 +679,13 @@ impl ModelConfig {
                 return Err(LoadError::UnsupportedFeature(
                     arch.clone(),
                     format!(
-                        "this olmo2 checkpoint declares BOTH a sliding window and                          rope.scaling.type = \"{scaling_type}\". llama.cpp ropes the                          sliding layers with the scaling switched off (freq_scale = 1,                          ext_factor = 0, attn_factor = 1; olmo2.cpp:120-134) and the                          full-attention layers with it on (:136-146), and ferrox carries                          one RoPE scaling for the whole model. An olmo2 file with a                          window and no scaling, or with scaling and no window, is                          unaffected"
+                        "this {arch} checkpoint declares BOTH a sliding window and \
+                         rope.scaling.type = \"{scaling_type}\". llama.cpp ropes the \
+                         sliding layers with the scaling switched off (freq_scale = 1, \
+                         ext_factor = 0, attn_factor = 1; {lines}) and the \
+                         full-attention layers with it on, and ferrox carries one RoPE \
+                         scaling for the whole model. A {arch} file with a window and no \
+                         scaling, or with scaling and no window, is unaffected"
                     ),
                 ));
             }
@@ -774,19 +796,17 @@ impl ModelConfig {
         )
         .map_err(|e| LoadError::UnsupportedFeature(arch.clone(), e.message(&arch)))?;
 
-        // Gemma: embeddings are scaled by sqrt(hidden_dim) at input.
-        // That is ARITHMETIC, not a key -- llama.cpp's Gemma graphs read
-        // no `embedding_scale` at all -- so it comes from the family and
-        // a Gemma file declaring the key is refused above rather than
-        // honoured. Granite's comes out of `{arch}.embedding_scale`.
-        let embedding_scale = if matches!(
-            arch_profile.family,
-            crate::capability::DecoderFamily::GemmaFamily
-        ) {
-            Some((hidden_dim as f32).sqrt())
-        } else {
-            multipliers.embedding_scale
-        };
+        // Gemma and afmoe: embeddings are scaled by sqrt(hidden_dim) at
+        // input. That is ARITHMETIC, not a key -- those graphs read no
+        // `embedding_scale` at all -- so it comes from the table and a
+        // file declaring the key on one of them is refused above rather
+        // than honoured. Granite's comes out of `{arch}.embedding_scale`.
+        let embedding_scale =
+            if crate::capability::embeddings_scaled_by_sqrt_n_embd(&arch, arch_profile.family) {
+                Some((hidden_dim as f32).sqrt())
+            } else {
+                multipliers.embedding_scale
+            };
 
         // llama.cpp's `f_attention_scale`, and ONLY where it differs from
         // the `1/sqrt(head_dim)` ferrox's attention kernels already
@@ -938,6 +958,24 @@ impl ModelConfig {
         let rope_dim = metadata_u64_any(file, &[key("rope.dimension_count")])
             .map(|d| d as usize)
             .filter(|d| *d > 0 && *d < head_dim);
+
+        // The sliding layers' OWN rotary and head widths
+        // (`llama-model.cpp:1215-1223`), which ferrox has one of each
+        // for. Only a model with a sliding layer reads them; on one
+        // that has none the keys are dead metadata, as they are
+        // upstream (`n_rot(il)` never takes the `_swa` branch).
+        if sliding_window.is_some() {
+            let geometry = crate::swa_geometry::SwaGeometry {
+                rope_dim_swa: metadata_u64_any(file, &[key("rope.dimension_count_swa")]),
+                key_length_swa: metadata_u64_any(file, &[key("attention.key_length_swa")]),
+                value_length_swa: metadata_u64_any(file, &[key("attention.value_length_swa")]),
+                rope_dim_full: rope_dim.unwrap_or(head_dim) as u64,
+                head_dim: head_dim as u64,
+            };
+            if let Some(reason) = crate::swa_geometry::swa_geometry_refusal(&arch, geometry) {
+                return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
+            }
+        }
 
         // See `ModelConfig::rope_attn_factor`.
         let rope_attn_factor = metadata_f32_any(file, &[key("rope.scaling.attn_factor")])
@@ -1310,7 +1348,9 @@ pub(crate) fn find_info<'a>(
 /// width, not per-head). Absent for every other preset/fixture this
 /// loader already handles -- `None` there is correct, not a missing
 /// feature.
-/// Loads the five gpt-oss-only tensors for one layer.
+/// Loads the four gpt-oss-only side-table tensors for one layer, and
+/// checks that the fifth, the attention sinks, was loaded onto the
+/// layer's [`AttnWeights`] by the generic tensor-presence read.
 ///
 /// Every one of them is **required**: a gpt-oss checkpoint that is
 /// missing any of these is not a gpt-oss checkpoint ferrox can run, and
@@ -1321,15 +1361,17 @@ pub(crate) fn find_info<'a>(
 /// and produce a plausible, wrong answer.
 ///
 /// Shapes follow `src/models/openai-moe.cpp::load_arch_tensors`:
-/// `attn_sinks {n_head}`, `attn_output.bias {n_embd}`,
-/// `ffn_gate_inp.bias {n_expert}`, `ffn_{gate,up}_exps.bias
-/// {n_ff_exp, n_expert}`, `ffn_down_exps.bias {n_embd, n_expert}`.
-/// GGUF stores the fastest dimension first, so the 2-D bias tensors
-/// arrive expert-major and split by simple chunking.
+/// `attn_sinks {n_head}` (`:44`, flags `0`, so REQUIRED there too),
+/// `attn_output.bias {n_embd}`, `ffn_gate_inp.bias {n_expert}`,
+/// `ffn_{gate,up}_exps.bias {n_ff_exp, n_expert}`,
+/// `ffn_down_exps.bias {n_embd, n_expert}`. GGUF stores the fastest
+/// dimension first, so the 2-D bias tensors arrive expert-major and
+/// split by simple chunking.
 fn load_gpt_oss_layer(
     file: &impl TensorSource,
     l: usize,
     config: &ModelConfig,
+    sinks_loaded: bool,
 ) -> Result<crate::decoder::GptOssLayer, LoadError> {
     let n_experts = config.moe.n_experts;
     let ff = config.moe.expert_ffn_dim;
@@ -1345,12 +1387,15 @@ fn load_gpt_oss_layer(
         }
     };
 
-    let attn_sinks = load_f32_vec(file, &format!("blk.{l}.attn_sinks.weight"))?;
-    want(
-        &format!("blk.{l}.attn_sinks.weight"),
-        attn_sinks.len(),
-        config.n_heads,
-    )?;
+    if !sinks_loaded {
+        return Err(LoadError::UnsupportedFeature(
+            config.name.to_string(),
+            format!(
+                "blk.{l}.attn_sinks.weight is missing; gpt-oss requires it \
+                 (src/models/openai-moe.cpp:44) and llama.cpp refuses the file without it"
+            ),
+        ));
+    }
     let o_bias = load_f32_vec(file, &format!("blk.{l}.attn_output.bias"))?;
     want(
         &format!("blk.{l}.attn_output.bias"),
@@ -1392,11 +1437,40 @@ fn load_gpt_oss_layer(
         .collect();
 
     Ok(crate::decoder::GptOssLayer {
-        attn_sinks,
         o_bias,
         router_bias,
         expert_bias,
     })
+}
+
+/// `blk.N.attn_sinks.weight` when the file carries it, checked to be
+/// one logit per query head of THIS layer (`{n_head}` in every graph
+/// that creates it: `openai-moe.cpp:44`, `mimo2.cpp:58`).
+///
+/// Optional here because that is what the tensor's consumers make it:
+/// `build_attn_mha` takes a nullable `sinks` and `mimo2.cpp:58` creates
+/// it `TENSOR_NOT_REQUIRED`. gpt-oss, which requires it, checks the
+/// result where its side table loads.
+fn load_attn_sinks(
+    file: &impl TensorSource,
+    l: usize,
+    n_heads: usize,
+) -> Result<Option<Vec<f32>>, LoadError> {
+    let name = format!("blk.{l}.attn_sinks.weight");
+    let Some(sinks) = load_f32_vec_optional(file, &name)? else {
+        return Ok(None);
+    };
+    if sinks.len() != n_heads {
+        return Err(LoadError::UnsupportedFeature(
+            name,
+            format!(
+                "attention sinks are one logit per query head; this layer has {n_heads} heads \
+                 and the tensor {} entries",
+                sinks.len()
+            ),
+        ));
+    }
+    Ok(Some(sinks))
 }
 
 pub(crate) fn load_f32_vec_optional(
@@ -2139,10 +2213,11 @@ impl Decoder {
         let path = path.as_ref();
         let file = ShardedGguf::open(path)?;
 
-        // gpt-oss carries five per-layer tensors the generic GQA layer
-        // structs have no home for. That is decided by the architecture
-        // string, so resolve it once here. See
-        // `crate::decoder::GptOssWeights`.
+        // gpt-oss carries four per-layer tensors the generic GQA layer
+        // structs have no home for (its fifth, the attention sinks, is
+        // `AttnWeights::sinks` and loads by tensor presence). That is
+        // decided by the architecture string, so resolve it once here.
+        // See `crate::decoder::GptOssWeights`.
         //
         // This used to be ONE flag with the norm-slot fact below,
         // `arch == "gpt-oss"`, standing for two unrelated facts.
@@ -2252,6 +2327,24 @@ impl Decoder {
                             &file,
                             l,
                         )?,
+                        // The architecture table decides whether there is
+                        // a gate and how it is applied; the tensor decides
+                        // its width. See `crate::attn_gate`.
+                        output_gate: crate::attn_gate::AttnGate::load(
+                            &file,
+                            &arch,
+                            l,
+                            n_heads,
+                            config.head_dim,
+                            config.hidden_dim,
+                        )?,
+                        // The TENSOR decides. Four llama.cpp graphs pass it
+                        // into the one `build_attn_mha`; on the generic
+                        // path a file that has it gets the sink term and
+                        // a file that does not gets none, whatever the
+                        // architecture string. gpt-oss's requirement is
+                        // checked where its side table loads.
+                        sinks: load_attn_sinks(&file, l, n_heads)?,
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,
@@ -2484,7 +2577,7 @@ impl Decoder {
             };
 
             if is_gpt_oss {
-                gpt_oss_layers.push(load_gpt_oss_layer(&file, l, &config)?);
+                gpt_oss_layers.push(load_gpt_oss_layer(&file, l, &config, attn.sinks.is_some())?);
             }
 
             layers.push(LayerWeights { attn, moe });

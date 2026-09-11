@@ -12,22 +12,23 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-11. **42** architectures run with
+Honest position, re-audited 2026-09-11. **44** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 15 unaudited refusals are now TRIAGED, and the refusal says which of
+The 13 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 14 need new code, 1 is unknown with the question stated. Five
+away**, 12 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
-`olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`
-and `openelm` on 2026-09-11, each with a libllama-golden fixture, which
-is what moved 46 to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21 to 20
-to 18 to 15; the step from 28 to 25 was moving the three alias rows off
+`olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
+`openelm`, `afmoe` and `laguna` on 2026-09-11, each with a
+libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
+to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13; the step from 28 to 25
+was moving the three alias rows off
 the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
 without lowering the refusing one. `smollm3` and EXAONE-4 32B closed
@@ -39,8 +40,8 @@ refusing is one fixture or one arm away, so every row that is left
 needs a different graph.
 
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
-times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 three times
-more, 20 to 19, 19 to 17 and 17 to 14. The first two took several rows
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 four times
+more, 20 to 19, 19 to 17, 17 to 14 and 14 to 12. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -52,7 +53,60 @@ refusal-by-name with it. The sixth is both lessons and a correction:
 `deci` and `openelm` closed TOGETHER on the per-layer shape seam, whose
 reach was MEASURED across all 140 graphs before it was built, and
 `arcee` closed ALONE because the verdict that said it shared a cause
-with `plm` had been read from one file and not the other.
+with `plm` had been read from one file and not the other. The seventh
+is the sixth's lesson applied to the sixth's leftovers: the shape seam
+had narrowed `afmoe`, `laguna` and `step35` to the same last word,
+`wqkv_gate`, and reading the three graphs SIDE BY SIDE before calling
+them one cause found one op with two free parameters rather than one
+graph -- two rows closed on it, the third says so.
+
+`afmoe` and `laguna` are ONE seam, `ferrox-models/src/attn_gate.rs`.
+llama.cpp's `LLM_TENSOR_ATTN_GATE` is created by six of the 140 graphs
+(measured); three of them (`qwen3next`, `qwen35`, `qwen35moe`) keep the
+gated delta-net's `z` projection under that name, a different op on a
+different engine, which is why the seam is keyed by architecture and
+not by tensor presence. In the three that gate their softmax attention
+the gate is projected from the SAME normed input Q/K/V read and
+multiplied into the attention output after the softmax-weighted V sum
+and before `wo` -- identical -- and what differs is the activation
+(`afmoe.cpp:183`, `step35.cpp:272` sigmoid; `laguna.cpp:246` SOFTPLUS),
+the width (`afmoe.cpp:73` per channel, `step35.cpp:96` per head,
+`laguna.cpp:110-124` either, read off the stored tensor with an abort
+for anything else) and whether the tensor may be absent (`step35.cpp:96`
+`TENSOR_NOT_REQUIRED`). So the type has two axes, `GateAct` and
+`GateWidth`, a per-architecture table pins the activation and the
+ADMISSIBLE widths, and the loader reads the width off the tensor and
+refuses one the table does not admit. The durable parts: the gate is
+applied in ONE function for the row body and the two batched host
+bodies, which collapsed the three hand-written `o_proj` / `o_bias` /
+`post_attn_norm` tails onto it, so it was added to one place rather
+than three; and every fused Metal launch takes its view of a layer's
+attention weights from ONE exhaustive destructure of `AttnWeights`
+(`Decoder::metal_attn_view`, no `..`), which answers `None` for a gate
+or for sinks, so a field added to that struct does not compile until
+the Metal side says whether the kernels serve it -- the fifth and sixth
+things found written into those stacks unconditionally. KL 7.03e-13
+(afmoe), 1.51e-13 (laguna M.1 shape, per element), 9.57e-14 (laguna
+XS.2 shape, per head, `head_count` as an array, a window). Building
+them found two defects: `afmoe.cpp:120` scales its embeddings by
+`sqrt(n_embd)` from arithmetic, the only non-Gemma graph that does
+(measured), so the Gemma family match in the loader is a table now;
+and the shared-expert inference probed `blk.0` for a `_shexp` tensor
+when `expert_shared_count` was absent, which is 0 for every
+leading-dense model -- `laguna.cpp:20` assigns the count before reading
+a key its converter never writes, so a real Laguna export would have
+loaded with its REQUIRED shared-expert tensors unread on every MoE
+layer. Two Laguna things stay refused by name from fixtures libllama
+runs: a `rope.dimension_count_swa` differing from `rope.dimension_count`
+(`ferrox-models/src/swa_geometry.rs`, for every architecture, with the
+two `_swa` head-width keys), and a window together with a RoPE scaling
+-- the Olmo-3 rule, one table now for `olmo2`, `mellum` and `laguna`
+where it had been `arch == "olmo2"`. Real Laguna-M.1 has neither; real
+Laguna-XS.2 has both. `mimo2`'s sinks moved off the gpt-oss NAME onto
+the TENSOR (`AttnWeights::sinks`; four graphs pass it into the one
+`build_attn_mha`) without closing the row, because every real MiMo-V2
+export carries three MTP blocks inside `block_count` and a per-layer
+window ARRAY; its verdict leads with those now.
 
 `deci` and `openelm` are ONE seam, `ferrox-models/src/layer_shapes.rs`.
 llama.cpp reads `head_count`, `head_count_kv` and `feed_forward_length`
