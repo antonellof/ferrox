@@ -21,6 +21,9 @@ pub mod gpu;
 pub mod attn;
 
 #[cfg(feature = "metal")]
+pub mod rope;
+
+#[cfg(feature = "metal")]
 pub mod decode_dense;
 
 #[cfg(feature = "metal")]

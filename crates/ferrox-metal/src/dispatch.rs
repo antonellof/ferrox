@@ -116,6 +116,7 @@ mod tests {
             ("lib.rs", include_str!("lib.rs")),
             ("mem_ranges.rs", include_str!("mem_ranges.rs")),
             ("moe_ids.rs", include_str!("moe_ids.rs")),
+            ("rope.rs", include_str!("rope.rs")),
             ("timing.rs", include_str!("timing.rs")),
         ];
         // This file holds the wrapper (the one legitimate caller of the
