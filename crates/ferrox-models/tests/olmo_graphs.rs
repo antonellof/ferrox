@@ -37,17 +37,21 @@
 //! no caller. `capability::NON_PARAMETRIC_LAYER_NORM` says all of this
 //! where the next person will look.
 //!
-//! **The clamp stayed a refusal, and that is the second finding.** The
-//! `olmo` triage verdict called `{arch}.attention.clamp_kqv` "an
-//! optional key nothing here applies", which reads like an aside. It is
-//! not: `llama-graph.cpp:1611-1652` clamps Q, K and V by it inside
+//! **The clamp was a refusal, and it is implemented now.** The `olmo`
+//! triage verdict called `{arch}.attention.clamp_kqv` "an optional key
+//! nothing here applies", which reads like an aside. It is not:
+//! `llama-graph.cpp:1611-1652` clamps Q, K and V by it inside
 //! `build_qkv`, `conversion/olmo.py:23-25` writes it for every
 //! checkpoint whose HF config carries a `clip_qkv` (OLMo-7B-Twin-2T and
-//! OLMo-1.7-7B do, at 8.0; the original OLMo-7B does not), and a second
-//! fixture measures that llama.cpp's own logits MOVE when the key is
-//! present. ferrox clamps no projection on any path, so it refuses --
-//! `crate::clamp_kqv`. This row is admitted for the checkpoints it
-//! really covers, which is the `baichuan`-13B precedent.
+//! OLMo-1.7-7B do, at 8.0; the original OLMo-7B does not), and the
+//! second fixture measures that llama.cpp's own logits MOVE when the
+//! key is present. It stayed a refusal while ferrox's three host bodies
+//! each applied the QKV bias in their own loop, because a clamp added
+//! to some of them would have been wrong on the others; it closed when
+//! `dbrx` needed the same clamp as a REQUIRED key and the three loops
+//! collapsed onto one helper (`decoder/qkv_bias.rs`, `crate::clamp_kqv`).
+//! `OLMO_CLAMPED_GOLDEN` is llama.cpp's answer for the clamped file, and
+//! the sabotage that pins it is dropping the clamp.
 //!
 //! **Where the numbers come from.** `OLMO_GOLDEN` was produced by
 //! running llama.cpp's own graph over the fixture through
@@ -66,10 +70,9 @@
 
 mod common;
 use common::{
-    assert_all_three_paths_match, graph_caches, graph_fixture_path, load_graph_fixture, worst_vs,
-    GRAPH_PROMPT,
+    assert_all_three_paths_match, graph_caches, load_graph_fixture, worst_vs, GRAPH_PROMPT,
 };
-use ferrox_models::{ModelConfig, NormOp, RopeLayout};
+use ferrox_models::{NormOp, RopeLayout};
 
 const OLMO: &str = "olmo";
 
@@ -122,6 +125,61 @@ const OLMO_GOLDEN: [f32; 48] = [
     -0.7475845,
     1.0401692,
     0.78326005,
+];
+
+/// The same weights with `olmo.attention.clamp_kqv = 8.0`, from
+/// llama.cpp. Differs from `OLMO_GOLDEN` by up to 0.18 in a logit,
+/// which is the clamp and nothing else: the two files are
+/// byte-identical apart from that one key.
+const OLMO_CLAMPED_GOLDEN: [f32; 48] = [
+    -1.5948613,
+    0.5056803,
+    -0.13761881,
+    -0.41353196,
+    -1.2346972,
+    1.0697594,
+    -1.1932158,
+    -0.51069546,
+    -1.9717276,
+    -1.4389496,
+    0.0059762,
+    1.2528489,
+    -0.7875987,
+    0.31666917,
+    0.12518159,
+    -0.07026945,
+    -0.5794481,
+    0.35173202,
+    2.3756158,
+    0.3073057,
+    -2.2741225,
+    1.7606305,
+    -0.06974431,
+    -0.36501426,
+    0.8467765,
+    -3.2045987,
+    0.42799103,
+    -1.3141127,
+    -2.1140578,
+    -1.5678383,
+    1.0730993,
+    1.3464007,
+    -1.0052842,
+    -0.66942203,
+    2.0486064,
+    -0.34467196,
+    1.0760533,
+    1.6434469,
+    -0.30358222,
+    1.9849664,
+    0.6845192,
+    1.1937413,
+    -0.018013388,
+    0.05063148,
+    1.2606807,
+    -0.8459838,
+    1.043538,
+    0.8363968,
 ];
 
 /// The row itself, on all three forward paths.
@@ -301,34 +359,64 @@ fn olmo_ropes_consecutive_pairs_and_the_fixture_can_see_the_other_variant() {
     );
 }
 
-/// An `olmo` file declaring a positive `attention.clamp_kqv` is
-/// REFUSED, and the refusal is reachable from a real checkpoint.
+/// An `olmo` file declaring a positive `attention.clamp_kqv` matches
+/// llama.cpp on all three paths, with the clamp applied.
 ///
 /// `olmo_clamped_tiny.gguf` is byte-identical to the fixture above
-/// except for that one key at 8.0 -- OLMo-1.7-7B's value -- and
-/// llama.cpp's logits for it are DIFFERENT, measured, so the clamp is
-/// not a no-op that could be quietly ignored. ferrox has no clamp on
-/// any projection and adding one to the CPU prefill body while missing
-/// the decode body or a fused Metal launch is the defect shape that has
-/// cost this engine eight model features, so it stops.
+/// except for that one key at 8.0 -- OLMo-1.7-7B's value -- so this is
+/// the clamp's own evidence, not the row's.
 #[test]
-fn an_olmo_file_declaring_a_qkv_clamp_is_refused() {
-    let path = graph_fixture_path("olmo_clamped");
-    let file = ferrox_gguf::GgufFile::open(&path).expect("fixture opens");
-    let err = ModelConfig::from_gguf(&file)
-        .expect_err("ferrox applies no QKV clamp; a file declaring one must stop");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("olmo.attention.clamp_kqv"),
-        "the refusal must name the key it refuses: {msg}"
+fn a_clamped_olmo_file_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("olmo_clamped", &OLMO_CLAMPED_GOLDEN);
+}
+
+/// The loader reads the clamp into the config for exactly this
+/// architecture, and llama.cpp's own "no clamp" sentinel is honoured.
+#[test]
+fn the_clamp_is_read_into_the_config() {
+    let clamped = load_graph_fixture("olmo_clamped");
+    assert_eq!(clamped.config.clamp_kqv, Some(8.0));
+    let plain = load_graph_fixture(OLMO);
+    assert_eq!(
+        plain.config.clamp_kqv, None,
+        "no key: llama.cpp's 0.0 default, no clamp"
+    );
+}
+
+/// Dropping the clamp diverges from llama.cpp, and applying one where
+/// there is none diverges too.
+///
+/// The first half is the sabotage that makes `OLMO_CLAMPED_GOLDEN` a
+/// test rather than a table: if the clamped file's projections never
+/// crossed 8.0 the clamp would be inert and this suite could not see
+/// whether it ran. The second half pins the direction: the unclamped
+/// file must not be clamped, or the original OLMo-7B -- whose converted
+/// file carries no key -- would run a graph llama.cpp does not.
+#[test]
+fn removing_or_inventing_the_clamp_diverges_from_llama_cpp() {
+    let mut d = load_graph_fixture("olmo_clamped");
+    d.config.clamp_kqv = None;
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &OLMO_CLAMPED_GOLDEN,
     );
     assert!(
-        msg.contains("llama-graph.cpp:1611-1652"),
-        "and the line that decides it: {msg}"
+        worst > 1e-2,
+        "dropping the clamp moved the output by only {worst}; the clamped fixture's \
+         projections must be too small for the clamp to bite, and it cannot see the \
+         feature it exists to pin"
     );
 
-    // The unclamped file is the one that loads, or the gate above would
-    // be refusing the architecture rather than the feature.
-    let ok = ferrox_gguf::GgufFile::open(graph_fixture_path(OLMO)).expect("fixture opens");
-    assert!(ModelConfig::from_gguf(&ok).is_ok());
+    let mut d = load_graph_fixture(OLMO);
+    d.config.clamp_kqv = Some(8.0);
+    let mut kv = graph_caches(&d);
+    let worst = worst_vs(
+        &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+        &OLMO_GOLDEN,
+    );
+    assert!(
+        worst > 1e-2,
+        "clamping the unclamped file moved the output by only {worst}"
+    );
 }

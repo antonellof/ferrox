@@ -177,6 +177,36 @@ pub fn worst_vs(got: &[f32], golden: &[f32]) -> f32 {
         .fold(0f32, f32::max)
 }
 
+/// `KL(llama.cpp || ferrox)` over the softmax of the two logit vectors,
+/// in nats.
+///
+/// The max absolute logit difference is what
+/// [`assert_all_three_paths_match`] gates on, because it is the sharper
+/// instrument on a 48-wide synthetic vocabulary. KL is reported beside
+/// it because it is the number `ferrox parity` speaks in and the one a
+/// reader can compare against the K-quant drift in
+/// `docs/plans/llama-cpp-gap-inventory.md` §10 -- a comparison that only
+/// means anything if both sides are quoted in the same unit.
+///
+/// Here rather than in each suite: it had grown two copies
+/// (`granite_family_graphs`, `no_rope_layer_graphs`), and a helper that
+/// drifts between two suites makes one of them quietly report a
+/// different number under the same name.
+pub fn kl_vs_golden(got: &[f32], golden: &[f32]) -> f64 {
+    let softmax = |v: &[f32]| -> Vec<f64> {
+        let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let exp: Vec<f64> = v.iter().map(|&x| (x as f64 - max).exp()).collect();
+        let sum: f64 = exp.iter().sum();
+        exp.into_iter().map(|e| e / sum).collect()
+    };
+    let p = softmax(golden);
+    let q = softmax(got);
+    p.iter()
+        .zip(q.iter())
+        .map(|(&p, &q)| if p > 0.0 { p * (p / q).ln() } else { 0.0 })
+        .sum()
+}
+
 // ---------------------------------------------------------------------
 // Real-checkpoint sweeps
 //

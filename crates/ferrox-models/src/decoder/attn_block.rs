@@ -105,25 +105,10 @@ impl Decoder {
             }
         };
 
-        if let Some(bias) = &layer.attn.q_bias {
-            for (x, b) in q.iter_mut().zip(bias.iter()) {
-                *x += b;
-            }
-        }
-        if let Some(bias) = &layer.attn.k_bias {
-            for (x, b) in k.iter_mut().zip(bias.iter()) {
-                *x += b;
-            }
-        }
-        if let Some(bias) = &layer.attn.v_bias {
-            for (x, b) in v.iter_mut().zip(bias.iter()) {
-                *x += b;
-            }
-        }
-
         // Whole rows here: one token's Q and K. See
         // `Decoder::qk_norm_after_rope` for why the norm has two homes.
         let (q_width, kv_width) = (q.len(), k.len());
+        self.apply_qkv_bias_and_clamp(layer, &mut q, &mut k, &mut v, q_width, kv_width);
         self.apply_qk_norms_pre_rope(layer, &mut q, &mut k, q_width, kv_width);
         self.apply_rope_attn_factor(&mut q, &mut k, layer_idx);
 

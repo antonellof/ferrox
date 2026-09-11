@@ -41,6 +41,8 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `exaone4` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `exaone-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `dbrx` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `grok` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mellum` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `talkie` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mimo2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -49,8 +51,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `grovemoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `laguna` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `step35` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `grok` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `dbrx` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `smallthinker` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `bitnet` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `openelm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
