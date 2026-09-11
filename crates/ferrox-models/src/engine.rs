@@ -36,6 +36,7 @@ use crate::kimi_decoder::{
     kimi_forward_token, KimiDecodeState, KimiDecoderConfig, KimiDecoderWeights,
 };
 use crate::kimi_tokenizer::KimiTokenizer;
+use crate::tokenizer::SpecialTokens;
 use ferrox_core::cache::KvCache;
 use ferrox_core::weight_matrix::WeightMatrix;
 
@@ -343,7 +344,10 @@ impl Engine for DeepseekV4Engine {
 /// loop encode/decode without caring which concrete tokenizer it was
 /// given.
 pub trait TextTokenizer {
-    fn encode(&self, text: &str) -> Vec<usize>;
+    /// `specials` is llama.cpp's `parse_special`: whether a literal
+    /// marker in `text` is the token it names or the characters it is
+    /// written with. See [`SpecialTokens`] for which callers want which.
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize>;
     fn decode(&self, ids: &[usize]) -> String;
 
     /// The raw bytes, before any UTF-8 decision is made about them.
@@ -361,8 +365,8 @@ pub trait TextTokenizer {
 }
 
 impl TextTokenizer for KimiTokenizer {
-    fn encode(&self, text: &str) -> Vec<usize> {
-        KimiTokenizer::encode(self, text)
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
+        KimiTokenizer::encode(self, text, specials)
             .into_iter()
             .map(|id| id as usize)
             .collect()

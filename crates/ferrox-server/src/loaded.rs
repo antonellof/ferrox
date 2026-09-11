@@ -38,6 +38,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::Json;
 
+use ferrox_models::tokenizer::SpecialTokens;
 use ferrox_models::EmbeddingModel;
 
 use crate::{budget, serving, ApiError, Model};
@@ -187,9 +188,14 @@ impl ActiveModel {
     /// Deliberately NOT reached through `generative()`: routes that
     /// need a decode still go through it and still refuse, and this
     /// pair is the only thing that steps around it.
-    pub(crate) fn encode_any(&self, text: &str) -> Vec<usize> {
+    ///
+    /// `specials` reaches the generative tokenizer as is. An encoder's
+    /// `token_ids` is the embedding input, which llama.cpp tokenizes
+    /// with `parse_special = true` and which wraps its own `[CLS]` /
+    /// `[SEP]`; there is no separate setting to honour on that side.
+    pub(crate) fn encode_any(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
         match &self.loaded {
-            Loaded::Generative(m) => m.encode(text),
+            Loaded::Generative(m) => m.encode(text, specials),
             Loaded::Encoder(e) => e.token_ids(text).into_iter().map(|t| t as usize).collect(),
         }
     }

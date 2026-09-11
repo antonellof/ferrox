@@ -97,6 +97,7 @@ use crate::{
     stats, ApiError, AppState, ChatCompletionRequest, ChatMessage, MessageContent, StopParam,
     ThinkingSwitch, ToolCallFunctionIn, ToolCallIn, ToolDef, ToolFunctionDef,
 };
+use ferrox_models::tokenizer::SpecialTokens;
 
 /// Stream silence after which a protocol-native `ping` goes out.
 ///
@@ -1712,7 +1713,7 @@ pub(crate) async fn count_tokens(
         // (`generate::generate` calls `prepend_bos`). `Model` exposes no
         // BOS id, so this can read one token low on a checkpoint that
         // has one; it is stated rather than guessed at.
-        let input_tokens = model.encode(&prompt).len();
+        let input_tokens = model.encode(&prompt, SpecialTokens::Parse).len();
         Ok::<Value, ApiError>(json!({"input_tokens": input_tokens}))
     })();
 

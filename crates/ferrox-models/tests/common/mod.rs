@@ -235,17 +235,17 @@ fn stretch(mut tokens: Vec<usize>, want: usize, bos: Option<usize>) -> Vec<usize
 /// cover: a suite that silently ran a different prompt would report a
 /// pass it had not earned.
 pub fn prompt_tokens(file: &ferrox_gguf::ShardedGguf, prompt: &str, want: usize) -> Vec<usize> {
-    use ferrox_models::tokenizer::{GgufBpeTokenizer, GgufSpmTokenizer};
+    use ferrox_models::tokenizer::{GgufBpeTokenizer, GgufSpmTokenizer, SpecialTokens};
     let raw: Vec<usize> = match file.metadata_str("tokenizer.ggml.model") {
         Some("gpt2" | "gemma4") => GgufBpeTokenizer::from_gguf(file)
             .expect("bpe tokenizer")
-            .encode(prompt)
+            .encode(prompt, SpecialTokens::Parse)
             .into_iter()
             .map(|i| i as usize)
             .collect(),
         Some("llama") => GgufSpmTokenizer::from_gguf(file)
             .expect("spm tokenizer")
-            .encode(prompt)
+            .encode(prompt, SpecialTokens::Parse)
             .into_iter()
             .map(|i| i as usize)
             .collect(),

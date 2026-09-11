@@ -137,9 +137,13 @@ pub fn run(args: ParityArgs) -> anyhow::Result<()> {
 
     let prompt = args.prompt.clone().unwrap_or_else(|| PROMPT.to_string());
 
-    let (tokens, ferrox_logits) =
-        crate::verify_engine::prefill_logits(Path::new(&path), &prompt, args.prompt_tokens)
-            .context("ferrox prefill")?;
+    let (tokens, ferrox_logits) = crate::verify_engine::prefill_logits(
+        Path::new(&path),
+        &prompt,
+        ferrox_models::tokenizer::SpecialTokens::Parse,
+        args.prompt_tokens,
+    )
+    .context("ferrox prefill")?;
 
     // The reference is pinned to llama.cpp's CPU path (n_gpu_layers = 0),
     // because ferrox's CPU path is the one cross-validated against NumPy.

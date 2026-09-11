@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use ferrox_gguf::{GgufFile, TensorSource};
 use ferrox_models::engine::Engine;
 use ferrox_models::gemma4_gguf_loader::{load_gemma4_engine, read_gemma4_hparams};
-use ferrox_models::tokenizer::{should_add_bos_token, GgufBpeTokenizer};
+use ferrox_models::tokenizer::{should_add_bos_token, GgufBpeTokenizer, SpecialTokens};
 
 const PROMPT: &str = "The capital of France is";
 const MAX_NEW_TOKENS: usize = 8;
@@ -244,7 +244,11 @@ fn gemma4_greedy_decode_answers_paris() {
     if should_add_bos_token(&file) {
         tokens.push(file.metadata_u64("tokenizer.ggml.bos_token_id").unwrap() as usize);
     }
-    tokens.extend(tok.encode(PROMPT).into_iter().map(|t| t as usize));
+    tokens.extend(
+        tok.encode(PROMPT, SpecialTokens::Parse)
+            .into_iter()
+            .map(|t| t as usize),
+    );
 
     let mut state = engine.new_state();
     let mut logits = Vec::new();

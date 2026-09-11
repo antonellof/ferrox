@@ -1,5 +1,5 @@
 use ferrox_gguf::GgufFile;
-use ferrox_models::tokenizer::GgufSpmTokenizer;
+use ferrox_models::tokenizer::{GgufSpmTokenizer, SpecialTokens};
 use std::env;
 
 fn main() {
@@ -8,7 +8,7 @@ fn main() {
     // Try SPM first
     let tok = GgufSpmTokenizer::from_gguf(&file).expect("spm");
     let prompt = "<start_of_turn>user\nWhat is the capital of France? Answer with one word.<end_of_turn>\n<start_of_turn>model\n";
-    let ids = tok.encode(prompt);
+    let ids = tok.encode(prompt, SpecialTokens::Parse);
     println!("n={}", ids.len());
     println!("{:?}", &ids[..ids.len().min(40)]);
 }

@@ -307,7 +307,7 @@ async fn save(
     let active = state.require_active()?;
     let cache = require_prefix_cache(&state)?;
     let (identity, decoder) = serving_identity(&active)?;
-    let mut tokens = active.encode_any(prompt);
+    let mut tokens = active.encode_any(prompt, ferrox_models::tokenizer::SpecialTokens::Parse);
     ferrox_models::tokenizer::prepend_bos(
         &mut tokens,
         active.generative_opt().and_then(|m| m.bos_id()),

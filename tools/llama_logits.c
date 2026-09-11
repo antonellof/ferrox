@@ -66,13 +66,25 @@
 // the two sides do not have to share a host endianness):
 //
 //   cases   "FXTK" | u32 n_cases | repeat( u32 n_bytes | n_bytes text )
-//   result  "FXTK" | u32 version=1 | u32 flags | u32 n_vocab
-//                  | u32 n_cases  | repeat( u32 n_tokens | n_tokens i32 )
+//   result  "FXTK" | u32 version=2 | u32 flags | u32 n_vocab
+//                  | u32 n_cases  | repeat( run(parse_special=false)
+//                                           run(parse_special=true) )
+//           run    u32 n_tokens | n_tokens i32
 //           flags bit0 = add_bos, bit1 = add_eos, as the vocab reports
 //           them. The ids themselves are dumped with add_special=false,
 //           so the BOS policy is compared as a FLAG rather than being
 //           baked into every sequence, where one disagreement would
 //           misreport every case as a tokenizer divergence.
+//
+//           Every case is tokenized TWICE, once per parse_special
+//           setting, because the two are different questions and
+//           ferrox has to answer both. Version 1 dumped only the
+//           parse_special=true answer, and that hid a real defect:
+//           ferrox parsed special-token markers unconditionally, so a
+//           document that MENTIONED `<|im_end|>` in prose was off by
+//           one token against llama.cpp's default, and the only
+//           reference the oracle had was the one setting on which the
+//           two agreed.
 //
 // CPU only (n_gpu_layers = 0) in the logits mode: the ferrox side of the
 // comparison is its CPU path, which is the one cross-validated against
@@ -96,7 +108,7 @@
 #endif
 
 #define FXTK_MAGIC "FXTK"
-#define FXTK_VERSION 1u
+#define FXTK_VERSION 2u
 
 // Exit code for "llama.cpp itself cannot load this checkpoint". Kept
 // distinct from the generic failure code because it is not evidence
@@ -291,19 +303,18 @@ static int cmd_tokenize(const char * model_path, const char * in_path, const cha
             break;
         }
         // add_special = false: BOS/EOS policy travels in `flags`.
-        // parse_special = true: ferrox's tokenizers always carve special
-        // tokens out of raw text, so the reference must too or the two
-        // sides are answering different questions.
-        const int32_t n = llama_tokenize(vocab, text, text_len, toks, cap, false, true);
-        if (n < 0) {
-            fprintf(stderr, "case %u needs %d tokens, buffer held %d\n", i, -n, cap);
-            free(toks);
-            rc = 1;
-            break;
-        }
-        wr_u32(f, (uint32_t) n);
-        for (int32_t t = 0; t < n; t++) {
-            wr_i32(f, (int32_t) toks[t]);
+        // parse_special: both, false first. See the format note above.
+        for (int parse_special = 0; parse_special <= 1 && rc == 0; parse_special++) {
+            const int32_t n = llama_tokenize(vocab, text, text_len, toks, cap, false, parse_special != 0);
+            if (n < 0) {
+                fprintf(stderr, "case %u needs %d tokens, buffer held %d\n", i, -n, cap);
+                rc = 1;
+                break;
+            }
+            wr_u32(f, (uint32_t) n);
+            for (int32_t t = 0; t < n; t++) {
+                wr_i32(f, (int32_t) toks[t]);
+            }
         }
         free(toks);
     }

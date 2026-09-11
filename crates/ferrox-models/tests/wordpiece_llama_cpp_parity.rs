@@ -64,6 +64,7 @@
 //! looks like one, and inputs that normalize away to nothing.
 
 use ferrox_gguf::ShardedGguf;
+use ferrox_models::tokenizer::SpecialTokens;
 use ferrox_models::GgufWordPieceTokenizer;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,7 +72,9 @@ use std::process::Command;
 struct Golden {
     name: &'static str,
     text: &'static str,
-    /// llama.cpp's ids for `text`, with `add_special = false`.
+    /// llama.cpp's ids for `text`, with `add_special = false` and
+    /// `parse_special = true` (the `bracket-specials` case is `[CLS]`
+    /// as id 101, which only the parsed setting gives).
     llama: &'static [u32],
 }
 
@@ -446,7 +449,7 @@ fn ferrox_matches_the_recorded_llama_cpp_tokenization() {
     let mut failures = Vec::new();
     let mut tokens = 0usize;
     for case in GOLDEN {
-        let ferrox = tok.encode(case.text);
+        let ferrox = tok.encode(case.text, SpecialTokens::Parse);
         tokens += case.llama.len();
         if ferrox != case.llama {
             failures.push(report(&tok, case.name, case.text, case.llama, &ferrox));
@@ -667,8 +670,10 @@ fn reference_tokenize(dumper: &Path, model: &Path, texts: &[&str]) -> (u32, usiz
 }
 
 /// The FXTK result format `tools/llama_logits.c` writes:
-/// `"FXTK" | u32 version | u32 flags | u32 n_vocab | u32 n_cases |
-/// repeat( u32 n_ids | n_ids * u32 )`.
+/// `"FXTK" | u32 version=2 | u32 flags | u32 n_vocab | u32 n_cases |
+/// repeat( run(parse_special=false) run(parse_special=true) )`, each
+/// run `u32 n_ids | n_ids * u32`. Only the parsed run is kept, because
+/// that is the setting the recorded table was made under.
 fn parse_fxtk(bytes: &[u8]) -> (u32, usize, Vec<Vec<u32>>) {
     assert_eq!(&bytes[..4], b"FXTK", "not an FXTK result file");
     let mut at = 4usize;
@@ -677,12 +682,20 @@ fn parse_fxtk(bytes: &[u8]) -> (u32, usize, Vec<Vec<u32>>) {
         at += 4;
         v
     };
-    assert_eq!(next(), 1, "this test reads FXTK v1");
+    assert_eq!(
+        next(),
+        2,
+        "this test reads FXTK v2; rebuild the dumper with ./tools/build_llama_logits.sh"
+    );
     let flags = next();
     let n_vocab = next() as usize;
     let n_cases = next() as usize;
     let cases = (0..n_cases)
         .map(|_| {
+            let n_as_text = next() as usize;
+            for _ in 0..n_as_text {
+                next();
+            }
             let n = next() as usize;
             (0..n).map(|_| next()).collect()
         })

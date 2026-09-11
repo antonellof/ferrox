@@ -142,9 +142,15 @@ pub fn run(args: ImatrixArgs) -> Result<()> {
         .with_context(|| format!("reading calibration text {}", args.file.display()))?;
 
     let t0 = Instant::now();
-    let (decoder, tokens, _eos) =
-        crate::verify_engine::load_and_tokenize(Path::new(&path), &text, None)
-            .context("loading the model and tokenizing the calibration text")?;
+    let (decoder, tokens, _eos) = crate::verify_engine::load_and_tokenize(
+        Path::new(&path),
+        &text,
+        // llama-imatrix's default (`common.h`: `parse_special = false`):
+        // calibration text that mentions `<s>` is text.
+        ferrox_models::tokenizer::SpecialTokens::AsText,
+        None,
+    )
+    .context("loading the model and tokenizing the calibration text")?;
     println!(
         "imatrix: tokenization and load took {:.1} s; {} tokens",
         t0.elapsed().as_secs_f64(),

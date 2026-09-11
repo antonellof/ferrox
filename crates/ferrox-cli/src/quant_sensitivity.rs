@@ -187,8 +187,12 @@ pub fn run(args: QuantSensitivityArgs) -> anyhow::Result<()> {
 
     let prompt = args.prompt.clone().unwrap_or_else(|| PROMPT.to_string());
     let path = crate::pull::resolve_model_path(&args.model)?;
-    let (mut decoder, tokens, _eos) =
-        crate::verify_engine::load_and_tokenize(Path::new(&path), &prompt, args.prompt_tokens)?;
+    let (mut decoder, tokens, _eos) = crate::verify_engine::load_and_tokenize(
+        Path::new(&path),
+        &prompt,
+        ferrox_models::tokenizer::SpecialTokens::Parse,
+        args.prompt_tokens,
+    )?;
 
     let n_layers = decoder.layers.len();
     let (from, to) = parse_layer_range(args.layers.as_deref(), n_layers)?;

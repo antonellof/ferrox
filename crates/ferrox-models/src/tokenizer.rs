@@ -30,11 +30,14 @@
 
 mod pretokenize;
 mod scored_vocab;
+mod special;
 mod unicode;
 mod unicode_data;
 mod wordpiece;
 
 use scored_vocab::ScoredVocab;
+pub use special::SpecialTokens;
+pub(crate) use special::{SpecialKind, SpecialTokenTable, TextOrSpecial};
 pub use wordpiece::{GgufWordPieceTokenizer, NormalizerOptions};
 
 /// The `tokenizer.ggml.pre` values whose llama.cpp arm sets
@@ -375,11 +378,9 @@ pub struct GgufBpeTokenizer {
     merge_rank: std::collections::HashMap<(String, String), usize>,
     byte_to_unicode: [char; 256],
     unicode_to_byte: std::collections::HashMap<char, u8>,
-    /// Control/user-defined tokens (chat-template markers and similar
-    /// added special tokens) from `tokenizer.ggml.token_type`, matched
-    /// as atomic substrings before normal BPE runs -- see
-    /// `split_on_special_tokens`.
-    special_tokens: Vec<(String, u32)>,
+    /// The vocabulary's special entries, carved out of the input before
+    /// BPE runs on what is left -- see [`special::SpecialTokenTable`].
+    special_tokens: SpecialTokenTable,
     /// Compiled pre-tokenization pattern (GPT-2 word regex, or
     /// newline-only for Gemma-4 SPM-BPE).
     pretokenize_pattern: fancy_regex::Regex,
@@ -400,205 +401,6 @@ pub enum TokenizerLoadError {
          needs one score per token; this checkpoint cannot be tokenized"
     )]
     ScoresVocabLengthMismatch { tokens: usize, scores: usize },
-}
-
-/// GGUF's real `tokenizer.ggml.token_type` per-token integer tag,
-/// confirmed directly against llama.cpp's real `llama_token_type` enum
-/// (`include/llama.h`) and its real GGUF-loading code
-/// (`src/llama-vocab.cpp`'s `toktypes[i]` switch), not guessed: this is
-/// a plain sequential enum on disk (`1=NORMAL, 2=UNKNOWN, 3=CONTROL,
-/// 4=USER_DEFINED, 5=UNUSED, 6=BYTE`), a different and simpler
-/// representation than llama.cpp's own *internal* bit-flag
-/// `llama_token_attr` type, which is derived from this at load time,
-/// not what's actually stored in the file.
-const GGML_TOKEN_TYPE_CONTROL: i64 = 3;
-const GGML_TOKEN_TYPE_USER_DEFINED: i64 = 4;
-
-/// Reads `tokenizer.ggml.token_type` (if present) and returns the
-/// `(token_text, id)` pairs for every CONTROL or USER_DEFINED entry
-/// (chat-template markers like `<|user|>`/`<|assistant|>`, and similar
-/// added special tokens) -- these must be recognized as atomic
-/// vocabulary entries during encoding rather than shattered into
-/// ordinary BPE/SPM/Unigram pieces, matching real llama.cpp's
-/// `tokenizer_st_partition` behavior (`src/llama-vocab.cpp`): special
-/// tokens are located as literal substrings and carved out of the
-/// input *before* normal tokenization runs on what's left, not folded
-/// into the regular vocabulary-matching pass.
-fn load_special_tokens(
-    file: &impl ferrox_gguf::TensorSource,
-    id_to_token: &[String],
-) -> Vec<(String, u32)> {
-    let Some(ferrox_gguf::GgufValue::Array(items)) = file.metadata("tokenizer.ggml.token_type")
-    else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .zip(id_to_token.iter())
-        .enumerate()
-        .filter_map(|(id, (v, text))| {
-            let ty = match v {
-                ferrox_gguf::GgufValue::I32(t) => *t as i64,
-                ferrox_gguf::GgufValue::U32(t) => *t as i64,
-                _ => return None,
-            };
-            // A checkpoint that flags its markers is the easy case.
-            //
-            // Not every one does. Yi-1.5-6B-Chat lists `<|im_start|>`
-            // (id 6) and `<|im_end|>` (id 7) as NORMAL, so this filter
-            // dropped them, the splitter never saw them, and
-            // `<|im_end|>` tokenized as SIX ordinary BPE pieces instead
-            // of the single token the model was trained on. Its prompt
-            // was malformed and its turn marker could not be matched by
-            // id, so nothing stopped and the marker came back as text
-            // mid-answer.
-            //
-            // So a token that LOOKS like a marker and exists verbatim in
-            // the vocabulary is treated as one whatever its type says.
-            // The shape test is what keeps this narrow: ordinary words
-            // are in the vocabulary too, and promoting those would split
-            // real text.
-            (ty == GGML_TOKEN_TYPE_CONTROL
-                || ty == GGML_TOKEN_TYPE_USER_DEFINED
-                || looks_like_marker(text))
-            .then(|| (text.clone(), id as u32))
-        })
-        .collect()
-}
-
-/// Is this vocabulary entry shaped like a special marker?
-///
-/// Deliberately strict: `<|...|>` and `<...>` with no whitespace, at
-/// least three characters. That covers `<|im_end|>`, `<|endoftext|>`,
-/// `<end_of_turn>` and `</s>` while excluding ordinary text, which also
-/// lives in the vocabulary and must keep tokenizing normally.
-fn looks_like_marker(text: &str) -> bool {
-    let t = text.trim();
-    if t.len() < 3 || t.contains(char::is_whitespace) {
-        return false;
-    }
-    (t.starts_with("<|") && t.ends_with("|>")) || (t.starts_with('<') && t.ends_with('>'))
-}
-
-/// One chunk of `split_on_special_tokens`'s output: either a raw text
-/// run to tokenize normally, or an already-resolved special token id.
-enum TextOrSpecial<'a> {
-    Text(&'a str),
-    Special(u32),
-}
-
-/// Splits `text` around every literal occurrence of any of `specials`
-/// (longest-match-first on ties, matching real llama.cpp's
-/// `tokenizer_st_partition`), leaving the text runs between/around
-/// them untouched for the caller's normal tokenization pass. Returns
-/// the whole input as one `Text` chunk when `specials` is empty (the
-/// overwhelmingly common fast path, since most GGUF files carry no
-/// `tokenizer.ggml.token_type` metadata at all).
-fn split_on_special_tokens<'a>(
-    text: &'a str,
-    specials: &[(String, u32)],
-) -> Vec<TextOrSpecial<'a>> {
-    if specials.is_empty() {
-        return vec![TextOrSpecial::Text(text)];
-    }
-    let mut segments = Vec::new();
-    let mut pos = 0usize;
-    while pos < text.len() {
-        let mut best: Option<(usize, usize, u32)> = None; // (start, len, id)
-        for (s, id) in specials {
-            if s.is_empty() {
-                continue;
-            }
-            if let Some(rel) = text[pos..].find(s.as_str()) {
-                let start = pos + rel;
-                let len = s.len();
-                let better = match best {
-                    None => true,
-                    Some((bstart, blen, _)) => start < bstart || (start == bstart && len > blen),
-                };
-                if better {
-                    best = Some((start, len, *id));
-                }
-            }
-        }
-        match best {
-            None => break,
-            Some((start, len, id)) => {
-                if start > pos {
-                    segments.push(TextOrSpecial::Text(&text[pos..start]));
-                }
-                segments.push(TextOrSpecial::Special(id));
-                pos = start + len;
-            }
-        }
-    }
-    if pos < text.len() {
-        segments.push(TextOrSpecial::Text(&text[pos..]));
-    }
-    segments
-}
-
-#[cfg(test)]
-mod special_token_split_tests {
-    use super::*;
-
-    fn text_of<'a>(seg: &TextOrSpecial<'a>) -> Option<&'a str> {
-        match seg {
-            TextOrSpecial::Text(t) => Some(t),
-            TextOrSpecial::Special(_) => None,
-        }
-    }
-
-    #[test]
-    fn empty_specials_list_returns_the_whole_text_unsplit() {
-        let segs = split_on_special_tokens("hello world", &[]);
-        assert_eq!(segs.len(), 1);
-        assert_eq!(text_of(&segs[0]), Some("hello world"));
-    }
-
-    #[test]
-    fn splits_around_a_single_special_token_in_the_middle() {
-        let specials = vec![("<|user|>".to_string(), 42u32)];
-        let segs = split_on_special_tokens("before<|user|>after", &specials);
-        assert_eq!(segs.len(), 3);
-        assert_eq!(text_of(&segs[0]), Some("before"));
-        assert!(matches!(segs[1], TextOrSpecial::Special(42)));
-        assert_eq!(text_of(&segs[2]), Some("after"));
-    }
-
-    #[test]
-    fn multiple_occurrences_and_multiple_distinct_specials_all_split() {
-        let specials = vec![
-            ("<|user|>".to_string(), 1u32),
-            ("<|assistant|>".to_string(), 2u32),
-        ];
-        let segs = split_on_special_tokens("<|user|>hi<|assistant|>hello<|user|>bye", &specials);
-        let kinds: Vec<Option<&str>> = segs.iter().map(text_of).collect();
-        assert_eq!(
-            kinds,
-            vec![None, Some("hi"), None, Some("hello"), None, Some("bye")]
-        );
-        assert!(matches!(segs[0], TextOrSpecial::Special(1)));
-        assert!(matches!(segs[2], TextOrSpecial::Special(2)));
-        assert!(matches!(segs[4], TextOrSpecial::Special(1)));
-    }
-
-    #[test]
-    fn longest_match_wins_on_a_tied_start_position() {
-        // "<|user|>" and a hypothetical shorter overlapping prefix
-        // starting at the same position must prefer the longer match.
-        let specials = vec![("<|user|>".to_string(), 1u32), ("<|u".to_string(), 99u32)];
-        let segs = split_on_special_tokens("<|user|>x", &specials);
-        assert!(matches!(segs[0], TextOrSpecial::Special(1)));
-    }
-
-    #[test]
-    fn no_match_at_all_returns_the_whole_text_as_one_segment() {
-        let specials = vec![("<|user|>".to_string(), 1u32)];
-        let segs = split_on_special_tokens("plain text with no specials", &specials);
-        assert_eq!(segs.len(), 1);
-        assert_eq!(text_of(&segs[0]), Some("plain text with no specials"));
-    }
 }
 
 impl GgufBpeTokenizer {
@@ -651,7 +453,7 @@ impl GgufBpeTokenizer {
             }
             BpeEncodingStyle::SpmWhitespace => pretokenize::newline_regex(),
         };
-        let special_tokens = load_special_tokens(file, &id_to_token);
+        let special_tokens = SpecialTokenTable::from_gguf(file, &id_to_token);
 
         Ok(GgufBpeTokenizer {
             token_to_id,
@@ -740,12 +542,14 @@ impl GgufBpeTokenizer {
         }
     }
 
-    /// Encodes text: specials first, then style-specific pretokenize +
-    /// `encode_word`. Gemma-4 escapes spaces to `▁` and splits only on
-    /// newlines; newline-only chunks look up the whole string in vocab
-    /// (multi-newline tokens) before BPE.
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        split_on_special_tokens(text, &self.special_tokens)
+    /// Encodes text: specials first (those `specials` lets through),
+    /// then style-specific pretokenize + `encode_word`. Gemma-4 escapes
+    /// spaces to `▁` and splits only on newlines; newline-only chunks
+    /// look up the whole string in vocab (multi-newline tokens) before
+    /// BPE.
+    pub fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<u32> {
+        self.special_tokens
+            .split(text, specials)
             .into_iter()
             .flat_map(|seg| -> Vec<u32> {
                 match seg {
@@ -922,10 +726,10 @@ pub struct GgufSpmTokenizer {
     /// [`GgufUnigramTokenizer`] so that the score lookup exists once
     /// rather than once per tokenizer.
     vocab: ScoredVocab,
-    /// Control/user-defined tokens from `tokenizer.ggml.token_type`,
-    /// matched as atomic substrings before normal merging -- see
-    /// `split_on_special_tokens`.
-    special_tokens: Vec<(String, u32)>,
+    /// The vocabulary's special entries, carved out of the input before
+    /// SentencePiece-BPE runs on what is left -- see
+    /// [`special::SpecialTokenTable`].
+    special_tokens: SpecialTokenTable,
     /// `tokenizer.ggml.add_space_prefix` (llama.cpp default `true` for
     /// SPM). When true, each normal-text run after a special (and the
     /// start of the string) is prefixed with SentencePiece `▁`. Gemma
@@ -985,7 +789,7 @@ impl Ord for SpmMergeCandidate {
 impl GgufSpmTokenizer {
     pub fn from_gguf(file: &impl ferrox_gguf::TensorSource) -> Result<Self, TokenizerLoadError> {
         let vocab = ScoredVocab::from_gguf(file)?;
-        let special_tokens = load_special_tokens(file, vocab.tokens());
+        let special_tokens = SpecialTokenTable::from_gguf(file, vocab.tokens());
         // llama.cpp defaults SPM `add_space_prefix` to true, then lets
         // `tokenizer.ggml.add_space_prefix` override (Gemma sets false).
         let add_space_prefix = match file.metadata("tokenizer.ggml.add_space_prefix") {
@@ -1012,16 +816,17 @@ impl GgufSpmTokenizer {
     /// which every real SentencePiece-BPE vocabulary includes for
     /// exactly this purpose) before merging begins.
     ///
-    /// Control/user-defined tokens (chat-template markers like
-    /// `<|user|>`) are first carved out as atomic substrings via
-    /// `split_on_special_tokens`, matching real llama.cpp's
-    /// `tokenizer_st_partition` behavior, so they're never shattered
-    /// into byte-fallback pieces; each remaining raw-text run between
-    /// them is merged independently. A leading dummy `▁` is applied to
-    /// a run only when [`Self::add_space_prefix`] is true (llama.cpp
-    /// `add_space_prefix && is_prev_special` for each fragment).
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        split_on_special_tokens(text, &self.special_tokens)
+    /// Special entries that `specials` lets through (chat-template
+    /// markers like `<|user|>`) are first carved out as atomic
+    /// substrings, matching real llama.cpp's `tokenizer_st_partition`
+    /// behavior, so they're never shattered into byte-fallback pieces;
+    /// each remaining raw-text run between them is merged
+    /// independently. A leading dummy `▁` is applied to a run only when
+    /// [`Self::add_space_prefix`] is true (llama.cpp `add_space_prefix
+    /// && is_prev_special` for each fragment).
+    pub fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<u32> {
+        self.special_tokens
+            .split(text, specials)
             .into_iter()
             .flat_map(|seg| match seg {
                 TextOrSpecial::Special(id) => vec![id],
@@ -1266,10 +1071,9 @@ pub struct GgufUnigramTokenizer {
     /// single-character "unknown token" fallback transition, matching
     /// the real `unknown_token_score_penalty` constant.
     unknown_token_score: f64,
-    /// Control/user-defined tokens from `tokenizer.ggml.token_type`,
-    /// matched as atomic substrings before the Viterbi pass -- see
-    /// `split_on_special_tokens`.
-    special_tokens: Vec<(String, u32)>,
+    /// The vocabulary's special entries, carved out of the input before
+    /// Viterbi runs on what is left -- see [`special::SpecialTokenTable`].
+    special_tokens: SpecialTokenTable,
 }
 
 impl GgufUnigramTokenizer {
@@ -1292,7 +1096,7 @@ impl GgufUnigramTokenizer {
         // A real score, not `+INFINITY`: `ScoredVocab` refuses an empty
         // vocabulary, so this fold always sees at least one entry.
         let unknown_token_score = vocab.min_score() as f64 - 10.0;
-        let special_tokens = load_special_tokens(file, vocab.tokens());
+        let special_tokens = SpecialTokenTable::from_gguf(file, vocab.tokens());
 
         Ok(GgufUnigramTokenizer {
             vocab,
@@ -1314,11 +1118,12 @@ impl GgufUnigramTokenizer {
     /// accumulate enough rounding error to flip which of two
     /// near-tied segmentations looks best.
     ///
-    /// Control/user-defined tokens (chat-template markers) are first
-    /// carved out as atomic substrings via `split_on_special_tokens`;
-    /// each remaining raw-text run is Viterbi-segmented independently.
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        split_on_special_tokens(text, &self.special_tokens)
+    /// Special entries that `specials` lets through (chat-template
+    /// markers) are first carved out as atomic substrings; each
+    /// remaining raw-text run is Viterbi-segmented independently.
+    pub fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<u32> {
+        self.special_tokens
+            .split(text, specials)
             .into_iter()
             .flat_map(|seg| match seg {
                 TextOrSpecial::Special(id) => vec![id],
@@ -1489,7 +1294,7 @@ mod gguf_vocab_tests {
             "Hello, World! 123",
             "ferrox is a pure-Rust inference engine.",
         ] {
-            let ids = tok.encode(sentence);
+            let ids = tok.encode(sentence, SpecialTokens::AsText);
             assert!(!ids.is_empty());
             let decoded = tok.decode(&ids);
             assert_eq!(
@@ -1509,7 +1314,7 @@ mod gguf_vocab_tests {
         // ferrox were still doing one giant merge over the whole
         // string (the pre-pretokenizer behavior), a cross-boundary
         // merge could produce a different sequence.
-        let combined = tok.encode("cat dog");
+        let combined = tok.encode("cat dog", SpecialTokens::AsText);
         let mut separate = tok.encode_word("cat");
         separate.extend(tok.encode_word(" dog"));
         assert_eq!(
@@ -1559,7 +1364,7 @@ mod gguf_vocab_tests {
             "para one\n\npara two\n",
             "line one\r\nline two\r\n",
         ] {
-            let ids = tok.encode(text);
+            let ids = tok.encode(text, SpecialTokens::AsText);
             assert_eq!(
                 tok.decode(&ids),
                 text,
@@ -1569,7 +1374,7 @@ mod gguf_vocab_tests {
 
         // And the loss was real: the tab between `a` and `b` is its own
         // token, not absorbed into either neighbour.
-        let ids = tok.encode("a\tb");
+        let ids = tok.encode("a\tb", SpecialTokens::AsText);
         assert_eq!(
             ids.len(),
             3,
@@ -1661,9 +1466,18 @@ mod gguf_spm_tests {
     #[test]
     fn matches_known_reference_encodings() {
         let tok = load_real_fixture();
-        assert_eq!(tok.encode("Hello world"), vec![15043, 3186]);
-        assert_eq!(tok.encode(" Hello world"), vec![29871, 15043, 3186]);
-        assert_eq!(tok.encode("Hello World"), vec![15043, 2787]);
+        assert_eq!(
+            tok.encode("Hello world", SpecialTokens::AsText),
+            vec![15043, 3186]
+        );
+        assert_eq!(
+            tok.encode(" Hello world", SpecialTokens::AsText),
+            vec![29871, 15043, 3186]
+        );
+        assert_eq!(
+            tok.encode("Hello World", SpecialTokens::AsText),
+            vec![15043, 2787]
+        );
     }
 
     /// Real regression test, found serving a real chat checkpoint:
@@ -1685,7 +1499,7 @@ mod gguf_spm_tests {
 
         let user_id = 269u32;
         let assistant_id = 270u32;
-        let ids = tok.encode("<|user|>hello<|assistant|>");
+        let ids = tok.encode("<|user|>hello<|assistant|>", SpecialTokens::Parse);
 
         assert_eq!(ids.first().copied(), Some(user_id), "ids={ids:?}");
         assert_eq!(ids.last().copied(), Some(assistant_id), "ids={ids:?}");
@@ -1704,12 +1518,12 @@ mod gguf_spm_tests {
     fn byte_fallback_handles_control_characters() {
         let tok = load_real_fixture();
         assert_eq!(
-            tok.encode("\t"),
+            tok.encode("\t", SpecialTokens::AsText),
             vec![29871, 12],
             "tab must byte-fallback to <0x09> = token 12"
         );
         assert_eq!(
-            tok.encode("\n"),
+            tok.encode("\n", SpecialTokens::AsText),
             vec![29871, 13],
             "newline must byte-fallback to <0x0A> = token 13"
         );
@@ -1772,7 +1586,7 @@ mod gguf_spm_tests {
                 .split_whitespace()
                 .map(|s| s.parse().unwrap())
                 .collect();
-            let got = tok.encode(text);
+            let got = tok.encode(text, SpecialTokens::AsText);
             assert_eq!(got, expected, "case #{i}: text={text:?}");
             checked += 1;
         }
@@ -1794,7 +1608,7 @@ mod gguf_spm_tests {
         // strips exactly one leading space from decoded output, but
         // the raw decode legitimately includes it.
         let text = "Hello world";
-        let ids = tok.encode(text);
+        let ids = tok.encode(text, SpecialTokens::AsText);
         assert_eq!(tok.decode(&ids), " Hello world");
     }
 
@@ -1807,7 +1621,7 @@ mod gguf_spm_tests {
         // `encode` always prepends a dummy leading space (SentencePiece
         // convention, see `decode_reverses_encode_for_ascii_text`
         // above), so the decoded round-trip carries it too.
-        let newline_id = tok.encode("\n");
+        let newline_id = tok.encode("\n", SpecialTokens::AsText);
         assert_eq!(tok.decode(&newline_id), " \n");
 
         // A multi-byte UTF-8 character split across several
@@ -1815,7 +1629,7 @@ mod gguf_spm_tests {
         // once reassembled -- not as mojibake or individually-invalid
         // UTF-8 fragments.
         let emoji = "🦀";
-        let ids = tok.encode(emoji);
+        let ids = tok.encode(emoji, SpecialTokens::AsText);
         assert_eq!(tok.decode(&ids), format!(" {emoji}"));
     }
 }
@@ -1890,7 +1704,7 @@ mod gguf_unigram_tests {
             ),
         ];
         for (text, expected) in cases {
-            let got = tok.encode(text);
+            let got = tok.encode(text, SpecialTokens::AsText);
             assert_eq!(&got, expected, "text={text:?}");
         }
     }
@@ -1898,7 +1712,7 @@ mod gguf_unigram_tests {
     #[test]
     fn decode_reverses_encode_for_ascii_text() {
         let tok = load_real_fixture();
-        let ids = tok.encode("hello world");
+        let ids = tok.encode("hello world", SpecialTokens::AsText);
         // encode's leading dummy `▁` decodes back to a leading space,
         // same SentencePiece convention as GgufSpmTokenizer.
         assert_eq!(tok.decode(&ids), " hello world");
@@ -1969,7 +1783,7 @@ mod gguf_unigram_tests {
             .with_scores(&scores);
         let tok = GgufUnigramTokenizer::from_gguf(&file).expect("lengths agree");
         assert_eq!(tok.vocab_size(), 100);
-        let ids = tok.encode("piece97");
+        let ids = tok.encode("piece97", SpecialTokens::AsText);
         assert!(
             ids.contains(&97),
             "the piece with the highest id must be reachable: ids={ids:?}"

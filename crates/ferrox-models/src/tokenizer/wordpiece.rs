@@ -53,7 +53,7 @@
 //! nothing, exactly as it matches nothing upstream.
 
 use super::unicode;
-use super::{load_special_tokens, split_on_special_tokens, TextOrSpecial, TokenizerLoadError};
+use super::{SpecialTokenTable, SpecialTokens, TextOrSpecial, TokenizerLoadError};
 use std::collections::HashMap;
 
 /// The phantom space llama.cpp's converter puts in front of every
@@ -114,11 +114,11 @@ pub struct GgufWordPieceTokenizer {
     max_token_len: usize,
     unk_id: u32,
     normalizer: NormalizerOptions,
-    /// `CONTROL`/`USER_DEFINED` entries, carved out of raw text before
+    /// The vocabulary's special entries, carved out of raw text before
     /// normalization runs. For a BERT vocabulary this is `[PAD]`,
     /// `[UNK]`, `[CLS]`, `[SEP]` and `[MASK]`, which is exactly
     /// llama.cpp's `cache_special_tokens` for the same file.
-    special_tokens: Vec<(String, u32)>,
+    special_tokens: SpecialTokenTable,
 }
 
 impl GgufWordPieceTokenizer {
@@ -153,7 +153,7 @@ impl GgufWordPieceTokenizer {
             .map(|v| v as u32)
             .unwrap_or(DEFAULT_UNK_ID);
 
-        let special_tokens = load_special_tokens(file, &id_to_token);
+        let special_tokens = SpecialTokenTable::from_gguf(file, &id_to_token);
 
         Ok(GgufWordPieceTokenizer {
             token_to_id,
@@ -179,9 +179,11 @@ impl GgufWordPieceTokenizer {
     /// decision lives with [`super::should_add_bos_token`] and
     /// [`super::prepend_bos`] for every tokenizer in this crate, and
     /// baking it in here would double it for callers that already do it.
-    pub fn encode(&self, text: &str) -> Vec<u32> {
+    /// `specials` is llama.cpp's `parse_special`: whether a literal
+    /// `[SEP]` in the text is the separator or five characters.
+    pub fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<u32> {
         let mut out = Vec::new();
-        for seg in split_on_special_tokens(text, &self.special_tokens) {
+        for seg in self.special_tokens.split(text, specials) {
             match seg {
                 TextOrSpecial::Special(id) => out.push(id),
                 TextOrSpecial::Text(t) => self.encode_normal_run(t, &mut out),
@@ -364,6 +366,7 @@ fn preprocess(text: &str, opts: NormalizerOptions) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::SpecialKind;
 
     const BOTH: NormalizerOptions = NormalizerOptions {
         lowercase: true,
@@ -502,7 +505,10 @@ mod tests {
             max_token_len,
             unk_id: 1,
             normalizer: BOTH,
-            special_tokens: vec![("[CLS]".to_string(), 2), ("[SEP]".to_string(), 3)],
+            special_tokens: SpecialTokenTable::from_entries([
+                ("[CLS]", 2, SpecialKind::Control),
+                ("[SEP]", 3, SpecialKind::Control),
+            ]),
         }
     }
 
@@ -511,8 +517,8 @@ mod tests {
         let t = toy();
         // ▁un + able, which only works because `able` carries no phantom
         // space and so cannot match at position 0.
-        assert_eq!(t.encode("unable"), [4, 9]);
-        assert_eq!(t.encode("hello"), [5]);
+        assert_eq!(t.encode("unable", SpecialTokens::AsText), [4, 9]);
+        assert_eq!(t.encode("hello", SpecialTokens::AsText), [5]);
     }
 
     /// Longest match first, not merely *a* match.
@@ -526,9 +532,13 @@ mod tests {
     #[test]
     fn the_longest_match_wins_where_a_shorter_one_would_also_cover() {
         let t = toy();
-        assert_eq!(t.encode("unaffable"), [11, 9], "▁unaff + able");
+        assert_eq!(
+            t.encode("unaffable", SpecialTokens::AsText),
+            [11, 9],
+            "▁unaff + able"
+        );
         assert_ne!(
-            t.encode("unaffable"),
+            t.encode("unaffable", SpecialTokens::AsText),
             [4, 8, 9],
             "▁un + aff + able is the shortest-first answer"
         );
@@ -541,7 +551,11 @@ mod tests {
     #[test]
     fn a_continuation_piece_cannot_start_a_word() {
         let t = toy();
-        assert_eq!(t.encode("aff"), [1], "no ▁aff, so [UNK]");
+        assert_eq!(
+            t.encode("aff", SpecialTokens::AsText),
+            [1],
+            "no ▁aff, so [UNK]"
+        );
     }
 
     /// The whole point of the all-or-nothing rule. `worlds` matches
@@ -552,26 +566,33 @@ mod tests {
     fn a_partly_covered_word_discards_its_pieces_and_becomes_one_unknown() {
         let t = toy();
         assert_eq!(
-            t.encode("worlds"),
+            t.encode("worlds", SpecialTokens::AsText),
             [1],
             "a partial cover must be discarded, not kept"
         );
         // The same word without the stray byte does cover, which is what
         // makes the assertion above about the fallback rule rather than
         // about the vocabulary being too small.
-        assert_eq!(t.encode("world"), [7]);
+        assert_eq!(t.encode("world", SpecialTokens::AsText), [7]);
     }
 
     #[test]
     fn each_word_falls_back_independently() {
         let t = toy();
-        assert_eq!(t.encode("hello zzz world"), [5, 1, 7]);
+        assert_eq!(
+            t.encode("hello zzz world", SpecialTokens::AsText),
+            [5, 1, 7]
+        );
     }
 
     #[test]
     fn punctuation_is_its_own_word_and_matches_its_own_piece() {
         let t = toy();
-        assert_eq!(t.encode("hello."), [5, 6], "▁hello then ▁.");
+        assert_eq!(
+            t.encode("hello.", SpecialTokens::AsText),
+            [5, 6],
+            "▁hello then ▁."
+        );
     }
 
     #[test]
@@ -579,7 +600,19 @@ mod tests {
         let t = toy();
         // Without the carve-out the brackets would each be their own
         // punctuation word and `[CLS]` would come back as four unknowns.
-        assert_eq!(t.encode("[CLS]hello[SEP]"), [2, 5, 3]);
+        assert_eq!(t.encode("[CLS]hello[SEP]", SpecialTokens::Parse), [2, 5, 3]);
+    }
+
+    /// llama.cpp's default: a `[SEP]` written in the text is text. The
+    /// toy vocabulary has no `[`, so the marker shatters to unknowns
+    /// around `hello`, which is what upstream does with
+    /// `parse_special = false`.
+    #[test]
+    fn as_text_leaves_a_written_marker_to_the_normal_pass() {
+        let t = toy();
+        let ids = t.encode("[CLS]hello[SEP]", SpecialTokens::AsText);
+        assert!(!ids.contains(&2) && !ids.contains(&3), "got {ids:?}");
+        assert!(ids.contains(&5), "hello survives: {ids:?}");
     }
 
     #[test]

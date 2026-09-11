@@ -18,7 +18,7 @@ use crate::encoder::{EncodeError, PairSequence, TextEncoder};
 use crate::loader::LoadError;
 use crate::pooling::{l2_normalize, pool, PoolingType};
 use crate::rank_head::{load_rank_head, RankHead};
-use crate::tokenizer::{GgufWordPieceTokenizer, TokenizerLoadError};
+use crate::tokenizer::{GgufWordPieceTokenizer, SpecialTokens, TokenizerLoadError};
 
 /// Encoder architectures upstream builds from `bert.cpp` and the other
 /// embedding rows in the capability catalog, with what each one needs
@@ -241,8 +241,14 @@ impl EmbeddingModel {
     /// pieces wrapped in the model's own special tokens. Public because
     /// `/v1/embeddings` has to report `usage.prompt_tokens`, and that
     /// number is this length — llama.cpp counts the specials too.
+    ///
+    /// `SpecialTokens::Parse`, as llama.cpp's `/v1/embeddings` does
+    /// (`tools/server/server-context.cpp`, `handle_embeddings_impl`:
+    /// `tokenize_input_prompts(..., /* add_special */ true,
+    /// /* parse_special */ true)`).
     pub fn token_ids(&self, text: &str) -> Vec<u32> {
-        self.encoder.wrap_special(&self.tokenizer.encode(text))
+        self.encoder
+            .wrap_special(&self.tokenizer.encode(text, SpecialTokens::Parse))
     }
 
     /// Text for `ids`, through this checkpoint's own vocabulary.
@@ -295,11 +301,17 @@ impl EmbeddingModel {
     /// [`Self::token_ids`] is separate from [`Self::embed`] — a route
     /// has to report `usage.prompt_tokens`, and that number is
     /// `tokens.len()`.
+    ///
+    /// `SpecialTokens::AsText` for both halves, as llama.cpp's
+    /// `format_prompt_rerank` does (`tools/server/server-common.cpp`:
+    /// `tokenize_input_subprompt(vocab, mctx, query, false, false)` and
+    /// the same for `doc`). A document that mentions `[SEP]` must not be
+    /// able to end the query half early.
     pub fn rerank_input(&self, query: &str, document: &str) -> Result<PairSequence, EmbedError> {
         self.encoder
             .wrap_special_pair(
-                &self.tokenizer.encode(query),
-                &self.tokenizer.encode(document),
+                &self.tokenizer.encode(query, SpecialTokens::AsText),
+                &self.tokenizer.encode(document, SpecialTokens::AsText),
             )
             .ok_or_else(|| EmbedError::NoPairInput {
                 arch: self.arch.clone(),
