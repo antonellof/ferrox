@@ -33,26 +33,35 @@ own. No llama.cpp bindings, no ggml wrapper. The loader, the quantized
 kernels, attention and expert routing are written here, in Rust.
 
 - **One binary, no runtime.** 19 MB with Metal and the server, and
-  completions, the API server, `download`, `bench` and `verify` are all
-  inside it. No wheels, no CUDA userspace to match against a driver.
-  PyTorch alone is 402 MB, before vLLM sits on top.
+  completions, the API server, `download`, `bench`, `batched-bench`,
+  `quantize`, `imatrix`, `gguf-split` and `verify` are all inside it. No
+  wheels, no CUDA userspace to match against a driver. PyTorch alone is
+  402 MB, before vLLM sits on top.
 - **Quantized end to end.** Weights stay quantized on mmap and
   dequantize inside the matmul, so an 8B model fits on a laptop.
   K-quants, the IQ tiers, MXFP4, F16 and BF16.
 - **Drop-in for llama.cpp.** Same flags, same sampler chain in the same
-  order. Tokenization is verified byte-for-byte on ten checkpoints, and
-  every engine number in [the speed table](benchmarks/RESULTS.md) was
-  measured against llama.cpp on the same host and the same file.
+  order, and the same tools: `quantize` writes Q8_0 and the K-quants
+  byte-identically to `llama-quantize`, with or without an importance
+  matrix, and `gguf-split`, `imatrix` and `batched-bench` are ports.
+  Tokenization is verified against libllama on twenty checkpoints under
+  both special-token settings, and every engine number in
+  [the speed table](benchmarks/RESULTS.md) was measured against
+  llama.cpp on the same host and the same file. 37 architectures run
+  with a logit comparison to back it; the rest stop and say what is
+  missing rather than guess.
 - **OpenAI-compatible server.** On Metal, multiple concurrent clients
   share one batched decode worker (llama.cpp slots + continuous batching,
   on by default). Paged KV shared across conversations, runtime model
-  swap, resumable streams, Anthropic and Responses endpoints, and
-  speculative decoding that stays lossless at any temperature. Point your
-  existing client at it.
+  swap, slot save and restore that refuses a mismatched checkpoint by
+  name, resumable streams, Anthropic and Responses endpoints, and
+  speculative decoding that stays lossless at any temperature. Point
+  your existing client at it.
 - **Structured output, enforced per token.** A GBNF grammar, a forced
-  `tool_choice`, or a tool's own `parameters` schema: a stack machine
-  masks every token that would break the constraint, so an invalid
-  answer is not reachable. No retry loop, no repair pass.
+  `tool_choice` in ten of the eleven tool-call wire formats, or a tool's
+  own `parameters` schema: a stack machine masks every token that would
+  break the constraint, so an invalid answer is not reachable. No retry
+  loop, no repair pass.
 - **Built for agents.** Reasoning streams into `reasoning_content`, tool
   calls parse in the eleven formats real checkpoints emit, and prompts
   are framed by the GGUF's own `tokenizer.chat_template`, compiled and
