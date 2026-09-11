@@ -12,10 +12,7 @@ use crate::attn::{
     encode_gqa_with_kv, encode_kv_store_append, encode_rope, LayerRope, MetalKvBuffers, MetalRope,
     RopeTarget, ScratchCaps,
 };
-use crate::elem::{
-    encode_add_rms_norm, encode_argmax, encode_gelu_mul, encode_rms_norm, encode_silu_mul,
-    encode_vec_add,
-};
+use crate::elem::{encode_argmax, encode_gelu_mul, encode_silu_mul, encode_vec_add};
 use crate::embd::{encode_get_rows, EmbdKind};
 use crate::gpu::{
     compute_encoder_concurrent, encode_matvec, resident_f32_buffer, resident_weight_buffer,
@@ -23,6 +20,7 @@ use crate::gpu::{
 };
 use crate::kernel_timing::SpanClock;
 use crate::mem_ranges::MemRanges;
+use crate::norm::{encode_add_rms_norm, encode_rms_norm};
 use crate::timing::{commit_wait_note, SubmitClock};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLCommandEncoder, MTLCommandQueue};

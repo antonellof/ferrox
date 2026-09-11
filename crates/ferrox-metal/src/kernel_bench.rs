@@ -9,10 +9,11 @@
 //! and the one to put beside a llama.cpp `us/run`. Hardware only.
 
 use crate::attn::{encode_gqa_for_bench, encode_rope, MetalRope, MetalRopeLayout, RopeTarget};
-use crate::elem::{encode_add_rms_norm, encode_gelu_mul, encode_rms_norm, encode_vec_add};
+use crate::elem::{encode_gelu_mul, encode_vec_add};
 use crate::gpu::{
     compute_encoder_concurrent, memory_barrier_buffers, shared_metal, MetalError, SharedMetal,
 };
+use crate::norm::{encode_add_rms_norm, encode_rms_norm};
 use crate::timing::{commit_wait_note, SubmitClock};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

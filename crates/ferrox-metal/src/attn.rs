@@ -53,11 +53,8 @@ pub use crate::decode_dense::{
 };
 use crate::dispatch::dispatch_counted;
 use crate::elem::{
-    encode_act_mul_f32_to_f16, encode_add_rms_norm, encode_add_rms_norm_batch,
-    encode_add_rms_norm_f32_to_f16_batch, encode_argmax, encode_f32_to_f16, encode_rms_norm,
-    encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_f32_to_f16_batch,
-    encode_rms_norm_per_head_batch, encode_silu_mul, encode_vec_add, encode_vec_add_at,
-    warm_prefill_elem_pipelines,
+    encode_act_mul_f32_to_f16, encode_argmax, encode_f32_to_f16, encode_silu_mul, encode_vec_add,
+    encode_vec_add_at, warm_prefill_elem_pipelines,
 };
 use crate::embd::encode_get_rows;
 use crate::gpu::{
@@ -69,6 +66,11 @@ use crate::gpu::{
 };
 use crate::mem_ranges::MemRanges;
 use crate::moe_ids::MoeIdsLog;
+use crate::norm::{
+    encode_add_rms_norm, encode_add_rms_norm_batch, encode_add_rms_norm_f32_to_f16_batch,
+    encode_rms_norm, encode_rms_norm_at, encode_rms_norm_batch, encode_rms_norm_f32_to_f16_batch,
+    encode_rms_norm_per_head_batch,
+};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{

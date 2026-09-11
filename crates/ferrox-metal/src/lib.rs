@@ -60,6 +60,9 @@ pub use dispatch::{metal_encode_stats, metal_encode_stats_reset, EncodeStats};
 pub mod elem;
 
 #[cfg(feature = "metal")]
+pub mod norm;
+
+#[cfg(feature = "metal")]
 pub mod embd;
 
 pub use capability::MetalProfile;
