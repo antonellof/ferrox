@@ -127,13 +127,47 @@ Gemma-2's dispatches are 7% of its host cost. The host lever is
 pipelining encode against execution; fusion is a GPU-side lever worth
 ~22% of GPU time.
 
+**2026-09-11: the table above is wrong, and the reason is worth more
+than the correction.** "GPU ms/tok" was the GPU time of ONE command
+buffer per token. A sampled decode token has TWO: the dense stack, and
+the lm_head in `launch_matvec_fused`, which had no timing tag. Its GPU
+time was therefore booked as host time. `FERROX_METAL_GPU_TIMING=1` now
+clocks every submission's encode phase, GPU phase and submit latency,
+and tags the lm_head. Per token, window means from one process (GPU
+columns load-immune; the host was not quiet, so the wall-derived ones
+are upper bounds):
+
+| Model | stack GPU | lm_head GPU | encode (both) | submit latency (both) | CPU between |
+|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 4.97-5.08 | **1.17-1.28** | 0.15-0.24 | 0.41-0.46 | ~0.06 |
+| Gemma-2-2B Q4_K_M | 12.03-12.44 | **2.78-2.91** | 0.42-0.45 | 0.81-0.88 | ~0.89 |
+
+So the "host" share was mostly the lm_head running on the GPU, and the
+part that IS the host divides three ways. **Encoding**, all ~2400
+argument-binding calls and ~420 dispatches and barriers, is **0.15-0.24 ms
+on Llama-3.2-1B and 0.42-0.45 ms on Gemma-2-2B, 2-3% of wall** -- the
+third independent measurement to say so, after the 0.61 µs injection
+slope (515 × 0.61 = 0.31 ms) and #156's removal of 48 ops for 0.04 ms.
+Argument packing and encode/execute pipelining are each bounded by that
+number, so neither was built. **Submit latency**, commit-to-GPU-start
+plus completion-to-wakeup, is ~0.2 ms per command buffer and there are
+two per token; folding the lm_head into the stack's buffer for sampled
+decode (the greedy fold already does) is the one host lever left, worth
+at most ~0.25 ms, 4% on the 1B. **CPU work between buffers** is Gemma's
+`final_logit_softcap`: a scalar `tanh` over 256k logits, 0.65 ms, more
+than that model's whole encode phase.
+
+And the GPU column changes the ranking: Gemma-2-2B's GPU time alone,
+12.03 + 2.78 = 14.8 ms, already exceeds llama.cpp's 14.74 ms token. The
+worst Metal row is a kernel gap after all, not a host one.
+
 ## Open
 
 | Issue | Gap | What is known |
 |---|---|---|
 | [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 22× to 34× | ~4× is tensor cores (`mul_mm` has none), ~5× is undiagnosed kernel efficiency. #148 bought 20–26% and ruled out dequant redundancy and occupancy |
 | [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing closed 9–19× to 2–5×. What limits the rest is not diagnosed — the access pattern was a real cost and was not the last one |
-| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, 1.11× worst row | kernels already beat llama.cpp's whole token, and the cost is host-side. [#156](https://github.com/antonellof/ferrox/pull/156) removed 13% of dispatches and 9% of barriers for **2.3%** of host time, so the count is not the lever and the hypothesis that it was is retired. Barriers were already hazard-driven. What is left is per-dispatch argument binding: ~2400 encoder calls per token against 418 dispatches and barriers |
+| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, 1.11× worst row | the "26% host" was an accounting error: the lm_head runs in a second, untimed command buffer, and its GPU time was booked as host. Encoding, argument binding included, is ~2% of wall (three measurements agree), so packing and pipelining are retired unbuilt. What is left on the host is ~0.2 ms of submit latency per command buffer (two per sampled token) and Gemma's 0.65 ms CPU softcap. Gemma-2's GPU time alone already exceeds llama.cpp's token, so the row is a kernel gap |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, 6.3× to 10.1× | was a missing kernel tier. [#159](https://github.com/antonellof/ferrox/pull/159) added AVX2 GEMMs for all five interleaved kinds and a per-workload dispatch rule, verified by execution on real AVX2 but **not yet benchmarked**, so this gap number still describes the code before it |
 | [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | the size rule landed in [#155](https://github.com/antonellof/ferrox/pull/155); the crossover constant is bracketed by the published numbers, not swept, and no before/after on a quiet host has been run. `MIN_TASK_MACS` is still there, which the issue asks to delete |
 | [#128](https://github.com/antonellof/ferrox/issues/128) | CPU decode dispatch, **closed** | The condvar wait was real and the cause was rayon's two-armed `join`: from a non-worker thread it injects and blocks on a mutex, ~150 times per token. [#167](https://github.com/antonellof/ferrox/pull/167) runs a whole forward in one `rayon::scope`. Note the trap: #128 had computed scheduling at 6.7% of a token and ruled it out, against a **stale denominator** taken before #155 removed the repack that inflated the token to 17 ms. At ~5 ms the same fixed cost is a much larger share |
