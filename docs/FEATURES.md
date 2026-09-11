@@ -205,8 +205,13 @@ llama.cpp's method, agreeing with `llama-perplexity` to within a fifth
 of one standard error on five checkpoints. Where the two differ, the gap
 is monotone in the quant and has the sign the documented `vec_dot_type`
 difference predicts. `ferrox quantize` writes **`Q8_0`, `Q4_K_S`,
-`Q4_K_M`, `Q5_K_M` and `Q6_K` byte-identically** to
-`llama_model_quantize()`, and refuses every other target by name.
+`Q4_K_M`, `Q5_K_S`, `Q5_K_M` and `Q6_K` byte-identically** to
+`llama_model_quantize()`, with or without an importance matrix
+(`--imatrix`, 311 of 311 tensors identical to `llama-quantize
+--imatrix` on a BF16 Qwen3-0.6B for all five targets tried), and
+refuses every other target by name. `ferrox imatrix` is
+`llama-imatrix`: same file format in both directions, so either tool's
+matrix feeds either quantizer.
 **The claim that Q4_K could never be byte-identical was wrong**, and it
 was wrong for an instructive reason: llama.cpp's `sumlx += w*x[i]*l`
 is contracted by its compiler into a single fused multiply-add, and

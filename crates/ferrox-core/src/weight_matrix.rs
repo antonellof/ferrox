@@ -1115,6 +1115,7 @@ impl WeightMatrix {
             self.cols(),
             "activation length must match matrix column count"
         );
+        crate::activation_tap::observe(self, x, 1);
         #[cfg(feature = "cuda")]
         {
             if cuda_dense_enabled() {
@@ -1864,6 +1865,7 @@ impl WeightMatrix {
         if batch_size == 0 {
             return Vec::new();
         }
+        crate::activation_tap::observe(self, x_batch, batch_size);
 
         /// Raw pointer to this function's `[batch][rows]` output, shared
         /// across rayon tasks.

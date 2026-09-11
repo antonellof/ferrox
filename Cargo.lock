@@ -446,6 +446,7 @@ name = "ferrox-cli"
 version = "0.19.1"
 dependencies = [
  "anyhow",
+ "byteorder",
  "clap",
  "ferrox-core",
  "ferrox-cuda",

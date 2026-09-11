@@ -61,7 +61,19 @@ pub fn probe_q6_k_group(xs: &[f32]) -> (f32, [i8; GROUP_ELEMS]) {
 
 /// Encodes one Q6_K super-block (exactly [`Q6_K_BLOCK_ELEMS`] values)
 /// and appends its [`Q6_K_BLOCK_BYTES`] bytes to `out`.
-pub fn encode_block_q6_k(block: &[f32; Q6_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
+///
+/// `qw` is this super-block's slice of the importance matrix, or `None`
+/// for the plain fit. Q6_K's imatrix path (`quantize_row_q6_K_impl`,
+/// `ggml-quants.c:1793`) is the plain path with the raw slice handed to
+/// `make_qx_quants` as its `qw` -- no `sigma2` blend, no different
+/// grid, no different stage 2; the blend is there in the C, commented
+/// out. So this is the one K-quant whose imatrix variant is a single
+/// argument and nothing else.
+pub fn encode_block_q6_k(
+    block: &[f32; Q6_K_BLOCK_ELEMS],
+    qw: Option<&[f32; Q6_K_BLOCK_ELEMS]>,
+    out: &mut Vec<u8>,
+) {
     // `l` is carried from the fit into the recode below, and the recode
     // skips any group whose reconstructed `d` rounded to zero (`if (!d)
     // continue;` upstream). The codes then written are the ones the fit
@@ -79,7 +91,7 @@ pub fn encode_block_q6_k(block: &[f32; Q6_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
             &mut l[lo..lo + GROUP_ELEMS],
             NMAX,
             RMSE_TYPE,
-            None,
+            qw.map(|q| &q[lo..lo + GROUP_ELEMS]),
         );
         *out_scale = scale;
         let abs_scale = scale.abs();
@@ -164,14 +176,15 @@ pub fn encode_block_q6_k(block: &[f32; Q6_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
 /// would produce bytes the caller's plan sized for Q6_K. The refusal
 /// belongs to the row and the fallback, if it is ever wanted, belongs
 /// to the planner.
-pub fn encode_row_q6_k(src: &[f32], out: &mut Vec<u8>) -> Option<()> {
+pub fn encode_row_q6_k(src: &[f32], qw: Option<&[f32]>, out: &mut Vec<u8>) -> Option<()> {
     let (blocks, rest) = src.as_chunks::<Q6_K_BLOCK_ELEMS>();
     if !rest.is_empty() {
         return None;
     }
+    let qw_blocks = super::imatrix_blocks::<Q6_K_BLOCK_ELEMS>(qw, blocks.len())?;
     out.reserve(blocks.len() * Q6_K_BLOCK_BYTES);
-    for block in blocks {
-        encode_block_q6_k(block, out);
+    for (i, block) in blocks.iter().enumerate() {
+        encode_block_q6_k(block, qw_blocks.map(|q| &q[i]), out);
     }
     Some(())
 }
@@ -383,7 +396,7 @@ mod tests {
     fn q6_k_matches_llama_cpp_quantize_row_q6_k_ref() {
         let x = k_quant_fixture();
         let mut got = Vec::new();
-        encode_row_q6_k(&x, &mut got).unwrap();
+        encode_row_q6_k(&x, None, &mut got).unwrap();
         assert_eq!(got.len(), LLAMA_CPP_Q6_K_GOLDEN.len());
         for (b, (g, w)) in got
             .as_chunks::<Q6_K_BLOCK_BYTES>()
@@ -403,9 +416,9 @@ mod tests {
     #[test]
     fn a_row_that_is_not_a_whole_number_of_super_blocks_is_refused() {
         let mut out = Vec::new();
-        assert!(encode_row_q6_k(&[0.5; Q6_K_BLOCK_ELEMS + 1], &mut out).is_none());
-        assert!(encode_row_q6_k(&[0.5; 16], &mut out).is_none());
-        assert!(encode_row_q6_k(&[], &mut out).is_some());
+        assert!(encode_row_q6_k(&[0.5; Q6_K_BLOCK_ELEMS + 1], None, &mut out).is_none());
+        assert!(encode_row_q6_k(&[0.5; 16], None, &mut out).is_none());
+        assert!(encode_row_q6_k(&[], None, &mut out).is_some());
     }
 
     /// An all-zero super-block is 210 zero bytes, which is what
@@ -416,7 +429,7 @@ mod tests {
     #[test]
     fn an_all_zero_super_block_is_all_zero_bytes_the_way_llama_cpp_writes_it() {
         let mut out = Vec::new();
-        encode_row_q6_k(&[0.0; Q6_K_BLOCK_ELEMS], &mut out).unwrap();
+        encode_row_q6_k(&[0.0; Q6_K_BLOCK_ELEMS], None, &mut out).unwrap();
         assert_eq!(out, vec![0u8; Q6_K_BLOCK_BYTES]);
     }
 
@@ -440,7 +453,7 @@ mod tests {
     fn every_element_lands_on_its_nearest_representable_level() {
         let x = k_quant_fixture();
         let mut bytes = Vec::new();
-        encode_row_q6_k(&x, &mut bytes).unwrap();
+        encode_row_q6_k(&x, None, &mut bytes).unwrap();
         let back = dequant_q6_k(&bytes).unwrap();
         assert_eq!(back.len(), x.len());
 
@@ -476,7 +489,7 @@ mod tests {
     fn the_group_scales_are_stored_signed() {
         let x = k_quant_fixture();
         let mut bytes = Vec::new();
-        encode_row_q6_k(&x, &mut bytes).unwrap();
+        encode_row_q6_k(&x, None, &mut bytes).unwrap();
         let any_negative = bytes
             .as_chunks::<Q6_K_BLOCK_BYTES>()
             .0

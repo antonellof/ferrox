@@ -31,15 +31,43 @@
 //! `q8_0_matches_llama_cpp_quantize_row_q8_0_ref` for the golden.
 
 pub mod fit;
+#[cfg(test)]
+mod imatrix_golden;
 pub mod q4_k;
 pub mod q5_k;
 pub mod q6_k;
+pub(crate) mod qp_quants;
 #[cfg(test)]
 mod testdata;
 
 use half::f16;
 
 use crate::{Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
+
+/// Splits a row's importance-matrix weights into one slice per
+/// super-block, for the three K-quant row encoders.
+///
+/// The outer `Option` is the refusal: `None` when `qw` is present but
+/// does not cover exactly `n_blocks` super-blocks, the same answer the
+/// row encoders give a ragged row. The inner `Option` is simply whether
+/// there is an imatrix at all. One function rather than the same
+/// length check spelled in each encoder, because a check that is right
+/// in two of three places is the bug shape this repo names first.
+pub(crate) fn imatrix_blocks<const N: usize>(
+    qw: Option<&[f32]>,
+    n_blocks: usize,
+) -> Option<Option<&[[f32; N]]>> {
+    match qw {
+        None => Some(None),
+        Some(qw) => {
+            let (blocks, rest) = qw.as_chunks::<N>();
+            if !rest.is_empty() || blocks.len() != n_blocks {
+                return None;
+            }
+            Some(Some(blocks))
+        }
+    }
+}
 
 /// Encodes one Q8_0 block (exactly [`Q8_0_BLOCK_ELEMS`] values) and
 /// appends its [`Q8_0_BLOCK_BYTES`] bytes to `out`.
