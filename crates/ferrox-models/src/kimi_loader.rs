@@ -62,7 +62,8 @@ pub enum KimiLoadError {
 }
 
 /// Reads any real tensor as an owned `f32` vector, dispatching on its
-/// real declared dtype (`F32` direct, `BF16` dequantized) -- exposed
+/// real declared dtype through [`crate::safetensors_f32::widen_to_f32`]
+/// (`F32` direct, `F16` / `BF16` widened losslessly) -- exposed
 /// `pub` since not every real weight (e.g. the per-layer
 /// `input_layernorm.weight`/`post_attention_layernorm.weight`, which
 /// aren't nested inside `KdaAttnWeights`/`MlaAttnWeights`/
@@ -73,18 +74,8 @@ pub fn load_f32_vec(shard: &ShardedSafetensors, name: &str) -> Result<Vec<f32>, 
         .tensor_info(name)
         .ok_or_else(|| ferrox_safetensors::SafetensorsError::TensorNotFound(name.to_string()))?;
     let raw = shard.tensor_bytes(name)?;
-    match info.dtype {
-        SafetensorsDtype::F32 => {
-            let mut out = Vec::with_capacity(raw.len() / 4);
-            for chunk in raw.as_chunks::<4>().0 {
-                out.push(f32::from_le_bytes(*chunk));
-            }
-            Ok(out)
-        }
-        SafetensorsDtype::BF16 => ferrox_quant::dequant_bf16(raw)
-            .map_err(|_| KimiLoadError::UnsupportedDtype(name.to_string(), info.dtype)),
-        other => Err(KimiLoadError::UnsupportedDtype(name.to_string(), other)),
-    }
+    crate::safetensors_f32::widen_to_f32(info.dtype, raw)
+        .ok_or_else(|| KimiLoadError::UnsupportedDtype(name.to_string(), info.dtype))
 }
 
 fn load_weight_matrix(

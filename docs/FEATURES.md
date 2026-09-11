@@ -287,7 +287,17 @@ OpenAI-compatible HTTP API:
   consumed` rejected the `cls.*` tensors nobody read. Verified end to
   end against `ms-marco-MiniLM-L6-v2`: the order matches a HuggingFace
   reference, which needed the document to be segment 1 rather than
-  llama.cpp's all-zero token types
+  llama.cpp's all-zero token types. The SCALE matches too, once the
+  pooler is back: llama.cpp's converter deletes `bert.pooler.dense`
+  from every BERT reranker, so the converter's output scores on about
+  plus or minus 0.2 where the checkpoint was trained to produce about
+  plus or minus 11 (#82). `ferrox splice-pooler` writes a GGUF that
+  carries the pooler, tied to the checkpoint by the classifier both
+  files hold rather than by a name; on the spliced file every score
+  is within 0.051 of HuggingFace across four query sets. A file
+  without the pooler still serves, with `ferrox_score_head:
+  classifier(cls)` on every response, so a client can tell which range
+  it is reading
 - Anthropic Messages: `POST /v1/messages` streaming and buffered
   (thinking and tool blocks, protocol-native `ping` keepalive) plus
   `POST /v1/messages/count_tokens`
