@@ -80,6 +80,31 @@ kernel void silu_mul_f32_to_f16(
 }
 "#;
 
+/// Gemma-2's `final_logit_softcapping`, in place over a vocabulary of
+/// logits: `y = cap * tanh(y * inv)`, with `inv = 1 / cap` computed on
+/// the host exactly as `ferrox_core::matmul::softcap_inplace` computes
+/// it, so the argument to `tanh` is the same float on both sides and
+/// `precise::tanh` is what separates them (about an ulp). This ran on
+/// the CPU after the lm_head's command buffer had completed, 0.65 ms
+/// per token for 256k logits (PR #202), more than the whole encode
+/// phase; as an epilogue in that buffer it is one dispatch.
+const SOFTCAP_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void softcap_f32(
+    device float* y [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    constant float& cap [[buffer(2)]],
+    constant float& inv [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        y[i] = cap * precise::tanh(y[i] * inv);
+    }
+}
+"#;
+
 /// `y[i] += a * x[i]` — MoE weighted expert accumulate.
 const AXPY_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
@@ -302,6 +327,60 @@ pub(crate) fn encode_silu_mul(
         encoder,
         MTLSize {
             width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// `y = cap * tanh(y / cap)` in place, Gemma-2's final logit softcap.
+/// A `cap <= 0.0` encodes nothing, exactly as the CPU version applies
+/// nothing.
+pub(crate) fn encode_softcap(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    y: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+    cap: f32,
+) -> Result<(), MetalError> {
+    if cap <= 0.0 {
+        return Ok(());
+    }
+    let pipe = ensure_pipeline(device, SOFTCAP_KERNEL_SRC, "softcap_f32")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(y), 0, 0);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            1,
+        );
+        let mut cap_f = cap;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut cap_f as *mut f32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+        // The same `1.0 / softcap` the CPU path multiplies by.
+        let mut inv_f = 1.0f32 / cap;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut inv_f as *mut f32 as *mut _).unwrap(),
+            4,
+            3,
+        );
+    }
+    let tg = 256usize;
+    dispatch_counted(
+        encoder,
+        MTLSize {
+            width: (n as usize).div_ceil(tg),
             height: 1,
             depth: 1,
         },
@@ -652,6 +731,46 @@ pub(crate) mod tests {
             let tol = 1e-4 * a.abs().max(1.0);
             assert!((a - b).abs() <= tol, "fused out {i}: {a} vs {b}");
         }
+    }
+
+    /// The GPU softcap must be the host `softcap_inplace` to within an
+    /// ulp of `tanh`, because the sampled decode path applies one and
+    /// the CPU reference path the other, and `ferrox verify` compares
+    /// their tokens. A `cap <= 0` must apply nothing, as the host does.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn softcap_matches_the_host_kernel() {
+        let shared = shared_metal().expect("metal");
+        let device = &shared.device;
+        let n = 1000usize;
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin() * 90.0).collect();
+        for cap in [30.0f32, 50.0] {
+            let inv = 1.0 / cap;
+            let want: Vec<f32> = x.iter().map(|v| cap * (v * inv).tanh()).collect();
+            let buf = upload(device, &x).unwrap();
+            let cmd = shared.queue.commandBuffer().unwrap();
+            let enc = cmd.computeCommandEncoder().unwrap();
+            encode_softcap(&enc, device, &buf, n as u32, cap).unwrap();
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            let got = read_f32(&buf, n);
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() <= 2e-6 * w.abs().max(1.0),
+                    "cap {cap} elem {i}: gpu {g} host {w}"
+                );
+                assert!(g.abs() < cap, "cap {cap} elem {i}: {g} escaped the cap");
+            }
+        }
+        let buf = upload(device, &x).unwrap();
+        let cmd = shared.queue.commandBuffer().unwrap();
+        let enc = cmd.computeCommandEncoder().unwrap();
+        encode_softcap(&enc, device, &buf, n as u32, 0.0).unwrap();
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        assert_eq!(read_f32(&buf, n), x, "a cap of 0 applies nothing");
     }
 
     #[test]
