@@ -8,6 +8,34 @@ same way an editor would. That rule earns its keep. Every screen here
 goes through the public API, so the API cannot rot without a screen
 breaking first and showing you.
 
+## Screens
+
+Captured at 3200 by 2000 from a real `ferrox-server` on Apple Metal,
+serving Llama-3.2-3B-Instruct Q4_K_M. Nothing is mocked; the timings
+under each answer are the server's own usage numbers.
+
+**Chat.** One model selector, conversations addressed by URL, and the
+server's timings under every answer.
+
+<img src="../docs/assets/studio-chat.webp" alt="Chat" width="100%" />
+
+**Models.** The inventory the server can see, with the loaded checkpoint
+marked. Picking a model happens in the chat header; this screen
+installs, removes and reports.
+
+<img src="../docs/assets/studio-models.webp" alt="Models" width="100%" />
+
+**Activity.** Every request this process served, keyed by the request
+id the response carried, with the counters and sparklines above it.
+
+<img src="../docs/assets/studio-activity.webp" alt="Activity" width="100%" />
+
+**Connect.** The base URL and key this app uses, and snippets for curl
+and the OpenAI SDK filled in from the model the server reports right
+now.
+
+<img src="../docs/assets/studio-connect.webp" alt="Connect" width="100%" />
+
 ## Working on it
 
 ```bash
