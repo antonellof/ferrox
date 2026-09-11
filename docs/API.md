@@ -589,14 +589,14 @@ prevent. A load-time NOTE says the same thing to an operator, because a
 log is what an operator sees and a JSON field is the only one a client
 can act on.
 
-Almost every GGUF in the wild is the second regime. llama.cpp's
-converter drops the pooler by name
-(`conversion/bert.py`, "we are only using BERT for embeddings so we do
-not need the pooling layer"), and under llama.cpp's tensor naming the
-pooler slot is `cls`, with `cls.output` being the classifier that
-follows it (`src/llama-graph.cpp`: `cls`, then bias, then `tanh`, then
-an optional head norm). ferrox reads `cls` when a file carries it and
-refuses to invent one when it does not.
+Every published GGUF is the second regime. llama.cpp's converter drops
+the pooler by name (`conversion/bert.py`, `BertModel.filter_tensors`,
+"we are only using BERT for embeddings so we do not need the pooling
+layer"; still unconditional on `master` as of 2026-09-11), and under
+llama.cpp's tensor naming the pooler slot is `cls`, with `cls.output`
+being the classifier that follows it (`src/llama-graph.cpp`: `cls`,
+then bias, then `tanh`, then an optional head norm). ferrox reads `cls`
+when a file carries it and refuses to invent one when it does not.
 
 An absent pooler is a NOTE rather than a refusal on purpose: nothing in
 the file distinguishes "trained without a pooler" from "converted
@@ -604,8 +604,41 @@ without one", and `jina-reranker-v1-tiny-en` is a real checkpoint whose
 head IS a direct projection. Refusing would reject a valid model to
 flag a lossy conversion.
 
-Tracked as [#82](https://github.com/antonellof/ferrox/issues/82), which
-stays open because no published GGUF carries the tensor yet.
+### Getting the first regime: `ferrox splice-pooler`
+
+The pooler is in the checkpoint's own safetensors, and `ferrox
+splice-pooler` writes a GGUF that carries it (`docs/CLI.md`). The tie
+between the two files is the classifier they both hold, compared
+element-wise to within the GGUF's storage precision; the GGUF's
+`general.name` is deliberately NOT trusted, because the published
+`ms-marco-MiniLM-L6-v2-Q8_0.gguf` names the L12 model. A pooler from
+any other checkpoint is refused naming the element that disagrees.
+
+Measured on `ms-marco-MiniLM-L6-v2`, four query sets, seventeen pairs,
+against the NumPy transcription of `BertForSequenceClassification`
+(`scripts/rerank_reference_ms_marco.py`, `hf` rows):
+
+| | `relevance_score` range | largest deviation from HuggingFace | orderings |
+|---|---|---|---|
+| converter's GGUF, `classifier(cls)` | about `-0.25 .. 0.15` | not comparable (a different function) | 4 of 4 match |
+| spliced, `classifier(tanh(pooler(cls)))` | `-11.19 .. 10.93` | `0.051` | 4 of 4 match |
+
+The "How many people live in Berlin?" set, converter's file then
+spliced, HuggingFace in the last row:
+
+```text
+[-0.027, 0.073, -0.175, -0.250, 0.009]
+[-4.302, 8.604, -11.100, -11.188, 0.647]
+[-4.320, 8.607, -11.101, -11.188, 0.637]
+```
+
+llama.cpp loads the spliced file and runs the pooler too (its
+`build_pooling` RANK arm reads `cls`); its scores still differ from
+HuggingFace by its all-zero token types, described above.
+
+Tracked as [#82](https://github.com/antonellof/ferrox/issues/82): the
+converter's output is still uncalibrated, and the splice is the
+in-tree route until upstream keeps the tensor.
 
 ## Errors that retrying will not fix
 

@@ -24,6 +24,7 @@ mod quant_sensitivity;
 mod quantize;
 mod run;
 mod serve_bench;
+mod splice_pooler;
 mod verify;
 mod verify_engine;
 
@@ -129,6 +130,12 @@ enum Commands {
     /// `<prefix>-NNNNN-of-MMMMM.gguf` names.
     #[command(name = "gguf-split")]
     GgufSplit(gguf_split::GgufSplitArgs),
+    /// Write a reranker GGUF that carries the pooler llama.cpp's
+    /// converter dropped (`bert.pooler.dense` -> `cls`), taken from
+    /// the checkpoint's own safetensors, so `/v1/rerank` scores on the
+    /// trained range instead of an uncalibrated one (issue #82).
+    #[command(name = "splice-pooler")]
+    SplicePooler(splice_pooler::SplicePoolerArgs),
     /// Print GGUF header metadata and tensor list for a model file.
     Inspect { path: String },
     /// Dry-run residency plan for a GGUF checkpoint: what it would
@@ -568,6 +575,7 @@ const SUBCOMMANDS: &[&str] = &[
     "quantize",
     "imatrix",
     "gguf-split",
+    "splice-pooler",
     "parity",
     "perplexity",
     "speculative",
@@ -810,6 +818,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Quantize(args) => quantize::run(args)?,
         Commands::Imatrix(args) => imatrix::run(args)?,
         Commands::GgufSplit(args) => gguf_split::run(args)?,
+        Commands::SplicePooler(args) => splice_pooler::run(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
             if file.shard_count() > 1 {

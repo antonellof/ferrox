@@ -833,6 +833,59 @@ metadata keys are ordered: 54 bytes on each later shard (the three
 work across the two tools: llama.cpp merges a set ferrox split, and
 ferrox merges a set llama.cpp split, each producing a 24,032-byte file.
 
+## Put a reranker's pooler back (`ferrox splice-pooler`)
+
+Every `BertForSequenceClassification` reranker GGUF in circulation is
+missing its pooler: llama.cpp's converter deletes `bert.pooler.dense`
+by name (`conversion/bert.py`, `BertModel.filter_tensors`, "we are only
+using BERT for embeddings so we don't need the pooling layer";
+unconditional on `master` as of 2026-09-11). The head then runs as
+`classifier(cls)` where the checkpoint was trained as
+`classifier(tanh(pooler(cls)))`: same ORDER, a score range about fifty
+times narrower, so a threshold copied from the model card never fires
+(issue #82). This writes a GGUF that carries the tensor.
+
+```bash
+ferrox download cross-encoder/ms-marco-MiniLM-L6-v2 model.safetensors --local-dir models/ms-marco-MiniLM-L6-v2
+ferrox splice-pooler -m models/ms-marco-MiniLM-L6-v2-Q8_0.gguf \
+    --safetensors models/ms-marco-MiniLM-L6-v2/model.safetensors \
+    -o models/ms-marco-MiniLM-L6-v2-Q8_0-pooled.gguf
+```
+
+The output is the input, every key and every tensor byte for byte, plus
+`cls.weight` / `cls.bias` (F32, under llama.cpp's own names) and one
+provenance key, `ferrox.rerank.pooler_source`. ferrox loads it with no
+further change and `/v1/rerank` reports
+`ferrox_score_head: classifier(tanh(pooler(cls)))`; llama.cpp loads it
+too, and its `build_pooling` RANK arm runs the pooler as well.
+
+**The pooler is tied to the checkpoint by the classifier, not by a
+name.** The GGUF's own metadata is not evidence: the published
+`ms-marco-MiniLM-L6-v2-Q8_0.gguf` says `general.name = Ms Marco MiniLM L
+12 v2` and points `base_model.0.repo_url` at the L12 repo, while its six
+layers and its scores are L6's. So the one tensor BOTH files carry,
+`cls.output.*` in the GGUF and `classifier.*` in the safetensors, must
+agree element-wise to within the GGUF's own storage precision (1/128 of
+the tensor's largest magnitude, which admits F32, F16, BF16 and Q8_0
+rounding and nothing coarser; a head stored coarser is refused by
+dtype). A safetensors whose classifier the GGUF does not contain is
+refused naming the tensor, the element and both values, and nothing is
+written. On the published file the measured agreement is `1.5e-5`
+against a bound of `4.8e-4`.
+
+Also refused: a GGUF that is not `bert`, one that already carries
+`cls.weight` (the refusal says where it was spliced from), one with no
+`cls.output` at all, a split file (merge it first), and a pooler of
+another width. The written file is reopened and passed through the
+rerank head loader before the command returns, so the only file it
+leaves behind is one the loader has accepted with the pooler in place.
+
+Measured on `ms-marco-MiniLM-L6-v2`, four query sets, seventeen pairs,
+against the NumPy transcription of HuggingFace's
+`BertForSequenceClassification` (`scripts/rerank_reference_ms_marco.py`):
+before, scores in about `-0.25..0.15`; after, `-11.19..10.93`, the
+largest deviation from HuggingFace `0.051`, every ordering identical.
+
 ## Hugging Face Hub (`download`, `pull`)
 
 Fetches a GGUF over HTTPS directly. No Python and no
