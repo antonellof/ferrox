@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 10,
+        n, 9,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -119,7 +119,13 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          needed of the plumbing that the first did not; `step35`'s half-width rotary \
          landed on `ferrox_models::swa_geometry` as the two-valued width llama.cpp's \
          `n_rot(il)` already was, and lifted Laguna-XS.2's `rope.dimension_count_swa` \
-         refusal by name with it \
+         refusal by name with it, and 10 until `mistral3` closed on the per-position \
+         attention temperature (`ferrox_models::attn_temperature`, \
+         tests/attn_temperature_graphs.rs) -- the reach measured first, three graphs of \
+         140, the other two on their own engines: `llama4` seeds the constants from \
+         literals and `deepseek2` / `mistral4` read the same key, which the MLA loader now \
+         refuses by name where it dropped it; its `yarn_log_multiplier` half found YaRN's \
+         magnitude term missing for every architecture (`ferrox_models::yarn_magnitude`) \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -371,7 +377,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 10);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 9);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -835,11 +841,8 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         // Batch 4. `maincoder` and `bailingmoe` were here and are now
         // audited; see `tests/one_match_arm_graphs.rs`.
         ("arctic", TriageClass::NewCode, "PARALLEL dense+MoE"),
-        (
-            "mistral3",
-            TriageClass::NewCode,
-            "attention temperature tuning",
-        ),
+        // `mistral3` was here on "attention temperature tuning" and is
+        // audited; see `tests/attn_temperature_graphs.rs`.
         (
             "nanbeige",
             TriageClass::NewCode,
@@ -1072,7 +1075,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 9, 1),
+        (0, 0, 8, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1112,7 +1115,14 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          two activation bodies, and the clamp's routed-versus-dense SITE the one thing the \
          second needed that the first did not; `step35`'s half-width rotary landed on \
          `ferrox_models::swa_geometry` as the two-valued width `n_rot(il)` already was \
-         upstream, which lifted Laguna-XS.2's second-rotary-width refusal by name. \
+         upstream, which lifted Laguna-XS.2's second-rotary-width refusal by name, and \
+         9 to 8 when `mistral3` closed on the per-position attention temperature \
+         (`ferrox_models::attn_temperature`) -- one cause behind three graphs, measured \
+         first, and only this one on the generic path: `llama4` (literals, its own \
+         engine) and `deepseek2` / `mistral4` (the same key, the MLA engine, which \
+         refuses it by name now) say so. Its verdict's other half, \
+         `yarn_log_multiplier`, turned out to adjust a YaRN magnitude term ferrox did \
+         not apply for ANY architecture (`ferrox_models::yarn_magnitude`). \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1121,7 +1131,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 10);
+    assert_eq!(fixture + arm + new_code + unknown, 9);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

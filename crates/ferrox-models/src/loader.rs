@@ -936,6 +936,26 @@ impl ModelConfig {
         // (`n_tokens + 8`, matching `tools/llama_logits.c`).
         let rope_orig_ctx = metadata_u64_any(file, &[key("rope.scaling.original_context_length")])
             .map(|v| v as usize);
+
+        // The per-position attention temperature (`crate::attn_temperature`).
+        // `mistral3.cpp:15` floors it on `hparams.n_ctx_orig_yarn`, which
+        // `llama-model.cpp:1164-1165` seeds from `context_length` BEFORE
+        // the YaRN key overrides it -- so a Ministral file with no YaRN
+        // key floors on its context length, and the resolver is handed
+        // that value rather than the key. Before this existed the key
+        // loaded and was silently dropped on the one generic-path
+        // architecture whose graph applies it.
+        let attn_temperature = crate::attn_temperature::resolve_attn_temperature(
+            &arch,
+            crate::attn_temperature::DeclaredTemperature {
+                scale: metadata_f32_any(file, &[key("attention.temperature_scale")]),
+                length: metadata_u64_any(file, &[key("attention.temperature_length")]),
+                n_ctx_orig_yarn: rope_orig_ctx
+                    .map(|v| v as u64)
+                    .or_else(|| metadata_u64_any(file, &[key("context_length")])),
+            },
+        )
+        .map_err(|e| LoadError::UnsupportedFeature(arch.clone(), e.message(&arch)))?;
         // `rope_freqs.weight` outranks the LongRoPE pair (llama.cpp
         // `get_rope_factors` checks it first), so a checkpoint carrying
         // it never populates these and the runtime re-pick below cannot
@@ -1008,8 +1028,9 @@ impl ModelConfig {
         let rope_dim = widths.full;
         let rope_dim_swa = widths.swa;
 
-        // See `ModelConfig::rope_attn_factor`.
-        let rope_attn_factor = metadata_f32_any(file, &[key("rope.scaling.attn_factor")])
+        // See `ModelConfig::rope_attn_factor`. `mut` because YaRN's
+        // magnitude term is folded into it below.
+        let mut rope_attn_factor = metadata_f32_any(file, &[key("rope.scaling.attn_factor")])
             .filter(|f| f.is_finite() && *f > 0.0)
             .unwrap_or(1.0);
 
@@ -1089,6 +1110,24 @@ impl ModelConfig {
         let rope_freqs = match yarn_scaling_from_gguf(file, &arch, rope_orig_ctx) {
             None => rope_freqs,
             Some(scaling) => {
+                // YaRN's MAGNITUDE half (`crate::yarn_magnitude`):
+                // llama.cpp multiplies the rotated channels of q and k
+                // by `get_mscale(factor, 1) / get_mscale(factor,
+                // log_mul)` on top of `rope.scaling.attn_factor`
+                // (`llama-context.cpp:196-231` with ggml's `rope_yarn`
+                // term cancelled), and ferrox applied only the key.
+                // Folded into the same field so it reaches the CPU
+                // helper and the Metal `mscale` uniform through one
+                // value. Gated on the same `Some(scaling)` as the
+                // frequency half, so a file ferrox does not rewrite
+                // (no `original_context_length`) takes neither half.
+                rope_attn_factor *= crate::yarn_magnitude::yarn_attn_magnitude(
+                    scaling.factor,
+                    crate::yarn_magnitude::yarn_log_mul_for(
+                        &arch,
+                        metadata_f32_any(file, &[key("rope.scaling.yarn_log_multiplier")]),
+                    ),
+                );
                 let rotary_dim = rope_dim.unwrap_or(head_dim);
                 if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) {
                     best_effort_fields.push(
@@ -1258,6 +1297,7 @@ impl ModelConfig {
             embedding_scale,
             residual_scale: multipliers.residual_scale,
             clamp_kqv,
+            attn_temperature,
             logit_multiplier: multipliers.logit_multiplier,
             attention_scale,
             rope_attn_factor,

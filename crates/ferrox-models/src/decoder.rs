@@ -806,7 +806,7 @@ impl Decoder {
     /// The per-model facts no fused Metal kernel implements, as ONE
     /// predicate the four Metal eligibility checks share.
     ///
-    /// Four today. `residual_scale`: every fused launch that folds a
+    /// Five today. `residual_scale`: every fused launch that folds a
     /// residual add in -- the dense decode stack, the resident MoE
     /// decode stack, and both prefill stacks -- adds the branch output
     /// to the stream on device, with no uniform for a multiplier, so a
@@ -825,6 +825,10 @@ impl Decoder {
     /// (`n_heads` is a launch argument, `MetalKvBuffers` one geometry),
     /// so a model whose layers disagree (`crate::layer_shapes`, deci /
     /// openelm) stays on the host bodies, which read each layer's own.
+    /// And the per-position attention temperature
+    /// (`crate::attn_temperature`): no fused launch takes a per-token Q
+    /// scale, so a Ministral-3 layer served by any of them would attend
+    /// at temperature 1 while the host bodies step it with position.
     /// Either way it is the same weights answering differently
     /// depending on which backend took the token, the exact failure
     /// `attention_scale` is fenced off for next door.
@@ -837,6 +841,7 @@ impl Decoder {
     fn metal_can_serve_model(config: &ModelConfig) -> bool {
         config.residual_scale.is_none()
             && config.clamp_kqv.is_none()
+            && config.attn_temperature.is_none()
             // `model_ffn_act` is `None` for an activation that varies
             // by layer (xIELU's parameters), which no fused kernel
             // takes; `fused_kernel_gelu_flag` is `None` for one no
@@ -4307,6 +4312,10 @@ impl Decoder {
                 // refusal that keeps those arms out of reach when
                 // `attention_scale` is set is in `layer_supports_metal_attn`.
                 self.apply_attention_scale(&mut q_batch);
+                // Same placement and same fence, per row: row `b` of this
+                // batch is position `start_pos + b`, which is what the
+                // RoPE loop above used for it.
+                self.apply_attn_temperature(&mut q_batch, q_width, |b| start_pos + b);
 
                 // ROWS, not positions: it is added to `b + 1` below to give
                 // each query in the batch the length of the KV it attends
@@ -4691,6 +4700,7 @@ impl Decoder {
                 // checkpoint carrying one answered at one temperature when
                 // decoded alone and another when batched with its neighbours.
                 self.apply_attention_scale(&mut q_batch);
+                self.apply_attn_temperature(&mut q_batch, q_width, |b| positions[b]);
 
                 let mut attn_out_batch = vec![0f32; batch_size * q_width];
                 for b in 0..batch_size {
@@ -6849,6 +6859,46 @@ mod metal_rope_tests {
             "...and the prefill dense stack"
         );
         assert!(!Decoder::metal_can_serve_model(&shaped));
+    }
+
+    /// A per-position attention temperature keeps every fused Metal
+    /// path off the model, through the same predicate.
+    ///
+    /// No fused launch takes a per-token Q scale: the host bodies
+    /// multiply Q by `log(floor(pos / floor) + 1) * scale + 1` after
+    /// RoPE (`crate::attn_temperature`), and a Ministral-3 layer served
+    /// by a fused launch would attend at temperature 1 while its
+    /// neighbours on the host stepped with position -- the same
+    /// disagreement the three fences above exist for. Only reachable
+    /// in a `--features metal` build.
+    #[test]
+    fn a_per_position_temperature_keeps_the_model_off_every_fused_metal_path() {
+        use crate::attn_temperature::AttnTemperature;
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut tempered = plain;
+        tempered.attn_temperature = Some(AttnTemperature {
+            scale: 0.5,
+            floor_scale: std::num::NonZeroU32::new(2).unwrap(),
+            offset: 0.0,
+        });
+        let d = Decoder::new_random_small(tempered.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a per-position Q scale no Metal kernel applies must refuse the fused attention"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &tempered),
+            "...and the prefill dense stack"
+        );
+        assert!(!Decoder::metal_can_serve_model(&tempered));
     }
 
     /// An FFN activation no fused kernel spells keeps the model off

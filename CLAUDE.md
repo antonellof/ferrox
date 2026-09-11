@@ -12,23 +12,23 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-11. **47** architectures run with
+Honest position, re-audited 2026-09-11. **48** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 10 unaudited refusals are now TRIAGED, and the refusal says which of
+The 9 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 9 need new code, 1 is unknown with the question stated. Five
+away**, 8 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
-`openelm`, `afmoe`, `laguna`, `mellum`, `apertus` and `step35` on
-2026-09-11, each with a
+`openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35` and
+`mistral3` on 2026-09-11, each with a
 libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
-to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10; the step from 28 to 25
+to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10 to 9; the step from 28 to 25
 was moving the three alias rows off
 the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
@@ -41,8 +41,9 @@ refusing is one fixture or one arm away, so every row that is left
 needs a different graph.
 
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
-times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 six times
-more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11 and 11 to 9. The first two took several rows
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times
+more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9
+to 8. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -77,7 +78,60 @@ plumbing question -- "layer `il` runs its FFN activation with these
 scalars", `get_key_or_arr` at `n_layer` length for both -- and TWO
 activation bodies, with the clamp's routed-versus-dense SITE the one
 thing the second needed of the plumbing that the first did not. Both
-rows closed on it, 11 to 9.
+rows closed on it, 11 to 9. The tenth is what a reach measurement looks
+like when it comes back with ONE: `mistral3` closed alone, 9 to 8,
+because the other two graphs that build the temperature input are on
+other engines, and its verdict's second half -- one GGUF key -- found
+a defect in every YaRN checkpoint on the generic path.
+
+`mistral3` closed on `ferrox-models/src/attn_temperature.rs`. `grep -ln
+'attn_temp\|temperature_scale\|build_inp_attn_scale' src/models/*.cpp`
+over all 140 graphs is `mistral3.cpp`, `llama4.cpp` and `deepseek2.cpp`
+(three false hits recorded in the module: `grok.cpp:23` reads
+`temperature_length` and applies it nowhere, `dflash` / `deepseek4`
+name a hyper-connection TENSOR, `plamo3.cpp:140` is a local). All three
+multiply Q by the same `[n_tokens]` input `llama-graph.cpp:163-167`
+fills with `log(floor((pos + offset) / floor_scale) + 1) * scale + 1`,
+AFTER RoPE and BEFORE `build_attn` with `kq_scale` untouched; what
+differs is where the constants come from: `mistral3.cpp:5,14-17` reads
+`attention.temperature_scale` and floors on `hparams.n_ctx_orig_yarn`,
+`deepseek2.cpp:46-47` reads the same scale with
+`attention.temperature_length` as the floor, `llama4.cpp:15-17` seeds
+0.1 / 8192 / 1.0 from literals and gates the multiply on its no-RoPE
+layers (`:175` is an `else if`). `AttnTemperature` is the three
+constants, `scale_at(pos)` is the formula in llama.cpp's precision
+(single up to the floor, double from the log), `ModelConfig::
+attn_temperature` the one accessor, ONE helper on the CPU row body and
+both batched host bodies taking the row's position as a function -- so
+`pos`, `start_pos + b` and `positions[b]` are three callers of one loop
+-- and `metal_can_serve_model` refuses the fused launches, none of
+which has a per-token Q scale. The floor is what a reader gets wrong:
+`llama-model.cpp:1164-1165` seeds `n_ctx_orig_yarn` from
+`context_length` BEFORE the YaRN key overrides it, so a Ministral with
+no `original_context_length` floors on its context length; a fixture
+of exactly that shape measures it (libllama byte-identical to the file
+with the key). KL 9.16e-15 with a floor of 2 that steps TWICE inside
+the six-token prompt, 5.14e-15 plain. The MLA engine (`deepseek2` /
+`mistral4`, i.e. Mistral-Large-3) REFUSES a nonzero scale by name now
+where it dropped both keys, because it has no golden to check an
+implementation against. Two corrections: the verdict's "leading-dense
++ MoE + shared expert" was wrong twice over (`mistral3.cpp:64-84` is
+dense OR MoE on every layer, and the `_shexp` tensors are created under
+an `n_ff_shexp` its hparams never set and read by no graph line; a
+`mistral3` file is a `llama` file with three keys); and `mistral3.cpp:9`
+reads `rope.scaling.yarn_log_multiplier`, whose job is to adjust YaRN's
+MAGNITUDE term -- which ferrox applied for NO architecture.
+`llama-context.cpp:196-231` multiplies `rope.scaling.attn_factor` by
+`get_mscale(factor, 1) / get_mscale(factor, log_mul)` on top of ggml's
+`rope_yarn` term, which it cancels; ferrox's `rope_attn_factor` carried
+the key alone, so every YaRN checkpoint on the generic path had
+attention logits low by `(1 + 0.1 ln factor)^2`, 1.30x at factor 4.
+`ferrox-models/src/yarn_magnitude.rs` folds it into the field the CPU
+helper and the Metal `mscale` uniform already read; two fixtures at
+factor 4 evidence both arms, KL 9.14e-15 and 3.45e-15, the second
+matching libllama's own `yarn_attn_factor = 1.0648` log line. Only
+`mistral3` reads the multiplier on the generic path (measured), so it
+is dead metadata everywhere else, as upstream.
 
 `apertus` and `step35` closed on `ferrox-models/src/act_layers.rs`.
 `apertus.cpp:6-9` reads `xielu.alpha_n` / `.alpha_p` / `.beta` / `.eps`
@@ -559,7 +613,13 @@ fifth variants were added, which is the rule working; the two seams
 are new files (`act_layers.rs`, `unread_tensors.rs`); and what
 `decoder.rs` gained is a `layer_idx` threaded into six FFN bodies plus
 a Metal fence test, which is the cost of an accessor the bodies did
-not have a layer to ask with.
+not have a layer to ask with. The attention-temperature wave
+(2026-09-11, last) left `decoder.rs` at 7118 and `loader.rs` at 5290:
+two new files (`attn_temperature.rs`, `yarn_magnitude.rs`), one helper
+in `decoder/rope.rs`, and what the big two gained is three one-line
+call sites, one predicate clause, one fence test and one resolution
+block -- the shape a seam SHOULD leave behind, and still fifty lines
+nobody split out first.
 
 **One of five shrank, and the rule still lost on balance.** `attn.rs`
 gave up 616 lines only because a change was made to it and the split
@@ -575,7 +635,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 47
+Those files are why llama.cpp has 140 architectures and ferrox has 48
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

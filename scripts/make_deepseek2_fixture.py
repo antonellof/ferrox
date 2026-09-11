@@ -37,9 +37,20 @@ correction at 1.0 (`attn_factor_org * ...` with `freq_scale = 1` makes
 every `logf(1/freq_scale)` term vanish, deepseek2.cpp:444-448). A fixture
 that exercises `rope_yarn_log_mul` is a separate, larger job.
 
+`--temperature` writes the same file with `attention.temperature_scale
+= 0.5` and `attention.temperature_length = 2`, the two keys
+`deepseek2.cpp:46-47` read for Mistral-Large-3's per-position attention
+temperature (`conversion/mistral.py:110,177`). llama.cpp's loader
+accepts it and reads both keys (measured, `llama_model_loader: - kv
+27/28`); the graph abort that follows (`ggml.c:3942`) is this fixture's
+pre-existing shape mismatch and happens on the plain file identically,
+which is why no golden is checked in for either. ferrox's MLA engine
+has no per-position Q scale and REFUSES the file by name
+(`crate::attn_temperature`), where it used to load and drop the key.
+
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
-        python3 scripts/make_deepseek2_fixture.py OUT.gguf
+        python3 scripts/make_deepseek2_fixture.py OUT.gguf [--temperature]
 
 That the file is a *valid* deepseek2 checkpoint was checked by running
 llama.cpp's own loader over it (`scripts/gptoss_reference_logits.cpp`
@@ -80,7 +91,13 @@ EXPERT_WEIGHTS_SCALE = 2.5
 K_MLA = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 
 
-def main(out_path: str) -> None:
+# The Mistral-Large-3 keys, for the `--temperature` variant. A floor
+# of 2 steps twice inside llama.cpp's six-token reference prompt.
+TEMP_SCALE = 0.5
+TEMP_LENGTH = 2
+
+
+def main(out_path: str, temperature: bool = False) -> None:
     rng = np.random.default_rng(0xD5002)
 
     def rnd(*shape: int) -> np.ndarray:
@@ -116,6 +133,10 @@ def main(out_path: str) -> None:
     w.add_expert_weights_norm(True)
     w.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
     w.add_file_type(gguf.LlamaFileType.ALL_F32)
+    if temperature:
+        # conversion/mistral.py:110 and :177, verbatim.
+        w.add_attn_temperature_scale(TEMP_SCALE)
+        w.add_attn_temperature_length(TEMP_LENGTH)
 
     tokens = ["<unk>", "<s>", "</s>"] + [f"tok{i}" for i in range(3, N_VOCAB)]
     w.add_tokenizer_model("llama")
@@ -188,4 +209,7 @@ def main(out_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "deepseek2-fixture.gguf")
+    main(
+        sys.argv[1] if len(sys.argv) > 1 else "deepseek2-fixture.gguf",
+        temperature="--temperature" in sys.argv[2:],
+    )

@@ -152,6 +152,45 @@ pub fn read_deepseek2_hparams(file: &impl TensorSource) -> Result<Deepseek2Hpara
         .map(|v| v != 0)
         .unwrap_or(true);
     let expert_weights_scale = meta_f32(file, &p("expert_weights_scale"), 1.0);
+    // The per-position attention temperature: `deepseek2.cpp:46-47`
+    // reads `attention.temperature_scale` and `attention.temperature_length`
+    // ("used by mistral-large", its own comment) and :595-598 / :632-635
+    // multiply Q by the per-token scale after RoPE; `mistral4` reuses
+    // both (`models.h:1311-1318`). This engine has no per-position Q
+    // scale and, unlike the generic decoder, no libllama-golden fixture
+    // to check one against, so a file that declares a nonzero scale
+    // STOPS here rather than running Mistral-Large-3 at temperature 1.
+    // The resolution is the generic path's (`crate::attn_temperature`),
+    // so the two loaders cannot disagree about which values mean "on".
+    let declared = crate::attn_temperature::DeclaredTemperature {
+        scale: file.metadata_f32(&p("attention.temperature_scale")),
+        length: file.metadata_u64(&p("attention.temperature_length")),
+        n_ctx_orig_yarn: None,
+    };
+    match crate::attn_temperature::resolve_attn_temperature(&arch, declared) {
+        Ok(None) => {}
+        Ok(Some(t)) => {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                format!(
+                    "`{arch}.attention.temperature_scale = {}` (floor \
+                     `{arch}.attention.temperature_length = {}`): llama.cpp's deepseek2 graph \
+                     multiplies Q by a per-position temperature (src/models/deepseek2.cpp:46-47, \
+                     595-598, 632-635; `crate::attn_temperature`) and the MLA engine has no \
+                     per-position Q scale. Implemented on the generic path for `mistral3`; \
+                     this engine refuses rather than run Mistral-Large-3 at temperature 1",
+                    t.scale,
+                    t.floor_scale.get()
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(LoadError::UnsupportedFeature(
+                arch.clone(),
+                e.message(&arch),
+            ));
+        }
+    }
     Ok(Deepseek2Hparams {
         arch,
         n_layer,

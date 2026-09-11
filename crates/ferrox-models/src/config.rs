@@ -378,6 +378,23 @@ pub struct ModelConfig {
     /// Metal launches are fenced off by `Decoder::metal_can_serve_model`
     /// because no kernel implements it.
     pub clamp_kqv: Option<f32>,
+    /// Per-position attention temperature -- llama.cpp's
+    /// `llm_graph_input_attn_temp`, the `[n_tokens]` vector
+    /// `log(floor((pos + offset) / floor_scale) + 1) * scale + 1` that
+    /// `mistral3.cpp:153-156` multiplies into Q after RoPE, before
+    /// `build_attn`, with `kq_scale` untouched. See
+    /// [`crate::attn_temperature`] for the census (three graphs of 140)
+    /// and the resolution.
+    ///
+    /// `Some` only for an architecture whose graph builds the input AND
+    /// a file declaring a nonzero `attention.temperature_scale`; the
+    /// key on any other architecture is dead metadata upstream and is
+    /// ignored here the same way. Applied through ONE helper,
+    /// `Decoder::apply_attn_temperature`, on every host body, and
+    /// fenced off the fused Metal launches by
+    /// `Decoder::metal_can_serve_model`, because none has a per-token Q
+    /// scale uniform.
+    pub attn_temperature: Option<crate::attn_temperature::AttnTemperature>,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -843,6 +860,7 @@ pub fn glm_5_2() -> ModelConfig {
         embedding_scale: None,
         residual_scale: None,
         clamp_kqv: None,
+        attn_temperature: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -928,6 +946,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         embedding_scale: None,
         residual_scale: None,
         clamp_kqv: None,
+        attn_temperature: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1045,6 +1064,7 @@ pub fn kimi_k3() -> ModelConfig {
         embedding_scale: None,
         residual_scale: None,
         clamp_kqv: None,
+        attn_temperature: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1108,6 +1128,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         embedding_scale: None,
         residual_scale: None,
         clamp_kqv: None,
+        attn_temperature: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1166,6 +1187,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         embedding_scale: None,
         residual_scale: None,
         clamp_kqv: None,
+        attn_temperature: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1227,6 +1249,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         embedding_scale: None,
         residual_scale: None,
         clamp_kqv: None,
+        attn_temperature: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,

@@ -10,6 +10,7 @@
 
 pub mod act_layers;
 pub mod attn_gate;
+pub mod attn_temperature;
 pub mod bert_encoder;
 pub mod bert_gguf_loader;
 pub mod block_residual;
@@ -89,6 +90,7 @@ pub mod tokenizer;
 pub mod unread_tensors;
 pub mod vision;
 pub mod vl_engine;
+pub mod yarn_magnitude;
 
 pub use bert_encoder::{BertEncoder, BertHparams, BertLayer};
 pub use bert_gguf_loader::{load_bert_encoder_from_path, read_bert_hparams, BERT_ARCH};
