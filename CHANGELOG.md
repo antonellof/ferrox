@@ -15,8 +15,31 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-11
+
 ### Fixed
 
+- **The Metal benchmark ledger booked the lm_head's GPU time as host
+  time.** #149's "host = wall minus GPU" used the GPU time of ONE
+  command buffer per token; a sampled decode token has two, and the
+  lm_head's had no timing tag, so 1.2 ms (Llama-3.2-1B) to 2.8 ms
+  (Gemma-2-2B) of GPU work read as a 26-29% host share that did not
+  exist. `FERROX_METAL_GPU_TIMING=1` clocks encode, GPU and submit
+  latency for every submission from one clock, and a submission cannot
+  be timed with a phase left out. Measured encode is 2-3% of wall, so
+  the argument-packing lever the issue named was retired unbuilt;
+  the correction moved the worst Metal row from "host" to "kernel".
+- **`/v1/rerank` scores from the published `ms-marco-MiniLM-L6-v2` GGUF
+  were fifty times too small.** llama.cpp's converter drops
+  `pooler.dense.*` for every BERT, so the file scores `classifier(cls)`
+  where HuggingFace scores `classifier(tanh(pooler(cls)))`; orderings
+  were right and the scale was not, which is why a threshold copied from
+  another engine never fired. `ferrox splice-pooler -m in.gguf
+  --safetensors model.safetensors -o out.gguf` writes the pooler back
+  under llama.cpp's own tensor names (llama-server loads the result and
+  applies it too), tied to the checkpoint by the classifier both files
+  hold rather than by a name the published file gets wrong. Seventeen
+  pairs within 0.051 of HuggingFace afterwards, orderings identical.
 - **The GLM, MLA and hybrid dedicated loaders would have run a
   checkpoint's MTP block as one more decoder layer.** `glm4moe`,
   `glm-dsa`, `glm4`, `deepseek2`, `qwen3next`, `qwen35` and `qwen35moe`
@@ -57,6 +80,63 @@ are the ones worth reading twice.
 
 ### Added
 
+- **Every one of the 16 comparable Metal `tg128` rows is now faster
+  than llama.cpp** (gap 0.60x-0.96x; prefill 0.99x-1.09x), re-measured
+  on a quiet host with `ferrox 0.20.0` receipts. Gemma-2-2B decode went
+  from 1.11x to 0.94x on three kernel rewrites none of which is
+  Gemma-specific: RoPE (one thread per rotary pair, one templated
+  NORM/NEOX kernel where there were four sources; 61.6 to 3.4 us),
+  RMSNorm (float4 loads, at most two loop trips; 14.2 to 4.7 us),
+  FA-vec decode at d=128/256 (compile-time tile loops so K and V loads
+  overlap; 38.9 to 17.6 us with the softcap), and the final logit
+  softcap moved off the host into the lm_head's command buffer as an
+  epilogue (0.65 ms of scalar `tanh` per Gemma-2 token, gone).
+  `FERROX_METAL_KERNEL_TIMING=1` attributes a token's GPU time per
+  dispatch kind, which is how the three were found: the matvecs, 80% of
+  the stack, were already at parity. `ferrox verify` token-identical and
+  `ferrox parity` unchanged on four models. Closes #149.
+- **The Studio Thinking block times the thought.** A live `Thinking for
+  12 seconds` while the model reasons, collapsing to `Thought for 15
+  seconds` (`1 min 20 s`, `1 h 5 min`) once the answer begins, one click
+  away; a thought cut off with no answer stays open under the Continue
+  banner and a continuation keeps counting. The time is the wall-clock
+  between the first `reasoning_content` delta and the first `content`
+  delta, persisted as `reasoning_ms` beside `reasoning_content`; older
+  records load and show their thought with no time.
+- **`grok` and `dbrx` are audited**, 37 to 39, each by extending a seam
+  from the day before by one column. Grok-1 on the MiniCPM defaults
+  hook: `grok.cpp:5-12` seeds seven hyper-parameters before the file
+  may override them, `logit_scale` is a multiply there and
+  `attention.output_scale` is "pre-scale Q, then softcap", so it
+  resolves into slots that existed; two of the seven are read by
+  llama.cpp and applied nowhere (measured), and ferrox neither applies
+  nor refuses them. DBRX on `NormOp::LayerNorm` (weight, no bias, the
+  variant OLMo-1 deliberately left unwritten until a caller arrived),
+  a REQUIRED `attention.clamp_kqv` (the three QKV-bias loops collapsed
+  onto `decoder/qkv_bias.rs` first, so the clamp is one line rather
+  than three), and `norm_sites.rs`, one table for which tensor feeds
+  which norm site, because `blk.N.attn_output_norm` is DBRX's pre-FFN
+  norm and Grok's post-attention norm. The clamp closed OLMo-1's
+  `clip_qkv` checkpoints with it. KL 4.7e-10 / 1.6e-10 (Grok, at the
+  GeGLU f16-table tolerance, measured), 3.4e-12 (DBRX). Grok-2's
+  parallel dense FFN stays refused by name from a fixture that has it.
+- **`arcee`, `deci` and `openelm` are audited**, 39 to 42. `arcee` is
+  the ungated ReLU-squared FFN, spelled as `GluAct::Reglu` with the gate
+  aliased to the up matrix rather than a fourth expert shape; on the
+  way, six Metal launch sites that derived `gelu = !is_swiglu()` (a
+  third activation would have run as GELU on all of them) now refuse on
+  `None` from one function. `deci` and `openelm` are one seam,
+  `layer_shapes.rs`: llama.cpp reads `head_count`, `head_count_kv` and
+  `feed_forward_length` as scalar-or-array for every architecture and
+  ferrox carried scalars; all 140 graphs were scanned for which honour
+  a per-layer value before a line was written, and the table records
+  each. `AttnShape::{Gqa, Linear, Absent}` is an enum so an
+  attention-less layer cannot be a zero count a loop accepts;
+  `ModelConfig::new_kv_caches` replaced ninety hand-written
+  `KvCache::new(config.n_kv_heads, ..)` sites and `KvCache::push`
+  asserts the width. KL 2.27e-14, 1.44e-13, 7.29e-13, 1.28e-13. `plm`
+  did NOT close with `arcee`: its verdict had been read from one file,
+  and the diff is 150 lines of MLA attention.
 - **`apertus` and `step35` are audited, on ONE seam with TWO
   activation bodies.** An FFN activation whose parameters vary by
   layer had no home: `FfnActivation` was a unit enum and every FFN
