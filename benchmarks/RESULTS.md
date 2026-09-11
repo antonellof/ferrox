@@ -14,7 +14,7 @@ Measured on **3 machines**, one section each. A gap only means something against
 | Machine | Backend | Prefill | Decode |
 |---|---|---|---|
 | AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic | CPU | 🔴 **6.26×** to 🔴 **10.14×** | 🔴 **1.06×** to 🔴 **1.92×** |
-| Apple M2 Pro (10c/6p) macOS 26.6.2 + Apple M2 Pro | METAL | ⚪ **1.01×** to 🔴 **1.10×** | 🟢 **0.64×** to 🔴 **1.11×** |
+| Apple M2 Pro (10c/6p) macOS 26.6.2 + Apple M2 Pro | METAL | ⚪ **0.99×** to 🔴 **1.09×** | 🟢 **0.60×** to ⚪ **0.96×** |
 | Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic + NVIDIA GeForce RTX 3060 | CUDA | 🔴 **22.55×** to 🔴 **33.79×** | 🔴 **2.18×** to 🔴 **5.04×** |
 
 ### AMD Ryzen 9 7945HX with Radeon Graphics (16c) Linux 6.17.0-23-generic
@@ -40,21 +40,22 @@ Measured on **3 machines**, one section each. A gap only means something against
 
 | Model | Prefill | Decode | ferrox pp512 | llama.cpp pp512 | ferrox tg128 | llama.cpp tg128 |
 |---|---|---|---:|---:|---:|---:|
-| Gemma-2-2B-IT Q4_K_M | ⚪ **1.05×** | 🔴 **1.11×** | 876 | 917 | 61.6 | 68.2 |
-| Gemma-3-1B-IT Q8_0 | ⚪ **1.04×** | 🟢 **0.80×** | 2685 | 2785 | 103 | 83.1 |
-| Gemma-4-E2B-IT Q4_K_M | — | — | 14.3 | — | 16.2 | — |
-| Llama-3.2-1B-Instruct IQ4_XS | ⚪ **1.03×** | 🟢 **0.94×** | 1852 | 1908 | 157 | 147 |
-| Llama-3.2-1B-Instruct Q4_K_M | ⚪ **1.04×** | ⚪ **0.98×** | 1815 | 1890 | 151 | 149 |
-| Llama-3.2-1B-Instruct Q5_K_M | ⚪ **1.02×** | 🟢 **0.90×** | 1659 | 1695 | 129 | 117 |
-| Llama-3.2-1B-Instruct Q6_K | 🔴 **1.08×** | ⚪ **0.97×** | 1712 | 1847 | 136 | 132 |
-| Llama-3.2-3B-Instruct Q4_K_M | ⚪ **1.02×** | ⚪ **1.03×** | 647 | 663 | 62.7 | 64.3 |
-| Meta-Llama-3.1-8B-Instruct Q4_K_M | ⚪ **1.03×** | ⚪ **0.98×** | 272 | 279 | 30.7 | 30.1 |
-| OLMoE-1B-7B-0924 Q4_0 | 🔴 **1.09×** | ⚪ **0.96×** | 1424 | 1552 | 160 | 153 |
-| Phi-4-mini-Instruct Q4_K_M | ⚪ **1.02×** | ⚪ **0.98×** | 551 | 561 | 51.2 | 50.0 |
-| Qwen2.5-0.5B-Instruct Q8_0 | 🔴 **1.10×** | 🟢 **0.65×** | 4485 | 4925 | 202 | 131 |
-| Qwen3-0.6B Q8_0 | ⚪ **1.02×** | 🟢 **0.76×** | 3450 | 3511 | 152 | 116 |
-| SmolLM2-135M-Instruct Q8_0 | ⚪ **1.02×** | 🟢 **0.64×** | 12004 | 12184 | 317 | 203 |
-| TinyLlama-1.1B-Chat-v1.0 Q8_0 | ⚪ **1.01×** | 🟢 **0.86×** | 2018 | 2036 | 128 | 109 |
+| Gemma-2-2B-IT Q4_K_M | ⚪ **1.02×** | 🟢 **0.94×** | 882 | 897 | 71.6 | 67.0 |
+| Gemma-3-1B-IT Q8_0 | ⚪ **1.03×** | 🟢 **0.68×** | 2691 | 2779 | 122 | 83.2 |
+| Gemma-4-E2B-IT Q4_K_M | — | — | 14.6 | — | 16.3 | — |
+| Llama-3.2-1B-Instruct IQ4_XS | ⚪ **1.03×** | 🟢 **0.90×** | 1847 | 1906 | 163 | 147 |
+| Llama-3.2-1B-Instruct Q4_K_M | ⚪ **1.04×** | 🟢 **0.95×** | 1814 | 1888 | 158 | 149 |
+| Llama-3.2-1B-Instruct Q5_K_M | ⚪ **1.02×** | 🟢 **0.86×** | 1654 | 1691 | 136 | 117 |
+| Llama-3.2-1B-Instruct Q6_K | 🔴 **1.08×** | 🟢 **0.94×** | 1709 | 1848 | 140 | 131 |
+| Llama-3.2-3B-Instruct Q4_K_M | ⚪ **1.03×** | 🟢 **0.94×** | 646 | 662 | 68.5 | 64.5 |
+| Meta-Llama-3.1-8B-Instruct Q4_K_M | ⚪ **1.03×** | 🟢 **0.95×** | 271 | 279 | 32.0 | 30.4 |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | ⚪ **1.03×** | 🟢 **0.95×** | 273 | 280 | 34.3 | 32.4 |
+| OLMoE-1B-7B-0924 Q4_0 | 🔴 **1.08×** | ⚪ **0.96×** | 1441 | 1556 | 174 | 168 |
+| Phi-4-mini-Instruct Q4_K_M | ⚪ **1.02×** | 🟢 **0.88×** | 543 | 556 | 53.9 | 47.6 |
+| Qwen2.5-0.5B-Instruct Q8_0 | 🔴 **1.09×** | 🟢 **0.60×** | 4511 | 4935 | 218 | 131 |
+| Qwen3-0.6B Q8_0 | ⚪ **0.99×** | 🟢 **0.61×** | 3535 | 3500 | 191 | 116 |
+| SmolLM2-135M-Instruct Q8_0 | ⚪ **1.02×** | 🟢 **0.60×** | 11878 | 12161 | 363 | 217 |
+| TinyLlama-1.1B-Chat-v1.0 Q8_0 | ⚪ **1.00×** | 🟢 **0.83×** | 2032 | 2034 | 132 | 110 |
 
 ### Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz (10c) Linux 5.15.0-186-generic + NVIDIA GeForce RTX 3060
 

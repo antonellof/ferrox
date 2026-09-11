@@ -7,9 +7,9 @@
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.61,
-  "host_load_1min_start": 1.41,
+  "ferrox_version": "0.20.0",
+  "host_load_1min_end": 4.81,
+  "host_load_1min_start": 1.49,
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
@@ -35,7 +35,7 @@
   },
   "id": "olmoe_q4",
   "kind": "engine",
-  "load_s": 0.030430875,
+  "load_s": 0.030822166,
   "model_path": "models/olmoe-1b-7b-0924-q4_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -45,27 +45,27 @@
   "tests": [
     {
       "ferrox_samples": [
-        1390.601489464564,
-        1424.3904610351312,
-        1426.8583585102072
+        1411.6819927355948,
+        1441.027466543599,
+        1446.214486692098
       ],
-      "ferrox_stddev": 16.540676026548034,
-      "ferrox_tps": 1424.3904610351312,
-      "gap": 1.0899047996093751,
-      "llama_tps": 1552.45,
+      "ferrox_stddev": 15.204367610412808,
+      "ferrox_tps": 1441.027466543599,
+      "gap": 1.079896140864375,
+      "llama_tps": 1556.16,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        160.0857709544692,
-        160.24429743908019,
-        159.78525520814202
+        173.30979517323635,
+        176.59762929106336,
+        174.4692631045189
       ],
-      "ferrox_stddev": 0.19036810245719915,
-      "ferrox_tps": 160.0857709544692,
-      "gap": 0.9581738532128905,
-      "llama_tps": 153.39,
+      "ferrox_stddev": 1.3615416790472694,
+      "ferrox_tps": 174.4692631045189,
+      "gap": 0.9609715603576563,
+      "llama_tps": 167.66,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

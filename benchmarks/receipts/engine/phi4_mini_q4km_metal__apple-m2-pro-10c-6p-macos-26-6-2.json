@@ -7,9 +7,9 @@
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.32,
-  "host_load_1min_start": 1.52,
+  "ferrox_version": "0.20.0",
+  "host_load_1min_end": 2.85,
+  "host_load_1min_start": 1.08,
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
@@ -35,7 +35,7 @@
   },
   "id": "phi4_mini_q4km",
   "kind": "engine",
-  "load_s": 0.051981958,
+  "load_s": 0.048400459,
   "model_path": "models/Phi-4-mini-instruct-Q4_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -45,27 +45,27 @@
   "tests": [
     {
       "ferrox_samples": [
-        549.181191116554,
-        550.7524817673257,
-        555.4312525001865
+        548.5333495822053,
+        542.9945595084325,
+        502.616731670815
       ],
-      "ferrox_stddev": 2.6546210689841447,
-      "ferrox_tps": 550.7524817673257,
-      "gap": 1.0191329473429882,
-      "llama_tps": 561.29,
+      "ferrox_stddev": 20.46510031135993,
+      "ferrox_tps": 542.9945595084325,
+      "gap": 1.024835314195,
+      "llama_tps": 556.48,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        51.139323193031466,
-        51.22041645800016,
-        51.24516919346674
+        54.281479999496554,
+        53.0560134198554,
+        53.90764346684899
       ],
-      "ferrox_stddev": 0.04520593784068695,
-      "ferrox_tps": 51.22041645800016,
-      "gap": 0.9761732421875,
-      "llama_tps": 50.0,
+      "ferrox_stddev": 0.512813137713237,
+      "ferrox_tps": 53.90764346684899,
+      "gap": 0.8835481749316406,
+      "llama_tps": 47.63,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

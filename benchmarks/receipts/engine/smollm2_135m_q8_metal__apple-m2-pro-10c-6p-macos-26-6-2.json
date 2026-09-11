@@ -7,9 +7,9 @@
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.37,
-  "host_load_1min_start": 1.37,
+  "ferrox_version": "0.20.0",
+  "host_load_1min_end": 1.94,
+  "host_load_1min_start": 1.94,
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
@@ -35,7 +35,7 @@
   },
   "id": "smollm2_135m_q8",
   "kind": "engine",
-  "load_s": 0.023222625,
+  "load_s": 0.021486667,
   "model_path": "models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -45,27 +45,27 @@
   "tests": [
     {
       "ferrox_samples": [
-        12004.032698516163,
-        12182.825666025205,
-        11562.48853207772
+        12110.4365850234,
+        10012.719674082846,
+        11878.420193314329
       ],
-      "ferrox_stddev": 260.7140485284147,
-      "ferrox_tps": 12004.032698516163,
-      "gap": 1.015002233499922,
-      "llama_tps": 12184.12,
+      "ferrox_stddev": 938.976172454061,
+      "ferrox_tps": 11878.420193314329,
+      "gap": 1.023761561057129,
+      "llama_tps": 12160.67,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        317.17591167297104,
-        317.3998996966723,
-        325.2600651155404
+        348.62612707694694,
+        362.6650076555892,
+        363.3282138306437
       ],
-      "ferrox_stddev": 3.7592243279363537,
-      "ferrox_tps": 317.3998996966723,
-      "gap": 0.6390676247656251,
-      "llama_tps": 202.84,
+      "ferrox_stddev": 6.77971947342656,
+      "ferrox_tps": 362.6650076555892,
+      "gap": 0.5986516355782031,
+      "llama_tps": 217.11,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

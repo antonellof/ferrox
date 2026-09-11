@@ -109,7 +109,9 @@ fix that outlived its cause, so they ran with no dispatch overlap.
 
 Output is byte-identical to `main`. That predicted Gemma-2-2B decode
 would move from 1.23× to about 1.12×, and the 2026-09-09 re-measurement
-confirms it at **1.11×**, still the worst Metal row.
+confirmed it at **1.11×**, then the worst Metal row. After the kernel
+work in #208 the 2026-09-11 re-measurement reads **0.94×**, and no
+Metal decode row is slower than llama.cpp any more.
 
 **Metal, where the rest of the gap is** (quiet host, GPU-clock and wall
 from one process; [#149](https://github.com/antonellof/ferrox/issues/149)).
@@ -208,8 +210,10 @@ token, ms (the lm_head buffer is unchanged within noise on all three):
 Gemma-2 prefill (`pp512`, GPU clock) 569.6 -> 565.9 ms, within noise.
 Against #202's quiet-host figures that is 12.03 -> ~10.2 ms of stack
 plus 0.65 ms of host removed, about 2.5 ms of a 17.3 ms token, which
-is the size of the 1.11x gap; the row needs a quiet-host `ferrox
-bench --compare` before `RESULTS.md` moves.
+is the size of the 1.11x gap. Measured on 2026-09-11 on a quiet host:
+Gemma-2-2B decode **1.11× to 0.94×**, Llama-3.2-3B **1.03× to 0.94×**,
+and every other Metal decode row moved the same direction; the summary
+line is now 0.60× to 0.96× on decode.
 
 ## Open
 
@@ -217,7 +221,7 @@ bench --compare` before `RESULTS.md` moves.
 |---|---|---|
 | [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 22× to 34× | ~4× is tensor cores (`mul_mm` has none), ~5× is undiagnosed kernel efficiency. #148 bought 20–26% and ruled out dequant redundancy and occupancy |
 | [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing closed 9–19× to 2–5×. What limits the rest is not diagnosed — the access pattern was a real cost and was not the last one |
-| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, 1.11× worst row | the "26% host" was an accounting error: the lm_head runs in a second, untimed command buffer, and its GPU time was booked as host. Encoding, argument binding included, is ~2% of wall (three measurements agree), so packing and pipelining are retired unbuilt. The kernel gap was then attributed per kind: RoPE, the norms and d=128/256 attention were 3x to 18x llama.cpp's per-dispatch cost, all memory-latency chains, and are fixed (stack GPU -15.5% on Gemma-2-2B, -9.6% on Llama-3B); the CPU softcap is a GPU epilogue. Left: ~0.2 ms submit latency per command buffer, two per sampled token; the quiet-host re-measure |
+| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, **closed**, worst row 0.96× | the "26% host" was an accounting error: the lm_head runs in a second, untimed command buffer, and its GPU time was booked as host. Encoding, argument binding included, is ~2% of wall (three measurements agree), so packing and pipelining are retired unbuilt. The kernel gap was then attributed per kind: RoPE, the norms and d=128/256 attention were 3x to 18x llama.cpp's per-dispatch cost, all memory-latency chains, and are fixed (stack GPU -15.5% on Gemma-2-2B, -9.6% on Llama-3B); the CPU softcap is a GPU epilogue. Left: ~0.2 ms submit latency per command buffer, two per sampled token; the quiet-host re-measure |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, 6.3× to 10.1× | was a missing kernel tier. [#159](https://github.com/antonellof/ferrox/pull/159) added AVX2 GEMMs for all five interleaved kinds and a per-workload dispatch rule, verified by execution on real AVX2 but **not yet benchmarked**, so this gap number still describes the code before it |
 | [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | the size rule landed in [#155](https://github.com/antonellof/ferrox/pull/155); the crossover constant is bracketed by the published numbers, not swept, and no before/after on a quiet host has been run. `MIN_TASK_MACS` is still there, which the issue asks to delete |
 | [#128](https://github.com/antonellof/ferrox/issues/128) | CPU decode dispatch, **closed** | The condvar wait was real and the cause was rayon's two-armed `join`: from a non-worker thread it injects and blocks on a mutex, ~150 times per token. [#167](https://github.com/antonellof/ferrox/pull/167) runs a whole forward in one `rayon::scope`. Note the trap: #128 had computed scheduling at 6.7% of a token and ruled it out, against a **stale denominator** taken before #155 removed the repack that inflated the token to 17 ms. At ~5 ms the same fixed cost is a much larger share |

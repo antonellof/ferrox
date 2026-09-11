@@ -1,6 +1,6 @@
 {
   "accelerator": "Apple M2 Pro",
-  "approx_params": 3958898688,
+  "approx_params": 8046772224,
   "arch": "llama",
   "backend": "metal",
   "backend_active": "Metal",
@@ -8,7 +8,7 @@
     "FERROX_CPU_INT_DOT": "1"
   },
   "ferrox_version": "0.20.0",
-  "host_load_1min_end": 1.95,
+  "host_load_1min_end": 1.73,
   "host_load_1min_start": 1.93,
   "host_spec": {
     "arch": "aarch64",
@@ -33,39 +33,39 @@
     "pressure": "nominal",
     "source": "NSProcessInfo.thermalState"
   },
-  "id": "llama32_3b_q4km",
+  "id": "mistral_7b_q4km",
   "kind": "engine",
-  "load_s": 0.042647875,
-  "model_path": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+  "load_s": 0.015069958,
+  "model_path": "models/Mistral-7B-Instruct-v0.2-Q4_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
   "reps": 3,
   "schema": 2,
-  "size_bytes": 2019377696,
+  "size_bytes": 4368439584,
   "tests": [
     {
       "ferrox_samples": [
-        640.6328251125565,
-        645.5926822513312,
-        646.6116371284852
+        272.53045391424195,
+        272.6572989979511,
+        272.4520813221656
       ],
-      "ferrox_stddev": 2.6116117841615725,
-      "ferrox_tps": 645.5926822513312,
-      "gap": 1.025832569369453,
-      "llama_tps": 662.27,
+      "ferrox_stddev": 0.08455519755674742,
+      "ferrox_tps": 272.53045391424195,
+      "gap": 1.0266375591479493,
+      "llama_tps": 279.79,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        68.52402158533876,
-        68.54300618576855,
-        68.47194098093144
+        34.40107267124232,
+        34.30759840433173,
+        34.3216313304973
       ],
-      "ferrox_stddev": 0.03004268768020193,
-      "ferrox_tps": 68.52402158533876,
-      "gap": 0.9414216869869532,
-      "llama_tps": 64.51,
+      "ferrox_stddev": 0.04115727046694998,
+      "ferrox_tps": 34.3216313304973,
+      "gap": 0.9451765182028125,
+      "llama_tps": 32.44,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }
