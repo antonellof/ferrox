@@ -1972,6 +1972,7 @@ mod tests {
             residual_scale: None,
             clamp_kqv: None,
             attn_temperature: None,
+            router_input: crate::router_input::RouterInput::NormedFfnInput,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

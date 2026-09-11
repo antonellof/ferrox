@@ -28,6 +28,9 @@ use ferrox_core::attention::{
     causal_gqa_attention_prefill_shared_kv_windowed, causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
+// The host FFN tails moved into `ffn_block`; the one remaining caller is
+// the Metal prefill arm's post-attention norm.
+#[cfg(feature = "metal")]
 use ferrox_core::matmul::rms_norm;
 pub use kv_window::{KvWindowPolicy, KV_WINDOW_ENV};
 #[cfg(feature = "metal")]
@@ -1375,6 +1378,10 @@ impl Decoder {
     #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     fn gpu_router_matches_host_routing(layer: &LayerWeights, config: &ModelConfig) -> bool {
         matches!(config.moe.gating, ferrox_moe::GatingFunction::Softmax)
+            // Every GPU router reads `normed2`; a model whose router
+            // reads the raw layer input (`crate::router_input`) would
+            // route on the wrong tensor at full speed.
+            && config.router_input == crate::router_input::RouterInput::NormedFfnInput
             // Conservative on purpose: `route_for_layer` only takes its
             // grouped arm for `n_groups > 1`, but a checkpoint that
             // declares the key at all is one this kernel was never
@@ -2508,6 +2515,12 @@ impl Decoder {
                     metal_moe_resident = false;
                 }
 
+                // The router's operand, captured where llama.cpp reads it:
+                // BEFORE attention (`smallthinker.cpp:111`). A resident
+                // Metal stack never serves that shape
+                // (`gpu_router_matches_host_routing`), so `hidden` is not
+                // stale for the one architecture that reads it here.
+                let operand = self.router_operand(layer, &hidden, 1);
                 #[cfg(feature = "metal")]
                 let normed = if metal_moe_resident {
                     // Residual is on-device; host rms_norm would use stale hidden.
@@ -2860,6 +2873,7 @@ impl Decoder {
                                 &mut hidden,
                                 None,
                                 residency.as_ref().map(|p| p.layer_plan(l)),
+                                operand,
                             );
                         }
                         continue;
@@ -2878,6 +2892,7 @@ impl Decoder {
                     &mut hidden,
                     oai,
                     residency.as_ref().map(|p| p.layer_plan(l)),
+                    operand,
                 );
             }
         } // run_cpu_layers
@@ -2953,6 +2968,7 @@ impl Decoder {
 
         for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
             // --- attention block ---
+            let operand = self.router_operand(layer, &hidden, 1);
             let normed = layer
                 .attn
                 .norm_weight
@@ -2983,6 +2999,7 @@ impl Decoder {
                 &mut hidden,
                 oai,
                 residency.as_ref().map(|p| p.layer_plan(l)),
+                operand,
             );
         }
 
@@ -3634,6 +3651,7 @@ impl Decoder {
         config: &ModelConfig,
         hidden_dim: usize,
         plan: Option<&PlacementPlan>,
+        operand: ffn_block::RouterOperand,
     ) -> Vec<f32> {
         if Self::is_dense_layer(layer) {
             layer.moe.record_activations(&[0]);
@@ -3643,7 +3661,12 @@ impl Decoder {
             let act = config.layer_ffn_acts(layer_idx).dense;
             return layer.moe.with_expert(0, |ex| run_expert(normed2, ex, act));
         }
-        let router_logits = layer.moe.router.apply(normed2);
+        // What the router reads is the caller's fact (`crate::router_input`):
+        // the normed FFN input here, or logits computed before attention.
+        let router_logits = match operand {
+            ffn_block::RouterOperand::FfnInput => layer.moe.router.apply(normed2),
+            ffn_block::RouterOperand::Precomputed(logits) => logits,
+        };
         Self::combine_ffn_outputs_for_position(
             layer_idx,
             layer,
@@ -4053,6 +4076,7 @@ impl Decoder {
             }
 
             // --- attention block ---
+            let operand = self.router_operand(layer, &hidden_batch, batch_size);
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
                 .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
@@ -4210,102 +4234,16 @@ impl Decoder {
                         }
                     }
                     if did_metal_prefill {
-                        // --- MoE FFN block (batched Metal when packed Q4) ---
-                        let normed2_batch: Vec<f32> = hidden_batch
-                            .chunks(hidden_dim)
-                            .flat_map(|h| layer.moe.norm_weight.apply(h, self.config.rms_norm_eps))
-                            .collect();
-                        let dense = Self::is_dense_layer(layer);
-                        let router_logits_batch = if dense {
-                            Vec::new()
-                        } else {
-                            layer.moe.router.apply_batch(&normed2_batch, batch_size)
-                        };
-                        let metal_ffn = if !dense {
-                            Self::try_metal_moe_prefill_batch(
-                                l,
-                                layer,
-                                &normed2_batch,
-                                &router_logits_batch,
-                                batch_size,
-                                hidden_dim,
-                                &self.config,
-                            )
-                        } else {
-                            None
-                        };
-                        if let Some(mut ffn_batch) = metal_ffn {
-                            if let Some(post) = &layer.attn.post_ffn_norm {
-                                ffn_batch = ffn_batch
-                                    .chunks(hidden_dim)
-                                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                    .collect();
-                            }
-                            residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-                        } else if let Some(mut ffn_batch) = Self::dense_ffn_batch(
+                        self.ffn_block_batch(
                             l,
                             layer,
-                            &normed2_batch,
+                            &mut hidden_batch,
                             batch_size,
-                            &self.config,
-                        ) {
-                            if let Some(post) = &layer.attn.post_ffn_norm {
-                                ffn_batch = ffn_batch
-                                    .chunks(hidden_dim)
-                                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                    .collect();
-                            }
-                            residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-                        } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
-                            l,
-                            layer,
-                            &normed2_batch,
-                            &router_logits_batch,
-                            batch_size,
-                            &self.config,
+                            oai,
                             residency.as_ref().map(|p| p.layer_plan(l)),
-                        ) {
-                            if let Some(post) = &layer.attn.post_ffn_norm {
-                                ffn_batch = ffn_batch
-                                    .chunks(hidden_dim)
-                                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                    .collect();
-                            }
-                            residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-                        } else {
-                            let n_experts = layer.moe.n_experts().max(1);
-                            for b in 0..batch_size {
-                                let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                                let mut ffn_out = if dense {
-                                    Self::run_ffn_block(
-                                        l,
-                                        layer,
-                                        normed2,
-                                        &self.config,
-                                        hidden_dim,
-                                        residency.as_ref().map(|p| p.layer_plan(l)),
-                                    )
-                                } else {
-                                    let router_logits =
-                                        &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                                    Self::combine_ffn_outputs_for_position(
-                                        l,
-                                        layer,
-                                        normed2,
-                                        router_logits,
-                                        &self.config,
-                                        hidden_dim,
-                                        residency.as_ref().map(|p| p.layer_plan(l)),
-                                    )
-                                };
-                                if let Some(post) = &layer.attn.post_ffn_norm {
-                                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
-                                }
-                                let hidden_row =
-                                    &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                                residual_add(hidden_row, &ffn_out, self.config.residual_scale);
-                            }
-                        }
+                            operand,
+                            ffn_block::BatchedFfnKernels::Prefill,
+                        );
                         l += 1;
                         continue 'layers;
                     }
@@ -4452,130 +4390,17 @@ impl Decoder {
                 );
             } // 'attention
 
-            // deci.cpp:147-149: no FFN, no norm, no residual add.
-            if shape.ffn_dim == 0 {
-                l += 1;
-                continue;
-            }
-
-            // --- MoE FFN block ---
-            let normed2_batch: Vec<f32> = hidden_batch
-                .par_chunks(hidden_dim)
-                .map(|h| layer.moe.norm_weight.apply(h, self.config.rms_norm_eps))
-                .flatten()
-                .collect();
-            if let Some(oai) = oai {
-                // gpt-oss: one position at a time through the single
-                // validated FFN. None of the batched fast paths below
-                // knows about router bias, expert bias or swiglu_oai.
-                for b in 0..batch_size {
-                    let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    let ffn_out = Self::gpt_oss_ffn(layer, oai, normed2, &self.config, hidden_dim);
-                    let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    residual_add(hidden_row, &ffn_out, self.config.residual_scale);
-                }
-                l += 1;
-                continue;
-            }
-            let dense = Self::is_dense_layer(layer);
-            // Skip the batched router matmul entirely for a dense
-            // layer -- there's nothing to route (see
-            // `is_dense_layer`'s doc comment), so computing it here
-            // just to ignore it below would waste the one matmul this
-            // fast path exists to avoid.
-            let router_logits_batch = if dense {
-                Vec::new()
-            } else {
-                layer.moe.router.apply_batch(&normed2_batch, batch_size)
-            };
-            #[cfg(feature = "metal")]
-            let metal_ffn = if !dense {
-                Self::try_metal_moe_prefill_batch(
-                    l,
-                    layer,
-                    &normed2_batch,
-                    &router_logits_batch,
-                    batch_size,
-                    hidden_dim,
-                    &self.config,
-                )
-            } else {
-                None
-            };
-            #[cfg(not(feature = "metal"))]
-            let metal_ffn: Option<Vec<f32>> = None;
-            if let Some(mut ffn_batch) = metal_ffn {
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_batch = ffn_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                        .collect();
-                }
-                residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-            } else if let Some(mut ffn_batch) =
-                Self::dense_ffn_batch(l, layer, &normed2_batch, batch_size, &self.config)
-            {
-                // Dense FFN, batched. Without this the FFN -- the
-                // majority of a dense model's prefill work -- ran one
-                // position at a time while Q/K/V and the router were
-                // already batched, which is why `pp512` measured about
-                // the same as `tg128`.
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_batch = ffn_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                        .collect();
-                }
-                residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-            } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
+            // --- FFN block ---
+            self.ffn_block_batch(
                 l,
                 layer,
-                &normed2_batch,
-                &router_logits_batch,
+                &mut hidden_batch,
                 batch_size,
-                &self.config,
+                oai,
                 residency.as_ref().map(|p| p.layer_plan(l)),
-            ) {
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_batch = ffn_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                        .collect();
-                }
-                residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-            } else {
-                let n_experts = layer.moe.n_experts().max(1);
-                for b in 0..batch_size {
-                    let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    let mut ffn_out = if dense {
-                        Self::run_ffn_block(
-                            l,
-                            layer,
-                            normed2,
-                            &self.config,
-                            hidden_dim,
-                            residency.as_ref().map(|p| p.layer_plan(l)),
-                        )
-                    } else {
-                        let router_logits =
-                            &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                        Self::combine_ffn_outputs_for_position(
-                            l,
-                            layer,
-                            normed2,
-                            router_logits,
-                            &self.config,
-                            hidden_dim,
-                            residency.as_ref().map(|p| p.layer_plan(l)),
-                        )
-                    };
-                    if let Some(post) = &layer.attn.post_ffn_norm {
-                        ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
-                    }
-                    let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                    residual_add(hidden_row, &ffn_out, self.config.residual_scale);
-                }
-            }
+                operand,
+                ffn_block::BatchedFfnKernels::Prefill,
+            );
             l += 1;
         }
 
@@ -4652,6 +4477,7 @@ impl Decoder {
             let shape = self.config.layer_shape(l);
             let (n_heads, n_kv_heads) = (shape.attention.n_heads(), shape.attention.n_kv_heads());
             // --- attention block ---
+            let operand = self.router_operand(layer, &hidden_batch, batch_size);
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
                 .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
@@ -4767,55 +4593,18 @@ impl Decoder {
                 );
             } // 'attention
 
-            if shape.ffn_dim == 0 {
-                continue;
-            }
-
-            // --- MoE FFN block ---
-            let normed2_batch: Vec<f32> = hidden_batch
-                .par_chunks(hidden_dim)
-                .map(|h| layer.moe.norm_weight.apply(h, self.config.rms_norm_eps))
-                .flatten()
-                .collect();
-            let dense = Self::is_dense_layer(layer);
-            let router_logits_batch = if dense || oai.is_some() {
-                Vec::new()
-            } else {
-                layer.moe.router.apply_batch(&normed2_batch, batch_size)
-            };
-            let n_experts = layer.moe.n_experts().max(1);
-
-            for b in 0..batch_size {
-                let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                let mut ffn_out = if let Some(oai) = oai {
-                    Self::gpt_oss_ffn(layer, oai, normed2, &self.config, hidden_dim)
-                } else if dense {
-                    Self::run_ffn_block(
-                        l,
-                        layer,
-                        normed2,
-                        &self.config,
-                        hidden_dim,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    )
-                } else {
-                    let router_logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                    Self::combine_ffn_outputs_for_position(
-                        l,
-                        layer,
-                        normed2,
-                        router_logits,
-                        &self.config,
-                        hidden_dim,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    )
-                };
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
-                }
-                let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                residual_add(hidden_row, &ffn_out, self.config.residual_scale);
-            }
+            // --- FFN block --- per row, as this body has always run it;
+            // see `BatchedFfnKernels::PerRow`.
+            self.ffn_block_batch(
+                l,
+                layer,
+                &mut hidden_batch,
+                batch_size,
+                oai,
+                residency.as_ref().map(|p| p.layer_plan(l)),
+                operand,
+                ffn_block::BatchedFfnKernels::PerRow,
+            );
         }
 
         let final_normed_batch: Vec<f32> = hidden_batch
@@ -4923,7 +4712,15 @@ mod tests {
         let expected_geglu = block_ref(&gelu);
         let expected_swiglu = block_ref(&silu);
 
-        let got = Decoder::run_ffn_block(1, layer, &normed2, &decoder.config, hidden_dim, None);
+        let got = Decoder::run_ffn_block(
+            1,
+            layer,
+            &normed2,
+            &decoder.config,
+            hidden_dim,
+            None,
+            ffn_block::RouterOperand::FfnInput,
+        );
         assert_eq!(got.len(), hidden_dim);
         for (i, (a, b)) in got.iter().zip(expected_geglu.iter()).enumerate() {
             assert!(
@@ -6332,11 +6129,23 @@ mod tests {
         );
 
         // A non-softmax gate: the GPU kernel implements softmax only.
-        let mut sigmoid = base;
+        let mut sigmoid = base.clone();
         sigmoid.moe.gating = ferrox_moe::GatingFunction::Sigmoid;
         assert!(
             !Decoder::gpu_router_matches_host_routing(plain_layer, &sigmoid),
             "a non-softmax gate must make the layer ineligible for the GPU router"
+        );
+
+        // A router that reads the raw layer input (`smallthinker`):
+        // every GPU router reads `normed2`, so the SAME logits routed
+        // the same way are still the wrong experts. `agrees` cannot see
+        // this one -- it compares two routers over one logit vector --
+        // which is exactly why the predicate has to.
+        let mut raw = base;
+        raw.router_input = crate::router_input::RouterInput::RawLayerInput;
+        assert!(
+            !Decoder::gpu_router_matches_host_routing(plain_layer, &raw),
+            "a raw-layer-input router must make the layer ineligible for the GPU router"
         );
     }
 

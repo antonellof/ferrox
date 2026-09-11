@@ -571,9 +571,11 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // `LLM_FFN_RELU_SQR` and `LLM_FFN_SEQ`: `down(relu(up(x))^2)`.
     // ferrox spells that as `FfnActivation::ReluSqr`, which the loader
     // serves by ALIASING the expert's gate to its up matrix and
-    // `ferrox_moe::GluAct::Reglu` (`relu(gate) * up`), so the gated
+    // `ferrox_moe::GluAct::ReluSqr` (reads `up` alone), so the gated
     // struct and every gated path are untouched and `relu(up)^2` is
     // what they compute; the dense hot paths skip the aliased matmul.
+    // (`GluAct::Reglu`, `relu(gate) * up`, served it until
+    // `smallthinker` needed that op on a REAL gate; see `uses_reglu`.)
     // No fused device kernel spells it, so `fused_kernel_gelu_flag`
     // returns `None` and `metal_can_serve_model` keeps the model off
     // the stacks -- which replaced six `gelu = !is_swiglu()` sites
@@ -707,6 +709,32 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // apply at all -- `crate::yarn_magnitude`, evidenced on two more
     // fixtures with the factor at 4. NORM RoPE, `1/sqrt(head_dim)`.
     "mistral3",
+    // tests/router_input_graphs.rs: `smallthinker`, NEW CODE on the
+    // ROUTER OPERAND -- `smallthinker.cpp:111` computes the router
+    // logits from `inpL`, the raw layer input before `attn_norm` and
+    // before attention, and `:151-161` passes them into `build_moe_ffn`
+    // as a precomputed `probs` with a NULL `ffn_gate_inp`. Four graphs
+    // of 140 pass `probs_in` (measured, `crate::router_input`); this is
+    // the only one on the generic path whose operand is not the normed
+    // FFN input the experts read. `RouterInput::RawLayerInput`, captured
+    // in ONE function (`Decoder::router_operand`) where each host body
+    // applies `attn_norm`; the GPU router paths refuse it through
+    // `gpu_router_matches_host_routing`. Its experts are `LLM_FFN_RELU`
+    // (`:158`) with a REAL gate -- `ggml_reglu_split`, `relu(gate) *
+    // up`, `FfnActivation::Reglu` -- which is NOT `arcee`'s ungated
+    // `relu(up)^2`; the one graph that passes it (`uses_reglu`). `:8`
+    // pins `n_swa = 4096` over whatever window the file declares
+    // (`swa_window_override`; libllama's logits are byte-identical for
+    // a declared 3 and a declared 4096, measured). NoPE on `il % 4 ==
+    // 0` from the `n_no_rope_layer_step` default (`crate::rope_layers`),
+    // everything rotated without a window (`:18`). Sigmoid or softmax
+    // gating from `expert_gating_func` (`conversion/smallthinker.py:
+    // 27-30`), `norm_w = true` literal, no shared expert, NEOX RoPE.
+    // Three fixtures: the window-declared shape, the no-window shape,
+    // and a hand-written `sliding_window_pattern = 2` with
+    // `rope.freq_base_swa` that pins the SWA period reading the key
+    // while the NoPE step stays the literal 4.
+    "smallthinker",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -994,8 +1022,10 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          attention -- through a second per-layer norm `ffn_norm_exps` (:45) and runs the MoE \
          on that, and :154 sums the two. The generic decoder computes one FFN on the \
          post-attention residual, so this is a different graph, not a wider one. The dense \
-         half is also sized `{n_embd, n_embd}` (:40-42) rather than n_ff. Same shape as \
-         `smallthinker`'s router: a branch fed from the raw layer input",
+         half is also sized `{n_embd, n_embd}` (:40-42) rather than n_ff. The same operand \
+         `smallthinker`'s ROUTER reads (`crate::router_input`, `RawLayerInput`), but here \
+         it feeds a whole second norm and a whole expert bank, not a `[n_expert]` logit \
+         vector, so that seam does not reach it",
     ),
     // `mistral3` was HERE, NEW CODE on the PER-POSITION ATTENTION
     // TEMPERATURE, and is audited now: `crate::attn_temperature` is the
@@ -1250,25 +1280,19 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // pre-FFN norm: `crate::norm::NormOp::LayerNorm`, `crate::clamp_kqv`
     // (which closed `olmo`'s clip_qkv sub-refusal with it) and the
     // same `norm_sites` table. See `AUDITED_GENERIC_GQA`.
-    (
-        "smallthinker",
-        TriageClass::NewCode,
-        "the MoE router reads a DIFFERENT tensor. src/models/smallthinker.cpp:111 computes \
-         the router logits from the raw layer input `inpL`, before the attention block, and \
-         passes them into build_moe_ffn as a precomputed `probs` with a NULL ffn_gate_inp \
-         (:151-161); every other MoE architecture routes on the normed FFN input, which is \
-         what ferrox computes. One more that alone would disqualify it: `LLM_FFN_RELU` \
-         experts (:158), and FfnActivation has no ReLU variant. :8 also pins n_swa to 4096 \
-         over whatever the file declares. NO LONGER a blocker: the NoPE layers. \
-         llama-hparams.h:203 defaults n_no_rope_layer_step to 4 and the SWA branch (:6-15) \
-         never overwrites it, so :108-109's `use_rope = n_no_rope_layer_step == n_layer || \
-         il % n_no_rope_layer_step != 0` leaves layers 0, 4, 8 ... unrotated -- the FIRST \
-         layer of each period, which is the OTHER phase from smollm3's -- and \
-         `crate::rope_layers` carries smallthinker as exactly that, with the no-window \
-         branch (:18, step = n_layer, i.e. rotate everything) as well. \
-         `default_swa_layout` and `swa_rope_base_follows_model` already carry smallthinker \
-         correctly; they are not the blocker",
-    ),
+    // `smallthinker` was HERE, NEW CODE on the ROUTER OPERAND, and is
+    // audited now (`crate::router_input`, `tests/router_input_graphs.rs`).
+    // Its verdict named three things and all three landed: the router
+    // reading `inpL` (`RouterInput::RawLayerInput`), the gated
+    // `LLM_FFN_RELU` experts (`FfnActivation::Reglu`, which the verdict
+    // called "one match arm" and which needed a variant because
+    // `ffn_is_ungated` and `layer_ffn_acts` must agree about whether
+    // the gate is real), and the `n_swa = 4096` pin
+    // (`swa_window_override`). The reach was measured before a line
+    // was written and came back with ONE: `grovemoe` also passes a
+    // precomputed `probs` but routes on the normed FFN input, and the
+    // two graphs whose operand really differs (`gemma4`, `nemotron-h`)
+    // are on other engines. See `AUDITED_GENERIC_GQA`.
     (
         "bitnet",
         TriageClass::NewCode,
@@ -1494,6 +1518,13 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // llama-model.cpp:2671.
             "apertus",
             "step35",
+            // Was NEW CODE in `NEOX_ROPE_TRIAGED` on the router
+            // operand (`smallthinker.cpp:111`), audited now on
+            // `crate::router_input` (`tests/router_input_graphs.rs`).
+            // NEOX RoPE: llama-model.cpp puts LLM_ARCH_SMALLTHINKER in
+            // the `LLAMA_ROPE_TYPE_NEOX` group, which
+            // `tests/rope_layout.rs` pins.
+            "smallthinker",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2340,13 +2371,59 @@ pub struct SwaPattern {
 /// rotation on `is_swa(il)`, so a spurious window would silently stop
 /// three layers in four from rotating.
 pub fn swa_disabled_by_arch(arch: &str, n_layers: usize) -> bool {
+    matches!(swa_window_override(arch, n_layers), SwaWindowOverride::Drop)
+}
+
+/// What llama.cpp does with a nonzero `attention.sliding_window` the
+/// file declares, for the architectures whose `load_arch_hparams` does
+/// not simply honour it.
+///
+/// Three answers, one table: HONOUR (every architecture not named),
+/// DROP (the two [`swa_disabled_by_arch`] rows -- no layer slides), and
+/// PIN (the window is replaced by a literal, and the layers still
+/// slide). [`swa_disabled_by_arch`] is DERIVED from this so the two
+/// cannot disagree about which rows decline the file's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwaWindowOverride {
+    /// The file's value is the window.
+    Honour,
+    /// No window at all, whatever the file says.
+    Drop,
+    /// This window, whatever the file says.
+    Pin(usize),
+}
+
+/// The third case's one row: `src/models/smallthinker.cpp:4-8` reads
+/// `attention.sliding_window` into `n_swa`, tests it for `> 0`, and
+/// on that branch assigns `hparams.n_swa = 4096` -- the value it just
+/// read is used as a flag and then overwritten. So a SmallThinker file
+/// declaring 3 slides at 4096, and libllama's logits for a fixture
+/// declaring 3 and the same fixture declaring 4096 are BYTE-IDENTICAL
+/// (measured, `tests/router_input_graphs.rs`). A file declaring 0 or
+/// nothing takes the other branch (`:16-18`): no window, every layer
+/// rotated.
+///
+/// This is a PIN rather than a DROP because the layers still slide
+/// (`:11` calls `set_swa_pattern`) and the SWA RoPE base still applies
+/// (`:13-15`); only the width is upstream's literal. Honouring the
+/// file's value here would mask three layers in four over a window
+/// the graph never uses. `conversion/smallthinker.py:32-38` writes the
+/// real `sliding_window_size` (4096 on every published SmallThinker),
+/// so on a real export the pin and the file agree and a reader cannot
+/// tell them apart; the fixture declares 3 so that they cannot.
+pub const SMALLTHINKER_PINNED_WINDOW: usize = 4096;
+
+/// See [`SwaWindowOverride`].
+pub fn swa_window_override(arch: &str, n_layers: usize) -> SwaWindowOverride {
     match arch {
-        "phi3" => true,
+        "phi3" => SwaWindowOverride::Drop,
         // exaone4.cpp:4. NOT `>= 64` and not a range: llama.cpp tests
         // equality, so a hypothetical 63- or 65-layer EXAONE-4 gets no
         // window there either.
-        "exaone4" => n_layers != 64,
-        _ => false,
+        "exaone4" if n_layers != 64 => SwaWindowOverride::Drop,
+        // smallthinker.cpp:8.
+        "smallthinker" => SwaWindowOverride::Pin(SMALLTHINKER_PINNED_WINDOW),
+        _ => SwaWindowOverride::Honour,
     }
 }
 
@@ -2391,6 +2468,24 @@ pub fn uses_geglu(arch: &str) -> bool {
 /// the half that is done.
 pub fn uses_relu_sqr(arch: &str) -> bool {
     matches!(arch, "arcee" | "plm" | "nemotron" | "jais2" | "nemotron-h")
+}
+
+/// Architectures whose experts are the GATED ReLU MLP:
+/// `build_moe_ffn(..., LLM_FFN_RELU, ...)` with `gate_exps` present,
+/// which `llama-graph.cpp:2195-2197` runs as `ggml_reglu_split(gate,
+/// up)`, i.e. `down(relu(gate(x)) * up(x))` (`smallthinker.cpp:62,158`).
+///
+/// ONE graph passes `LLM_FFN_RELU` to `build_moe_ffn` upstream --
+/// measured, `grep -n 'LLM_FFN_RELU[^_]' src/models/*.cpp` over all
+/// 140: `smallthinker.cpp:158`. The only other two hits, `t5.cpp:243,
+/// 345`, are `build_ffn` with a NULL gate (ungated `relu(up)`, a
+/// different op again) on an encoder-decoder engine, so they are not
+/// listed. Distinct from [`uses_relu_sqr`] on purpose: that is
+/// `LLM_FFN_RELU_SQR` with NO gate, served by aliasing gate to up, and
+/// a loader that aliased this one would compute `relu(up) * up` on a
+/// file whose gate tensor it had silently dropped.
+pub fn uses_reglu(arch: &str) -> bool {
+    matches!(arch, "smallthinker")
 }
 
 pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
@@ -2969,7 +3064,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 9,
+            seen == 8,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -3035,15 +3130,23 @@ mod audit_tests {
              on its own engine and `deepseek2` / `mistral4` on the MLA engine, which \
              REFUSES the key by name now where it dropped it; and its `yarn_log_multiplier` \
              half found YaRN's magnitude term missing for EVERY architecture \
-             (`crate::yarn_magnitude`). \
-             What is left is 8 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             (`crate::yarn_magnitude`), and 9 until `smallthinker` closed on the router \
+             operand (`crate::router_input`, tests/router_input_graphs.rs) -- the reach \
+             measured first over every `build_moe_ffn` call site: four graphs pass a \
+             precomputed `probs_in`, and it is the only one on the generic path whose \
+             operand is not the normed FFN input; its gated ReLU experts split \
+             `GluAct::ReluSqr` from `GluAct::Reglu`, because the one variant that had \
+             served `arcee` by aliasing would have skipped a real gate. \
+             What is left is 7 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
              closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
              `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
-             `step35` and `mistral3`, and each closure but `olmo`'s, `arcee`'s, `mellum`'s \
-             and `mistral3`'s took more than one row at a time because each found ONE cause \
-             behind several refusals; `mellum`'s cause IS shared and moved three verdicts, \
-             but only one of them was closable by it, and `mistral3`'s is shared with two \
-             rows on other engines"
+             `step35`, `mistral3` and `smallthinker`, and each closure but `olmo`'s, \
+             `arcee`'s, `mellum`'s, `mistral3`'s and `smallthinker`'s took more than one row \
+             at a time because each found ONE cause behind several refusals; `mellum`'s \
+             cause IS shared and moved three verdicts, but only one of them was closable \
+             by it, `mistral3`'s is shared with two rows on other engines, and \
+             `smallthinker`'s mechanism (a precomputed `probs`) is shared with three rows \
+             whose CAUSE it is not"
         );
     }
 
@@ -3060,14 +3163,15 @@ mod audit_tests {
         // `headline()` below, because a class with no rows still has to
         // render distinctly the day something lands in it again.
         //
-        // `smallthinker`, which used to be `dbrx`, which used to be
-        // `olmo`: the sample keeps moving because the rows keep
-        // closing. `olmo`'s non-parametric LayerNorm, then `dbrx`'s
-        // weighted one plus its clamp and its `attn_output_norm` slot,
-        // are all implemented now. `smallthinker` routes on the raw
-        // layer input and runs ReLU experts, and nothing landed so far
-        // reaches either.
-        let new_code = unaudited_refusal_detail("smallthinker");
+        // `bitnet`, which used to be `smallthinker`, which used to be
+        // `dbrx`, which used to be `olmo`: the sample keeps moving
+        // because the rows keep closing. `olmo`'s non-parametric
+        // LayerNorm, then `dbrx`'s weighted one plus its clamp and its
+        // `attn_output_norm` slot, then `smallthinker`'s router operand
+        // and gated ReLU experts, are all implemented now. `bitnet`
+        // needs two norm slots INSIDE the blocks, and nothing landed so
+        // far reaches either.
+        let new_code = unaudited_refusal_detail("bitnet");
         // `phi4` is the only UNKNOWN row left: `mistral`, `mixtral` and
         // `yi` used to be the other three and are refused as strings
         // now (see `NO_UPSTREAM_ARCH`).
@@ -3094,7 +3198,7 @@ mod audit_tests {
         // The blocker itself, not only the class label, has to be in the
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
-        assert!(new_code.contains("smallthinker.cpp:111"), "{new_code}");
+        assert!(new_code.contains("bitnet.cpp:24,36"), "{new_code}");
         assert!(unknown.contains("LLM_ARCH_NAMES"), "{unknown}");
         // The two empty classes still have to be distinguishable.
         let labels = [
@@ -3115,7 +3219,7 @@ mod audit_tests {
     /// whole point of the inversion.
     #[test]
     fn an_unchecked_architecture_is_not_audited() {
-        assert!(!is_audited_generic("smallthinker"));
+        assert!(!is_audited_generic("bitnet"));
         assert!(!is_audited_generic("talkie"));
         assert!(!is_audited_generic("an-arch-that-does-not-exist"));
     }

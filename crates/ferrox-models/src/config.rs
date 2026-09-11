@@ -395,6 +395,15 @@ pub struct ModelConfig {
     /// `Decoder::metal_can_serve_model`, because none has a per-token Q
     /// scale uniform.
     pub attn_temperature: Option<crate::attn_temperature::AttnTemperature>,
+    /// WHICH TENSOR THE MoE ROUTER READS -- the normed FFN input for
+    /// every graph but one, the raw layer input for `smallthinker`
+    /// (`smallthinker.cpp:111`). See [`crate::router_input`] for the
+    /// census (four graphs of 140 pass a precomputed `probs_in`, one on
+    /// the generic path) and the seam. `Decoder::router_operand` is the
+    /// ONE place the operand is captured, and the GPU router paths
+    /// refuse a model whose operand they cannot read
+    /// (`Decoder::gpu_router_matches_host_routing`).
+    pub router_input: crate::router_input::RouterInput,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -516,12 +525,30 @@ pub enum FfnActivation {
     ///
     /// The loader ALIASES the expert's `gate` to its `up` matrix (a
     /// zero-copy view of the same bytes) and this maps to
-    /// `ferrox_moe::GluAct::Reglu`, `relu(gate) * up`, which on the
-    /// aliased pair is exactly `relu(up)^2`. That is what lets every
-    /// gated path serve it unchanged; the dense hot paths skip the
-    /// aliased matmul through `GluAct::ungated`, and no fused device
-    /// kernel spells it, so `fused_kernel_gelu_flag` is `None`.
+    /// `ferrox_moe::GluAct::ReluSqr`, which reads `up` alone. That is
+    /// what lets every gated path serve it unchanged; the dense hot
+    /// paths skip the aliased matmul through `GluAct::ungated`, and no
+    /// fused device kernel spells it, so `fused_kernel_gelu_flag` is
+    /// `None`.
     ReluSqr,
+    /// GATED ReLU, `down(relu(gate(x)) * up(x))` with a REAL gate
+    /// matrix -- llama.cpp's `LLM_FFN_RELU` under `build_moe_ffn` with
+    /// `gate_exps` present, which takes `ggml_reglu_split(gate, up)`
+    /// (`llama-graph.cpp:2195-2197`; `smallthinker.cpp:158`, the only
+    /// graph of 140 that passes it there -- `capability::uses_reglu`).
+    ///
+    /// `ferrox_moe::GluAct::Reglu`, on a pair the loader did NOT alias.
+    /// Two variants rather than [`Self::ReluSqr`] with a flag, because
+    /// `ffn_is_ungated` (the loader's aliasing decision) and
+    /// `layer_ffn_acts` (the body) must agree about which of the two a
+    /// file is, and a variant is the one spelling both read. The
+    /// `GluAct` side is two variants for the same reason: it used to
+    /// be one, `ungated()` answered `relu(up)^2` for it, and the dense
+    /// hot path skipped a gate that was real (the SmallThinker fixture
+    /// found it; `ferrox_moe::GluAct` says how). No fused device kernel
+    /// spells it, so `fused_kernel_gelu_flag` is `None` and every Metal
+    /// launch refuses.
+    Reglu,
     /// UNGATED xIELU with PER-LAYER parameters: `down(xielu_il(up(x)))`
     /// -- llama.cpp's `ggml_xielu(up, alpha_n[il], alpha_p[il],
     /// beta[il], eps[il])` (`apertus.cpp:132-138`), the four read as
@@ -861,6 +888,7 @@ pub fn glm_5_2() -> ModelConfig {
         residual_scale: None,
         clamp_kqv: None,
         attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -947,6 +975,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         residual_scale: None,
         clamp_kqv: None,
         attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1065,6 +1094,7 @@ pub fn kimi_k3() -> ModelConfig {
         residual_scale: None,
         clamp_kqv: None,
         attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1129,6 +1159,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         residual_scale: None,
         clamp_kqv: None,
         attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1188,6 +1219,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         residual_scale: None,
         clamp_kqv: None,
         attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1250,6 +1282,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         residual_scale: None,
         clamp_kqv: None,
         attn_temperature: None,
+        router_input: crate::router_input::RouterInput::NormedFfnInput,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
