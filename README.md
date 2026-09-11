@@ -148,6 +148,22 @@ that answers the question without that variable in it.
 [docs/MODELS.md](docs/MODELS.md) lists what runs today, and which
 checkpoints stop with an error instead.
 
+## Ferrox Studio
+
+A web UI for the server: chat, the model inventory, live request
+activity, and copy-pasteable connection snippets. It is a separate app
+that talks to `ferrox-server` over the same public API every other
+client uses, so nothing in it can work that the API does not expose.
+
+<img src="docs/assets/studio-chat.webp" alt="Ferrox Studio chat" width="100%" />
+
+```bash
+ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -ngl all &
+cd ui && npm install && npm run dev      # http://localhost:5173
+```
+
+More screenshots and how it is put together: [`ui/README.md`](ui/README.md).
+
 ## Use it as a library
 
 Published as [`ferrox-inference`](https://crates.io/crates/ferrox-inference),
