@@ -5426,6 +5426,14 @@ pub struct MatvecLaunch<'a> {
     pub rows_per_tg: usize,
 }
 
+/// What runs over every output vector after the matvecs, in the same
+/// command buffer, before the wait.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MatvecEpilogue {
+    /// Gemma-2's `final_logit_softcapping`: `y = cap * tanh(y / cap)`.
+    pub softcap: Option<f32>,
+}
+
 /// Encodes every launch into a single compute command buffer sharing
 /// one uploaded `x`, then waits once. Independent projections that
 /// share an activation (e.g. Q/K/V) should use this instead of N
@@ -5433,6 +5441,42 @@ pub struct MatvecLaunch<'a> {
 pub fn launch_matvec_fused(
     x: &[f32],
     launches: &[MatvecLaunch<'_>],
+) -> Result<Vec<Vec<f32>>, MetalError> {
+    launch_matvec_fused_with(x, launches, MatvecEpilogue::default())
+}
+
+/// One matvec of the kind named as `matvec_launch_meta` names it, with
+/// an epilogue: the lm_head of a sampled Gemma-2 decode token, softcap
+/// included, so the host never touches the 256k logits before sampling
+/// them. `None` when the kind has no Metal matvec.
+pub fn launch_matvec_kind_with(
+    kind: &str,
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    epilogue: MatvecEpilogue,
+) -> Option<Result<Vec<f32>, MetalError>> {
+    let (kernel_src, fn_name, block_bytes, block_elems, rows_per_tg) = matvec_launch_meta(kind)?;
+    let launch = MatvecLaunch {
+        kernel_src,
+        fn_name,
+        block_bytes,
+        block_elems,
+        weights,
+        rows,
+        row_bytes,
+        rows_per_tg,
+    };
+    Some(launch_matvec_fused_with(x, &[launch], epilogue).map(|mut outs| outs.pop().unwrap()))
+}
+
+/// [`launch_matvec_fused`] with an [`MatvecEpilogue`] applied to every
+/// output in the same command buffer.
+pub fn launch_matvec_fused_with(
+    x: &[f32],
+    launches: &[MatvecLaunch<'_>],
+    epilogue: MatvecEpilogue,
 ) -> Result<Vec<Vec<f32>>, MetalError> {
     if launches.is_empty() {
         return Ok(Vec::new());
@@ -5488,6 +5532,13 @@ pub fn launch_matvec_fused(
             &x_buf,
             &out_bufs[i],
         )?;
+    }
+    // A serial encoder: the epilogue reads what the matvecs wrote
+    // without a barrier of its own.
+    if let Some(cap) = epilogue.softcap {
+        for (i, launch) in launches.iter().enumerate() {
+            crate::elem::encode_softcap(&encoder, device, &out_bufs[i], launch.rows as u32, cap)?;
+        }
     }
     encoder.endEncoding();
     // The lm_head of every sampled (non-greedy) decode token runs here,

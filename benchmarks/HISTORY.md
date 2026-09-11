@@ -161,13 +161,63 @@ And the GPU column changes the ranking: Gemma-2-2B's GPU time alone,
 12.03 + 2.78 = 14.8 ms, already exceeds llama.cpp's 14.74 ms token. The
 worst Metal row is a kernel gap after all, not a host one.
 
+**2026-09-11, which kernels.** `FERROX_METAL_KERNEL_TIMING=1` gives
+every op group of the dense decode stack its own timestamp-sampled
+encoder, and beside it `kernel_bench` (an ignored hardware test) times
+each small kernel serialized in one encoder the way `test-backend-ops
+perf` does under `GGML_METAL_CONCURRENCY_DISABLE=1`, so the number sits
+next to a llama.cpp `us/run` for the same op. The matvecs were already
+at parity (Q4_K 2304x9216: 101 us ferrox, 100-103 llama.cpp; Q6_K
+9216x2304: 116 against 122-128); everything small was not, and none of
+it was Gemma-specific fusion. Serialized, per dispatch, M2 Pro, min of 7:
+
+| kernel (Gemma-2-2B shape) | main | llama.cpp | branch |
+|---|---:|---:|---:|
+| RoPE, 8+4 heads of 256 | 61.6 us | 2 x 2.8 | 3.4 |
+| RoPE, 24+8 heads of 128 (Llama-3B) | 21.4 | 2 x 2.8 | 2.9 |
+| RMSNorm 2304 | 14.2 | 3.2 | 4.7 |
+| add + RMSNorm 2304 | 12.8 | 3.2 | 4.8 |
+| attention d=256, 8/4 heads, 96 keys, softcap | 38.9 | 13.4 | 17.6 |
+| attention, same, no softcap | 36.7 | -- | 14.2 |
+
+Three causes, all of them memory-latency chains an Apple GPU will not
+overlap on its own: RoPE dispatched one thread per HEAD (threadgroups of
+width 1) and looped 128 pairs of pow/sin/cos inside it; the norms read
+one float per thread per iteration with a runtime trip count, so a
+2304-wide norm was 18 serial memory latencies; the d=128/256 attention
+walked each 32-key tile with a runtime bound and a runtime-indexed
+score array, so each key's loads waited on the previous key's
+`simd_sum`. Now one thread per pair, float4 norms sized to the row, and
+compile-time tile loops. Gemma-2's other candidates were checked and
+are NOT the gap: the sandwich norms cost the same per dispatch as
+Llama's, GeGLU is 4.5 us against llama.cpp's 6.2, and llama.cpp fuses
+`rms_norm + mul + add` where ferrox fuses `add + rms_norm`, one dispatch
+per sublayer either way. The one absent fusion was the final logit
+softcap, 0.65 ms of host `tanh` over 256k logits per sampled token; it
+is an epilogue in the lm_head's command buffer now.
+
+Interleaved main/branch/main/branch, GPU clock of the dense stack per
+token, ms (the lm_head buffer is unchanged within noise on all three):
+
+| Model | main | branch | Change |
+|---|---:|---:|---:|
+| Gemma-2-2B Q4_K_M | 12.00, 12.16, 12.20 | 10.22, 10.20, 10.32 | **-15.5%** |
+| Llama-3.2-3B Q4_K_M | 13.44, 13.51, 13.49 | 12.14, 12.19, 12.23 | **-9.6%** |
+| Llama-3.2-1B Q4_K_M | 4.96, 4.96, 4.95 | 4.68, 4.67, 4.68 | **-5.7%** |
+
+Gemma-2 prefill (`pp512`, GPU clock) 569.6 -> 565.9 ms, within noise.
+Against #202's quiet-host figures that is 12.03 -> ~10.2 ms of stack
+plus 0.65 ms of host removed, about 2.5 ms of a 17.3 ms token, which
+is the size of the 1.11x gap; the row needs a quiet-host `ferrox
+bench --compare` before `RESULTS.md` moves.
+
 ## Open
 
 | Issue | Gap | What is known |
 |---|---|---|
 | [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 22× to 34× | ~4× is tensor cores (`mul_mm` has none), ~5× is undiagnosed kernel efficiency. #148 bought 20–26% and ruled out dequant redundancy and occupancy |
 | [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing closed 9–19× to 2–5×. What limits the rest is not diagnosed — the access pattern was a real cost and was not the last one |
-| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, 1.11× worst row | the "26% host" was an accounting error: the lm_head runs in a second, untimed command buffer, and its GPU time was booked as host. Encoding, argument binding included, is ~2% of wall (three measurements agree), so packing and pipelining are retired unbuilt. What is left on the host is ~0.2 ms of submit latency per command buffer (two per sampled token) and Gemma's 0.65 ms CPU softcap. Gemma-2's GPU time alone already exceeds llama.cpp's token, so the row is a kernel gap |
+| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, 1.11× worst row | the "26% host" was an accounting error: the lm_head runs in a second, untimed command buffer, and its GPU time was booked as host. Encoding, argument binding included, is ~2% of wall (three measurements agree), so packing and pipelining are retired unbuilt. The kernel gap was then attributed per kind: RoPE, the norms and d=128/256 attention were 3x to 18x llama.cpp's per-dispatch cost, all memory-latency chains, and are fixed (stack GPU -15.5% on Gemma-2-2B, -9.6% on Llama-3B); the CPU softcap is a GPU epilogue. Left: ~0.2 ms submit latency per command buffer, two per sampled token; the quiet-host re-measure |
 | [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, 6.3× to 10.1× | was a missing kernel tier. [#159](https://github.com/antonellof/ferrox/pull/159) added AVX2 GEMMs for all five interleaved kinds and a per-workload dispatch rule, verified by execution on real AVX2 but **not yet benchmarked**, so this gap number still describes the code before it |
 | [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | the size rule landed in [#155](https://github.com/antonellof/ferrox/pull/155); the crossover constant is bracketed by the published numbers, not swept, and no before/after on a quiet host has been run. `MIN_TASK_MACS` is still there, which the issue asks to delete |
 | [#128](https://github.com/antonellof/ferrox/issues/128) | CPU decode dispatch, **closed** | The condvar wait was real and the cause was rayon's two-armed `join`: from a non-worker thread it injects and blocks on a mutex, ~150 times per token. [#167](https://github.com/antonellof/ferrox/pull/167) runs a whole forward in one `rayon::scope`. Note the trap: #128 had computed scheduling at 6.7% of a token and ruled it out, against a **stale denominator** taken before #155 removed the repack that inflated the token to 17 ms. At ~5 ms the same fixed cost is a much larger share |
@@ -231,7 +281,11 @@ warmup, so their prefill numbers include cold mmap page faults.
   has no `gemma4` arch, so its column is blank.
 - **Mixtral** is skipped by `--fit-host` on the Apple host.
 - **Metal regressions to keep off:** legacy GQA NSG=4, sequential
-  GREEDY argmax, float4 elem, early Multi-CB. `FERROX_METAL_FA_VEC=0`
-  costs ~25.5 pred.
+  GREEDY argmax, early Multi-CB. `FERROX_METAL_FA_VEC=0` costs ~25.5
+  pred. "float4 elem" used to be on this list from a 2026-08 wall-clock
+  wash on a thermally limited host (~22 against ~21 pred, both noisy);
+  the NORMS are float4 since 2026-09-11 on GPU-clock, interleaved
+  evidence (14.2 -> 4.7 us per dispatch serialized, stack -15.5% on
+  Gemma-2-2B), and the SiLU/GELU/add kernels stay scalar, untouched.
 - Run-to-run spread is ~20% on the Apple host; a claim tighter than
   that needs interleaved A/B.

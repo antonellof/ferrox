@@ -3613,8 +3613,9 @@ impl Decoder {
     /// capping produces a different distribution -- not an error, just a
     /// quietly wrong one.
     fn logits_from_normed(&self, final_normed: &[f32]) -> Vec<f32> {
-        Logits::from_output_head(
-            self.output_head.apply(final_normed),
+        Logits::project(
+            &self.output_head,
+            final_normed,
             self.config.final_logit_softcap,
             self.config.logit_multiplier,
         )

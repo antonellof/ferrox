@@ -28,6 +28,7 @@
 //! vocabulary-shaped on the way out.
 
 use ferrox_core::matmul::softcap_inplace;
+use ferrox_core::weight_matrix::WeightMatrix;
 
 /// A vocabulary of logits that has already had `final_logit_softcap`
 /// applied (or has none to apply).
@@ -67,6 +68,26 @@ impl Logits {
             softcap_inplace(&mut raw, sc);
         }
         Logits(raw)
+    }
+
+    /// Project one final-normed hidden state through `head` and apply
+    /// the two post-projection transforms. The only way to build a
+    /// single-row `Logits` from a head, so that where the cap runs is
+    /// decided here and nowhere else: with a cap and no multiplier it
+    /// is [`WeightMatrix::apply_softcapped`], which folds the cap into
+    /// the matvec's own command buffer on Metal; otherwise it is
+    /// [`Self::from_output_head`] on the raw projection. No
+    /// architecture declares both today; the order is pinned there.
+    pub(crate) fn project(
+        head: &WeightMatrix,
+        x: &[f32],
+        softcap: Option<f32>,
+        multiplier: Option<f32>,
+    ) -> Self {
+        match (softcap, multiplier) {
+            (Some(cap), None) => Logits(head.apply_softcapped(x, cap)),
+            _ => Self::from_output_head(head.apply(x), softcap, multiplier),
+        }
     }
 
     pub(crate) fn as_slice(&self) -> &[f32] {
@@ -201,6 +222,35 @@ mod tests {
             Logits::from_output_head(vec![100.0, -100.0], None, None).into_vec(),
             vec![100.0, -100.0],
             "no cap configured must leave the head's output exactly alone"
+        );
+    }
+
+    /// `project` is the one way to build single-row logits from a head,
+    /// and with a cap it takes a different route (`apply_softcapped`,
+    /// the Metal epilogue when there is one) from the raw projection
+    /// plus `from_output_head`. The two routes must agree, or the cap
+    /// would depend on which backend answered. Checked on the host
+    /// here; the Metal epilogue is checked against the host kernel by
+    /// `ferrox_metal::elem`'s hardware test.
+    #[test]
+    fn project_with_a_cap_agrees_with_the_raw_projection_capped_afterwards() {
+        use ferrox_core::tensor::Tensor;
+        let (rows, cols) = (5usize, 4usize);
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.7).sin() * 40.0)
+            .collect();
+        let head = WeightMatrix::F32(Tensor::new(data, vec![rows, cols]));
+        let x = [1.0f32, -2.0, 0.5, 3.0];
+        let via_project = Logits::project(&head, &x, Some(30.0), None).into_vec();
+        let via_raw = Logits::from_output_head(head.apply(&x), Some(30.0), None).into_vec();
+        assert_eq!(via_project, via_raw);
+        for v in &via_project {
+            assert!(v.abs() < 30.0, "a capped logit is inside (-cap, cap): {v}");
+        }
+        // Without a cap there is only the raw route.
+        assert_eq!(
+            Logits::project(&head, &x, None, None).into_vec(),
+            head.apply(&x)
         );
     }
 

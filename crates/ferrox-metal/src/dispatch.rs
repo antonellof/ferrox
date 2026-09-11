@@ -110,10 +110,15 @@ mod tests {
             ("dispatch.rs", include_str!("dispatch.rs")),
             ("elem.rs", include_str!("elem.rs")),
             ("embd.rs", include_str!("embd.rs")),
+            ("fa_vec_decode.rs", include_str!("fa_vec_decode.rs")),
             ("gpu.rs", include_str!("gpu.rs")),
+            ("kernel_bench.rs", include_str!("kernel_bench.rs")),
+            ("kernel_timing.rs", include_str!("kernel_timing.rs")),
             ("lib.rs", include_str!("lib.rs")),
             ("mem_ranges.rs", include_str!("mem_ranges.rs")),
             ("moe_ids.rs", include_str!("moe_ids.rs")),
+            ("norm.rs", include_str!("norm.rs")),
+            ("rope.rs", include_str!("rope.rs")),
             ("timing.rs", include_str!("timing.rs")),
         ];
         // This file holds the wrapper (the one legitimate caller of the

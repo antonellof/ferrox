@@ -1135,6 +1135,56 @@ impl WeightMatrix {
         self.apply_cpu(x)
     }
 
+    /// [`Self::apply`] followed by `softcap_inplace(.., softcap)`, as
+    /// ONE operation: Gemma-2's lm_head with its `final_logit_softcap`.
+    ///
+    /// On Metal the cap runs as an epilogue in the matvec's own command
+    /// buffer (`ferrox_metal::gpu::MatvecEpilogue`), so the host never
+    /// walks the 256k logits before sampling them: that walk was
+    /// 0.65 ms per token, more than the whole encode phase (PR #202).
+    /// Everywhere else, and whenever the Metal launch is refused or
+    /// fails, it is the host multiply-tanh it always was. Either way
+    /// the caller gets capped logits and never has to remember the cap.
+    pub fn apply_softcapped(&self, x: &[f32], softcap: f32) -> Vec<f32> {
+        #[cfg(feature = "metal")]
+        if metal_dense_enabled() {
+            if let WeightMatrix::Quantized {
+                data,
+                rows,
+                cols,
+                kind,
+            } = self
+            {
+                if let Some(kind_name) = Metal::matvec_kernel(*kind) {
+                    crate::activation_tap::observe(self, x, 1);
+                    let row_bytes = self.block_bytes_per_row(*kind, *cols);
+                    let epilogue = ferrox_metal::gpu::MatvecEpilogue {
+                        softcap: Some(softcap),
+                    };
+                    match ferrox_metal::gpu::launch_matvec_kind_with(
+                        kind_name,
+                        data.as_slice(),
+                        x,
+                        *rows,
+                        row_bytes,
+                        epilogue,
+                    ) {
+                        Some(Ok(out)) => return out,
+                        Some(Err(e)) => {
+                            eprintln!(
+                                "ferrox: Metal softcapped matvec failed, falling back to CPU: {e}"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        let mut out = self.apply(x);
+        crate::matmul::softcap_inplace(&mut out, softcap);
+        out
+    }
+
     /// CPU-only matvec (NEON/AVX/scalar via `ferrox-quant`). Used by
     /// [`Self::apply`] after Metal miss/disable, and by GPU parity tests
     /// that must not recurse into [`Self::apply_gpu`].

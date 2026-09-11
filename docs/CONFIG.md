@@ -219,6 +219,7 @@ do that without a GPU capture.
 |---|---|
 | `FERROX_METAL_MM_TIMING` | `1`, accumulate **wall-clock** setup / GPU-wait / readback microseconds across the prefill GEMM paths and print the totals. This is how long the host waited, which is what a `pp512` number is made of |
 | `FERROX_METAL_GPU_TIMING` | `1`, accumulate **GPU-clock** milliseconds per tagged submission (`moe-decode/tok`, `dense-decode/tok`, `prefill-dense-stack`) from the command buffer's own timestamps, and print a running mean. Different question from the above: this one excludes host stalls |
+| `FERROX_METAL_KERNEL_TIMING` | `1`, attribute the dense decode stack's GPU time to dispatch KINDS (matvec, attention, norm, RoPE, ...) and print a table. Apple GPUs sample the timestamp counter only at encoder boundaries, so every op group gets its own sampled encoder while this is on: the small-kernel rows carry an encoder boundary each and the between-encoder gaps are their own row. The ratio between two builds or two models measured the same way is the number it exists for |
 | `FERROX_METAL_BARRIER_LOG` | `1`, log the running barriers-per-op ratio from `MemRanges`. `1.00` means the pass is fully serialised; lower means dispatches are overlapping. This is the direct measure of what a graph change bought |
 
 ## Test and development fixtures
