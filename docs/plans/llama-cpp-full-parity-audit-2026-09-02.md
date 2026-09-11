@@ -117,7 +117,7 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 | llama.cpp tool | ferrox command | Status |
 |----------------|----------------|--------|
 | `llama-cli` | `ferrox run` | partial — flag parity mostly done |
-| `llama-server` | `ferrox serve` | partial — slot save/load missing |
+| `llama-server` | `ferrox serve` | partial — slot save/restore present, `GET /slots` / `/props` / `/infill` absent |
 | `llama-bench` | `ferrox bench` | **ported** |
 | `llama-quantize` | `ferrox quantize` | partial — Q8_0 byte-identical; K-quants missing |
 | `llama-perplexity` | `ferrox perplexity` | partial — corpus ppl; no HellaSwag |
@@ -183,9 +183,9 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 
 | Gap | llama.cpp | ferrox |
 |-----|-----------|--------|
-| Slot save/load | yes | **missing** |
-| `-np` / `--parallel` | yes | env only (`FERROX_CB_MAX_SEQS`) |
-| `-b` / `-ub` batch flags | yes | env only |
+| Slot save/load | yes | **`POST /slots/{id}?action=save\|restore`** (2026-09-11), gated on `--slot-save-path`, restoring into the prefix cache; the file carries a checkpoint fingerprint and a mismatch is refused by name. `erase` refused by name, `GET /slots` absent |
+| `-np` / `--parallel` | yes | wired (was already; the row was stale). Read back as `ferrox_scheduler_max_seqs` on `/metrics` since 2026-09-11 |
+| `-b` / `-ub` batch flags | yes | **wired** (2026-09-11), one number on both decode paths, read back as `ferrox_scheduler_prefill_chunk` |
 | Partial `-ngl` | yes | all-or-nothing |
 | Streamed CB output | token stream | buffers full completion |
 | gguf-split merge/split | yes | **`ferrox gguf-split`**, both directions |
@@ -232,7 +232,7 @@ Ranked per [`north-star.md`](north-star.md) and [`roadmap.md`](roadmap.md).
 | 5 | **Model layer reorg phase 1** — extract `attn_block`, `rope`, per-arch trait | L | Everything below |
 | 6 | **K-quant encoders** (#70) — Q4_K_M write parity | L | `ferrox quantize` usefulness |
 | 7 | **CUDA mul_mm + mmvq** — port from Metal `mul_mm_sg_impl` | L | CUDA prefill |
-| 8 | **Server: `-np`, slot save/load, streamed CB** | M | Serving parity |
+| 8 | **Server: ~~`-np`~~, ~~slot save/load~~, streamed CB** | M | Serving parity. `-np` was already wired; slot save/restore and `-b`/`-ub` landed 2026-09-11. Streamed CB output remains |
 | 9 | **Embedding model path** — WordPiece + BERT loader | L | BGE/E5/nomic-embed |
 | ~~10~~ | ~~**gguf-split utility**~~ | S | **done 2026-09-09**: `ferrox gguf-split` |
 

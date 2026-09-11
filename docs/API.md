@@ -30,6 +30,7 @@ comes back the same way.
 | `GET`/`POST /v1/conversations/{conversation_id}` | Read one with its messages, or rename, retarget and append |
 | `POST /v1/conversations/{conversation_id}/delete` | Delete. Spelled as a POST suffix because the CORS allow-list is `GET, POST`, so a `DELETE` method would work from curl and fail from every cross-origin browser |
 | `POST /v1/admin/prepare-stop` | Close admission, seal the accounting, and make the receipt durable (see below) |
+| `POST /slots/{id_slot}?action=save\|restore` | llama.cpp's slot save/restore: persist a prompt prefix's KV to disk and load it back after a restart. Needs `--slot-save-path` and `FERROX_PREFIX_CACHE_ENTRIES` (see below). `action=erase` is refused by name |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |
 | `GET /` | 404. The web UI in [`ui/`](../ui) is a separate app and this server does not serve it |
@@ -860,14 +861,107 @@ wait for admission. Past that cap a request gets a `503` with a
 `Retry-After` header instead of joining an unbounded queue, and the JSON
 body names the queue depth, the cap and `retry_after_seconds`.
 
+`-b N` / `--batch-size N` and `-ub N` / `--ubatch-size N` set the
+prefill chunk on both decode paths at once (`FERROX_CB_PREFILL_CHUNK`
+here and `FERROX_CHUNKED_PREFILL` on the private loop, which used to be
+two independent knobs for one number). ferrox has one prefill stage, so
+the two flags resolve the way llama.cpp resolves them
+(`src/llama-context.cpp:265`): the smaller of whichever was named.
+
 While a batcher is active, `GET /metrics` reports
 `ferrox_prefill_chunks_total`, `ferrox_prefill_tokens_total`,
-`ferrox_decode_steps_total`, `ferrox_scheduler_queue_depth` and
-`ferrox_scheduler_queue_rejected_total`.
+`ferrox_decode_steps_total`, `ferrox_scheduler_queue_depth`,
+`ferrox_scheduler_queue_rejected_total`, and the configured caps
+`ferrox_scheduler_max_seqs` (`-np`; 0 when unlimited) and
+`ferrox_scheduler_prefill_chunk` (`-ub`), so a flag can be read back
+from the process that received it rather than trusted.
 
 Every `503` this server returns carries `Retry-After: 1`. It is a fixed
 hint, not a computed one. An honest estimate would need the caller's
 throughput, and the server does not know it.
+
+## Slot save and restore
+
+llama.cpp's `POST /slots/{id_slot}?action=save|restore`, so a long
+system prompt survives a restart instead of being prefilled again. The
+route, the `action` query, the gate and the response fields are
+llama.cpp's (`tools/server/server.cpp:273`,
+`server-context.cpp:4536-4567`, `server-task.cpp:1570-1592`); a client
+written against `llama-server` works unchanged.
+
+```bash
+# Start with somewhere to put the files, and the prefix cache the
+# slots restore into.
+FERROX_PREFIX_CACHE_ENTRIES=8 ferrox-server -m model.gguf \
+  --slot-save-path ./slots --port 8383
+
+# Prefill a prompt, store its KV in the prefix cache, and write it to
+# ./slots/system.fslot
+curl -s -X POST 'http://127.0.0.1:8383/slots/0?action=save' \
+  -H 'content-type: application/json' \
+  -d '{"filename":"system.fslot","prompt":"You are a terse assistant ..."}'
+# {"id_slot":0,"filename":"system.fslot","n_saved":83,"n_written":5953021,"timings":{"save_ms":297.5}}
+
+# ... restart the server ...
+
+curl -s -X POST 'http://127.0.0.1:8383/slots/0?action=restore' \
+  -H 'content-type: application/json' \
+  -d '{"filename":"system.fslot"}'
+# {"id_slot":0,"filename":"system.fslot","n_restored":83,"n_read":5953021,"timings":{"restore_ms":75.5}}
+```
+
+Any completion whose prompt starts with those tokens then reports
+`cached_tokens: 83` in `usage` and prefills only the remainder, with
+the same greedy output the cold server gave.
+
+Two things differ from llama.cpp, and are said rather than emulated:
+
+- **`id_slot` is bookkeeping.** llama.cpp has N fixed slots each owning
+  a KV region, and `-np` sets N. ferrox builds KV per request and
+  shares prefixes through one `PrefixCache`, so there is no per-slot
+  region for the id to select. It is validated (a non-negative
+  integer) and echoed.
+- **`save` names its `prompt`.** llama.cpp saves whatever the slot was
+  last serving; nothing here is "last serving" anything. The body
+  carries the prompt to prefill, tokenized with BOS exactly as a
+  completion would be.
+
+`action=erase` is `501`, not a no-op: the prefix cache has whole-cache
+clearing and no per-entry eviction, so erasing one slot would mean
+erasing all of them. Delete the file, or restart.
+
+**A restore is refused, by name, when the file is not of the model
+being served.** A slot file is raw attention state; restoring it under
+other weights does not fail, it answers wrongly. So the file carries
+the checkpoint's identity and a restore compares it before storing
+anything:
+
+```
+400 slot_model_mismatch
+refusing to restore ./slots/system.fslot: checkpoint: the slot was saved
+under 2b77f720... and this server is serving 3a59835e.... Restoring
+attention state computed by other weights does not fail, it answers wrongly
+```
+
+The identity is a SHA-256 over the GGUF's metadata (sorted, typed),
+its full tensor directory, and 4 KiB from the head and tail of every
+tensor, beside the layer count, KV head count, head dimension and KV
+dtype. Path, size and hyper-parameters were each rejected as the key
+because each admits the likely pair, two fine-tunes of one base at one
+quantisation. The same model at a different quantisation is refused on
+`checkpoint`; a different model is refused on `model` or the first
+shape field that differs. llama.cpp's own slot file
+(`src/llama-context.cpp:3081-3141`) carries no identity at all.
+
+The file is framed with a length-and-digest prefix like
+`ferrox_core::kv_disk`'s blocks: a truncated, edited or foreign file is
+refused before anything is parsed or allocated. Filenames are a strict
+whitelist (`[A-Za-z0-9._-]`, no leading dot), so a name cannot leave
+`--slot-save-path`.
+
+Slots are implemented for the generic GGUF decoder. The dedicated
+engines (Kimi, MLA, Gemma-4, GLM-5.2) refuse by name; so does a server
+without a checkpoint on disk.
 
 ## MCP
 
@@ -1293,7 +1387,8 @@ multi-GPU, tensor parallel, prefill/decode disaggregation · streamed
 argument deltas for the JSON-payload tool formats (they arrive whole) ·
 streamed tool calls on the continuous-batching path · a speculative
 decode path in the server, so every speculation field in `usage` is
-absent today · llama.cpp's `/infill`, `/props`, `/slots`,
+absent today · llama.cpp's `/infill`, `/props`, `GET /slots` (the live
+slot listing; `POST /slots/{id}` save/restore is supported, see above),
 `/apply-template` and `/lora-adapters`, none of which have a
 ferrox counterpart.
 
