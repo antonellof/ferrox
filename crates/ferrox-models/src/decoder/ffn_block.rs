@@ -37,7 +37,7 @@ impl Decoder {
             .apply(hidden, self.config.rms_norm_eps);
         let mut ffn_out = match oai {
             Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
-            None => Self::run_ffn_block(layer, &normed2, &self.config, hidden_dim, plan),
+            None => Self::run_ffn_block(layer_idx, layer, &normed2, &self.config, hidden_dim, plan),
         };
         if let Some(post) = &layer.attn.post_ffn_norm {
             ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);

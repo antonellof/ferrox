@@ -14,7 +14,6 @@
 
 mod attn_block;
 mod entry;
-mod ffn_act;
 mod ffn_block;
 pub mod kv_window;
 mod lm_head;
@@ -838,10 +837,21 @@ impl Decoder {
     fn metal_can_serve_model(config: &ModelConfig) -> bool {
         config.residual_scale.is_none()
             && config.clamp_kqv.is_none()
-            && GluAct::from(config.ffn_activation)
-                .fused_kernel_gelu_flag()
+            // `model_ffn_act` is `None` for an activation that varies
+            // by layer (xIELU's parameters), which no fused kernel
+            // takes; `fused_kernel_gelu_flag` is `None` for one no
+            // kernel spells.
+            && config
+                .model_ffn_act()
+                .and_then(GluAct::fused_kernel_gelu_flag)
                 .is_some()
             && config.layer_shapes.is_uniform()
+            // Each fused launch takes ONE rotary width (`MetalRope::
+            // rot_dim`); a model whose sliding layers rotate a
+            // different width from its full ones (`rope_dim_swa`,
+            // Step-3.5 and Laguna-XS.2) stays on the host bodies, which
+            // read each layer's own through `layer_rope`.
+            && !config.rope_dim_varies_by_layer()
     }
 
     /// True when this layer can use the fused Metal attention block
@@ -947,7 +957,7 @@ impl Decoder {
         layer.attn.post_attn_norm.is_some()
             || layer.attn.post_ffn_norm.is_some()
             || self.config.layer_sliding_window(layer_idx).is_some()
-            || !GluAct::from(self.config.ffn_activation).is_swiglu()
+            || !self.config.layer_ffn_acts(layer_idx).all_swiglu()
             // `Some(base)` when this layer rotates at the model's own
             // base, so this ONE comparison covers both stack-only RoPE
             // facts: a per-layer base (Gemma-3's sliding layers) and a
@@ -970,7 +980,23 @@ impl Decoder {
     /// five layers in six at the wrong scale.
     #[cfg(feature = "metal")]
     fn metal_layer_rope(&self, layer_idx: usize) -> Option<ferrox_metal::attn::LayerRope<'_>> {
-        let (theta, freq_factors) = self.config.layer_rope(layer_idx)?;
+        // Exhaustive on purpose: the third field is the rotary width,
+        // which the Metal kernels take as ONE uniform for every layer
+        // (`MetalRope::rot_dim`, from `metal_rope`). A layer whose width
+        // differs from the model's must never reach a launch, and
+        // `metal_can_serve_model` refuses such a model up front; this
+        // is the check that the fence held, not a second fence.
+        let crate::config::LayerRopeParams {
+            theta,
+            freq_factors,
+            rot_dim,
+        } = self.config.layer_rope(layer_idx)?;
+        assert_eq!(
+            rot_dim,
+            self.config.rope_dim.filter(|w| *w < self.config.head_dim),
+            "layer {layer_idx} rotates a different width from the model's; \
+             `metal_can_serve_model` must have refused this model"
+        );
         Some(ferrox_metal::attn::LayerRope {
             theta,
             freq_factors,
@@ -1129,7 +1155,7 @@ impl Decoder {
         if !Self::metal_can_serve_model(config)
             || Self::is_dense_layer(layer)
             || !layer.moe.shared_experts.is_empty()
-            || !GluAct::from(config.ffn_activation).is_swiglu()
+            || !config.model_ffn_act().is_some_and(GluAct::is_swiglu)
             // See `gpu_router_matches_host_routing`: the GPU router
             // takes router weights and nothing else.
             || !Self::gpu_router_matches_host_routing(layer, config)
@@ -1233,7 +1259,10 @@ impl Decoder {
     ) -> Option<Vec<f32>> {
         // `None` for an activation no fused kernel implements: the
         // stack does not launch, rather than running it as GELU.
-        let gelu = GluAct::from(self.config.ffn_activation).fused_kernel_gelu_flag()?;
+        let gelu = self
+            .config
+            .model_ffn_act()
+            .and_then(GluAct::fused_kernel_gelu_flag)?;
         let mut prefill_layers = Vec::with_capacity(run_len);
         for li in start..start + run_len {
             let layer = &self.layers[li];
@@ -1335,7 +1364,7 @@ impl Decoder {
             && !Self::is_dense_layer(layer)
             && layer.moe.shared_experts.is_empty()
             && Self::gpu_router_matches_host_routing(layer, config)
-            && GluAct::from(config.ffn_activation).is_swiglu()
+            && config.model_ffn_act().is_some_and(GluAct::is_swiglu)
             // Streamed experts are eligible too. They were excluded
             // while the fused launch could not hold all of top-k at
             // once; it can now, by materialising each expert into an
@@ -1486,6 +1515,7 @@ impl Decoder {
     /// Returns FFN outs `[T, H]` or `None`.
     #[cfg(feature = "metal")]
     fn try_metal_moe_prefill_batch(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2_batch: &[f32],
         router_logits_batch: &[f32],
@@ -1493,9 +1523,10 @@ impl Decoder {
         hidden_dim: usize,
         config: &ModelConfig,
     ) -> Option<Vec<f32>> {
+        let acts = config.layer_ffn_acts(layer_idx);
         if batch_size == 0
             || !ferrox_core::metal_dense_enabled()
-            || !GluAct::from(config.ffn_activation).is_swiglu()
+            || !acts.routed.is_swiglu()
             // The GPU router kernels take router weights and nothing
             // else: no `exp_probs_b` input, no `expert_weights_scale`
             // uniform, no groups. See `gpu_router_matches_host_routing`.
@@ -1553,10 +1584,9 @@ impl Decoder {
             batch_size,
             hidden_dim,
             &mut out,
-            // Guaranteed `Swiglu` by the fence at the top of this
-            // function; read from the config anyway so the two cannot
-            // drift apart.
-            GluAct::from(config.ffn_activation),
+            // The shared experts are `build_ffn`'s site, not the routed
+            // experts' the fence above checked; on the host either way.
+            acts.dense,
         );
         Some(out)
     }
@@ -2234,8 +2264,10 @@ impl Decoder {
                         let mut dense_layers = Vec::with_capacity(self.layers.len());
                         // The stack's activation uniform, or no stack
                         // at all for an activation it cannot spell.
-                        let stack_gelu =
-                            GluAct::from(self.config.ffn_activation).fused_kernel_gelu_flag();
+                        let stack_gelu = self
+                            .config
+                            .model_ffn_act()
+                            .and_then(GluAct::fused_kernel_gelu_flag);
                         let mut ok = stack_gelu.is_some();
                         for (li, layer) in self.layers.iter().enumerate() {
                             let ExpertBacking::Resident(experts) = &layer.moe.experts else {
@@ -2692,6 +2724,7 @@ impl Decoder {
                                                                 self.config.rms_norm_eps,
                                                             );
                                                             let ffn_out = Self::combine_ffn_outputs_for_position(
+                                                                l,
                                                                 layer,
                                                                 &normed2,
                                                                 &logits,
@@ -3064,19 +3097,16 @@ impl Decoder {
             }
         });
         let mut activated = vec![0f32; n_slots * ffn_rows];
-        // Generic over the gate nonlinearity rather than two copies of
-        // the loop, and monomorphised so the call still inlines: the
-        // combine here is always parallel (decode's `n_slots * ffn_rows`
-        // sits under `ferrox_core::matmul`'s own fork threshold), which
-        // is why this does not just call `act.apply`.
-        fn combine<F: Fn(f32) -> f32 + Sync>(out: &mut [f32], gate: &[f32], up: &[f32], f: F) {
-            ferrox_core::par::items_mut(out, 1, |idx, a| *a = f(gate[idx]) * up[idx]);
-        }
-        match act {
-            GluAct::Swiglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::silu),
-            GluAct::Geglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::gelu),
-            GluAct::Reglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::relu),
-        }
+        // The combine here is always parallel (decode's `n_slots *
+        // ffn_rows` sits under `ferrox_core::matmul`'s own fork
+        // threshold), which is why this does not just call `act.apply`.
+        // `GluAct::combine` is that function one element at a time --
+        // this used to match the variant here and multiply `f(gate) *
+        // up` itself, a second spelling of the activation that a
+        // parameterised variant (xIELU reads `up` alone) could not fit.
+        ferrox_core::par::items_mut(&mut activated, 1, |idx, a| {
+            *a = act.combine(gate[idx], up[idx])
+        });
         let mut outs: Vec<(Vec<f32>, f32)> = decision
             .weights
             .iter()
@@ -3211,6 +3241,7 @@ impl Decoder {
     }
 
     fn combine_ffn_outputs_for_position(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2: &[f32],
         router_logits: &[f32],
@@ -3219,7 +3250,8 @@ impl Decoder {
         plan: Option<&PlacementPlan>,
     ) -> Vec<f32> {
         let decision = Self::route_for_layer(layer, router_logits, config);
-        let act = GluAct::from(config.ffn_activation);
+        let acts = config.layer_ffn_acts(layer_idx);
+        let act = acts.routed;
         layer.moe.record_activations(&decision.expert_ids);
         // Best-effort warm of the routed experts for this layer into
         // the store cache (SSD streaming overlap). Resident-backed
@@ -3288,7 +3320,7 @@ impl Decoder {
             .moe
             .shared_experts
             .iter()
-            .map(|e| run_expert(normed2, e, act))
+            .map(|e| run_expert(normed2, e, acts.dense))
             .collect();
         // Qwen2-MoE-specific: see `MoeWeights::shared_expert_gate`'s doc
         // comment. Scaling here (before `combine_expert_outputs`, which
@@ -3335,11 +3367,13 @@ impl Decoder {
     /// Decode (`batch_size == 1`) still takes the fused per-position
     /// launch, which is the right shape there.
     fn dense_ffn_batch(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2_batch: &[f32],
         batch_size: usize,
         config: &ModelConfig,
     ) -> Option<Vec<f32>> {
+        let act = config.layer_ffn_acts(layer_idx).dense;
         // Match the GPU `mul_mm` threshold: below it the per-call launch
         // overhead outweighs the weight reuse.
         if !Self::is_dense_layer(layer) || batch_size < 4 {
@@ -3376,7 +3410,7 @@ impl Decoder {
         #[cfg(feature = "metal")]
         if let (true, Some(gelu)) = (
             ferrox_core::weight_matrix::metal_dense_enabled(),
-            GluAct::from(config.ffn_activation).fused_kernel_gelu_flag(),
+            act.fused_kernel_gelu_flag(),
         ) {
             let fused = layer.moe.with_expert(0, |ex| {
                 let (g, u, d) = (
@@ -3406,7 +3440,7 @@ impl Decoder {
             let up = ex
                 .up
                 .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-            let activated = GluAct::from(config.ffn_activation).apply(&gate, &up);
+            let activated = act.apply(&gate, &up);
             ex.down.apply_batch(&activated, batch_size)
         }))
     }
@@ -3420,14 +3454,15 @@ impl Decoder {
     /// the combine goes through [`GluAct`], so GeGLU no longer falls out
     /// to the per-position path.
     fn moe_ffn_batch(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2_batch: &[f32],
         router_logits_batch: &[f32],
         batch_size: usize,
-        hidden_dim: usize,
         config: &ModelConfig,
         plan: Option<&PlacementPlan>,
     ) -> Option<Vec<f32>> {
+        let hidden_dim = config.hidden_dim;
         if batch_size < 32 || Self::is_dense_layer(layer) {
             return None;
         }
@@ -3437,7 +3472,8 @@ impl Decoder {
         if ferrox_core::metal_dense_enabled() {
             return None;
         }
-        let act = GluAct::from(config.ffn_activation);
+        let acts = config.layer_ffn_acts(layer_idx);
+        let act = acts.routed;
         let ExpertBacking::Resident(experts) = &layer.moe.experts else {
             return None;
         };
@@ -3493,7 +3529,7 @@ impl Decoder {
             batch_size,
             hidden_dim,
             &mut acc,
-            act,
+            acts.dense,
         );
         Some(acc)
     }
@@ -3554,6 +3590,7 @@ impl Decoder {
     /// fast path (see `is_dense_layer`) or the full router+combine path
     /// with the router computed inline via a single-position `apply`.
     fn run_ffn_block(
+        layer_idx: usize,
         layer: &LayerWeights,
         normed2: &[f32],
         config: &ModelConfig,
@@ -3565,11 +3602,12 @@ impl Decoder {
             // One expert, run exactly the way a routed one is. The GeGLU
             // arm used to be spelled out here and nowhere else, which is
             // precisely how the routed paths ended up SwiGLU-only.
-            let act = GluAct::from(config.ffn_activation);
+            let act = config.layer_ffn_acts(layer_idx).dense;
             return layer.moe.with_expert(0, |ex| run_expert(normed2, ex, act));
         }
         let router_logits = layer.moe.router.apply(normed2);
         Self::combine_ffn_outputs_for_position(
+            layer_idx,
             layer,
             normed2,
             &router_logits,
@@ -3920,8 +3958,10 @@ impl Decoder {
                                         up: ex.up.mul_mm_sg_launch()?,
                                         down: ex.down.mul_mm_sg_launch()?,
                                     };
-                                    let gelu = GluAct::from(self.config.ffn_activation)
-                                        .fused_kernel_gelu_flag()?;
+                                    let gelu = self
+                                        .config
+                                        .model_ffn_act()
+                                        .and_then(GluAct::fused_kernel_gelu_flag)?;
                                     let prefill_layer =
                                         ferrox_metal::attn::PrefillDenseLayerMetal {
                                             // See `try_metal_prefill_dense_stack`:
@@ -4141,6 +4181,7 @@ impl Decoder {
                         };
                         let metal_ffn = if !dense {
                             Self::try_metal_moe_prefill_batch(
+                                l,
                                 layer,
                                 &normed2_batch,
                                 &router_logits_batch,
@@ -4159,9 +4200,13 @@ impl Decoder {
                                     .collect();
                             }
                             residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-                        } else if let Some(mut ffn_batch) =
-                            Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
-                        {
+                        } else if let Some(mut ffn_batch) = Self::dense_ffn_batch(
+                            l,
+                            layer,
+                            &normed2_batch,
+                            batch_size,
+                            &self.config,
+                        ) {
                             if let Some(post) = &layer.attn.post_ffn_norm {
                                 ffn_batch = ffn_batch
                                     .chunks(hidden_dim)
@@ -4170,11 +4215,11 @@ impl Decoder {
                             }
                             residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
                         } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
+                            l,
                             layer,
                             &normed2_batch,
                             &router_logits_batch,
                             batch_size,
-                            hidden_dim,
                             &self.config,
                             residency.as_ref().map(|p| p.layer_plan(l)),
                         ) {
@@ -4191,6 +4236,7 @@ impl Decoder {
                                 let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
                                 let mut ffn_out = if dense {
                                     Self::run_ffn_block(
+                                        l,
                                         layer,
                                         normed2,
                                         &self.config,
@@ -4201,6 +4247,7 @@ impl Decoder {
                                     let router_logits =
                                         &router_logits_batch[b * n_experts..(b + 1) * n_experts];
                                     Self::combine_ffn_outputs_for_position(
+                                        l,
                                         layer,
                                         normed2,
                                         router_logits,
@@ -4398,6 +4445,7 @@ impl Decoder {
             #[cfg(feature = "metal")]
             let metal_ffn = if !dense {
                 Self::try_metal_moe_prefill_batch(
+                    l,
                     layer,
                     &normed2_batch,
                     &router_logits_batch,
@@ -4419,7 +4467,7 @@ impl Decoder {
                 }
                 residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
             } else if let Some(mut ffn_batch) =
-                Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
+                Self::dense_ffn_batch(l, layer, &normed2_batch, batch_size, &self.config)
             {
                 // Dense FFN, batched. Without this the FFN -- the
                 // majority of a dense model's prefill work -- ran one
@@ -4434,11 +4482,11 @@ impl Decoder {
                 }
                 residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
             } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
+                l,
                 layer,
                 &normed2_batch,
                 &router_logits_batch,
                 batch_size,
-                hidden_dim,
                 &self.config,
                 residency.as_ref().map(|p| p.layer_plan(l)),
             ) {
@@ -4455,6 +4503,7 @@ impl Decoder {
                     let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
                     let mut ffn_out = if dense {
                         Self::run_ffn_block(
+                            l,
                             layer,
                             normed2,
                             &self.config,
@@ -4465,6 +4514,7 @@ impl Decoder {
                         let router_logits =
                             &router_logits_batch[b * n_experts..(b + 1) * n_experts];
                         Self::combine_ffn_outputs_for_position(
+                            l,
                             layer,
                             normed2,
                             router_logits,
@@ -4694,6 +4744,7 @@ impl Decoder {
                     Self::gpt_oss_ffn(layer, oai, normed2, &self.config, hidden_dim)
                 } else if dense {
                     Self::run_ffn_block(
+                        l,
                         layer,
                         normed2,
                         &self.config,
@@ -4703,6 +4754,7 @@ impl Decoder {
                 } else {
                     let router_logits = &router_logits_batch[b * n_experts..(b + 1) * n_experts];
                     Self::combine_ffn_outputs_for_position(
+                        l,
                         layer,
                         normed2,
                         router_logits,
@@ -4824,7 +4876,7 @@ mod tests {
         let expected_geglu = block_ref(&gelu);
         let expected_swiglu = block_ref(&silu);
 
-        let got = Decoder::run_ffn_block(layer, &normed2, &decoder.config, hidden_dim, None);
+        let got = Decoder::run_ffn_block(1, layer, &normed2, &decoder.config, hidden_dim, None);
         assert_eq!(got.len(), hidden_dim);
         for (i, (a, b)) in got.iter().zip(expected_geglu.iter()).enumerate() {
             assert!(
@@ -4912,7 +4964,7 @@ mod tests {
         let shared_out_raw = run_expert(
             &normed2,
             &decoder.layers[1].moe.shared_experts[0],
-            GluAct::from(decoder.config.ffn_activation),
+            decoder.config.layer_ffn_acts(1).dense,
         );
         let gate_logit: f32 = gate_vec
             .iter()
@@ -4930,6 +4982,7 @@ mod tests {
         // same experts, same input).
         let router_logits = decoder.layers[1].moe.router.apply(&normed2);
         let ungated_total = Decoder::combine_ffn_outputs_for_position(
+            1,
             &decoder.layers[1],
             &normed2,
             &router_logits,
@@ -4939,6 +4992,7 @@ mod tests {
         );
         decoder.layers[1].moe.shared_expert_gate = Some(gate_vec);
         let gated_total = Decoder::combine_ffn_outputs_for_position(
+            1,
             &decoder.layers[1],
             &normed2,
             &router_logits,
@@ -6824,9 +6878,42 @@ mod metal_rope_tests {
         ));
         assert!(!Decoder::metal_can_serve_model(&ungated));
         assert_eq!(
-            GluAct::from(ungated.ffn_activation).fused_kernel_gelu_flag(),
+            ungated
+                .model_ffn_act()
+                .and_then(GluAct::fused_kernel_gelu_flag),
             None
         );
+
+        // The two PARAMETERISED activations answer no whole-model
+        // activation at all, and the two-width rotary is a fourth thing
+        // the fused stacks cannot take; each keeps the model off alone.
+        let mut xielu = ungated.clone();
+        xielu.ffn_activation =
+            crate::config::FfnActivation::Xielu(crate::act_layers::XieluLayers::new(vec![
+                ferrox_moe::XieluParams::from_gguf(
+                    0.8, 0.8, 0.5, -1e-6
+                );
+                xielu.n_layers
+            ]));
+        assert_eq!(xielu.model_ffn_act(), None);
+        assert!(!Decoder::metal_can_serve_model(&xielu));
+        let mut clamped = ungated.clone();
+        clamped.ffn_activation =
+            crate::config::FfnActivation::SwigluClamped(crate::act_layers::SwigluClamps::new(
+                vec![0.0; clamped.n_layers],
+                vec![7.0; clamped.n_layers],
+            ));
+        assert_eq!(clamped.model_ffn_act(), None);
+        assert!(!Decoder::metal_can_serve_model(&clamped));
+        let mut two_widths = ungated;
+        two_widths.ffn_activation = crate::config::FfnActivation::Swiglu;
+        assert!(Decoder::metal_can_serve_model(&two_widths));
+        two_widths.sliding_window = Some(4);
+        two_widths.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
+        two_widths.n_layers = 2;
+        two_widths.rope_dim_swa = Some(two_widths.head_dim / 2);
+        assert!(two_widths.rope_dim_varies_by_layer());
+        assert!(!Decoder::metal_can_serve_model(&two_widths));
     }
 
     /// An attention output gate or a set of attention sinks keeps THAT
@@ -6924,15 +7011,15 @@ mod metal_rope_tests {
         let decoder = Decoder::new_random_small(cfg, 6, 32);
 
         for il in 0..decoder.layers.len() {
-            let (theta, ff) = decoder
+            let rope = decoder
                 .config
                 .layer_rope(il)
                 .expect("every layer rotates here");
             let sent = decoder
                 .metal_layer_rope(il)
                 .expect("so every layer is handed a rope");
-            assert_eq!(sent.theta, theta, "layer {il} base");
-            assert_eq!(sent.freq_factors, ff, "layer {il} divisors");
+            assert_eq!(sent.theta, rope.theta, "layer {il} base");
+            assert_eq!(sent.freq_factors, rope.freq_factors, "layer {il} divisors");
         }
 
         // Not vacuous: with `swa_pattern = 6` last-dense, layers 0..=4

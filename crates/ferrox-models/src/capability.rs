@@ -644,12 +644,15 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // the M.1 shape (no window, per element, uniform heads) and the
     // XS.2 shape (window, period 4 dense-first, per head, and
     // `head_count` as a per-layer ARRAY, which `crate::layer_shapes`
-    // carries). Two things stay refused by name in `loader.rs`, each
-    // from a fixture that has it: a window together with a RoPE
-    // scaling (`:48,184-192` run the sliding layers with YaRN off, the
-    // Olmo-3 rule), and `rope.dimension_count_swa` (`:50`) differing
-    // from `rope.dimension_count`, a second rotary width no host body
-    // takes yet. NEOX RoPE (llama-model.cpp:2676-2677).
+    // carries). One thing stays refused by name in `loader.rs`, from a
+    // fixture that has it: a window together with a RoPE scaling
+    // (`:48,184-192` run the sliding layers with YaRN off, the Olmo-3
+    // rule). `rope.dimension_count_swa` (`:50`) differing from
+    // `rope.dimension_count` -- a second rotary width -- was the other
+    // and is SERVED since `step35` closed on the same two-valued width
+    // (`ModelConfig::rope_dim_swa`, `crate::swa_geometry`); the
+    // XS.2-shaped fixture that carries it matches libllama. NEOX RoPE
+    // (llama-model.cpp:2676-2677).
     "laguna",
     // `mellum` (mellum.cpp:12-17,45-68,108-197): the per-layer
     // sliding-window ARRAY, honoured -- the scalar overload of
@@ -666,6 +669,26 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // Mellum2 export declares -- stays refused by name
     // (`crate::swa_geometry`).
     "mellum",
+    // tests/per_layer_activation_graphs.rs: `apertus` (apertus.cpp:6-9,
+    // 45-46, 93-96, 129-142), the first architecture whose FFN
+    // activation takes PARAMETERS THAT VARY BY LAYER -- xIELU with four
+    // `n_layer`-long arrays (`xielu.alpha_n`, `.alpha_p`, `.beta`,
+    // `.eps`, no architecture prefix) that `ggml_xielu` folds through
+    // a softplus at graph build. `crate::act_layers` reads them exactly
+    // as `get_key_or_arr` does (an array at `n_layer` length or a
+    // scalar broadcast; a second fixture carries the scalar form and
+    // libllama honours the broadcast), `ferrox_moe::GluAct::Xielu`
+    // carries one layer's four, and `ModelConfig::layer_ffn_act(il)`
+    // replaced the model-wide `GluAct::from(ffn_activation)` at every
+    // FFN body, so no site can take the activation without saying
+    // which layer's. The FFN is UNGATED like `arcee`'s and takes the
+    // same gate-to-up alias; per-head RMS QK-norm before RoPE; NEOX.
+    // Its optional `attn_q_norm.bias` / `attn_k_norm.bias` are created
+    // and never read upstream (`crate::unread_tensors`, measured). No
+    // fused Metal kernel spells xIELU, so every Metal launch refuses
+    // it through `ModelConfig::model_ffn_act`.
+    "apertus",
+    "step35",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1127,18 +1150,18 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // sigmoid default for `expert_gating_func` (`:29-30`) had been in
     // `SIGMOID_GATING_ARCHITECTURES` since 2026-09-01; the fixture
     // declares no gating key so that default is what it measures.
-    (
-        "apertus",
-        TriageClass::NewCode,
-        "xIELU, with four PER-LAYER parameter arrays. src/models/apertus.cpp:6-9 reads \
-         xielu_alpha_n, xielu_alpha_p, xielu_beta and xielu_eps as n_layer-long arrays and \
-         :132-135 indexes them per layer; `FfnActivation` (config.rs:302-312) has three \
-         variants and no way to carry a per-layer parameter at all. The FFN is also UNGATED \
-         -- :45-46 creates only ffn_down and ffn_up, no ffn_gate -- so it is the same \
-         two-matrix shape as `arcee` and `plm` on top of the activation. It further requires \
-         optional attn_q_norm/attn_k_norm BIASES (:50,:52), and ferrox's norms take a weight \
-         only",
-    ),
+    // `apertus` was HERE, NEW CODE on xIELU with four PER-LAYER
+    // parameter arrays (`apertus.cpp:6-9,132-138`). The arrays are
+    // `crate::act_layers` (read as `get_key_or_arr` reads them, an
+    // array at `n_layer` length or a scalar broadcast), the activation
+    // is `ferrox_moe::GluAct::Xielu` carrying that layer's four, and
+    // `ModelConfig::layer_ffn_act(il)` is the one accessor every FFN
+    // body asks -- the row is audited on a libllama-golden fixture
+    // (`tests/per_layer_activation_graphs.rs`). The verdict's third
+    // sentence was wrong: `:50,52` CREATE `attn_q_norm.bias` /
+    // `attn_k_norm.bias` and `:93,96` pass `NULL` as the bias, so they
+    // are never read; measured (libllama's logits byte-identical with
+    // and without them) and recorded in `crate::unread_tensors`.
     (
         "grovemoe",
         TriageClass::NewCode,
@@ -1168,40 +1191,25 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // (`:50`). The gate is `crate::attn_gate` and the row is audited on
     // two libllama-golden fixtures, one per width
     // (`tests/gated_attention_graphs.rs`). The second rotary width is a
-    // REFUSAL by name in `loader.rs` -- a file whose
+    // REFUSAL by name in `loader.rs` for one day -- a file whose
     // `rope.dimension_count_swa` differs from `rope.dimension_count` --
-    // and so is a window with a RoPE scaling (`:48,184-192`, the Olmo-3
-    // rule, `swa_layers_unscaled_rope`), each from a fixture that has
-    // it. Real Laguna-M.1 has neither; real Laguna-XS.2 has both and
-    // stops at the first.
-    (
-        "step35",
-        TriageClass::NewCode,
-        "per-layer SwiGLU clamp arrays, and a half-width RoPE on the full-attention layers. \
-         Every real Step-3.5 export has both (Step-3.5-Flash: `swiglu_limits`, \
-         `swiglu_limits_shared`, `partial_rotary_factors` 0.5 on full / 1.0 on sliding, 45 \
-         trunk layers plus 3 MTP): the clamp arrays for the routed and the shared experts \
-         (src/models/step35.cpp:28-29, LLM_KV_SWIGLU_CLAMP_EXP / _SHEXP; \
-         conversion/step3.py:207-220 writes both at block_count length), applied at \
-         llama-graph.cpp:2146-2164 (routed) and :1751-1768 (shared AND the dense layers, \
-         which share `build_ffn`) as `clamp(up, -l, l)` times `min(silu(gate), l)`, where \
-         ferrox's only clamp is the gpt-oss scalar with a different formula; and :9 halving \
-         `n_rot_full` AFTER llama-model.cpp:1222 seeded `n_rot_swa` from it, so `n_rot(il)` \
-         is the full width on sliding layers and half on the rest \
-         (`crate::swa_geometry`'s refusal from the other direction). NO LONGER a blocker: \
-         the NEXTN blocks (:32-55, step3.py:117-119,222-223), skipped by \
-         `crate::mtp_blocks`. NO LONGER a blocker: the per-layer sliding-window BOOL ARRAY \
-         -- :26 `get_key_or_arr(..., is_swa_impl, n_layer())` before :32 reads nextn, so at \
-         block_count length, and step3.py:173,179 always writes it; `crate::swa_layers` \
-         honours it here and broadcasts a scalar as a bool, since for this architecture a \
-         scalar 1 means every layer slides, not every layer is full. NO LONGER a blocker: \
-         the gated attention -- :96 creates `wqkv_gate` OPTIONAL and :268-284 multiply the \
-         attention output by `sigmoid(gate)` per head before `wo`; `crate::attn_gate` \
-         carries exactly that. NO LONGER a blocker: the per-layer head counts -- \
-         :76-78,122-124 and :208-209,388-389 read n_head / the KV widths PER LAYER, which \
-         `crate::layer_shapes` carries. The SIGMOID default \
-         for expert_gating_func (:19-20) is in SIGMOID_GATING_ARCHITECTURES",
-    ),
+    // and is served now (`ModelConfig::rope_dim_swa`, with `step35`);
+    // a window with a RoPE scaling (`:48,184-192`, the Olmo-3 rule,
+    // `swa_layers_unscaled_rope`) stays refused, from a fixture that
+    // has it. Real Laguna-M.1 has neither; real Laguna-XS.2 has both
+    // and stops at the scaling.
+    // `step35` was HERE, NEW CODE on its per-layer SwiGLU clamp arrays
+    // (`step35.cpp:28-29`, applied by llama.cpp's generic
+    // `build_moe_ffn` / `build_ffn` at `llama-graph.cpp:2146-2164` /
+    // `:1751-1768`) and its half-width rotary on the full layers
+    // (`:9`). The clamp is the second body on the per-layer activation
+    // seam `apertus` opened -- `crate::act_layers::SwigluClamps`, read
+    // by SITE, `ferrox_moe::GluAct::SwigluClamped` -- and the width is
+    // `ModelConfig::rope_dim_swa` (`crate::swa_geometry`, the same
+    // two-valued `n_rot(il)` that lifted Laguna-XS.2's refusal). Three
+    // libllama-golden fixtures (`tests/clamped_swiglu_graphs.rs`):
+    // clamped, unclamped, and with a NextN block. Everything else the
+    // verdict had crossed off is carried by them rather than assumed.
     // `mistral`, `mixtral` and `yi` were HERE, UNKNOWN on
     // NO_UPSTREAM_ARCH. The question that verdict asked -- "is there a
     // real GGUF spelling one of these?" -- was answered NO, with a
@@ -1455,6 +1463,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // window-with-YaRN half stays refused by name. NEOX RoPE:
             // llama-model.cpp:2682.
             "mellum",
+            // Was NEW CODE in `NEOX_ROPE_TRIAGED` on xIELU's per-layer
+            // parameter arrays, audited now on `crate::act_layers`
+            // (`tests/per_layer_activation_graphs.rs`). NEOX RoPE:
+            // llama-model.cpp:2671.
+            "apertus",
+            "step35",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2925,7 +2939,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 12,
+            seen == 10,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2977,8 +2991,15 @@ mod audit_tests {
              over-refusal of every real EXAONE-4 32B / EXAONE-MoE / Olmo-3 export, whose \
              array llama.cpp IGNORES (measured: libllama's logits do not move when it is \
              inverted), and `crate::mtp_blocks` landed beside it and skips the NextN \
-             blocks `mimo2` and `step35` named, so both lead with what is left. What is \
-             left is 11 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             blocks `mimo2` and `step35` named, so both lead with what is left, and 12 \
+             until `apertus` and `step35` closed together on the per-layer ACTIVATION \
+             PARAMETER seam (`crate::act_layers`, tests/per_layer_activation_graphs.rs, \
+             tests/clamped_swiglu_graphs.rs) -- one plumbing question, `layer il runs its \
+             FFN activation with these scalars`, and two bodies, xIELU and the clamped \
+             SwiGLU, read side by side before being called one cause; `step35`'s \
+             half-width rotary landed on `crate::swa_geometry` as a two-valued width and \
+             lifted Laguna-XS.2's `rope.dimension_count_swa` refusal by name with it. \
+             What is left is 9 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
              closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
              `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna` and `mellum`, and each \
              closure but `olmo`'s, `arcee`'s and `mellum`'s took more than one row at a \

@@ -8,7 +8,8 @@
 //! scheduler rather than copied CLI-flag parsing code. See
 //! docs/THIRD_PARTY_NOTICES.md.
 
-use ferrox_core::matmul::{geglu, swiglu};
+pub mod glu_act;
+
 use ferrox_core::weight_matrix::WeightMatrix;
 
 /// Where a given expert's weights currently live. `GpuDevice`-placed
@@ -944,115 +945,7 @@ pub fn run_expert_oai(
     out
 }
 
-/// Which gated activation an expert's `down(act(gate(x)) * up(x))` FFN
-/// uses.
-///
-/// A named type rather than a `bool` or an implicit default, and a
-/// REQUIRED argument of [`run_expert`] / [`run_expert_placed`], because
-/// the alternative already failed once: every routed-expert path in
-/// `ferrox-models` hardcoded SwiGLU while only the dense arm consulted
-/// `ModelConfig::ffn_activation`, so a GeGLU MoE would have computed the
-/// wrong activation with nothing to notice. A caller cannot forget an
-/// argument the compiler demands.
-///
-/// [`Geglu`](GluAct::Geglu) is `gelu(gate) * up` with llama.cpp's tanh
-/// GELU approximation (`ferrox_core::matmul::gelu`), which is what
-/// `build_moe_ffn` does under `LLM_FFN_GELU` -- the real shape of
-/// llama.cpp's `grok` (`src/models/grok.cpp`, `LLM_FFN_GELU` passed to
-/// `build_moe_ffn`).
-///
-/// [`Reglu`](GluAct::Reglu) is `relu(gate) * up`, and it exists for an
-/// FFN that has NO gate at all: llama.cpp's `LLM_FFN_RELU_SQR` under
-/// `LLM_FFN_SEQ` with a null gate (`arcee.cpp:123-128`, also `plm`,
-/// `nemotron`, `jais2`, `nemotron-h`) is `down(relu(up(x))^2)`. The
-/// loader aliases the expert's `gate` to its `up` matrix, so
-/// `relu(gate) * up` is `relu(up)^2` on every gated path without a
-/// branch, and [`GluAct::ungated`] lets the dense hot paths skip the
-/// aliased matmul. See `ferrox_core::matmul::reglu`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GluAct {
-    /// `silu(gate) * up`.
-    Swiglu,
-    /// `gelu(gate) * up`.
-    Geglu,
-    /// `relu(gate) * up`; with `gate` aliased to `up`, `relu(up)^2`.
-    Reglu,
-}
-
-impl GluAct {
-    /// The gated combine itself. One place, so a new variant is a
-    /// compile error at every site instead of a silent SwiGLU.
-    pub fn apply(self, gate: &[f32], up: &[f32]) -> Vec<f32> {
-        match self {
-            GluAct::Swiglu => swiglu(gate, up),
-            GluAct::Geglu => geglu(gate, up),
-            GluAct::Reglu => ferrox_core::matmul::reglu(gate, up),
-        }
-    }
-
-    /// The scalar gate nonlinearity, for callers that fuse the multiply
-    /// into a loop of their own (`cpu_moe_topk_parallel_slots`).
-    pub fn gate_fn(self) -> fn(f32) -> f32 {
-        match self {
-            GluAct::Swiglu => ferrox_core::matmul::silu,
-            GluAct::Geglu => ferrox_core::matmul::gelu,
-            GluAct::Reglu => ferrox_core::matmul::relu,
-        }
-    }
-
-    /// Whether the fused device kernels, which only implement SwiGLU,
-    /// may serve this activation.
-    pub fn is_swiglu(self) -> bool {
-        matches!(self, GluAct::Swiglu)
-    }
-
-    /// Whether the fused dense kernels that take a `gelu: bool` uniform
-    /// may serve this activation, and what to pass them.
-    ///
-    /// `None` is a refusal, and it is the whole reason this exists: six
-    /// launch sites in `decoder.rs` used to derive that flag as
-    /// `!act.is_swiglu()`, which reads "not SwiGLU, therefore GELU" --
-    /// true while the enum had two variants and silently wrong for the
-    /// third, which those kernels would have run as GELU. A site that
-    /// asks this question cannot get a `bool` for a variant no kernel
-    /// implements.
-    pub fn fused_kernel_gelu_flag(self) -> Option<bool> {
-        match self {
-            GluAct::Swiglu => Some(false),
-            GluAct::Geglu => Some(true),
-            GluAct::Reglu => None,
-        }
-    }
-
-    /// The elementwise function this activation applies to `up` ALONE
-    /// when the loader has aliased `gate` to `up`, or `None` for a
-    /// genuinely gated activation.
-    ///
-    /// The dense hot paths (`run_expert`, the batched dense FFN) use it
-    /// to skip the aliased gate matmul. Every other path runs the gated
-    /// form on the aliased pair, which is the same arithmetic --
-    /// `reglu_with_gate_aliased_to_up_is_relu_squared` pins that.
-    pub fn ungated(self) -> Option<UngatedFn> {
-        match self {
-            GluAct::Swiglu | GluAct::Geglu => None,
-            GluAct::Reglu => Some(relu_sqr),
-        }
-    }
-}
-
-/// The elementwise function [`GluAct::ungated`] hands back.
-pub type UngatedFn = fn(&[f32]) -> Vec<f32>;
-
-/// `relu(x)^2`, elementwise: the ungated form [`GluAct::Reglu`] stands
-/// for once the gate is known to be `up` itself.
-pub fn relu_sqr(up: &[f32]) -> Vec<f32> {
-    up.iter()
-        .map(|&x| {
-            let r = ferrox_core::matmul::relu(x);
-            r * r
-        })
-        .collect()
-}
+pub use glu_act::{relu_sqr, GluAct, Ungated, XieluParams};
 
 /// Runs one token's hidden state through a single expert's gated FFN.
 ///
@@ -1063,7 +956,7 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f3
     // GPU when placed), so nothing is given up by skipping the pair.
     if let Some(f) = act.ungated() {
         let up = expert.up.apply(hidden);
-        return expert.down.apply(&f(&up));
+        return expert.down.apply(&f.apply(&up));
     }
     #[cfg(any(feature = "cuda", feature = "metal"))]
     if act.is_swiglu() {
@@ -1731,13 +1624,13 @@ mod tests {
         let slotted: Vec<f32> = gated_out
             .iter()
             .zip(up_out.iter())
-            .map(|(g, u)| GluAct::Reglu.gate_fn()(*g) * u)
+            .map(|(g, u)| GluAct::Reglu.combine(*g, *u))
             .collect();
         let slotted = expert.down.apply(&slotted);
         for (name, got) in [
             ("run_expert", &shortcut),
             ("apply", &gated),
-            ("gate_fn", &slotted),
+            ("combine", &slotted),
         ] {
             for (a, b) in got.iter().zip(want.iter()) {
                 assert!((a - b).abs() < 1e-6, "{name}: {got:?} vs {want:?}");

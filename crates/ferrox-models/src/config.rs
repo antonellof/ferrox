@@ -255,7 +255,19 @@ pub struct ModelConfig {
     /// (`<arch>.rope.dimension_count`, llama.cpp `hparams.n_rot`).
     /// `None` means the whole head rotates, which is the common case.
     /// Phi-3/Phi-4 rotate 96 of 128.
+    ///
+    /// This is the FULL-attention layers' width, llama.cpp's
+    /// `n_rot_full`; [`Self::rope_dim_swa`] is the sliding layers'.
     pub rope_dim: Option<usize>,
+    /// The SLIDING layers' rotary width when it differs from
+    /// [`Self::rope_dim`] -- llama.cpp's `n_rot_swa`, read from
+    /// `rope.dimension_count_swa` or halved-from-full for `step35`
+    /// (`crate::swa_geometry`), consumed through `n_rot(il)`
+    /// (`llama-hparams.cpp:85-91`). `None` means the sliding layers
+    /// rotate the same width as the full ones, which is every
+    /// architecture but the ones the table names. `Some(head_dim)` is
+    /// the whole head, and [`Self::layer_rope`] normalises it.
+    pub rope_dim_swa: Option<usize>,
     /// LongRoPE/YaRN magnitude scaling (`<arch>.rope.scaling.attn_factor`,
     /// llama.cpp `hparams.rope_attn_factor` folded into
     /// `cparams.yarn_attn_factor` at `llama-context.cpp:231`, then applied
@@ -377,6 +389,26 @@ pub struct ModelConfig {
     pub best_effort_fields: &'static [&'static str],
 }
 
+/// One layer's RoPE, as [`ModelConfig::layer_rope`] hands it out: the
+/// three things llama.cpp's `ggml_rope_ext` call takes per layer that
+/// vary by layer.
+///
+/// A struct rather than a tuple so that a consumer names every field
+/// it takes; the Metal side destructures it exhaustively and refuses a
+/// `rot_dim` its one-uniform kernels cannot honour per layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerRopeParams<'a> {
+    /// This layer's frequency base (`rope_theta`, or `rope_theta_swa`
+    /// on a sliding layer).
+    pub theta: f32,
+    /// This layer's per-band divisors, `rot_dim/2` long, or `None` to
+    /// divide by nothing.
+    pub freq_factors: Option<&'a [f32]>,
+    /// This layer's rotary width when narrower than `head_dim`; `None`
+    /// rotates the whole head. llama.cpp's `n_rot(il)`.
+    pub rot_dim: Option<usize>,
+}
+
 /// The resolved per-band RoPE divisors, for BOTH kinds of layer.
 ///
 /// llama.cpp splits RoPE per layer in two places, not one:
@@ -444,7 +476,13 @@ impl RopeFreqs {
 }
 
 /// Dense / expert FFN non-linearity used by the generic decoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Not `Copy` and not `Eq` since [`FfnActivation::Xielu`]: that
+/// variant CARRIES its per-layer parameters, so the kind and the
+/// parameters cannot disagree, and a `ModelConfig` clone shares them
+/// through an `Arc`. [`ModelConfig::layer_ffn_act`] is how a layer
+/// body turns this into the `GluAct` it runs.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum FfnActivation {
     /// `silu(gate) * up` with separate gate/up matrices (Llama / Qwen).
     #[default]
@@ -467,6 +505,26 @@ pub enum FfnActivation {
     /// aliased matmul through `GluAct::ungated`, and no fused device
     /// kernel spells it, so `fused_kernel_gelu_flag` is `None`.
     ReluSqr,
+    /// UNGATED xIELU with PER-LAYER parameters: `down(xielu_il(up(x)))`
+    /// -- llama.cpp's `ggml_xielu(up, alpha_n[il], alpha_p[il],
+    /// beta[il], eps[il])` (`apertus.cpp:132-138`), the four read as
+    /// `n_layer`-long arrays or broadcast scalars (`:6-9`).
+    ///
+    /// The table IS the variant, so there is no second field for it to
+    /// disagree with. `crate::act_layers` reads it and hands layer
+    /// `il`'s set out through [`ModelConfig::layer_ffn_act`]; the
+    /// loader aliases gate to up exactly as for [`Self::ReluSqr`], and
+    /// `ferrox_moe::GluAct::Xielu` reads the `up` operand alone. No
+    /// fused device kernel spells it, so every Metal launch refuses it.
+    Xielu(crate::act_layers::XieluLayers),
+    /// SwiGLU with a PER-LAYER, PER-SITE clamp: llama.cpp's
+    /// `swiglu_clamp_exp[il]` on the routed experts and
+    /// `swiglu_clamp_shexp[il]` on the dense layers and shared experts
+    /// (`step35.cpp:28-29`; applied at `llama-graph.cpp:2146-2164` and
+    /// `:1751-1768` as `min(silu(gate), l) * clamp(up, -l, l)`). A zero
+    /// entry is plain SwiGLU on that site; `ferrox_moe::GluAct::
+    /// SwigluClamped` is the body. No fused device kernel spells it.
+    SwigluClamped(crate::act_layers::SwigluClamps),
 }
 
 impl ModelConfig {
@@ -580,9 +638,11 @@ impl ModelConfig {
             .expect("aligned_block_size returns a size BlockLayout accepts")
     }
 
-    /// BOTH halves of layer `il`'s RoPE: the frequency base and the
+    /// ALL THREE halves of layer `il`'s RoPE: the frequency base, the
     /// per-band divisors, which llama.cpp varies per layer together
-    /// (`llama-model.cpp:2029-2035`, and see [`RopeFreqs`]).
+    /// (`llama-model.cpp:2029-2035`, and see [`RopeFreqs`]), and the
+    /// rotary WIDTH, which it varies by the same sliding-or-full fact
+    /// (`n_rot(il)`, `llama-hparams.cpp:85-91`; [`Self::rope_dim_swa`]).
     ///
     /// Every RoPE call site takes the pair from here. Splitting them was
     /// the defect: `layer_rope_theta` varied the base per layer while
@@ -598,7 +658,7 @@ impl ModelConfig {
     /// take the base and the divisors without also answering "does this
     /// layer rotate": that is the third thing the three had to agree
     /// about, and two of them were already one value for this reason.
-    pub fn layer_rope(&self, layer_idx: usize) -> Option<(f32, Option<&[f32]>)> {
+    pub fn layer_rope(&self, layer_idx: usize) -> Option<LayerRopeParams<'_>> {
         let sliding = self.layer_sliding_window(layer_idx).is_some();
         if !self.rope_layers.rotates(layer_idx, sliding) {
             return None;
@@ -607,10 +667,32 @@ impl ModelConfig {
             (true, Some(theta)) => theta,
             _ => self.rope_theta,
         };
-        Some((
+        let rot_dim = match (sliding, self.rope_dim_swa) {
+            (true, Some(w)) => Some(w),
+            _ => self.rope_dim,
+        }
+        // The whole head is spelled `None`, whichever key said so, so
+        // nothing downstream special-cases "narrower by zero".
+        .filter(|w| *w < self.head_dim);
+        Some(LayerRopeParams {
             theta,
-            self.rope_freqs.as_ref().map(|f| f.for_layer(sliding)),
-        ))
+            freq_factors: self.rope_freqs.as_ref().map(|f| f.for_layer(sliding)),
+            rot_dim,
+        })
+    }
+
+    /// True when the sliding layers rotate a different width from the
+    /// full ones -- the whole-model fact the fused Metal launches refuse
+    /// on, since each takes ONE `rot_dim` uniform for every layer.
+    ///
+    /// Derived from [`Self::layer_rope`] rather than from the field, so
+    /// a `rope_dim_swa` that merely restates `rope_dim` (or the whole
+    /// head) is not a difference.
+    pub fn rope_dim_varies_by_layer(&self) -> bool {
+        let widths: Vec<Option<usize>> = (0..self.n_layers)
+            .filter_map(|il| self.layer_rope(il).map(|r| r.rot_dim))
+            .collect();
+        widths.windows(2).any(|w| w[0] != w[1])
     }
 
     /// Does layer `il` rotate at all? Derived from [`Self::layer_rope`]
@@ -633,7 +715,7 @@ impl ModelConfig {
     /// which is every site that actually rotates something. This one is
     /// for the callers that only report or compare the base.
     pub fn layer_rope_theta(&self, layer_idx: usize) -> Option<f32> {
-        self.layer_rope(layer_idx).map(|(theta, _)| theta)
+        self.layer_rope(layer_idx).map(|r| r.theta)
     }
 
     /// True when the sliding layers need different per-band divisors
@@ -745,6 +827,7 @@ pub fn glm_5_2() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
@@ -830,6 +913,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
@@ -945,6 +1029,7 @@ pub fn kimi_k3() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
@@ -1008,6 +1093,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
@@ -1066,6 +1152,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,
@@ -1126,6 +1213,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         rope_freqs: None,
         rope_attn_factor: 1.0,
         rope_dim: None,
+        rope_dim_swa: None,
         rope_freqs_long: None,
         rope_freqs_short: None,
         rope_orig_ctx: None,

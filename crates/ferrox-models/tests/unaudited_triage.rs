@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 12,
+        n, 10,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -110,7 +110,16 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          array; the same seam lifted an over-refusal on every real EXAONE-4 32B, \
          EXAONE-MoE and Olmo-3 export, whose arrays llama.cpp IGNORES, and \
          `ferrox_models::mtp_blocks` beside it skips the NextN blocks `mimo2` and `step35` \
-         named, so both say so and lead with what is left \
+         named, so both say so and lead with what is left, and 12 until `apertus` and \
+         `step35` closed together on the per-layer ACTIVATION PARAMETER seam \
+         (`ferrox_models::act_layers`, tests/per_layer_activation_graphs.rs, \
+         tests/clamped_swiglu_graphs.rs) -- ONE plumbing question behind two verdicts, \
+         `layer il runs its FFN activation with these scalars`, and TWO bodies, xIELU and \
+         the clamped SwiGLU, with the site (routed versus dense) the one thing the second \
+         needed of the plumbing that the first did not; `step35`'s half-width rotary \
+         landed on `ferrox_models::swa_geometry` as the two-valued width llama.cpp's \
+         `n_rot(il)` already was, and lifted Laguna-XS.2's `rope.dimension_count_swa` \
+         refusal by name with it \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -362,7 +371,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 12);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 10);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -633,26 +642,32 @@ fn the_per_layer_shape_seam_closed_two_rows_and_its_reach_is_recorded_on_the_res
         assert!(per_layer_shapes_read_by_llama_cpp(arch), "{arch}");
     }
     // `laguna` was the third row here and closed the next day on the
-    // gated attention; it reads per-layer heads and is served.
-    assert!(is_audited_generic("laguna") && per_layer_shapes_read_by_llama_cpp("laguna"));
-    for arch in ["mimo2", "step35"] {
-        let t = unaudited_triage(arch).expect("still refuses");
-        assert_eq!(t.class, TriageClass::NewCode);
+    // gated attention; `step35` the fourth, on the per-layer activation
+    // seam. Both read per-layer heads and are served.
+    for arch in ["laguna", "step35"] {
         assert!(
-            t.blocker.contains("NO LONGER a blocker: the per-layer"),
-            "`{arch}` must say the per-layer half is done: {}",
-            t.blocker
-        );
-        assert!(
-            t.blocker.contains("crate::layer_shapes"),
-            "`{arch}` must point at the seam: {}",
-            t.blocker
-        );
-        assert!(
-            per_layer_shapes_read_by_llama_cpp(arch),
-            "{arch} is in the reach table"
+            is_audited_generic(arch) && per_layer_shapes_read_by_llama_cpp(arch),
+            "{arch}"
         );
     }
+    // `mimo2` is the one row in the reach table still refusing.
+    let arch = "mimo2";
+    let t = unaudited_triage(arch).expect("still refuses");
+    assert_eq!(t.class, TriageClass::NewCode);
+    assert!(
+        t.blocker.contains("NO LONGER a blocker: the per-layer"),
+        "`{arch}` must say the per-layer half is done: {}",
+        t.blocker
+    );
+    assert!(
+        t.blocker.contains("crate::layer_shapes"),
+        "`{arch}` must point at the seam: {}",
+        t.blocker
+    );
+    assert!(
+        per_layer_shapes_read_by_llama_cpp(arch),
+        "{arch} is in the reach table"
+    );
     // `nanbeige` reads the arrays too and is NOT served: it rewrites
     // them to loop its physical layers, which is a different graph.
     let t = unaudited_triage("nanbeige").expect("still refuses");
@@ -861,9 +876,16 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         // three graphs that have it, and both rows are audited on
         // libllama-golden fixtures (`tests/gated_attention_graphs.rs`);
         // `the_gated_attention_seam_closed_two_rows_and_narrowed_the_third`
-        // below pins that, and pins that `step35` now says the gate is
-        // not what stops it.
-        ("apertus", TriageClass::NewCode, "xIELU"),
+        // below pins that.
+        // `apertus` was HERE, NEW CODE on xIELU's four per-layer
+        // parameter arrays. `ferrox_models::act_layers` reads them as
+        // `get_key_or_arr` does and `ferrox_moe::GluAct::Xielu` carries
+        // one layer's four; the row is audited on libllama-golden
+        // fixtures (`tests/per_layer_activation_graphs.rs`), one with
+        // the arrays and one with the scalar spelling llama.cpp
+        // broadcasts. Its verdict's third sentence -- QK-norm BIASES
+        // ferrox's norms cannot take -- was wrong: `apertus.cpp:93,96`
+        // pass NULL for them, measured byte-identical with and without.
         // `exaone-moe` was HERE, NEW CODE on "GLOBAL layers get no
         // RoPE". That is `exaone4.cpp:116` with `swa_type` pinned to
         // STANDARD -- one rule, not two -- and `ferrox_models::
@@ -879,11 +901,15 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         // no verdict --
         // `the_qk_norm_ordering_arm_is_no_longer_anybody_s_leading_blocker`
         // below is what pins that.
-        (
-            "step35",
-            TriageClass::NewCode,
-            "per-layer SwiGLU clamp arrays",
-        ),
+        // `step35` was HERE, NEW CODE on its per-layer SwiGLU clamp
+        // arrays and its half-width rotary on the full layers. The
+        // clamp is the second body on the same seam as `apertus`'s
+        // xIELU (`ferrox_models::act_layers`, `GluAct::SwigluClamped`,
+        // read by SITE), the rotary width is `ModelConfig::rope_dim_swa`
+        // (`ferrox_models::swa_geometry`), and the row is audited on
+        // three libllama-golden fixtures (`tests/clamped_swiglu_graphs.rs`):
+        // clamped, unclamped, and with a NextN block.
+        // `the_per_layer_activation_seam_closed_two_rows` below pins it.
     ];
     for (arch, class, evidence) in cases {
         let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
@@ -980,34 +1006,20 @@ fn the_per_layer_rope_gate_is_no_longer_anybody_s_leading_blocker() {
 /// The gated attention was the LEADING blocker of two rows (`afmoe`,
 /// `laguna`) and a listed blocker of a third (`step35`), and
 /// `ferrox_models::attn_gate` implements it for all three graphs that
-/// have it. So: the two are audited and carry no verdict, and `step35`
-/// must now say the gate is NOT what stops it -- a verdict that keeps
-/// naming an implemented feature as a blocker is the shape this suite
-/// exists to catch. `mimo2`'s leading blocker moved the same way: the
+/// have it. So: all three are audited and carry no verdict -- `step35`
+/// said the gate was not what stopped it for one day and then closed
+/// on what did. `mimo2`'s leading blocker moved the same way: the
 /// sinks are a tensor-presence fact now and its verdict leads with what
 /// every real export actually carries.
 #[test]
 fn the_gated_attention_seam_closed_two_rows_and_narrowed_the_third() {
     use ferrox_models::attn_gate::{attn_gate_spec, GatePresence, ATTN_GATE_ARCHS};
-    for arch in ["afmoe", "laguna"] {
+    for arch in ["afmoe", "laguna", "step35"] {
         assert!(
             is_audited_generic(arch) && unaudited_triage(arch).is_none(),
-            "`{arch}` closed on the gated attention and must carry no verdict"
+            "`{arch}` closed and must carry no verdict"
         );
     }
-    let t = unaudited_triage("step35").expect("step35 still refuses");
-    assert!(
-        t.blocker
-            .contains("NO LONGER a blocker: the gated attention"),
-        "`step35` must say the gate is implemented: {}",
-        t.blocker
-    );
-    assert!(
-        !t.blocker
-            .starts_with("per-layer SwiGLU clamp arrays and a gated attention"),
-        "`step35` still leads with a feature ferrox implements: {}",
-        t.blocker
-    );
     assert_eq!(
         attn_gate_spec("step35").map(|s| s.presence),
         Some(GatePresence::Optional),
@@ -1060,7 +1072,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 11, 1),
+        (0, 0, 9, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1094,7 +1106,13 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          verdicts named, and `mellum` is the one generic-path graph that honours the \
          array; `ferrox_models::mtp_blocks` landed beside it and skips the NextN blocks \
          both named, so `mimo2` now leads with its split K/V head width and `step35` \
-         with its clamp arrays and half-width rotary. \
+         with its clamp arrays and half-width rotary, and 11 to 9 when `apertus` and \
+         `step35` closed together on the per-layer ACTIVATION PARAMETER seam \
+         (`ferrox_models::act_layers`) -- one plumbing question behind two verdicts and \
+         two activation bodies, and the clamp's routed-versus-dense SITE the one thing the \
+         second needed that the first did not; `step35`'s half-width rotary landed on \
+         `ferrox_models::swa_geometry` as the two-valued width `n_rot(il)` already was \
+         upstream, which lifted Laguna-XS.2's second-rotary-width refusal by name. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1103,5 +1121,34 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 12);
+    assert_eq!(fixture + arm + new_code + unknown, 10);
+}
+
+/// The per-layer activation-parameter seam closed two rows whose
+/// verdicts named different activations -- xIELU and a clamped SwiGLU
+/// -- because the thing missing was the same plumbing: a layer's FFN
+/// activation carrying scalars read from the GGUF. Both are audited,
+/// neither carries a verdict, and the two tables that decide which
+/// architecture reads which keys are the measured lists.
+#[test]
+fn the_per_layer_activation_seam_closed_two_rows() {
+    use ferrox_models::act_layers::{reads_swiglu_clamps, uses_xielu};
+    for arch in ["apertus", "step35"] {
+        assert!(
+            is_audited_generic(arch) && unaudited_triage(arch).is_none(),
+            "`{arch}` closed on the per-layer activation seam and must carry no verdict"
+        );
+    }
+    assert!(uses_xielu("apertus") && !reads_swiglu_clamps("apertus"));
+    assert!(reads_swiglu_clamps("step35") && !uses_xielu("step35"));
+    // No row still refusing names either activation as its blocker.
+    for p in architecture_catalog() {
+        let Some(t) = p.triage else { continue };
+        assert!(
+            !t.blocker.contains("xIELU") && !t.blocker.contains("swiglu_clamp"),
+            "`{}` names an implemented activation as a blocker: {}",
+            p.gguf_name,
+            t.blocker
+        );
+    }
 }

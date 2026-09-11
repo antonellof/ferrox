@@ -49,15 +49,19 @@ impl Decoder {
         pos: usize,
         theta: f32,
         freq_factors: Option<&[f32]>,
+        rot_dim: Option<usize>,
     ) {
         use crate::config::RopeLayout;
-        // Partial rotary (llama.cpp `hparams.n_rot` < `n_embd_head_k`,
-        // GGUF `<arch>.rope.dimension_count`): Phi-3/Phi-4 rotate only the
-        // first 96 of each 128-wide head and pass the remaining 32
-        // through untouched. Rotating the whole head instead is not a
-        // subtle error — it moves dimensions the model never trained to
-        // be position-dependent.
-        let slice = match self.config.rope_dim {
+        // Partial rotary (llama.cpp `hparams.n_rot(il)` < `n_embd_head_k`,
+        // GGUF `<arch>.rope.dimension_count` and its `_swa` twin):
+        // Phi-3/Phi-4 rotate only the first 96 of each 128-wide head and
+        // pass the remaining 32 through untouched; Step-3.5 rotates half
+        // the head on its full-attention layers and all of it on the
+        // sliding ones. Rotating the whole head instead is not a subtle
+        // error -- it moves dimensions the model never trained to be
+        // position-dependent. The width is THIS LAYER's, from
+        // `ModelConfig::layer_rope`, never the model-wide field.
+        let slice = match rot_dim {
             Some(rot) if rot < slice.len() => &mut slice[..rot],
             _ => slice,
         };
@@ -80,10 +84,15 @@ impl Decoder {
     /// silent failure the rule exists to stop -- fluent output from
     /// positions the checkpoint never encodes that way.
     pub(crate) fn apply_rope_head_layer(&self, slice: &mut [f32], pos: usize, layer_idx: usize) {
-        let Some((theta, freq_factors)) = self.config.layer_rope(layer_idx) else {
+        let Some(crate::config::LayerRopeParams {
+            theta,
+            freq_factors,
+            rot_dim,
+        }) = self.config.layer_rope(layer_idx)
+        else {
             return;
         };
-        self.apply_rope_head_theta(slice, pos, theta, freq_factors)
+        self.apply_rope_head_theta(slice, pos, theta, freq_factors, rot_dim)
     }
 
     /// llama.cpp's RoPE `mscale` (ggml `rope_yarn`), applied where the
@@ -110,7 +119,10 @@ impl Decoder {
     #[inline]
     pub(crate) fn apply_rope_attn_factor(&self, q: &mut [f32], k: &mut [f32], layer_idx: usize) {
         let m = self.config.rope_attn_factor;
-        if m == 1.0 || !self.config.layer_rotates(layer_idx) {
+        let Some(rope) = self.config.layer_rope(layer_idx) else {
+            return;
+        };
+        if m == 1.0 {
             return;
         }
         // ggml folds `attn_factor` into cos_theta/sin_theta inside
@@ -123,7 +135,7 @@ impl Decoder {
         // attn_factor 1.1902, so 32 dims per head were scaled that
         // llama.cpp leaves alone.
         let head_dim = self.config.head_dim;
-        let rot = self.config.rope_dim.unwrap_or(head_dim).min(head_dim);
+        let rot = rope.rot_dim.unwrap_or(head_dim).min(head_dim);
         for buf in [q, k] {
             for head in buf.chunks_mut(head_dim) {
                 let n = rot.min(head.len());
@@ -179,7 +191,8 @@ mod tests {
 
         let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
         let before = head.clone();
-        decoder.apply_rope_head_theta(&mut head, 3, 10000.0, None);
+        let rot_dim = decoder.config.layer_rope(0).expect("rotates").rot_dim;
+        decoder.apply_rope_head_theta(&mut head, 3, 10000.0, None, rot_dim);
 
         assert_eq!(
             &head[4..],
@@ -269,7 +282,8 @@ mod tests {
 
         let mut head: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
         let before = head.clone();
-        decoder.apply_rope_head_theta(&mut head, 3, 10000.0, None);
+        let rot_dim = decoder.config.layer_rope(0).expect("rotates").rot_dim;
+        decoder.apply_rope_head_theta(&mut head, 3, 10000.0, None, rot_dim);
         assert!(head[4..] != before[4..]);
     }
 

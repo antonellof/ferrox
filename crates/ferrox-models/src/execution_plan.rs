@@ -62,7 +62,7 @@ impl ExecutionPlan {
             family,
             rope: config.rope_layout,
             qk_norm: config.qk_norm_style,
-            ffn_activation: config.ffn_activation,
+            ffn_activation: config.ffn_activation.clone(),
             memory: MemoryPlan {
                 kind: memory_kind,
                 swa_layers: config.swa_layers.clone(),

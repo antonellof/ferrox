@@ -27,16 +27,19 @@
 //! `laguna_swa` (XS.2 shape) is softplus / per head, and its per-layer
 //! `head_count` array means the per-head gate is sized by each layer's
 //! own count. `step35`'s corner, sigmoid / per head / optional, is the
-//! product of two axes each evidenced here, and the row still refuses
-//! for four other things its verdict names.
+//! product of two axes each evidenced here, and the row closed on its
+//! own suite (`tests/clamped_swiglu_graphs.rs`).
 //!
-//! **Two laguna refusals are evidenced from files that have the
-//! thing.** `laguna_swa_rot` declares `rope.dimension_count_swa` half
-//! the head, which libllama honours (`n_rot(il)` at
-//! llama-hparams.cpp:85-91 -- its golden differs from `laguna_swa`'s
-//! by up to 0.3), and `laguna_swa_yarn` declares a YaRN scaling that
-//! `laguna.cpp:48,184-192` switch off on the sliding layers. ferrox
-//! refuses both by name (`ferrox_models::swa_geometry`).
+//! **One laguna refusal is evidenced from a file that has the thing,
+//! and one former refusal is served from one.** `laguna_swa_rot`
+//! declares `rope.dimension_count_swa` half the head, which libllama
+//! honours (`n_rot(il)` at llama-hparams.cpp:85-91 -- its golden
+//! differs from `laguna_swa`'s by up to 0.3); ferrox honours it too
+//! now, through `ModelConfig::rope_dim_swa` (`ferrox_models::
+//! swa_geometry`, the seam Step-3.5's halved full-layer width landed
+//! on), and matches that golden. `laguna_swa_yarn` declares a YaRN
+//! scaling that `laguna.cpp:48,184-192` switch off on the sliding
+//! layers, and stays refused by name.
 //!
 //! **Where the numbers come from.** Each golden was produced by running
 //! llama.cpp's own graph over its fixture through
@@ -406,20 +409,86 @@ fn a_gate_width_the_architecture_does_not_admit_is_refused_naming_the_tensor() {
     );
 }
 
-/// A second rotary width for the sliding layers is refused by name,
-/// from a file libllama loads and runs differently with it: the
-/// `--swa-rot` fixture's golden differs from `laguna_swa`'s.
+/// llama.cpp's logits for `laguna_swa_rot_tiny.gguf`: the sliding
+/// layers rotate 4 of 8 dims, the full layers all 8.
+const LAGUNA_SWA_ROT_GOLDEN: [f32; 48] = [
+    -2.900597,
+    -0.21544212,
+    1.1636807,
+    2.0950882,
+    -0.66421103,
+    1.5038196,
+    0.1658414,
+    2.6975534,
+    -1.0402565,
+    0.99273187,
+    -3.1984298,
+    -0.96442115,
+    -1.9525335,
+    -1.4564579,
+    3.614548,
+    1.1388557,
+    0.92276263,
+    -1.3367314,
+    -3.053658,
+    1.1712291,
+    3.2525735,
+    -2.7948487,
+    -0.9251003,
+    -0.23932657,
+    -0.8467276,
+    -2.6862788,
+    0.9524888,
+    -0.51321614,
+    1.3821557,
+    2.6605582,
+    -1.7582645,
+    -1.4891844,
+    -4.2057133,
+    1.7533894,
+    -2.1401525,
+    -0.6105618,
+    -2.5806613,
+    -1.5213596,
+    0.009132922,
+    -0.0018042773,
+    -1.1191428,
+    0.8924065,
+    -1.6698679,
+    -0.83779836,
+    0.3776102,
+    0.081464976,
+    0.7033006,
+    1.0798461,
+];
+
+/// A second rotary width for the sliding layers, from a file libllama
+/// loads and runs differently with it (this golden differs from
+/// `laguna_swa`'s), is SERVED: each layer rotates its own width
+/// (`ModelConfig::layer_rope`), and rotating every layer at either one
+/// width diverges. This used to be a refusal by name.
 #[test]
-fn a_swa_rotary_width_differing_from_the_full_one_is_refused_naming_the_key() {
-    let file =
-        ferrox_gguf::GgufFile::open(graph_fixture_path("laguna_swa_rot")).expect("fixture opens");
-    let err = ModelConfig::from_gguf(&file).expect_err("refused at the header");
-    let msg = format!("{err}");
+fn a_swa_rotary_width_differing_from_the_full_one_is_served_per_layer() {
+    assert_all_three_paths_match("laguna_swa_rot", &LAGUNA_SWA_ROT_GOLDEN);
+    let d = load_graph_fixture("laguna_swa_rot");
+    assert_eq!(d.config.rope_dim, None, "full layers: the whole head");
+    assert_eq!(d.config.rope_dim_swa, Some(4), "sliding layers: half");
+    assert!(d.config.rope_dim_varies_by_layer());
     assert!(
-        msg.contains("laguna.rope.dimension_count_swa` = 4"),
-        "{msg}"
+        worst_vs(&LAGUNA_SWA_ROT_GOLDEN, &LAGUNA_SWA_GOLDEN) > 1e-1,
+        "the two fixtures must disagree, or the width is invisible"
     );
-    assert!(msg.contains("llama-hparams.cpp:85-91"), "{msg}");
+    for (what, full, swa) in [("all whole", None, None), ("all half", Some(4), None)] {
+        let mut d = load_graph_fixture("laguna_swa_rot");
+        d.config.rope_dim = full;
+        d.config.rope_dim_swa = swa;
+        let mut kv = graph_caches(&d);
+        let worst = worst_vs(
+            &d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
+            &LAGUNA_SWA_ROT_GOLDEN,
+        );
+        assert!(worst > 1e-2, "{what}: the output moved by only {worst}");
+    }
 }
 
 /// A window together with a RoPE scaling is Laguna-XS.2's real shape

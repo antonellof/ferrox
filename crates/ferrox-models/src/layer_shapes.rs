@@ -91,7 +91,7 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
         "laguna",
         "generic. laguna.cpp:87-88 (loader) and :176-177 (graph) read n_head(i) per layer; \
          KV heads uniform (:86). Closed with the gated attention (`crate::attn_gate`); the \
-         second rotary width at :50 is refused by name (`crate::swa_geometry`)",
+         second rotary width at :50 is `ModelConfig::rope_dim_swa` (`crate::swa_geometry`)",
     ),
     (
         "mimo2",
@@ -102,10 +102,11 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
     ),
     (
         "step35",
-        "NOT closed by this seam: step35.cpp:76-78,208-209 read heads per layer AND :28-29 \
-         read per-layer clamp arrays, :9 halves the full layers' rotary width (the gate at \
-         :96 is `crate::attn_gate`, the is_swa array at :26 is `crate::swa_layers` and the \
-         NEXTN blocks at :32 are `crate::mtp_blocks` now)",
+        "generic. step35.cpp:76-78,208-209 (loader and graph) read heads and KV widths per \
+         layer. Closed with the per-layer activation seam (`crate::act_layers`, the clamp \
+         arrays at :28-29) and the two-valued rotary width (`crate::swa_geometry`, :9); the \
+         gate at :96 is `crate::attn_gate`, the is_swa array at :26 `crate::swa_layers`, \
+         the NEXTN blocks at :32 `crate::mtp_blocks`",
     ),
     (
         "nanbeige",
@@ -767,7 +768,7 @@ mod tests {
     }
 
     /// Every row of the reach table cites a llama.cpp line, and the
-    /// three that this seam serves are the ones on the generic path.
+    /// five that this seam serves are the ones on the generic path.
     #[test]
     fn the_reach_table_cites_its_lines_and_names_what_each_row_still_needs() {
         for (arch, note) in PER_LAYER_SHAPE_ARCHS {
@@ -778,7 +779,7 @@ mod tests {
             .filter(|(_, n)| n.starts_with("generic"))
             .map(|(a, _)| *a)
             .collect();
-        assert_eq!(generic, ["deci", "openelm", "plamo3", "laguna"]);
+        assert_eq!(generic, ["deci", "openelm", "plamo3", "laguna", "step35"]);
         assert!(per_layer_shapes_read_by_llama_cpp("deci"));
         assert!(!per_layer_shapes_read_by_llama_cpp("granite"));
     }

@@ -12,22 +12,23 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-11. **45** architectures run with
+Honest position, re-audited 2026-09-11. **47** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 12 unaudited refusals are now TRIAGED, and the refusal says which of
+The 10 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 11 need new code, 1 is unknown with the question stated. Five
+away**, 9 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
-`openelm`, `afmoe`, `laguna` and `mellum` on 2026-09-11, each with a
+`openelm`, `afmoe`, `laguna`, `mellum`, `apertus` and `step35` on
+2026-09-11, each with a
 libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
-to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12; the step from 28 to 25
+to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10; the step from 28 to 25
 was moving the three alias rows off
 the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
@@ -40,8 +41,8 @@ refusing is one fixture or one arm away, so every row that is left
 needs a different graph.
 
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
-times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 five times
-more, 20 to 19, 19 to 17, 17 to 14, 14 to 12 and 12 to 11. The first two took several rows
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 six times
+more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11 and 11 to 9. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -69,7 +70,65 @@ measures the ignoring) or still need something the seam does not touch.
 Reading `get_key_or_arr`'s two overloads before assuming "an array is
 per-layer truth" is what found that: for fifteen graphs it is dead
 metadata, and honouring it would have been wrong on every real EXAONE
-and Olmo-3 file.
+and Olmo-3 file. The ninth is the seventh's leftover and the question
+the task asked first: are xIELU's four per-layer arrays and Step-3.5's
+two per-layer clamp arrays ONE seam? Read side by side, they are one
+plumbing question -- "layer `il` runs its FFN activation with these
+scalars", `get_key_or_arr` at `n_layer` length for both -- and TWO
+activation bodies, with the clamp's routed-versus-dense SITE the one
+thing the second needed of the plumbing that the first did not. Both
+rows closed on it, 11 to 9.
+
+`apertus` and `step35` closed on `ferrox-models/src/act_layers.rs`.
+`apertus.cpp:6-9` reads `xielu.alpha_n` / `.alpha_p` / `.beta` / `.eps`
+(no architecture prefix, `llama-arch.cpp:370-373`) as REQUIRED
+`n_layer`-long arrays or one scalar broadcast, and `:132-138` hands
+layer `il`'s four to `ggml_xielu` over its `ffn_up` output, ungated,
+with the softplus folded at graph build; `grep -l ggml_xielu` over the
+140 graphs is that one file. `step35.cpp:28-29` reads
+`swiglu_clamp_exp` / `_shexp` as OPTIONAL arrays and llama.cpp's
+GENERIC `build_moe_ffn` (`llama-graph.cpp:2146-2164`) and `build_ffn`
+(`:1751-1768`) apply layer `il`'s entry above `1e-6` as `min(silu(gate),
+l) * clamp(up, -l, l)`, the routed experts from one array and the
+shared experts AND the leading dense layers from the other, because
+`build_ffn` is both; three graphs read the keys and two are on their
+own engine. `FfnActivation::Xielu` and `::SwigluClamped` CARRY their
+tables so kind and parameters cannot disagree, `ferrox_moe::GluAct`
+gained the two bodies -- which cost it `Eq`, and turned `gate_fn() ->
+fn(f32) -> f32` into `combine(gate, up)`, because with the gate aliased
+to up `xielu(gate) * up` is the wrong function by a factor of the input
+-- and `ModelConfig::layer_ffn_acts(il)` answers a `routed` / `dense`
+pair at every FFN body; the model-wide `GluAct::from(ffn_activation)`
+no longer exists, because it cannot be written for a variant that
+needs the layer, and `model_ffn_act()` is `None` for both BY TYPE, so
+every fused Metal launch refuses them through the predicate it already
+shared. `step35`'s other thing, the half-width rotary on its full
+layers (`:9` halves `n_rot_full` AFTER `llama-model.cpp:1222` seeded
+`n_rot_swa`, no key), landed on the seam that had refused it from the
+other direction: `ModelConfig::rope_dim_swa` is the two-valued width
+`n_rot(il)` already was upstream, `layer_rope(il)` hands out
+`LayerRopeParams { theta, freq_factors, rot_dim }` so no rotation site
+takes the pair without the width, and the fused Metal launches (one
+`rot_dim` uniform) are fenced off a model whose widths differ. That
+lifted Laguna-XS.2's `rope.dimension_count_swa` refusal by name with
+it: the fixture that had evidenced the refusal matches libllama, KL
+7.29e-14. Real Step-3.5-Flash also carries a llama3 `rope_freqs.weight`
+that `step35.cpp:247` passes to the full layers ONLY (measured, the one
+generic-path graph that does); the loader takes the tensor's first
+`n_rot_full/2` bands for the full layers and divides by nothing on the
+sliding ones for that architecture, and refuses two widths with
+divisors for any other. KL 4.91e-14 (apertus, arrays) and 5.06e-14
+(the scalar spelling llama.cpp broadcasts; the goldens differ);
+1.59e-13 (step35, both arrays with a zero beside each nonzero entry),
+2.59e-13 (neither key, plain SwiGLU; the goldens differ), 1.59e-13
+(a NextN block inside `block_count`, byte-identical to the trunk's
+golden upstream). Building them corrected one sentence of `apertus`'s
+verdict: `apertus.cpp:50,52` CREATE `attn_q_norm.bias` /
+`attn_k_norm.bias` and `:93,96` pass `NULL` as the bias, so they are
+never read; a fixture that carries them measures libllama's logits
+byte-identical with and without, and `ferrox-models/src/
+unread_tensors.rs` records the slot so `assert_every_tensor_consumed`
+can tell "ignored as llama.cpp ignores it" from "missing".
 
 `mellum` closed on `ferrox-models/src/swa_layers.rs`, and the
 EXAONE-4 32B / EXAONE-MoE / Olmo-3 over-refusal lifted with it. llama.cpp
@@ -127,8 +186,8 @@ one block, the array at trunk length -- has a fixture, KL 1.09e-14.
 `mimo2` still refuses, and its verdict leads with what no seam touches:
 MiMo-V2-Flash is `head_dim: 192, v_head_dim: 128`, a V width that
 differs from K's, which every KV cache and attention kernel here takes
-as one number. `step35` leads with its clamp arrays and its half-width
-rotary on the full layers.
+as one number. `step35` led with its clamp arrays and its half-width
+rotary on the full layers, and closed on both the same day (above).
 
 `afmoe` and `laguna` are ONE seam, `ferrox-models/src/attn_gate.rs`.
 llama.cpp's `LLM_TENSOR_ATTN_GATE` is created by six of the 140 graphs
@@ -166,13 +225,14 @@ when `expert_shared_count` was absent, which is 0 for every
 leading-dense model -- `laguna.cpp:20` assigns the count before reading
 a key its converter never writes, so a real Laguna export would have
 loaded with its REQUIRED shared-expert tensors unread on every MoE
-layer. Two Laguna things stay refused by name from fixtures libllama
-runs: a `rope.dimension_count_swa` differing from `rope.dimension_count`
-(`ferrox-models/src/swa_geometry.rs`, for every architecture, with the
-two `_swa` head-width keys), and a window together with a RoPE scaling
--- the Olmo-3 rule, one table now for `olmo2`, `mellum` and `laguna`
-where it had been `arch == "olmo2"`. Real Laguna-M.1 has neither; real
-Laguna-XS.2 has both. `mimo2`'s sinks moved off the gpt-oss NAME onto
+layer. One Laguna thing stays refused by name from a fixture libllama
+runs: a window together with a RoPE scaling -- the Olmo-3 rule, one
+table now for `olmo2`, `mellum` and `laguna` where it had been `arch ==
+"olmo2"`. The other, a `rope.dimension_count_swa` differing from
+`rope.dimension_count` (`ferrox-models/src/swa_geometry.rs`), was
+refused for one day and is served since `step35` closed on the same
+two-valued width; the two `_swa` head-width keys stay refused there.
+Real Laguna-M.1 has neither; real Laguna-XS.2 has both. `mimo2`'s sinks moved off the gpt-oss NAME onto
 the TENSOR (`AttnWeights::sinks`; four graphs pass it into the one
 `build_attn_mha`) without closing the row, because every real MiMo-V2
 export carries three MTP blocks inside `block_count` and a per-layer
@@ -492,6 +552,14 @@ The per-layer shape wave (2026-09-11) left `decoder.rs` at 6842 and
 (`decoder/ffn_block.rs`) replaced three copies, but the two batched
 attention bodies still had to be edited in place, and each of those
 edits is a labelled block around 400 lines nobody has yet split out.
+The per-layer activation wave (2026-09-11, later) left `decoder.rs` at
+7068 and `loader.rs` at 5250, and moved `ferrox-moe/src/lib.rs` from
+2150 to 2043: `GluAct` left it for `glu_act.rs` BEFORE the fourth and
+fifth variants were added, which is the rule working; the two seams
+are new files (`act_layers.rs`, `unread_tensors.rs`); and what
+`decoder.rs` gained is a `layer_idx` threaded into six FFN bodies plus
+a Metal fence test, which is the cost of an accessor the bodies did
+not have a layer to ask with.
 
 **One of five shrank, and the rule still lost on balance.** `attn.rs`
 gave up 616 lines only because a change was made to it and the split
