@@ -50,11 +50,7 @@ fn load() -> Decoder {
 }
 
 fn caches(decoder: &Decoder) -> Vec<KvCache> {
-    decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect()
+    decoder.config.new_kv_caches()
 }
 
 /// The cases `par::on_workers` declines to promote, and so the cases

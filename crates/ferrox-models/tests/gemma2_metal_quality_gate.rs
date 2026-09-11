@@ -50,9 +50,7 @@ fn greedy_continuation(decoder: &Decoder, tok: &GgufSpmTokenizer, file: &Sharded
             }
         }
     }
-    let mut caches: Vec<KvCache> = (0..decoder.config.n_layers)
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let mut logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
     let mut text = String::new();
     for _ in 0..MAX_NEW {

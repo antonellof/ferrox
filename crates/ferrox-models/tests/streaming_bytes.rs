@@ -107,11 +107,7 @@ fn streamed_and_resident_agree_on_a_real_checkpoint() {
         vec![791usize, 2380, 6156, 8146, 527],
     ] {
         let ids_of = |d: &Decoder| -> Vec<usize> {
-            let mut caches: Vec<ferrox_core::cache::KvCache> = d
-                .layers
-                .iter()
-                .map(|_| ferrox_core::cache::KvCache::new(d.config.n_kv_heads, d.config.head_dim))
-                .collect();
+            let mut caches: Vec<ferrox_core::cache::KvCache> = d.config.new_kv_caches();
             // PREFILL the prompt as a batch, then decode. The CLI does
             // this, and it matters: prefill and decode take different MoE
             // paths, and a decode-only test does not reproduce the repack

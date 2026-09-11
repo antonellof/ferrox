@@ -8,7 +8,6 @@
 
 use std::sync::mpsc::Sender;
 
-use ferrox_core::cache::KvCache;
 use ferrox_models::tokenizer::StopTokens;
 use ferrox_models::Decoder;
 use std::sync::Arc;
@@ -48,13 +47,7 @@ pub struct PrefillState {
 
 impl PrefillState {
     pub fn new(decoder: Arc<Decoder>, prompt_tokens: &[usize], chunk_size: usize) -> Self {
-        let kv = RowKv::Contiguous(
-            decoder
-                .layers
-                .iter()
-                .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                .collect(),
-        );
+        let kv = RowKv::Contiguous(decoder.config.new_kv_caches());
         PrefillState::over(decoder, kv, prompt_tokens, chunk_size)
     }
 

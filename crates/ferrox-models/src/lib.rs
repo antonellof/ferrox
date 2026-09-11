@@ -49,6 +49,7 @@ pub mod kimi_tokenizer;
 pub mod kimi_validate;
 pub mod kv_budget;
 pub mod latent_moe;
+pub mod layer_shapes;
 pub mod llama4_engine;
 pub mod loader;
 pub mod minimax_engine;

@@ -20,6 +20,7 @@ use ferrox_core::cache::{KvCache, PagedKvCache, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
 
 use super::{Decoder, GptOssLayer, LayerWeights};
+use crate::layer_shapes::AttnShape;
 
 /// Where one row's K/V is written, and what that implies for the kernel
 /// that reads it back.
@@ -61,7 +62,15 @@ impl Decoder {
     /// will run on the host at all.
     ///
     /// Returns the attention branch's contribution to the residual --
-    /// the caller adds it.
+    /// the caller adds it -- or `None` for a layer that HAS no
+    /// attention branch (`AttnShape::Absent`, deci.cpp:107-109), where
+    /// the residual passes straight through. `Option` rather than an
+    /// all-zero vector so a caller cannot add a branch that does not
+    /// exist without saying so.
+    ///
+    /// The head counts are THIS layer's (`ModelConfig::layer_shape`),
+    /// which is what makes deci's and openelm's per-layer widths one
+    /// body with everyone else's.
     pub(crate) fn attn_block(
         &self,
         layer_idx: usize,
@@ -69,10 +78,17 @@ impl Decoder {
         normed: &[f32],
         pos: usize,
         kv: KvStep<'_>,
-    ) -> Vec<f32> {
+    ) -> Option<Vec<f32>> {
         let head_dim = self.config.head_dim;
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
+        let (n_heads, n_kv_heads) = match self.config.layer_shape(layer_idx).attention {
+            AttnShape::Gqa {
+                n_heads,
+                n_kv_heads,
+            } => (n_heads, n_kv_heads),
+            // deci.cpp:115-118: `attn_norm` then `wo`, nothing else.
+            AttnShape::Linear => return Some(layer.attn.o_proj.apply(normed)),
+            AttnShape::Absent => return None,
+        };
 
         let (mut q, mut k, mut v) = {
             #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -133,7 +149,7 @@ impl Decoder {
         if let Some(post) = &layer.attn.post_attn_norm {
             projected = rms_norm(&projected, post, self.config.rms_norm_eps);
         }
-        projected
+        Some(projected)
     }
 
     /// Appends one row's K/V to whichever backing `kv` names, then
@@ -155,8 +171,15 @@ impl Decoder {
         q: &[f32],
         oai: Option<&GptOssLayer>,
     ) -> Vec<f32> {
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
+        // Only a GQA layer pushes; the other two shapes returned before
+        // projecting anything. `n_heads()` is zero for them, and zero
+        // heads is not a kernel argument this body may be handed.
+        let shape = self.config.layer_shape(layer_idx).attention;
+        let (n_heads, n_kv_heads) = (shape.n_heads(), shape.n_kv_heads());
+        assert!(
+            matches!(shape, AttnShape::Gqa { .. }),
+            "layer {layer_idx} has no KV to push ({shape:?})"
+        );
         let head_dim = self.config.head_dim;
         let window = self.config.layer_sliding_window(layer_idx);
         // Derived from the variant rather than passed as a flag; see

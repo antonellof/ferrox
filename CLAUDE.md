@@ -12,23 +12,23 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-11. **39** architectures run with
+Honest position, re-audited 2026-09-11. **42** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 18 unaudited refusals are now TRIAGED, and the refusal says which of
+The 15 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 17 need new code, 1 is unknown with the question stated. Five
+away**, 14 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
-`olmo` on 2026-09-10, and `exaone-moe`, `grok` and `dbrx` on
-2026-09-11, each with a libllama-golden fixture, which is what moved 46
-to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21 to 20 to 18; the step
-from 28 to 25 was moving the three alias rows off the generic path
-rather than a closure. `minicpm` moved too and is not in that count: it
+`olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`
+and `openelm` on 2026-09-11, each with a libllama-golden fixture, which
+is what moved 46 to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21 to 20
+to 18 to 15; the step from 28 to 25 was moving the three alias rows off
+the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
 without lowering the refusing one. `smollm3` and EXAONE-4 32B closed
 with `exaone-moe` and are the same case, one a DedicatedOnly refusal and
@@ -39,15 +39,80 @@ refusing is one fixture or one arm away, so every row that is left
 needs a different graph.
 
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
-times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 twice more,
-20 to 19 and 19 to 17. The first two took several rows at once for the
-same reason, and it is the lesson: each found ONE cause behind several
-refusals. The fourth did too and the column hides it: the per-layer
-RoPE gate closed THREE refusals and only `exaone-moe` was in the column.
-The fifth is the lesson's other half: `grok` and `dbrx` each closed by
-extending a seam that had landed the day BEFORE -- the MiniCPM defaults
-hook, the `NormOp` enum, the norm-slot decision -- by one column, and
-the clamp `dbrx` needed closed a third row's refusal-by-name with it.
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 three times
+more, 20 to 19, 19 to 17 and 17 to 14. The first two took several rows
+at once for the same reason, and it is the lesson: each found ONE cause
+behind several refusals. The fourth did too and the column hides it:
+the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
+in the column. The fifth is the lesson's other half: `grok` and `dbrx`
+each closed by extending a seam that had landed the day BEFORE -- the
+MiniCPM defaults hook, the `NormOp` enum, the norm-slot decision -- by
+one column, and the clamp `dbrx` needed closed a third row's
+refusal-by-name with it. The sixth is both lessons and a correction:
+`deci` and `openelm` closed TOGETHER on the per-layer shape seam, whose
+reach was MEASURED across all 140 graphs before it was built, and
+`arcee` closed ALONE because the verdict that said it shared a cause
+with `plm` had been read from one file and not the other.
+
+`deci` and `openelm` are ONE seam, `ferrox-models/src/layer_shapes.rs`.
+llama.cpp reads `head_count`, `head_count_kv` and `feed_forward_length`
+as scalar-or-array for EVERY architecture (`llama-model.cpp:1149-1158`)
+and hands most graphs layer 0 through `LLAMA_LOAD_LOCALS`; ferrox
+carried all three as scalars that every host body read once above its
+layer loop. Before a line was written, all 140 `src/models/*.cpp` were
+scanned for `n_head(i)`, `n_head_kv(i)`, `n_ff(i)`, `n_embd_k_gqa(i)`,
+`n_embd_v_gqa(i)`, `n_rot(i)` and the `_arr` fields, in both the tensor
+loader and the graph: 22 files read one somewhere, 17 honour one in
+both places, and `layer_shapes::PER_LAYER_SHAPE_ARCHS` records each
+with what it still needs -- `deci`, `openelm`, `plamo3` served;
+`laguna`, `mimo2`, `step35` narrowed to their other blocker (a
+`wqkv_gate`, attention sinks, per-layer clamp arrays); `nanbeige`
+copying the arrays to loop its layers; `gemma4` on its own engine; and
+seven hybrid recurrent rows where `n_head_kv(i) == 0` means "recurrent".
+The scan corrected two readings on the way: `n_rot(il)` is NOT an array
+upstream (`llama-hparams.cpp:85-91` is `is_swa(il) ? n_rot_swa :
+n_rot_full`), so `step35`'s "per-layer rotary width" is a two-valued
+field and a smaller seam; and `granite.cpp:204` reads `n_head(il)` in
+its graph while sizing tensors from layer 0, so a heterogeneous Granite
+file fails in llama.cpp's own loader. The durable parts: `ModelConfig::
+layer_shape(il)` is the ONE accessor and `AttnShape::{Gqa, Linear,
+Absent}` is an enum, so deci's two attention-less layer kinds cannot be
+spelled as a zero count that a `0..n_heads` loop silently accepts;
+`ModelConfig::new_kv_caches` replaced some ninety hand-written
+`KvCache::new(config.n_kv_heads, ..)` sites and `KvCache::push` asserts
+the width, so a cache built from the scalar panics on a narrower layer's
+first token; `metal_can_serve_model` (the predicate `residual_scale` and
+`clamp_kqv` already shared) refuses every fused Metal launch for a
+non-uniform model, because each takes one `n_heads` and one KV geometry;
+the CUDA resident KV and the slot-file writer refuse on the same fact.
+Two things the fixtures found in llama.cpp itself: an FFN-free layer
+WITH attention has its attention output DISCARDED (`deci.cpp:147-149`
+`continue`s before the residual add at `:150-153`; scaling that layer's
+attention weights by 3 leaves libllama's logits byte-identical,
+measured), which ferrox refuses by name rather than pins; and if such a
+layer is LAST, libllama aborts (`GGML_ASSERT(buffer)`,
+ggml-backend.cpp:194), so a real export whose final block is a no-op
+cannot run there at all. KL 1.44e-13 (Nemotron shape, one layer of
+each kind), 7.29e-13 (DeciLM-7B shape, `head_count_kv` alone varying),
+1.28e-13 (openelm, three layers sharing no width).
+
+`arcee` is the ungated ReLU-squared FFN, `down(relu(up(x))^2)`
+(`arcee.cpp:39-40,123-128`), and it is spelled without a fourth
+`ExpertWeights` shape: `FfnActivation::ReluSqr` maps to
+`GluAct::Reglu` (`relu(gate) * up`) and the loader ALIASES the gate to
+the up matrix, so every gated path computes `relu(up)^2` with no branch
+and the two dense hot paths skip the aliased matmul. What it removed
+matters more than what it added: SIX launch sites derived the fused
+Metal kernels' `gelu: bool` as `!is_swiglu()`, which reads "not SwiGLU,
+therefore GELU", and a third activation would have run as GELU on all
+of them; `GluAct::fused_kernel_gelu_flag` is `None` for it and every
+site refuses on `None`. KL 2.27e-14. `plm` did NOT close with it, and
+that is the correction: the shared verdict constant had been written
+from `arcee.cpp`, and `diff arcee.cpp plm.cpp` is 150 lines of
+DeepSeek-2 MLA attention (`plm.cpp:16-19,32-36,84-166`) that the
+generic decoder does not have. Five graphs pass `LLM_FFN_RELU_SQR`
+(measured); `capability::uses_relu_sqr` lists them so the next one to
+close finds its FFN already named.
 
 `olmo` is the exception that says what the rule is really made of. It
 closed ALONE, and before writing a line of code the question "what else
@@ -296,6 +361,13 @@ Re-measured 2026-09-10, against the 2026-09-03 numbers:
 | `ferrox-quant/src/lib.rs` | 8239 | **8242** | flat |
 | `ferrox-models/src/decoder.rs` | 6752 | **6780** | grew |
 
+The per-layer shape wave (2026-09-11) left `decoder.rs` at 6842 and
+`loader.rs` at 5005: the seam itself is a 700-line new file
+(`layer_shapes.rs`) and the one row-level FFN body it needed
+(`decoder/ffn_block.rs`) replaced three copies, but the two batched
+attention bodies still had to be edited in place, and each of those
+edits is a labelled block around 400 lines nobody has yet split out.
+
 **One of five shrank, and the rule still lost on balance.** `attn.rs`
 gave up 616 lines only because a change was made to it and the split
 came first, which is the rule working as written. `lib.rs` gained 147
@@ -310,7 +382,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 39
+Those files are why llama.cpp has 140 architectures and ferrox has 42
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

@@ -31,10 +31,11 @@ use ferrox_moe::{ExpertWeights, GatingFunction, MoeLayerConfig};
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::config::ModelConfig;
+use crate::config::{FfnActivation, ModelConfig};
 #[cfg(feature = "metal")]
 use crate::decoder::MoePackedQ4Planes;
 use crate::decoder::{AttnWeights, Decoder, ExpertBacking, LayerWeights, MoeWeights};
+use crate::norm::NormOp;
 
 #[derive(Debug, Error)]
 pub enum LoadError {
@@ -377,29 +378,50 @@ impl ModelConfig {
             .metadata_u64(&key("embedding_length"))
             .ok_or_else(|| LoadError::MissingHparam(key("embedding_length")))?
             as usize;
-        let n_heads = file
-            .metadata_u64(&key("attention.head_count"))
-            .ok_or_else(|| LoadError::MissingHparam(key("attention.head_count")))?
-            as usize;
+        // Scalar OR per-layer array, as llama.cpp reads all three
+        // (`get_key_or_arr`, llama-model.cpp:1149-1158). The scalars
+        // below are the WIDEST layer's; `ModelConfig::layer_shape` is
+        // what a layer body reads. See `crate::layer_shapes`.
+        let heads_per_layer =
+            crate::layer_shapes::read_u64_per_layer(file, &key("attention.head_count"), n_layers)?
+                .ok_or_else(|| LoadError::MissingHparam(key("attention.head_count")))?;
+        let n_heads = heads_per_layer.iter().copied().max().unwrap_or(0) as usize;
 
         let mut best_effort_fields: Vec<&'static str> = Vec::new();
 
-        let n_kv_heads = file
-            .metadata_u64(&key("attention.head_count_kv"))
-            .map(|v| v as usize)
-            .unwrap_or_else(|| {
+        let kv_heads_per_layer = match crate::layer_shapes::read_u64_per_layer(
+            file,
+            &key("attention.head_count_kv"),
+            n_layers,
+        )? {
+            Some(v) => v,
+            None => {
                 best_effort_fields.push("n_kv_heads (no attention.head_count_kv key; assumed equal to n_heads, i.e. plain MHA)");
-                n_heads
-            });
-        let head_dim = file
-            .metadata_u64(&key("attention.key_length"))
-            .map(|v| v as usize)
-            .unwrap_or_else(|| {
+                heads_per_layer.clone()
+            }
+        };
+        let n_kv_heads = kv_heads_per_layer.iter().copied().max().unwrap_or(0) as usize;
+        let head_dim = match file.metadata_u64(&key("attention.key_length")) {
+            Some(v) => v as usize,
+            None => {
+                // llama.cpp derives it from LAYER 0's head count
+                // (`n_embd / n_head()`, llama-model.cpp:1195), which on
+                // a file whose layer 0 has none is a division by zero
+                // there and a refusal here.
+                let h0 = heads_per_layer.first().copied().unwrap_or(0) as usize;
+                if h0 == 0 {
+                    return Err(LoadError::MissingHparam(format!(
+                        "{} (layer 0 declares head_count 0, so it cannot be derived as \
+                         hidden_dim / n_heads)",
+                        key("attention.key_length")
+                    )));
+                }
                 best_effort_fields.push(
                     "head_dim (no attention.key_length key; derived as hidden_dim / n_heads)",
                 );
-                hidden_dim / n_heads
-            });
+                hidden_dim / h0
+            }
+        };
         let v_head_dim = file
             .metadata_u64(&key("attention.value_length"))
             .map(|v| v as usize)
@@ -492,16 +514,18 @@ impl ModelConfig {
         // is optional. llama.cpp `qwen2moe.cpp` uses
         // `n_ff_exp = n_ff_exp ? n_ff_exp : n_ff / n_expert_used` (1408 for
         // Qwen1.5-MoE); the shared expert keeps the full `n_ff` (5632).
-        let feed_forward_length = metadata_u64_any(file, &[key("feed_forward_length")])
-            // Qwen-1 declares gate and up as one number; see
-            // `FFN_LENGTH_COUNTS_GATE_AND_UP`.
-            .map(|ff| {
-                if FFN_LENGTH_COUNTS_GATE_AND_UP.contains(&arch.as_str()) {
-                    ff / 2
-                } else {
-                    ff
-                }
-            });
+        let ffn_per_layer =
+            crate::layer_shapes::read_u64_per_layer(file, &key("feed_forward_length"), n_layers)?
+                // Qwen-1 declares gate and up as one number; see
+                // `FFN_LENGTH_COUNTS_GATE_AND_UP`.
+                .map(|v| {
+                    if FFN_LENGTH_COUNTS_GATE_AND_UP.contains(&arch.as_str()) {
+                        v.into_iter().map(|ff| ff / 2).collect()
+                    } else {
+                        v
+                    }
+                });
+        let feed_forward_length = ffn_per_layer.as_ref().and_then(|v| v.iter().copied().max());
         let expert_ffn_dim = metadata_u64_any(file, &[key("expert_feed_forward_length")])
             .or_else(|| {
                 feed_forward_length.map(|ff| {
@@ -518,6 +542,13 @@ impl ModelConfig {
                 );
                 (hidden_dim * 4) as u64
             }) as usize;
+        let layer_shapes = crate::layer_shapes::LayerShapes::resolve(
+            &arch,
+            &heads_per_layer,
+            &kv_heads_per_layer,
+            ffn_per_layer.as_deref(),
+            expert_ffn_dim,
+        )?;
         let n_dense_leading_layers = if LEADING_DENSE_KEY_IS_INERT.contains(&arch.as_str()) {
             0
         } else {
@@ -842,6 +873,7 @@ impl ModelConfig {
             // architecture and the family partition does not match it:
             // `grok` is StandardGqa and passes `LLM_FFN_GELU`.
             _ if crate::capability::uses_geglu(&arch) => crate::config::FfnActivation::Gelu,
+            _ if crate::capability::uses_relu_sqr(&arch) => crate::config::FfnActivation::ReluSqr,
             crate::capability::DecoderFamily::GemmaFamily => crate::config::FfnActivation::Gelu,
             crate::capability::DecoderFamily::PhiFamily => {
                 crate::config::FfnActivation::SwigluFused
@@ -1095,6 +1127,7 @@ impl ModelConfig {
             // `exaone4` decides both off the same layer count and the
             // two must not be able to disagree.
             rope_layers: crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some()),
+            layer_shapes,
             moe: MoeLayerConfig {
                 n_experts: n_experts.max(1),
                 n_experts_active,
@@ -1417,16 +1450,60 @@ pub(crate) fn slice_quantized_rows(
     })
 }
 
-/// Dense-layer FFN tensors: standard gate/up/down, or Phi-3 fused
-/// `ffn_up` with `2 * expert_ffn_dim` rows and no separate gate.
+/// Dense-layer FFN tensors: standard gate/up/down, Phi-3 fused
+/// `ffn_up` with `2 * ffn_dim` rows and no separate gate, the UNGATED
+/// two-matrix FFN (`FfnActivation::ReluSqr`), or nothing at all for an
+/// FFN-free layer (`ffn_dim == 0`).
+///
+/// `ffn_dim` is THIS layer's width (`ModelConfig::layer_shape`), which
+/// is the model's for every architecture but the per-layer ones.
 fn load_dense_expert(
     file: &impl TensorSource,
     layer: usize,
     config: &ModelConfig,
+    ffn_dim: usize,
 ) -> Result<ExpertWeights, LoadError> {
+    if ffn_dim == 0 {
+        return Ok(crate::layer_shapes::absent_ffn(config.hidden_dim));
+    }
     let gate_name = format!("blk.{layer}.ffn_gate.weight");
     let up_name = format!("blk.{layer}.ffn_up.weight");
     let down_name = format!("blk.{layer}.ffn_down.weight");
+    if config.ffn_activation == FfnActivation::ReluSqr {
+        // `arcee.cpp:39-40` creates `ffn_up` and `ffn_down` and no gate;
+        // a file carrying one describes a graph this architecture does
+        // not compute, and would otherwise be left as an unread tensor
+        // with a less specific message.
+        if file.find_tensor(&gate_name).is_some() {
+            return Err(LoadError::UnsupportedFeature(
+                config.name.to_string(),
+                format!(
+                    "{gate_name} is present but this architecture's FFN is ungated \
+                     (LLM_FFN_RELU_SQR under LLM_FFN_SEQ with a null gate, arcee.cpp:123-128)"
+                ),
+            ));
+        }
+        let up = load_weight_matrix(file, &up_name)?;
+        if up.rows() != ffn_dim {
+            return Err(LoadError::UnsupportedFeature(
+                config.name.to_string(),
+                format!(
+                    "{up_name} has {} rows; the ungated FFN expects feed_forward_length = \
+                     {ffn_dim}",
+                    up.rows()
+                ),
+            ));
+        }
+        // The alias: the same tensor read again. A zero-copy view of the
+        // same bytes for a quantized mmapped file; an owned widening for
+        // an F32/F16 one. See `FfnActivation::ReluSqr` for why the pair
+        // is aliased rather than the struct given an `Option`.
+        return Ok(ExpertWeights {
+            gate: load_weight_matrix(file, &up_name)?,
+            up,
+            down: load_weight_matrix(file, &down_name)?,
+        });
+    }
     if file.find_tensor(&gate_name).is_some() {
         return Ok(ExpertWeights {
             gate: load_weight_matrix(file, &gate_name)?,
@@ -1436,7 +1513,7 @@ fn load_dense_expert(
     }
     // Phi-3 fused SwiGLU: up is [hidden, 2*ff], first half gate, second up.
     let fused = load_weight_matrix(file, &up_name)?;
-    let ff = config.moe.expert_ffn_dim;
+    let ff = ffn_dim;
     if fused.rows() != 2 * ff {
         return Err(LoadError::UnsupportedFeature(
             config.name.to_string(),
@@ -2105,66 +2182,92 @@ impl Decoder {
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut refined_qk_norm = config.qk_norm_style;
         for l in 0..config.n_layers {
-            // Q/K/V and their biases come out of ONE decision about
-            // which spelling this layer uses -- see `qkv_fused`. They
-            // used to be resolved independently, and a checkpoint that
-            // fused both (ChatGLM, Qwen-1) had its bias dropped.
-            let crate::qkv_fused::QkvProjections {
-                q: q_proj,
-                k: k_proj,
-                v: v_proj,
-                q_bias,
-                k_bias,
-                v_bias,
-            } = crate::qkv_fused::load_fused_or_split_qkv(&file, l, &config)?;
-            let q_norm = load_f32_vec_optional(&file, &format!("blk.{l}.attn_q_norm.weight"))?;
-            let k_norm = load_f32_vec_optional(&file, &format!("blk.{l}.attn_k_norm.weight"))?;
-            // Refine WholeVector vs PerHead from the first observed norm length.
-            if let Some(ref w) = q_norm {
-                if w.len() == config.head_dim {
-                    refined_qk_norm = crate::capability::QkNormStyle::PerHead;
-                } else if w.len() == config.n_heads * config.head_dim {
-                    refined_qk_norm = crate::capability::QkNormStyle::WholeVector;
-                } else {
-                    return Err(LoadError::UnsupportedFeature(
-                        config.name.to_string(),
-                        format!(
-                            "blk.{l}.attn_q_norm.weight length {} matches neither head_dim={} \
-                             nor n_heads*head_dim={}",
-                            w.len(),
-                            config.head_dim,
-                            config.n_heads * config.head_dim
-                        ),
-                    ));
+            // THIS layer's head counts and FFN width. Uniform for every
+            // architecture but the per-layer ones (`crate::layer_shapes`),
+            // and the loader reads the shape rather than the scalars so
+            // that a deci / openelm layer is sized by its own header.
+            let shape = config.layer_shape(l);
+            let attn = match shape.attention {
+                crate::layer_shapes::AttnShape::Gqa { n_heads, .. } => {
+                    // Q/K/V and their biases come out of ONE decision about
+                    // which spelling this layer uses -- see `qkv_fused`. They
+                    // used to be resolved independently, and a checkpoint that
+                    // fused both (ChatGLM, Qwen-1) had its bias dropped.
+                    let crate::qkv_fused::QkvProjections {
+                        q: q_proj,
+                        k: k_proj,
+                        v: v_proj,
+                        q_bias,
+                        k_bias,
+                        v_bias,
+                    } = crate::qkv_fused::load_fused_or_split_qkv(&file, l, &config)?;
+                    let q_norm =
+                        load_f32_vec_optional(&file, &format!("blk.{l}.attn_q_norm.weight"))?;
+                    let k_norm =
+                        load_f32_vec_optional(&file, &format!("blk.{l}.attn_k_norm.weight"))?;
+                    // Refine WholeVector vs PerHead from the first observed norm length.
+                    if let Some(ref w) = q_norm {
+                        if w.len() == config.head_dim {
+                            refined_qk_norm = crate::capability::QkNormStyle::PerHead;
+                        } else if w.len() == n_heads * config.head_dim {
+                            refined_qk_norm = crate::capability::QkNormStyle::WholeVector;
+                        } else {
+                            return Err(LoadError::UnsupportedFeature(
+                                config.name.to_string(),
+                                format!(
+                                    "blk.{l}.attn_q_norm.weight length {} matches neither \
+                                     head_dim={} nor n_heads*head_dim={}",
+                                    w.len(),
+                                    config.head_dim,
+                                    n_heads * config.head_dim
+                                ),
+                            ));
+                        }
+                    }
+                    let attn = AttnWeights {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj: load_weight_matrix(&file, &format!("blk.{l}.attn_output.weight"))?,
+                        // Which tensor, which function, and whether there is a
+                        // norm here at all: all three answered by the table.
+                        norm_weight: norm_sites.load_pre_norm(norm_sites.attn, &file, Some(l))?,
+                        q_norm,
+                        k_norm,
+                        // Qwen2/Qwen2-MoE-family real QKV bias (`attn_{q,k,v}.bias`,
+                        // real config `qkv_bias`, `o_proj` has none) -- see
+                        // `AttnWeights::q_bias`'s doc comment. Resolved above,
+                        // alongside the projections they belong to, because a
+                        // file that fuses the weight fuses the bias too.
+                        q_bias,
+                        k_bias,
+                        v_bias,
+                        post_attn_norm: crate::norm_sites::NormSites::load_post_norm(
+                            norm_sites.post_attn,
+                            &file,
+                            l,
+                        )?,
+                        post_ffn_norm: crate::norm_sites::NormSites::load_post_norm(
+                            norm_sites.post_ffn,
+                            &file,
+                            l,
+                        )?,
+                    };
+                    crate::layer_shapes::check_gqa_projection_widths(
+                        l,
+                        shape.attention,
+                        config.head_dim,
+                        config.hidden_dim,
+                        &attn,
+                    )?;
+                    attn
                 }
-            }
-            let attn = AttnWeights {
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj: load_weight_matrix(&file, &format!("blk.{l}.attn_output.weight"))?,
-                // Which tensor, which function, and whether there is a
-                // norm here at all: all three answered by the table.
-                norm_weight: norm_sites.load_pre_norm(norm_sites.attn, &file, Some(l))?,
-                q_norm,
-                k_norm,
-                // Qwen2/Qwen2-MoE-family real QKV bias (`attn_{q,k,v}.bias`,
-                // real config `qkv_bias`, `o_proj` has none) -- see
-                // `AttnWeights::q_bias`'s doc comment. Resolved above,
-                // alongside the projections they belong to, because a
-                // file that fuses the weight fuses the bias too.
-                q_bias,
-                k_bias,
-                v_bias,
-                post_attn_norm: crate::norm_sites::NormSites::load_post_norm(
-                    norm_sites.post_attn,
+                other => crate::layer_shapes::load_non_gqa_attention(
+                    other,
                     &file,
                     l,
-                )?,
-                post_ffn_norm: crate::norm_sites::NormSites::load_post_norm(
-                    norm_sites.post_ffn,
-                    &file,
-                    l,
+                    &norm_sites,
+                    config.hidden_dim,
                 )?,
             };
 
@@ -2182,7 +2285,7 @@ impl Decoder {
                 config.moe.n_experts
             };
             let experts: ExpertBacking = if is_dense_layer {
-                ExpertBacking::Resident(vec![load_dense_expert(&file, l, &config)?])
+                ExpertBacking::Resident(vec![load_dense_expert(&file, l, &config, shape.ffn_dim)?])
             } else {
                 // Try store-backed layouts first when the cache is
                 // enabled; fall back to resident when any of the three
@@ -2368,8 +2471,13 @@ impl Decoder {
                 // The same table as the attention slot, so the two
                 // pre-norms cannot disagree about the function, and the
                 // pre-FFN tensor's NAME comes from the same row that
-                // decided the post-attention slot must not read it.
-                norm_weight: norm_sites.load_pre_norm(norm_sites.ffn, &file, Some(l))?,
+                // decided the post-attention slot must not read it. An
+                // FFN-free layer (`deci.cpp:52-54`) has no such tensor.
+                norm_weight: if shape.ffn_dim == 0 {
+                    NormOp::None
+                } else {
+                    norm_sites.load_pre_norm(norm_sites.ffn, &file, Some(l))?
+                },
                 activation_counts,
                 #[cfg(feature = "metal")]
                 packed_q4,
@@ -2927,6 +3035,75 @@ mod tests {
                 .ffn_activation,
             FfnActivation::Swiglu
         );
+
+        // The ungated ReLU-squared row, and the four that share its FFN
+        // and refuse for something else (`capability::uses_relu_sqr`).
+        assert_eq!(
+            config_for_arch("arcee")
+                .expect("arcee loads")
+                .ffn_activation,
+            FfnActivation::ReluSqr
+        );
+        for shared in ["plm", "nemotron", "jais2", "nemotron-h"] {
+            assert!(crate::capability::uses_relu_sqr(shared), "{shared}");
+        }
+        assert!(!crate::capability::uses_relu_sqr("llama"));
+    }
+
+    /// A per-layer array whose entries differ, on an architecture whose
+    /// llama.cpp graph reads layer 0, is refused naming the table; the
+    /// same arrays with equal entries are the uniform model, for any
+    /// architecture, because a converter may spell a scalar as a list.
+    ///
+    /// Reachability, not only `LayerShapes::resolve`'s own unit test:
+    /// this goes through `from_gguf` on a header-only file, which is
+    /// where `openelm` used to die on `MissingHparam` for a key its
+    /// file carried.
+    #[test]
+    fn a_varying_per_layer_array_is_refused_on_a_layer_zero_architecture_and_equal_ones_are_uniform(
+    ) {
+        let kvs = [
+            ("general.architecture", Kv::Str("llama")),
+            ("llama.block_count", Kv::U32(2)),
+            ("llama.embedding_length", Kv::U32(64)),
+            ("llama.attention.head_count", Kv::Arr32(&[2, 2])),
+            ("llama.attention.head_count_kv", Kv::Arr32(&[2, 1])),
+            ("llama.attention.key_length", Kv::U32(32)),
+            ("llama.rope.freq_base", Kv::F32(10_000.0)),
+        ];
+        let err = ModelConfig::from_gguf(&open_metadata_gguf("layer_shapes_vary", &kvs))
+            .expect_err("llama takes layer 0 upstream");
+        let msg = err.to_string();
+        assert!(msg.contains("PER_LAYER_SHAPE_ARCHS"), "{msg}");
+        assert!(msg.contains("LLAMA_LOAD_LOCALS"), "{msg}");
+
+        let kvs = [
+            ("general.architecture", Kv::Str("llama")),
+            ("llama.block_count", Kv::U32(2)),
+            ("llama.embedding_length", Kv::U32(64)),
+            ("llama.attention.head_count", Kv::Arr32(&[2, 2])),
+            ("llama.attention.head_count_kv", Kv::Arr32(&[1, 1])),
+            ("llama.attention.key_length", Kv::U32(32)),
+            ("llama.rope.freq_base", Kv::F32(10_000.0)),
+        ];
+        let cfg = ModelConfig::from_gguf(&open_metadata_gguf("layer_shapes_equal", &kvs))
+            .expect("equal arrays are the uniform model");
+        assert!(cfg.layer_shapes.is_uniform());
+        assert_eq!((cfg.n_heads, cfg.n_kv_heads), (2, 1));
+
+        // An array of the wrong length is refused as llama.cpp refuses
+        // it (`key has wrong array length`).
+        let kvs = [
+            ("general.architecture", Kv::Str("llama")),
+            ("llama.block_count", Kv::U32(2)),
+            ("llama.embedding_length", Kv::U32(64)),
+            ("llama.attention.head_count", Kv::Arr32(&[2, 2, 2])),
+            ("llama.attention.key_length", Kv::U32(32)),
+            ("llama.rope.freq_base", Kv::F32(10_000.0)),
+        ];
+        let err = ModelConfig::from_gguf(&open_metadata_gguf("layer_shapes_len", &kvs))
+            .expect_err("three entries for two layers");
+        assert!(err.to_string().contains("wrong array length"), "{err}");
     }
 
     /// The no-renormalise list is keyed on what llama.cpp's GRAPH does,

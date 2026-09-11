@@ -119,11 +119,7 @@ pub fn load_graph_fixture(name: &str) -> Decoder {
 }
 
 pub fn graph_caches(decoder: &Decoder) -> Vec<KvCache> {
-    decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect()
+    decoder.config.new_kv_caches()
 }
 
 /// Prefill, decode and continuous batching are three separate bodies in

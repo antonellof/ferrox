@@ -19,7 +19,7 @@
 //!
 //! The Metal side applies the bias inside its kernels
 //! (`ferrox_metal::attn::AttnExtras`) and has no clamp, which is why
-//! `Decoder::metal_can_serve_scalars` refuses every fused launch for a
+//! `Decoder::metal_can_serve_model` refuses every fused launch for a
 //! clamped model.
 
 use crate::clamp_kqv::clamp_in_place;

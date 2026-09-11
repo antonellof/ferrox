@@ -315,9 +315,7 @@ pub fn run(args: PerplexityArgs) -> anyhow::Result<()> {
         // A fresh cache per window is llama.cpp's `llama_memory_clear`:
         // windows are independent, and a carried-over cache would let
         // window N attend over window N-1 and quietly lower the number.
-        let mut caches: Vec<KvCache> = (0..decoder.layers.len())
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let logits = decoder.forward_batch(&ids, 0, &mut caches);
         anyhow::ensure!(
             logits.len() == plan.n_ctx,

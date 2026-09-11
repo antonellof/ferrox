@@ -1459,11 +1459,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         }
     };
 
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
     // Speculative decoding with a real draft model, when `-d` names
     // one. The verification rule lives in `ferrox_models::speculative`

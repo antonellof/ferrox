@@ -50,9 +50,7 @@ const MODELS: &[&str] = &[
 ];
 
 fn greedy_contiguous(decoder: &Decoder, prompt: &[usize], eos: Option<usize>) -> Vec<usize> {
-    let mut caches: Vec<KvCache> = (0..decoder.layers.len())
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let mut logits = decoder.forward_batch_last(prompt, 0, &mut caches);
     let mut out = Vec::with_capacity(MAX_NEW_TOKENS);
     for pos in (prompt.len()..).take(MAX_NEW_TOKENS) {

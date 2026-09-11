@@ -440,11 +440,7 @@ fn prefill_chunking_does_not_change_logits() {
     let prompt: Vec<usize> = (0..11).map(|i| (i * 3 + 1) % 16).collect();
 
     let mut sequential: Vec<f32> = Vec::new();
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     for (pos, &tok) in prompt.iter().enumerate() {
         sequential = decoder.forward_token(tok, pos, &mut caches);
     }

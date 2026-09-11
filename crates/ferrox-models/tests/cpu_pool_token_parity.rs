@@ -93,9 +93,7 @@ fn greedy_tokens(path: &Path) -> Vec<usize> {
         .into_iter()
         .map(|t| t as usize)
         .collect();
-    let mut caches: Vec<KvCache> = (0..config.n_layers)
-        .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = config.new_kv_caches();
 
     let logits = decoder.forward_batch(&prompt, 0, &mut caches);
     let mut last = logits.last().expect("non-empty prompt").clone();

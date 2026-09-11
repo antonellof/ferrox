@@ -565,6 +565,58 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // (`:171-184`, `sqrt(2)/2` on the sum) is refused BY NAME in
     // `loader.rs`, so this row is admitted for Grok-1.
     "grok",
+    // tests/ungated_ffn_graphs.rs: Arcee AFM, NEW CODE on ONE fact --
+    // the FFN has no gate. `arcee.cpp:39-40` creates `ffn_up` and
+    // `ffn_down` only, and `:123-128` is `build_ffn` with a NULL gate,
+    // `LLM_FFN_RELU_SQR` and `LLM_FFN_SEQ`: `down(relu(up(x))^2)`.
+    // ferrox spells that as `FfnActivation::ReluSqr`, which the loader
+    // serves by ALIASING the expert's gate to its up matrix and
+    // `ferrox_moe::GluAct::Reglu` (`relu(gate) * up`), so the gated
+    // struct and every gated path are untouched and `relu(up)^2` is
+    // what they compute; the dense hot paths skip the aliased matmul.
+    // No fused device kernel spells it, so `fused_kernel_gelu_flag`
+    // returns `None` and `metal_can_serve_model` keeps the model off
+    // the stacks -- which replaced six `gelu = !is_swiglu()` sites
+    // that would have run a third activation as GELU. Everything else
+    // is `llama` (:6 says so): NORM RoPE (llama-model.cpp:2600),
+    // optional `output.weight` with a tied fallback (:20-25),
+    // `n_embd_head == n_rot` asserted (:51-52). The same FFN is in
+    // `plm`, `nemotron`, `jais2` and `nemotron-h`, each of which refuses
+    // for something else; see `UNGATED_RELU_SQR`.
+    "arcee",
+    // tests/per_layer_shape_graphs.rs: the PER-LAYER-SHAPE pair, two
+    // rows on one seam (`crate::layer_shapes`). llama.cpp reads
+    // `head_count`, `head_count_kv` and `feed_forward_length` as
+    // scalar-or-array for every architecture and hands most graphs
+    // layer 0; these two index the arrays in both their tensor loader
+    // and their graph, and ferrox carried all three as scalars. The
+    // scan that sized the seam is recorded in
+    // `layer_shapes::PER_LAYER_SHAPE_ARCHS`.
+    //
+    // `deci` (deci.cpp:30-34 loader, :103-105 graph): all three per
+    // layer AND a three-way branch on them -- `n_head == 0` passes the
+    // residual through with no norm (:107-109), `n_head_kv == 0` runs
+    // `attn_norm` then `wo` alone (:115-118), `n_ff == 0` skips the FFN
+    // (:147-149). `AttnShape::{Gqa, Linear, Absent}` and
+    // `LayerShape::ffn_dim` are those, and the fixture has one layer of
+    // each kind. A second fixture is the DeciLM-7B shape
+    // (conversion/deci.py:114-118: `head_count_kv` alone as an array).
+    // The FFN-free layer WITH attention is refused: `:147-149`
+    // `continue`s before the residual add, and scaling that layer's
+    // attention weights by 3 leaves libllama's logits byte-identical
+    // (measured), so the branch is dead in the reference graph and
+    // ferrox will not pin it. NORM RoPE (llama-model.cpp:2576).
+    "deci",
+    // `openelm` (openelm.cpp:26-28 loader, :67-69 graph): all three per
+    // layer, one fused `wqkv` per layer sized `(2*n_head_kv(i) +
+    // n_head(i)) * n_embd_head_k` (:34) -- `qkv_fused::FusedQkvRows::of`
+    // takes the layer now -- per-head QK-norm before RoPE (:82-102),
+    // NEOX RoPE (llama-model.cpp:2650), a tied lm_head with no fallback
+    // (:22). The fixture's three layers share no KV width and no FFN
+    // width. Its converter writes the arrays (conversion/openelm.py:
+    // 57-59), which `layer_shapes::read_u64_per_layer` reads where
+    // `GgufValue::as_u64` used to die on them.
+    "openelm",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -827,19 +879,14 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // `qwen.cpp:33-35` sizes every FFN matrix `n_ff/2`, because
     // Qwen-1's `intermediate_size` counts gate and up together. `qwen`
     // stays refused, with that added to its reason.
-    (
-        "deci",
-        TriageClass::NewCode,
-        "DeciLM / Llama-3.1-Nemotron layers are not all the same shape. \
-         src/models/deci.cpp:30-34 reads n_head(i), n_head_kv(i) and n_ff(i) PER LAYER, and \
-         the graph branches on them three ways: `n_head == 0` is an attention-free layer \
-         that passes the residual straight through (:107-109), `n_head_kv == 0` is a \
-         \"linear attention\" layer that applies only `wo` with no Q/K/V and no RoPE \
-         (:115-118), and `n_ff == 0` skips the FFN and the residual add entirely with a \
-         `continue` (:147-149). ferrox's ModelConfig carries n_heads, n_kv_heads and \
-         expert_ffn_dim as SCALARS and its decoder runs the same block on every layer, so \
-         there is nowhere to put any of the three. Same class as `openelm`, one step worse",
-    ),
+    // `deci` was HERE, NEW CODE on PER-LAYER SHAPES, and is audited
+    // now with `openelm` on one seam (`crate::layer_shapes`,
+    // `tests/per_layer_shape_graphs.rs`). Its three layer kinds are
+    // `AttnShape::{Gqa, Linear, Absent}` plus `ffn_dim == 0`; the one
+    // combination llama.cpp's graph handles by discarding a computed
+    // branch (`deci.cpp:147-149` before `:150-153`) is refused by name
+    // from a fixture that has it, with the drop MEASURED rather than
+    // read.
     // `olmo` was HERE, NEW CODE on the non-parametric LayerNorm, and is
     // audited now: `crate::norm::NormOp::LayerNormNoParams` implements
     // the function and `tests/olmo_graphs.rs` carries the fixture. Its
@@ -882,11 +929,15 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          rewrites the per-layer head/ff/swa arrays so the graph walks n_layer_all steps over \
          n_layer_phys sets of weights, and :167 applies `output_norm` to the running \
          residual inside the loop at the end of each pass. ferrox's decoder walks its layer \
-         vector exactly once and has no concept of a loop count. Everything inside one pass \
-         (:52-63, :106-155) is plain llama, which is what makes this deceptive: the tensor \
-         set alone looks generic",
+         vector exactly once and has no concept of a loop count. The per-layer arrays \
+         themselves (`crate::layer_shapes`) are not the blocker: :24-26 copies them, it \
+         does not vary them, and it is the copy that has no home. Everything inside one \
+         pass (:52-63, :106-155) is plain llama, which is what makes this deceptive: the \
+         tensor set alone looks generic",
     ),
-    ("arcee", TriageClass::NewCode, UNGATED_RELU_SQR),
+    // `arcee` was HERE, NEW CODE on `UNGATED_RELU_SQR`, and is audited
+    // now: the FFN is `FfnActivation::ReluSqr` and
+    // `tests/ungated_ffn_graphs.rs` carries the fixture.
     ("plm", TriageClass::NewCode, UNGATED_RELU_SQR),
 ];
 
@@ -931,23 +982,36 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
 const NO_UPSTREAM_ARCH: &str =
     "this is not a GGUF architecture. `mistral`, `mixtral` and `yi` appear in neither      LLM_ARCH_NAMES (src/llama-arch.cpp lists `mistral3` and `mistral4` and nothing else      under that prefix) nor gguf-py's MODEL_ARCH_NAMES, and libllama REFUSES a file      declaring one of them: `unknown model architecture: 'mistral'` -- measured, on a      synthetic llama-shaped file written under each of the three strings. Every real      Mistral, Mixtral and Yi checkpoint converts to `llama` instead, which ferrox audits      and runs: the two in this repo's own models/ directory      (Mistral-7B-Instruct-v0.2-Q4_K_M.gguf, Yi-1.5-6B-Chat-Q4_K_M.gguf) both declare      `general.architecture = llama`. IF YOUR FILE REALLY SPELLS THIS, it came from a      converter neither engine has read, so its RoPE variant, its norm placement and its      FFN shape are all undetermined and ferrox will not guess -- re-convert it with      llama.cpp's convert_hf_to_gguf.py and it will load as `llama`. These rows used to sit      on the generic path with NEOX RoPE, while `llama` is in llama_model_rope_type's NORM      group, so such a file would have been rotated on the wrong pairs of every Q/K head";
 
-/// Shared by `arcee` and `plm`: an ungated ReLU-squared MLP.
+/// Was shared by `arcee` and `plm`: an ungated ReLU-squared MLP. `arcee`
+/// closed on it (2026-09-11, `FfnActivation::ReluSqr`,
+/// `tests/ungated_ffn_graphs.rs`); `plm` did not, and this is the
+/// verdict that says why.
 ///
-/// Found by the activation audit the `deepseek` renormalisation bug
-/// prompted, not by reading these two files on purpose. Both were on the
-/// generic path with nothing recording that their FFN is neither SwiGLU
-/// nor GeGLU.
+/// The original verdict called the two "one cause" from the FFN alone,
+/// and it was wrong by an attention block: reading `plm.cpp` against
+/// `arcee.cpp` before assuming they were identical (the `diff` is 150
+/// lines) shows `plm.cpp:16-19,32-36` creating `attn_kv_a_mqa`,
+/// `attn_kv_a_norm` and `attn_kv_b` sized by `kv_lora_rank` and
+/// `n_rot`, and `:84-166` running DeepSeek-2's MLA attention -- Q split
+/// into `q_nope`/`q_pe`, a compressed KV normed and re-expanded, a
+/// shared roped key concatenated onto every head. ferrox has that
+/// attention only in the dedicated `MlaEngine`. Five graphs use the
+/// FFN (`arcee`, `plm`, `nemotron`, `jais2`, `nemotron-h`, measured by
+/// grepping `LLM_FFN_RELU_SQR` over `src/models/`); only `arcee` needed
+/// nothing else.
 const UNGATED_RELU_SQR: &str =
-    "an UNGATED ReLU-squared MLP, which is a different FFN shape and not only a different \
-     activation. src/models/arcee.cpp:39-40 and plm.cpp:39-40 create only `ffn_up` and \
-     `ffn_down` and no `ffn_gate` at all, and arcee.cpp:123-128 calls build_ffn with a NULL \
-     gate, `LLM_FFN_RELU_SQR` and `LLM_FFN_SEQ` -- i.e. `down(relu(up(x))^2)`, two matrices \
-     in sequence. ferrox's `ExpertWeights` has three required matrices and \
-     `FfnActivation` has only the gated Swiglu / SwigluFused / Gelu variants \
-     (config.rs:302-312), so there is no shape for this and no activation for it either. It \
-     fails closed rather than computing SwiGLU: `load_dense_expert` (loader.rs:1112-1136) \
-     finds no `ffn_gate`, falls to the Phi-3 fused path, and rejects an `ffn_up` that is \
-     `n_ff` rows rather than `2 * n_ff`";
+    "DeepSeek-2 MLA attention on a dense model, and NOT the ungated ReLU-squared FFN the \
+     verdict used to name -- that half is IMPLEMENTED (`FfnActivation::ReluSqr`, audited on \
+     `arcee`, whose `arcee.cpp:123-128` is the same `build_ffn(up, NULL gate, down, \
+     LLM_FFN_RELU_SQR, LLM_FFN_SEQ)` call as plm.cpp:181-187). What remains is the \
+     attention: src/models/plm.cpp:16-19 sizes `attn_kv_a_mqa` {n_embd, kv_lora_rank + \
+     n_rot}, `attn_kv_a_norm` {kv_lora_rank} and `attn_kv_b` {kv_lora_rank, n_head * \
+     (qk_nope + v)} from `attention.kv_lora_rank` (:5), and :84-166 splits Q into nope/pe \
+     views, RMS-norms the compressed KV, re-expands it, ropes ONE shared key and repeats it \
+     across the heads -- `deepseek2.cpp`'s graph with no q_lora and no MoE. ferrox runs \
+     that attention only inside the dedicated `MlaEngine` (`mla_gguf_loader.rs`, arch-gated \
+     to `deepseek2` / `mistral4`), which has no dense ReLU-squared FFN and no libllama-golden \
+     evidence of its own; the generic decoder has no MLA at all";
 
 /// Triaged rows of the generic **NEOX**-RoPE group. Same rules as
 /// [`NORM_ROPE_TRIAGED`].
@@ -983,15 +1047,17 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     (
         "mimo2",
         TriageClass::NewCode,
-        "attention sinks on a non-gpt-oss architecture, plus per-layer shapes. \
-         src/models/mimo2.cpp:58 creates `attn_sinks` per layer; ferrox implements sinks \
-         only inside the gpt-oss path and, per docs/MODELS.md, on CPU only. :47-49 reads \
-         n_head and the KV widths PER LAYER, :16 and :181 scale the attention output by \
-         {arch}.attention.value_scale (a key ferrox neither reads nor gates), :6-12 makes \
-         SWA unconditional with a per-layer is_swa ARRAY rather than a period, and :19,:76-82 \
-         add NEXTN/MTP layers with a `layer_out_norm`. Any one of the first three would \
-         disqualify it; the dense-or-MoE-per-layer choice at :63-72 is the only part ferrox \
-         already has",
+        "attention sinks on a non-gpt-oss architecture. NO LONGER a blocker: the per-layer \
+         shapes -- :47-49 and :111-112 read n_head / n_head_kv PER LAYER, which \
+         `crate::layer_shapes` carries now (audited on `deci` and `openelm`), and mimo2 is \
+         in its reach table. What remains: src/models/mimo2.cpp:58 creates `attn_sinks` per \
+         layer, and ferrox implements sinks only inside the gpt-oss path and, per \
+         docs/MODELS.md, on CPU only; :16 and :181 scale the attention output by \
+         {arch}.attention.value_scale (a key ferrox neither reads nor gates); :6-12 makes \
+         SWA unconditional with a per-layer is_swa ARRAY rather than a period; and :19,:76-82 \
+         add NEXTN/MTP layers with a `layer_out_norm`. Any one of the first two would \
+         disqualify it; the dense-or-MoE-per-layer choice at :63-72 is the only other part \
+         ferrox already has",
     ),
     (
         "afmoe",
@@ -1050,32 +1116,38 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     (
         "laguna",
         TriageClass::NewCode,
-        "per-layer head counts AND a second rotary width. conversion/laguna.py:79 calls \
-         `add_head_count(per_layer_heads)` with a LIST, so the array is really in the file, \
-         and src/models/laguna.cpp:87-88 and :176-177 read n_head(i) / n_head_kv(i) per \
-         layer while ferrox carries both as scalars. :50 then reads \
-         LLM_KV_ROPE_DIMENSION_COUNT_SWA into `n_rot_swa`, so the sliding-window layers \
-         rotate a DIFFERENT number of dimensions than the full-attention layers (its own \
-         comment at :43-45: full layers YaRN over 64 dims, SWA layers plain RoPE over 128); \
-         ferrox has one rotary_dim. It also creates `wqkv_gate` (:124), the gated-attention \
-         tensor afmoe has, and :55-56 defaults expert_gating_func to SIGMOID when the key is \
-         absent where ferrox would default to softmax. `default_swa_layout` already has \
-         laguna as dense_first period 4, which is correct and is not the blocker",
+        "gated attention and a second rotary width. NO LONGER a blocker: the per-layer head \
+         counts. conversion/laguna.py:79 writes `head_count` as a LIST and \
+         src/models/laguna.cpp:87-88,176-177 read n_head(i) / n_head_kv(i) per layer; \
+         `crate::layer_shapes` carries that now (audited on `deci` and `openelm`), and \
+         laguna is in its reach table. What remains: :124 creates `wqkv_gate`, the \
+         gated-attention tensor afmoe has and the generic decoder has no slot for; :50 \
+         reads LLM_KV_ROPE_DIMENSION_COUNT_SWA into `n_rot_swa`, so the sliding-window \
+         layers rotate a DIFFERENT number of dimensions than the full-attention layers (its \
+         own comment at :43-45: full layers YaRN over 64 dims, SWA layers plain RoPE over \
+         128) -- note this is `llama-hparams.cpp:85-91`'s two-valued `is_swa(il) ? \
+         n_rot_swa : n_rot_full`, not a per-layer array, so it is a `rope_dim_swa` field \
+         and not another seam; and :55-56 defaults expert_gating_func to SIGMOID when the \
+         key is absent where ferrox would default to softmax. `default_swa_layout` already \
+         has laguna as dense_first period 4, which is correct and is not the blocker",
     ),
     (
         "step35",
         TriageClass::NewCode,
-        "a per-LAYER rotary width. src/models/step35.cpp:65-70 takes `n_rot_max` as the max \
-         of `hparams.n_rot(i)` over all layers -- because n_rot varies by layer -- and :9 \
-         first halves n_rot_full; ferrox has one rotary_dim for the model. On top of that: \
-         per-layer SwiGLU clamp arrays for the routed and shared experts (:28-29, \
-         LLM_KV_SWIGLU_CLAMP_EXP / _SHEXP), where ferrox's only clamp is the gpt-oss scalar; \
-         a `wqkv_gate` (:96); a per-layer is_swa ARRAY rather than a period (:26), which \
-         ferrox reads only as a scalar; NEXTN/MTP layers with trunk-only and MTP-only load \
-         modes (:32-49); and expert_gating_func defaulting to SIGMOID when absent (:19-20) \
-         where ferrox defaults to softmax. The inventory guessed this was \"probably \
-         parameterisable from the gpt-oss clamp\" -- the clamp is, the per-layer n_rot is \
-         not",
+        "per-layer SwiGLU clamp arrays and a gated attention. NO LONGER a blocker: the \
+         per-layer head counts -- :76-78,122-124 (loader) and :208-209,388-389 (graph) read \
+         n_head / the KV widths PER LAYER, which `crate::layer_shapes` carries now (audited \
+         on `deci` and `openelm`), and step35 is in its reach table. NARROWED: the \
+         \"per-layer rotary width\" at src/models/step35.cpp:65-70 (`n_rot_max` as the max \
+         of `hparams.n_rot(i)`) is `llama-hparams.cpp:85-91`'s two-valued `is_swa(il) ? \
+         n_rot_swa : n_rot_full`, not an array, so it is a `rope_dim_swa` field rather \
+         than a seam; :9 first halves n_rot_full. What remains: per-layer SwiGLU clamp \
+         arrays for the routed and shared experts (:28-29, LLM_KV_SWIGLU_CLAMP_EXP / \
+         _SHEXP), where ferrox's only clamp is the gpt-oss scalar; a `wqkv_gate` (:96); a \
+         per-layer is_swa ARRAY rather than a period (:26), which ferrox reads only as a \
+         scalar; NEXTN/MTP layers with trunk-only and MTP-only load modes (:32-49); and \
+         expert_gating_func defaulting to SIGMOID when absent (:19-20) where ferrox \
+         defaults to softmax",
     ),
     // `mistral`, `mixtral` and `yi` were HERE, UNKNOWN on
     // NO_UPSTREAM_ARCH. The question that verdict asked -- "is there a
@@ -1132,23 +1204,12 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          unread-tensor gate (`blk.N.attn_sub_norm`, llama-arch.cpp:510-511), which is the \
          right outcome and not a small fix",
     ),
-    (
-        "openelm",
-        TriageClass::NewCode,
-        "per-LAYER head counts and FFN width. src/models/openelm.cpp:26-28 reads \
-         `hparams.n_head(i)`, `n_head_kv(i)` and `n_ff(i)` per layer and sizes the fused \
-         `wqkv` as `n_embd x (2*n_head_kv(i) + n_head(i)) * n_embd_head_k` (:34), and the \
-         graph re-derives those widths for every layer (:67-69). ferrox's ModelConfig \
-         carries n_heads, n_kv_heads and expert_ffn_dim as SCALARS, and \
-         `qkv_fused::load_fused_or_split_qkv` splits a fused QKV at offsets computed from \
-         those scalars, \
-         so there is nowhere to put this. It fails closed, but NOT with this message: \
-         conversion/openelm.py:57-59 writes head_count, head_count_kv and \
-         feed_forward_length as ARRAYS, and `GgufValue::as_u64` returns None for an array \
-         (ferrox-gguf/src/lib.rs:83-93), so the load dies on a missing-hparam error for keys \
-         the file does carry, before the unaudited gate is reached. That misleading message \
-         is the `glm4moe` shape and should be fixed alongside",
-    ),
+    // `openelm` was HERE, NEW CODE on PER-LAYER SHAPES, and is audited
+    // now with `deci` (`crate::layer_shapes`,
+    // `tests/per_layer_shape_graphs.rs`). The misleading missing-hparam
+    // message its verdict named is gone with it:
+    // `layer_shapes::read_u64_per_layer` reads the arrays
+    // `conversion/openelm.py:57-59` writes.
 ];
 
 /// Full inventory keyed by GGUF `general.architecture` string.
@@ -1223,6 +1284,16 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // evidence. NORM RoPE: llama-model.cpp puts LLM_ARCH_SMOLLM3 in
         // the consecutive-pairs group (:2600).
         v.push(gqa_norm("smollm3"));
+        // `arcee` was NEW CODE in `NORM_ROPE_TRIAGED` on the ungated
+        // ReLU-squared FFN, which `FfnActivation::ReluSqr` implements
+        // (`tests/ungated_ffn_graphs.rs`). NORM RoPE: LLM_ARCH_ARCEE is
+        // in the consecutive-pairs group (llama-model.cpp:2600).
+        v.push(gqa_norm("arcee"));
+        // `deci` was NEW CODE in `NORM_ROPE_TRIAGED` on per-layer
+        // shapes, which `crate::layer_shapes` implements
+        // (`tests/per_layer_shape_graphs.rs`). NORM RoPE: LLM_ARCH_DECI
+        // is in the consecutive-pairs group (llama-model.cpp:2576).
+        v.push(gqa_norm("deci"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1311,6 +1382,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // `tests/grok_graphs.rs`.
             "dbrx",
             "grok",
+            // Was NEW CODE in `NEOX_ROPE_TRIAGED` on per-layer shapes,
+            // audited now with `deci` on `crate::layer_shapes`
+            // (`tests/per_layer_shape_graphs.rs`). NEOX RoPE:
+            // llama-model.cpp:2650.
+            "openelm",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2188,6 +2264,23 @@ pub fn uses_geglu(arch: &str) -> bool {
     matches!(arch, "grok")
 }
 
+/// Architectures whose FFN is the UNGATED ReLU-squared MLP:
+/// `build_ffn(up, NULL gate, down, LLM_FFN_RELU_SQR, LLM_FFN_SEQ)`,
+/// i.e. `down(relu(up(x))^2)` (`arcee.cpp:123-128`).
+///
+/// Five graphs pass `LLM_FFN_RELU_SQR` upstream -- measured, by
+/// grepping `src/models/*.cpp`: `arcee`, `plm`, `nemotron`, `jais2`,
+/// `nemotron-h`. Only `arcee` reaches the generic path with nothing
+/// else in the way: `plm` is MLA attention (`UNGATED_RELU_SQR`),
+/// `nemotron` and `jais2` are in the biased-LayerNorm group
+/// (`WEIGHTED_LAYER_NORM`), `nemotron-h` is a hybrid recurrent model.
+/// They are listed so that closing one of them finds its FFN already
+/// implemented and named here, and so that `plm`'s verdict can point at
+/// the half that is done.
+pub fn uses_relu_sqr(arch: &str) -> bool {
+    matches!(arch, "arcee" | "plm" | "nemotron" | "jais2" | "nemotron-h")
+}
+
 pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
     let last_dense = |period| {
         Some(SwaPattern {
@@ -2758,7 +2851,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 18,
+            seen == 15,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2792,11 +2885,17 @@ mod audit_tests {
              defaults hook and the norm-site table for `grok`, the LayerNorm variant, \
              the QKV clamp and the same table for `dbrx` (tests/grok_graphs.rs, \
              tests/dbrx_graphs.rs) -- with the clamp also closing `olmo`'s clip_qkv \
-             refusal by name. What is left is 17 NEW CODE and one UNKNOWN (`phi4`). The \
-             NEW CODE rows that have closed are `olmo2`, `exaone4`, the three Granite \
-             rows, `exaone-moe`, `grok` and `dbrx`, and each closure but `olmo`'s took \
-             more than one row at a time because each found ONE cause behind several \
-             refusals"
+             refusal by name, and 18 until `arcee` closed on the ungated ReLU-squared FFN \
+             (`FfnActivation::ReluSqr`, tests/ungated_ffn_graphs.rs) -- ALONE, because the \
+             constant it shared with `plm` had named the FFN and missed `plm`'s MLA \
+             attention -- and `deci` and `openelm` closed together on the per-layer shape \
+             seam (`crate::layer_shapes`, tests/per_layer_shape_graphs.rs), which the scan \
+             that sized it says reaches `laguna`, `mimo2` and `step35` too, each of which \
+             still needs something else. What is left is 14 NEW CODE and one UNKNOWN \
+             (`phi4`). The NEW CODE rows that have closed are `olmo2`, `exaone4`, the \
+             three Granite rows, `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci` and \
+             `openelm`, and each closure but `olmo`'s and `arcee`'s took more than one \
+             row at a time because each found ONE cause behind several refusals"
         );
     }
 

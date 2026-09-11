@@ -1,4 +1,3 @@
-use ferrox_core::KvCache;
 use ferrox_gguf::GgufFile;
 use ferrox_models::decoder::Decoder;
 use ferrox_models::ModelConfig;
@@ -27,9 +26,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
-    let mut caches: Vec<_> = (0..decoder.layers.len())
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<_> = decoder.config.new_kv_caches();
     let mut logits = Vec::new();
     for (i, &tok) in tokens.iter().enumerate() {
         logits = decoder.forward_token(tok, i, &mut caches);

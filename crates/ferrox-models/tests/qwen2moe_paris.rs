@@ -66,12 +66,8 @@ fn qwen2moe_cpu_greedy_paris_regression() {
 
     eprintln!("prompt tokens ({}) = {tokens:?}", tokens.len());
 
-    let mut caches: Vec<KvCache> = (0..config.n_layers)
-        .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))
-        .collect();
-    let mut caches_last: Vec<KvCache> = (0..config.n_layers)
-        .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = config.new_kv_caches();
+    let mut caches_last: Vec<KvCache> = config.new_kv_caches();
 
     let logits_per_pos = decoder.forward_batch(&tokens, 0, &mut caches);
     let batch_last = logits_per_pos.last().expect("non-empty prompt");

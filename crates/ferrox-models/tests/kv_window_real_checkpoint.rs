@@ -86,9 +86,7 @@ fn run(path: &Path, policy: KvWindowPolicy) -> Run {
 
     let prompt = ids(PROMPT_LEN, 7, config.vocab_size);
     let script = ids(STEPS, 1234, config.vocab_size);
-    let mut caches: Vec<KvCache> = (0..config.n_layers)
-        .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = config.new_kv_caches();
 
     let mut last = decoder.forward_batch_last(&prompt, 0, &mut caches);
     let mut logits = vec![last.clone()];

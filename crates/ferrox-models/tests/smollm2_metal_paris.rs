@@ -72,9 +72,7 @@ fn smollm2_metal_greedy_paris_regression() {
         .map(|t| t as usize)
         .collect();
 
-    let mut caches: Vec<KvCache> = (0..config.n_layers)
-        .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = config.new_kv_caches();
 
     let logits_per_pos = decoder.forward_batch(&tokens, 0, &mut caches);
     let mut last_logits = logits_per_pos.last().expect("non-empty prompt").clone();

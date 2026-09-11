@@ -421,9 +421,7 @@ fn percentile(xs: &mut [f64], q: f64) -> f64 {
 }
 
 fn last_logits(decoder: &Decoder, tokens: &[usize]) -> Vec<f32> {
-    let mut caches: Vec<KvCache> = (0..decoder.layers.len())
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     decoder.forward_batch_last(tokens, 0, &mut caches)
 }
 

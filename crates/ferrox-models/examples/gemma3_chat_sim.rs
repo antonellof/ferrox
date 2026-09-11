@@ -1,4 +1,3 @@
-use ferrox_core::KvCache;
 use ferrox_gguf::GgufFile;
 use ferrox_models::decoder::Decoder;
 use ferrox_models::tokenizer::{GgufSpmTokenizer, SpecialTokens};
@@ -21,9 +20,7 @@ fn main() {
     println!("tokens={tokens:?}");
     let config = ModelConfig::from_gguf(&file).unwrap();
     let decoder = Decoder::from_gguf(path, config).unwrap();
-    let mut caches: Vec<_> = (0..decoder.layers.len())
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<_> = decoder.config.new_kv_caches();
     let mut logits = Vec::new();
     for (i, &t) in tokens.iter().enumerate() {
         logits = decoder.forward_token(t, i, &mut caches);

@@ -743,9 +743,7 @@ mod tests {
     }
 
     fn caches(decoder: &Decoder) -> Vec<KvCache> {
-        (0..decoder.layers.len())
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect()
+        decoder.config.new_kv_caches()
     }
 
     fn argmax(logits: &[f32]) -> usize {

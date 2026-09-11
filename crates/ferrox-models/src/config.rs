@@ -166,7 +166,15 @@ pub struct ModelConfig {
     pub name: &'static str,
     pub n_layers: usize,
     pub hidden_dim: usize,
+    /// Query heads of the WIDEST layer. Every layer's for a uniform
+    /// model, which is every model but the per-layer-shape ones
+    /// (`crate::layer_shapes`); a layer body must read its own count
+    /// through [`Self::layer_shape`], never this field.
     pub n_heads: usize,
+    /// KV heads of the WIDEST layer, so that a budget priced from it
+    /// over-counts rather than under-counts a heterogeneous model.
+    /// Same rule as `n_heads`: per-layer computation reads
+    /// [`Self::layer_shape`]; caches come from [`Self::new_kv_caches`].
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub vocab_size: usize,
@@ -287,6 +295,15 @@ pub struct ModelConfig {
     /// decide it, and [`Self::layer_rope`] returning `None` is the only
     /// way a call site learns of it.
     pub rope_layers: crate::rope_layers::RopeLayers,
+    /// WHICH LAYERS HAVE WHICH SHAPE -- llama.cpp's `n_head(il)`,
+    /// `n_head_kv(il)` and `n_ff(il)`.
+    ///
+    /// `Uniform` for every architecture whose graph reads layer 0, which
+    /// is all but the rows in `layer_shapes::PER_LAYER_SHAPE_ARCHS`.
+    /// [`Self::layer_shape`] is the one accessor; the fused Metal
+    /// launches and the CUDA resident KV are fenced off any model that
+    /// is not `Uniform`, because each holds one geometry.
+    pub layer_shapes: crate::layer_shapes::LayerShapes,
     /// Attention logit soft-capping (Gemma 2+). Applied as
     /// `softcap * tanh(score / softcap)` before softmax.
     pub attn_logit_softcap: Option<f32>,
@@ -342,7 +359,7 @@ pub struct ModelConfig {
     /// here rather than to a clamp that zeroes every projection. The
     /// resolution lives in [`crate::clamp_kqv`]; the decoder applies it
     /// through ONE helper shared by every host body, and the fused
-    /// Metal launches are fenced off by `Decoder::metal_can_serve_scalars`
+    /// Metal launches are fenced off by `Decoder::metal_can_serve_model`
     /// because no kernel implements it.
     pub clamp_kqv: Option<f32>,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
@@ -432,6 +449,20 @@ pub enum FfnActivation {
     SwigluFused,
     /// Gemma GeGLU: `gelu(gate) * up`.
     Gelu,
+    /// UNGATED ReLU-squared: `down(relu(up(x))^2)`, two matrices in
+    /// sequence and no `ffn_gate` at all -- llama.cpp's
+    /// `LLM_FFN_RELU_SQR` under `LLM_FFN_SEQ` with a null gate
+    /// (`arcee.cpp:39-40,123-128`; also `plm`, `nemotron`, `jais2`,
+    /// `nemotron-h`, each of which needs more than this).
+    ///
+    /// The loader ALIASES the expert's `gate` to its `up` matrix (a
+    /// zero-copy view of the same bytes) and this maps to
+    /// `ferrox_moe::GluAct::Reglu`, `relu(gate) * up`, which on the
+    /// aliased pair is exactly `relu(up)^2`. That is what lets every
+    /// gated path serve it unchanged; the dense hot paths skip the
+    /// aliased matmul through `GluAct::ungated`, and no fused device
+    /// kernel spells it, so `fused_kernel_gelu_flag` is `None`.
+    ReluSqr,
 }
 
 impl ModelConfig {
@@ -731,6 +762,7 @@ pub fn glm_5_2() -> ModelConfig {
         swa_pattern: None,
         swa_dense_first: false,
         rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -814,6 +846,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         swa_pattern: None,
         swa_dense_first: false,
         rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -929,6 +962,7 @@ pub fn kimi_k3() -> ModelConfig {
         swa_pattern: None,
         swa_dense_first: false,
         rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -990,6 +1024,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         swa_pattern: None,
         swa_dense_first: false,
         rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -1046,6 +1081,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         swa_pattern: None,
         swa_dense_first: false,
         rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,
@@ -1105,6 +1141,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         swa_pattern: None,
         swa_dense_first: false,
         rope_layers: crate::rope_layers::RopeLayers::All,
+        layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
         final_logit_softcap: None,
         embedding_scale: None,

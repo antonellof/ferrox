@@ -15,6 +15,7 @@
 mod attn_block;
 mod entry;
 mod ffn_act;
+mod ffn_block;
 pub mod kv_window;
 mod lm_head;
 mod qk_norm;
@@ -776,10 +777,10 @@ impl Decoder {
         }
     }
 
-    /// The per-model scalars no Metal kernel applies, as ONE predicate
-    /// the four Metal eligibility checks share.
+    /// The per-model facts no fused Metal kernel implements, as ONE
+    /// predicate the four Metal eligibility checks share.
     ///
-    /// Two today. `residual_scale`: every fused launch that folds a
+    /// Four today. `residual_scale`: every fused launch that folds a
     /// residual add in -- the dense decode stack, the resident MoE
     /// decode stack, and both prefill stacks -- adds the branch output
     /// to the stream on device, with no uniform for a multiplier, so a
@@ -788,17 +789,32 @@ impl Decoder {
     /// the QKV bias inside their kernels (`AttnExtras`) and clamp
     /// nothing, so a DBRX or clamped-OLMo layer served by any of them
     /// would run unclamped projections while the host bodies clamp
-    /// (`decoder/qkv_bias.rs`). Either way it is the same weights
-    /// answering differently depending on which backend took the token,
-    /// the exact failure `attention_scale` is fenced off for next door.
+    /// (`decoder/qkv_bias.rs`). An FFN activation the kernels cannot
+    /// spell: every fused dense launch takes a `gelu: bool`, so the
+    /// ungated ReLU-squared FFN (`GluAct::Reglu`, arcee) has no value to
+    /// pass and every site that asks `fused_kernel_gelu_flag` gets
+    /// `None` -- this predicate keeps the whole model off the stacks so
+    /// that a layer is never half-served. And per-layer shapes: the
+    /// stacks size Q/K/V and the Metal KV plane from ONE head count
+    /// (`n_heads` is a launch argument, `MetalKvBuffers` one geometry),
+    /// so a model whose layers disagree (`crate::layer_shapes`, deci /
+    /// openelm) stays on the host bodies, which read each layer's own.
+    /// Either way it is the same weights answering differently
+    /// depending on which backend took the token, the exact failure
+    /// `attention_scale` is fenced off for next door.
     ///
     /// It is one function rather than four spellings because the GPU
     /// router's eligibility check has already drifted four ways in this
     /// file -- prefill tested three conditions, fused decode two, and
     /// the whole-stack decode NONE.
     #[cfg(feature = "metal")]
-    fn metal_can_serve_scalars(config: &ModelConfig) -> bool {
-        config.residual_scale.is_none() && config.clamp_kqv.is_none()
+    fn metal_can_serve_model(config: &ModelConfig) -> bool {
+        config.residual_scale.is_none()
+            && config.clamp_kqv.is_none()
+            && GluAct::from(config.ffn_activation)
+                .fused_kernel_gelu_flag()
+                .is_some()
+            && config.layer_shapes.is_uniform()
     }
 
     /// True when this layer can use the fused Metal attention block
@@ -807,7 +823,7 @@ impl Decoder {
     #[cfg(feature = "metal")]
     fn layer_supports_metal_attn(&self, layer: &LayerWeights) -> bool {
         use crate::config::RopeLayout;
-        if !Self::metal_can_serve_scalars(&self.config) {
+        if !Self::metal_can_serve_model(&self.config) {
             return false;
         }
         // gpt-oss: no Metal kernel implements attention sinks, so the
@@ -997,7 +1013,7 @@ impl Decoder {
     /// decode); SWA fit is checked separately.
     #[cfg(feature = "metal")]
     fn metal_prefill_dense_layer_eligible(layer: &LayerWeights, config: &ModelConfig) -> bool {
-        Self::is_dense_layer(layer) && Self::metal_can_serve_scalars(config)
+        Self::is_dense_layer(layer) && Self::metal_can_serve_model(config)
     }
 
     #[cfg(feature = "metal")]
@@ -1024,7 +1040,7 @@ impl Decoder {
         layer: &'a LayerWeights,
         config: &ModelConfig,
     ) -> Option<ferrox_metal::gpu::PrefillMoeMetal<'a>> {
-        if !Self::metal_can_serve_scalars(config)
+        if !Self::metal_can_serve_model(config)
             || Self::is_dense_layer(layer)
             || !layer.moe.shared_experts.is_empty()
             || !GluAct::from(config.ffn_activation).is_swiglu()
@@ -1129,7 +1145,9 @@ impl Decoder {
         kv_caches: &mut [KvCache],
         host_kv_authoritative: bool,
     ) -> Option<Vec<f32>> {
-        let gelu = !GluAct::from(self.config.ffn_activation).is_swiglu();
+        // `None` for an activation no fused kernel implements: the
+        // stack does not launch, rather than running it as GELU.
+        let gelu = GluAct::from(self.config.ffn_activation).fused_kernel_gelu_flag()?;
         let mut prefill_layers = Vec::with_capacity(run_len);
         for li in start..start + run_len {
             let layer = &self.layers[li];
@@ -1227,7 +1245,7 @@ impl Decoder {
     /// routing decision the GPU router reproduces exactly.
     #[cfg(feature = "metal")]
     fn layer_supports_metal_moe_resident(layer: &LayerWeights, config: &ModelConfig) -> bool {
-        Self::metal_can_serve_scalars(config)
+        Self::metal_can_serve_model(config)
             && !Self::is_dense_layer(layer)
             && layer.moe.shared_experts.is_empty()
             && Self::gpu_router_matches_host_routing(layer, config)
@@ -1476,18 +1494,21 @@ impl Decoder {
                     shex.gate.mul_mm_sg_launch(),
                     shex.up.mul_mm_sg_launch(),
                     shex.down.mul_mm_sg_launch(),
+                    // The launch's last argument selects GELU over
+                    // SiLU inside the kernel; hardcoding `false` here
+                    // ran a shared expert as SwiGLU on a GeGLU model,
+                    // and `!is_swiglu()` would run a third activation
+                    // as GELU. `None` keeps the host path.
+                    act.fused_kernel_gelu_flag(),
                 ) {
-                    (Some(g), Some(u), Some(d)) => {
-                        // The launch's last argument selects GELU over
-                        // SiLU inside the kernel; hardcoding `false` here
-                        // ran a shared expert as SwiGLU on a GeGLU model.
+                    (Some(g), Some(u), Some(d), Some(gelu)) => {
                         ferrox_metal::gpu::launch_dense_ffn_swiglu_batch(
                             &g,
                             &u,
                             &d,
                             normed2_batch,
                             batch_size,
-                            !act.is_swiglu(),
+                            gelu,
                         )
                         .ok()
                     }
@@ -1696,7 +1717,7 @@ impl Decoder {
     ) -> Vec<f32> {
         #[cfg(feature = "cuda")]
         {
-            if cuda_gqa_enabled() {
+            if cuda_gqa_enabled() && self.config.layer_shapes.is_uniform() {
                 match ferrox_cuda::attn::launch_gqa_decode_resident(
                     layer, q, k, v, n_heads, n_kv_heads, head_dim, seq_len,
                 ) {
@@ -1744,10 +1765,11 @@ impl Decoder {
         ferrox_metal::gpu::clear_resident_activation();
 
         assert_eq!(kv_caches.len(), self.layers.len());
-        let hidden_dim = self.config.hidden_dim;
         // Read only by the Metal arms below: the host layer body moved
-        // into `attn_block`, which reads the geometry off `self.config`
-        // itself.
+        // into `attn_block` / `ffn_block_row`, which read the geometry
+        // off `self.config` themselves.
+        #[cfg(feature = "metal")]
+        let hidden_dim = self.config.hidden_dim;
         #[cfg(feature = "metal")]
         let head_dim = self.config.head_dim;
         #[cfg(feature = "metal")]
@@ -1785,9 +1807,12 @@ impl Decoder {
         #[cfg(not(feature = "metal"))]
         let mut hidden = self.embed_token(token_id);
         #[cfg(feature = "cuda")]
-        if cuda_gqa_enabled() {
+        if cuda_gqa_enabled() && self.config.layer_shapes.is_uniform() {
             // Fixed capacity so ensure_layer_kv does not recreate (and
-            // wipe) mid-sequence as pos grows.
+            // wipe) mid-sequence as pos grows. ONE geometry for every
+            // layer, which is why a per-layer-shape model never seeds it
+            // (`gqa_attention` skips the resident hook on the same
+            // predicate).
             const CUDA_KV_CAP: usize = 4096;
             if let Err(e) = ferrox_cuda::attn::ensure_layer_kv(
                 self.layers.len(),
@@ -2108,7 +2133,11 @@ impl Decoder {
                     if seq_ok {
                         // Build launches only for resident dense experts (Llama path).
                         let mut dense_layers = Vec::with_capacity(self.layers.len());
-                        let mut ok = true;
+                        // The stack's activation uniform, or no stack
+                        // at all for an activation it cannot spell.
+                        let stack_gelu =
+                            GluAct::from(self.config.ffn_activation).fused_kernel_gelu_flag();
+                        let mut ok = stack_gelu.is_some();
                         for (li, layer) in self.layers.iter().enumerate() {
                             let ExpertBacking::Resident(experts) = &layer.moe.experts else {
                                 ok = false;
@@ -2222,7 +2251,7 @@ impl Decoder {
                                 folded.as_ref().map(FoldedLmHead::launch),
                                 folded.as_ref().is_some_and(FoldedLmHead::argmax_only),
                                 embd_gather.as_ref(),
-                                !GluAct::from(self.config.ffn_activation).is_swiglu(),
+                                stack_gelu.expect("`ok` is false without it"),
                             ) {
                                 Ok(out) => {
                                     // Metal KV advanced in-place. Skip host
@@ -2655,47 +2684,31 @@ impl Decoder {
                     }
                     if did_metal_attn {
                         if !did_metal_dense && !did_metal_moe {
-                            let normed2 = layer
-                                .moe
-                                .norm_weight
-                                .apply(&hidden, self.config.rms_norm_eps);
-                            let ffn_out = Self::run_ffn_block(
+                            self.ffn_block_row(
+                                l,
                                 layer,
-                                &normed2,
-                                &self.config,
-                                hidden_dim,
+                                &mut hidden,
+                                None,
                                 residency.as_ref().map(|p| p.layer_plan(l)),
                             );
-                            residual_add(&mut hidden, &ffn_out, self.config.residual_scale);
                         }
                         continue;
                     }
                 }
 
                 let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-                let projected =
-                    self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache));
-                residual_add(&mut hidden, &projected, self.config.residual_scale);
-
-                // --- MoE FFN block ---
-                let normed2 = layer
-                    .moe
-                    .norm_weight
-                    .apply(&hidden, self.config.rms_norm_eps);
-                let mut ffn_out = match oai {
-                    Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
-                    None => Self::run_ffn_block(
-                        layer,
-                        &normed2,
-                        &self.config,
-                        hidden_dim,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    ),
-                };
-                if let Some(post) = &layer.attn.post_ffn_norm {
-                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                if let Some(projected) =
+                    self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache))
+                {
+                    residual_add(&mut hidden, &projected, self.config.residual_scale);
                 }
-                residual_add(&mut hidden, &ffn_out, self.config.residual_scale);
+                self.ffn_block_row(
+                    l,
+                    layer,
+                    &mut hidden,
+                    oai,
+                    residency.as_ref().map(|p| p.layer_plan(l)),
+                );
             }
         } // run_cpu_layers
 
@@ -2764,7 +2777,6 @@ impl Decoder {
                     .expect("checked against free_block_count under this same guard");
             }
         }
-        let hidden_dim = self.config.hidden_dim;
 
         let mut hidden = self.embed_token(token_id);
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
@@ -2783,7 +2795,7 @@ impl Decoder {
             // `gpt_oss_ffn` -- five features that each produce a
             // plausible distribution rather than an error.
             let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-            let projected = self.attn_block(
+            if let Some(projected) = self.attn_block(
                 l,
                 layer,
                 &normed,
@@ -2792,28 +2804,16 @@ impl Decoder {
                     cache: &mut *cache,
                     stores,
                 },
-            );
-            residual_add(&mut hidden, &projected, self.config.residual_scale);
-
-            // --- MoE FFN block ---
-            let normed2 = layer
-                .moe
-                .norm_weight
-                .apply(&hidden, self.config.rms_norm_eps);
-            let mut ffn_out = match oai {
-                Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
-                None => Self::run_ffn_block(
-                    layer,
-                    &normed2,
-                    &self.config,
-                    hidden_dim,
-                    residency.as_ref().map(|p| p.layer_plan(l)),
-                ),
-            };
-            if let Some(post) = &layer.attn.post_ffn_norm {
-                ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+            ) {
+                residual_add(&mut hidden, &projected, self.config.residual_scale);
             }
-            residual_add(&mut hidden, &ffn_out, self.config.residual_scale);
+            self.ffn_block_row(
+                l,
+                layer,
+                &mut hidden,
+                oai,
+                residency.as_ref().map(|p| p.layer_plan(l)),
+            );
         }
 
         let final_normed = self.final_norm.apply(&hidden, self.config.rms_norm_eps);
@@ -2976,6 +2976,7 @@ impl Decoder {
         match act {
             GluAct::Swiglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::silu),
             GluAct::Geglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::gelu),
+            GluAct::Reglu => combine(&mut activated, &gate, &up, ferrox_core::matmul::relu),
         }
         let mut outs: Vec<(Vec<f32>, f32)> = decision
             .weights
@@ -3274,8 +3275,10 @@ impl Decoder {
         // Three separate launches cost three round trips per layer plus
         // four copies of a `batch x ffn_dim` tensor.
         #[cfg(feature = "metal")]
-        if ferrox_core::weight_matrix::metal_dense_enabled() {
-            let gelu = !GluAct::from(config.ffn_activation).is_swiglu();
+        if let (true, Some(gelu)) = (
+            ferrox_core::weight_matrix::metal_dense_enabled(),
+            GluAct::from(config.ffn_activation).fused_kernel_gelu_flag(),
+        ) {
             let fused = layer.moe.with_expert(0, |ex| {
                 let (g, u, d) = (
                     ex.gate.mul_mm_sg_launch()?,
@@ -3655,7 +3658,11 @@ impl Decoder {
 
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
-        let n_heads = self.config.n_heads;
+        // The Metal KV plane holds ONE geometry, and `use_metal_attn`
+        // below is false for a per-layer-shape model
+        // (`metal_can_serve_model`), so the widest layer's count is
+        // every layer's wherever this is read.
+        #[cfg(feature = "metal")]
         let n_kv_heads = self.config.n_kv_heads;
 
         // [batch, hidden], flattened row-major.
@@ -3736,8 +3743,18 @@ impl Decoder {
 
         let n_layers = self.layers.len();
         let mut l = 0usize;
-        while l < n_layers {
+        // Labelled for the Metal arm inside the `'attention` block below,
+        // whose `continue` must name the loop it leaves.
+        #[allow(unused_labels)]
+        'layers: while l < n_layers {
             let layer = &self.layers[l];
+            // THIS layer's head counts. Zero for the two attention-less
+            // shapes, which leave the loop below before a width is used;
+            // the Metal arms only run on a uniform model
+            // (`metal_can_serve_model`), where every layer's counts are
+            // the config's.
+            let shape = self.config.layer_shape(l);
+            let (n_heads, n_kv_heads) = (shape.attention.n_heads(), shape.attention.n_kv_heads());
             let q_width = n_heads * head_dim;
             let kv_width = n_kv_heads * head_dim;
 
@@ -3803,8 +3820,8 @@ impl Decoder {
                                         up: ex.up.mul_mm_sg_launch()?,
                                         down: ex.down.mul_mm_sg_launch()?,
                                     };
-                                    let gelu =
-                                        !GluAct::from(self.config.ffn_activation).is_swiglu();
+                                    let gelu = GluAct::from(self.config.ffn_activation)
+                                        .fused_kernel_gelu_flag()?;
                                     let prefill_layer =
                                         ferrox_metal::attn::PrefillDenseLayerMetal {
                                             // See `try_metal_prefill_dense_stack`:
@@ -3859,371 +3876,404 @@ impl Decoder {
                 .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
+            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
 
-            // One shared activation-quant pass for q/k/v (plan 1e): the
-            // three projections read the same normed batch, so quantize it
-            // once instead of once per projection. A kind mismatch inside
-            // the group just re-quantizes locally.
-            let qkv_acts = layer
-                .attn
-                .q_proj
-                .quantize_batch_acts(&normed_batch, batch_size);
-            let mut q_batch = layer.attn.q_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            let mut v_batch = layer.attn.v_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            drop(qkv_acts);
+            // The GQA body, or the two shapes that have none of it
+            // (`crate::layer_shapes::AttnShape`): a labelled block so the
+            // FFN half below is reached by all three without a copy of
+            // it, and so the Metal arms inside keep their `continue`s.
+            'attention: {
+                match shape.attention {
+                    // deci.cpp:107-109: the residual passes straight through.
+                    crate::layer_shapes::AttnShape::Absent => break 'attention,
+                    // deci.cpp:115-118: `attn_norm` then `wo`, nothing else.
+                    crate::layer_shapes::AttnShape::Linear => {
+                        let projected = layer.attn.o_proj.apply_batch(&normed_batch, batch_size);
+                        residual_add(&mut hidden_batch, &projected, self.config.residual_scale);
+                        break 'attention;
+                    }
+                    crate::layer_shapes::AttnShape::Gqa { .. } => {}
+                }
 
-            self.apply_qkv_bias_and_clamp(
-                layer,
-                &mut q_batch,
-                &mut k_batch,
-                &mut v_batch,
-                q_width,
-                kv_width,
-            );
+                // One shared activation-quant pass for q/k/v (plan 1e): the
+                // three projections read the same normed batch, so quantize it
+                // once instead of once per projection. A kind mismatch inside
+                // the group just re-quantizes locally.
+                let qkv_acts = layer
+                    .attn
+                    .q_proj
+                    .quantize_batch_acts(&normed_batch, batch_size);
+                let mut q_batch = layer.attn.q_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                let mut v_batch = layer.attn.v_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                drop(qkv_acts);
 
-            self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            // Host-side `mscale`, applied before either backend ropes.
-            // The Metal branch below therefore hands its kernels
-            // `attn_factor_applied_by_caller()` — folding it into cos/sin
-            // there as well would square it.
-            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
+                self.apply_qkv_bias_and_clamp(
+                    layer,
+                    &mut q_batch,
+                    &mut k_batch,
+                    &mut v_batch,
+                    q_width,
+                    kv_width,
+                );
 
-            #[cfg(feature = "metal")]
-            {
-                let mut did_metal_prefill = false;
-                // The Metal prefill kernel is full-causal: only safe on a
-                // SWA layer while every causal position is still inside
-                // the window. Longer prompts fall back to CPU attention.
-                let swa_fits = match self.config.layer_sliding_window(l) {
-                    Some(window) => start_pos + batch_size <= window,
-                    None => true,
-                };
-                // Metal prefill applies attn softcap in FA-vec / legacy GQA.
-                if let Some(guard) = metal_kv_guard.as_mut() {
-                    if let Some(metal_kvs) = guard.as_mut() {
-                        // POSITIONS: compared against `start_pos`.
-                        // `layer_rope` is `None` where llama.cpp does
-                        // not rotate this layer at all
-                        // (`crate::rope_layers`); the Metal prefill
-                        // block always ropes, so such a layer takes the
-                        // CPU body below rather than a rotation the
-                        // checkpoint never trained.
-                        if let (true, Some(layer_rope)) = (
-                            metal_kvs[l].seq_len == cache.positions()
-                                && start_pos == cache.positions()
-                                && swa_fits,
-                            self.metal_layer_rope(l),
-                        ) {
-                            let prefill_res = {
-                                ferrox_metal::attn::launch_prefill_attn_block(
-                                    &q_batch,
-                                    &k_batch,
-                                    &v_batch,
-                                    &mut metal_kvs[l],
-                                    n_heads,
-                                    batch_size,
-                                    self.metal_rope().attn_factor_applied_by_caller(),
-                                    layer_rope,
-                                    start_pos,
-                                    self.config.attn_logit_softcap,
-                                    false,
-                                )
-                                .map(|(attn_out_batch, _, _)| {
-                                    Self::advance_host_kv_after_metal_prefill(
-                                        &metal_kvs[l],
-                                        cache,
+                self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                // Host-side `mscale`, applied before either backend ropes.
+                // The Metal branch below therefore hands its kernels
+                // `attn_factor_applied_by_caller()` — folding it into cos/sin
+                // there as well would square it.
+                self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
+
+                #[cfg(feature = "metal")]
+                {
+                    let mut did_metal_prefill = false;
+                    // The Metal prefill kernel is full-causal: only safe on a
+                    // SWA layer while every causal position is still inside
+                    // the window. Longer prompts fall back to CPU attention.
+                    let swa_fits = match self.config.layer_sliding_window(l) {
+                        Some(window) => start_pos + batch_size <= window,
+                        None => true,
+                    };
+                    // Metal prefill applies attn softcap in FA-vec / legacy GQA.
+                    if let Some(guard) = metal_kv_guard.as_mut() {
+                        if let Some(metal_kvs) = guard.as_mut() {
+                            // POSITIONS: compared against `start_pos`.
+                            // `layer_rope` is `None` where llama.cpp does
+                            // not rotate this layer at all
+                            // (`crate::rope_layers`); the Metal prefill
+                            // block always ropes, so such a layer takes the
+                            // CPU body below rather than a rotation the
+                            // checkpoint never trained.
+                            if let (true, Some(layer_rope)) = (
+                                metal_kvs[l].seq_len == cache.positions()
+                                    && start_pos == cache.positions()
+                                    && swa_fits,
+                                self.metal_layer_rope(l),
+                            ) {
+                                let prefill_res = {
+                                    ferrox_metal::attn::launch_prefill_attn_block(
+                                        &q_batch,
+                                        &k_batch,
+                                        &v_batch,
+                                        &mut metal_kvs[l],
+                                        n_heads,
                                         batch_size,
-                                        host_kv_authoritative,
-                                    );
-                                    let projected_batch =
-                                        layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-                                    let projected_batch =
-                                        if let Some(post) = &layer.attn.post_attn_norm {
-                                            projected_batch
-                                                .chunks(hidden_dim)
-                                                .flat_map(|row| {
-                                                    rms_norm(row, post, self.config.rms_norm_eps)
-                                                })
-                                                .collect::<Vec<_>>()
-                                        } else {
-                                            projected_batch
-                                        };
-                                    residual_add(
-                                        &mut hidden_batch,
-                                        &projected_batch,
-                                        self.config.residual_scale,
-                                    );
-                                    true
-                                })
-                            };
-                            match prefill_res {
-                                Ok(true) => {
-                                    did_metal_prefill = true;
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    eprintln!(
-                                        "ferrox: Metal prefill attn failed, CPU fallback: {e}"
-                                    );
-                                    **guard = None;
+                                        self.metal_rope().attn_factor_applied_by_caller(),
+                                        layer_rope,
+                                        start_pos,
+                                        self.config.attn_logit_softcap,
+                                        false,
+                                    )
+                                    .map(
+                                        |(attn_out_batch, _, _)| {
+                                            Self::advance_host_kv_after_metal_prefill(
+                                                &metal_kvs[l],
+                                                cache,
+                                                batch_size,
+                                                host_kv_authoritative,
+                                            );
+                                            let projected_batch = layer
+                                                .attn
+                                                .o_proj
+                                                .apply_batch(&attn_out_batch, batch_size);
+                                            let projected_batch =
+                                                if let Some(post) = &layer.attn.post_attn_norm {
+                                                    projected_batch
+                                                        .chunks(hidden_dim)
+                                                        .flat_map(|row| {
+                                                            rms_norm(
+                                                                row,
+                                                                post,
+                                                                self.config.rms_norm_eps,
+                                                            )
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                } else {
+                                                    projected_batch
+                                                };
+                                            residual_add(
+                                                &mut hidden_batch,
+                                                &projected_batch,
+                                                self.config.residual_scale,
+                                            );
+                                            true
+                                        },
+                                    )
+                                };
+                                match prefill_res {
+                                    Ok(true) => {
+                                        did_metal_prefill = true;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        eprintln!(
+                                            "ferrox: Metal prefill attn failed, CPU fallback: {e}"
+                                        );
+                                        **guard = None;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                if did_metal_prefill {
-                    // --- MoE FFN block (batched Metal when packed Q4) ---
-                    let normed2_batch: Vec<f32> = hidden_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|h| layer.moe.norm_weight.apply(h, self.config.rms_norm_eps))
-                        .collect();
-                    let dense = Self::is_dense_layer(layer);
-                    let router_logits_batch = if dense {
-                        Vec::new()
-                    } else {
-                        layer.moe.router.apply_batch(&normed2_batch, batch_size)
-                    };
-                    let metal_ffn = if !dense {
-                        Self::try_metal_moe_prefill_batch(
+                    if did_metal_prefill {
+                        // --- MoE FFN block (batched Metal when packed Q4) ---
+                        let normed2_batch: Vec<f32> = hidden_batch
+                            .chunks(hidden_dim)
+                            .flat_map(|h| layer.moe.norm_weight.apply(h, self.config.rms_norm_eps))
+                            .collect();
+                        let dense = Self::is_dense_layer(layer);
+                        let router_logits_batch = if dense {
+                            Vec::new()
+                        } else {
+                            layer.moe.router.apply_batch(&normed2_batch, batch_size)
+                        };
+                        let metal_ffn = if !dense {
+                            Self::try_metal_moe_prefill_batch(
+                                layer,
+                                &normed2_batch,
+                                &router_logits_batch,
+                                batch_size,
+                                hidden_dim,
+                                &self.config,
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(mut ffn_batch) = metal_ffn {
+                            if let Some(post) = &layer.attn.post_ffn_norm {
+                                ffn_batch = ffn_batch
+                                    .chunks(hidden_dim)
+                                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                                    .collect();
+                            }
+                            residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
+                        } else if let Some(mut ffn_batch) =
+                            Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
+                        {
+                            if let Some(post) = &layer.attn.post_ffn_norm {
+                                ffn_batch = ffn_batch
+                                    .chunks(hidden_dim)
+                                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                                    .collect();
+                            }
+                            residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
+                        } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
                             layer,
                             &normed2_batch,
                             &router_logits_batch,
                             batch_size,
                             hidden_dim,
                             &self.config,
-                        )
-                    } else {
-                        None
-                    };
-                    if let Some(mut ffn_batch) = metal_ffn {
-                        if let Some(post) = &layer.attn.post_ffn_norm {
-                            ffn_batch = ffn_batch
-                                .chunks(hidden_dim)
-                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                .collect();
-                        }
-                        residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-                    } else if let Some(mut ffn_batch) =
-                        Self::dense_ffn_batch(layer, &normed2_batch, batch_size, &self.config)
-                    {
-                        if let Some(post) = &layer.attn.post_ffn_norm {
-                            ffn_batch = ffn_batch
-                                .chunks(hidden_dim)
-                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                .collect();
-                        }
-                        residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-                    } else if let Some(mut ffn_batch) = Self::moe_ffn_batch(
-                        layer,
-                        &normed2_batch,
-                        &router_logits_batch,
-                        batch_size,
-                        hidden_dim,
-                        &self.config,
-                        residency.as_ref().map(|p| p.layer_plan(l)),
-                    ) {
-                        if let Some(post) = &layer.attn.post_ffn_norm {
-                            ffn_batch = ffn_batch
-                                .chunks(hidden_dim)
-                                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                                .collect();
-                        }
-                        residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
-                    } else {
-                        let n_experts = layer.moe.n_experts().max(1);
-                        for b in 0..batch_size {
-                            let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                            let mut ffn_out = if dense {
-                                Self::run_ffn_block(
-                                    layer,
-                                    normed2,
-                                    &self.config,
-                                    hidden_dim,
-                                    residency.as_ref().map(|p| p.layer_plan(l)),
-                                )
-                            } else {
-                                let router_logits =
-                                    &router_logits_batch[b * n_experts..(b + 1) * n_experts];
-                                Self::combine_ffn_outputs_for_position(
-                                    layer,
-                                    normed2,
-                                    router_logits,
-                                    &self.config,
-                                    hidden_dim,
-                                    residency.as_ref().map(|p| p.layer_plan(l)),
-                                )
-                            };
+                            residency.as_ref().map(|p| p.layer_plan(l)),
+                        ) {
                             if let Some(post) = &layer.attn.post_ffn_norm {
-                                ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                                ffn_batch = ffn_batch
+                                    .chunks(hidden_dim)
+                                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                                    .collect();
                             }
-                            let hidden_row =
-                                &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
-                            residual_add(hidden_row, &ffn_out, self.config.residual_scale);
+                            residual_add(&mut hidden_batch, &ffn_batch, self.config.residual_scale);
+                        } else {
+                            let n_experts = layer.moe.n_experts().max(1);
+                            for b in 0..batch_size {
+                                let normed2 = &normed2_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                                let mut ffn_out = if dense {
+                                    Self::run_ffn_block(
+                                        layer,
+                                        normed2,
+                                        &self.config,
+                                        hidden_dim,
+                                        residency.as_ref().map(|p| p.layer_plan(l)),
+                                    )
+                                } else {
+                                    let router_logits =
+                                        &router_logits_batch[b * n_experts..(b + 1) * n_experts];
+                                    Self::combine_ffn_outputs_for_position(
+                                        layer,
+                                        normed2,
+                                        router_logits,
+                                        &self.config,
+                                        hidden_dim,
+                                        residency.as_ref().map(|p| p.layer_plan(l)),
+                                    )
+                                };
+                                if let Some(post) = &layer.attn.post_ffn_norm {
+                                    ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+                                }
+                                let hidden_row =
+                                    &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
+                                residual_add(hidden_row, &ffn_out, self.config.residual_scale);
+                            }
+                        }
+                        l += 1;
+                        continue 'layers;
+                    }
+                }
+
+                // RoPE per token is independent; parallelize for CPU pp512.
+                q_batch
+                    .par_chunks_mut(q_width)
+                    .zip(k_batch.par_chunks_mut(kv_width))
+                    .enumerate()
+                    .for_each(|(b, (q_row, k_row))| {
+                        let pos = start_pos + b;
+                        for h in 0..n_heads {
+                            self.apply_rope_head_layer(
+                                &mut q_row[h * head_dim..(h + 1) * head_dim],
+                                pos,
+                                l,
+                            );
+                        }
+                        for h in 0..n_kv_heads {
+                            self.apply_rope_head_layer(
+                                &mut k_row[h * head_dim..(h + 1) * head_dim],
+                                pos,
+                                l,
+                            );
+                        }
+                    });
+                // `maincoder` / `hunyuan-moe` norm HERE instead. Reachable
+                // only on the host path, which is why
+                // `layer_supports_metal_attn` refuses the layer outright
+                // rather than letting the Metal arms above consume a batch
+                // that has not been normed yet.
+                self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                // Elementwise, so the whole Q batch in one call. Like the
+                // multi-sequence path, this body did not apply it at all
+                // until the decoration audit. It is placed AFTER the Metal
+                // arms above deliberately: none of the seven fused launches
+                // has an `attention_scale` uniform, and Q never returns to
+                // the host inside `launch_prefill_dense_layer` /
+                // `launch_prefill_dense_stack` for it to be scaled. The
+                // refusal that keeps those arms out of reach when
+                // `attention_scale` is set is in `layer_supports_metal_attn`.
+                self.apply_attention_scale(&mut q_batch);
+
+                // ROWS, not positions: it is added to `b + 1` below to give
+                // each query in the batch the length of the KV it attends
+                // over, which is a count of resident rows.
+                let base_seq_len = cache.rows();
+                for b in 0..batch_size {
+                    cache
+                        .push(
+                            &k_batch[b * kv_width..(b + 1) * kv_width],
+                            &v_batch[b * kv_width..(b + 1) * kv_width],
+                        )
+                        .expect("unbounded/planned KvCache growth is infallible");
+                }
+
+                // Prefill attention over the just-written KV prefix. Parallel
+                // over query positions — the serial loop was a dominant CPU
+                // pp512 bottleneck (each query still attends only its causal
+                // prefix; K/V slices are immutable after the pushes above).
+                let cache_k = &cache.k;
+                let cache_v = &cache.v;
+                let softcap = self.config.attn_logit_softcap;
+                let window = self.config.layer_sliding_window(l);
+                // gpt-oss takes the per-query path on every layer, windowed
+                // or not: the blocked kernel has no sink term. Everything
+                // else goes through the blocked kernel, which is Rayon over
+                // `[query-block x head]` against one shared KV buffer,
+                // windowed or not. SWA layers used to take a per-query
+                // `causal_gqa_attention_windowed_softcap` instead, which is
+                // `online_attn_accumulate`: two scalar `exp` and a
+                // head_dim-wide rescale per KV position, with the head axis
+                // serial inside each task. On Gemma-3-1B (22 of 26 layers
+                // are SWA) that arm was 19.6% of non-idle CPU `pp512`
+                // samples while doing the *same* KV work as this one - at
+                // `pp512` the 512-wide window covers the whole prompt.
+                let attn_out_batch = if let Some(oai) = oai {
+                    let mut out = vec![0f32; batch_size * q_width];
+                    out.par_chunks_mut(q_width)
+                        .enumerate()
+                        .for_each(|(b, dest)| {
+                            let seq_len_b = base_seq_len + b + 1;
+                            let cache_elems = seq_len_b * kv_width;
+                            let attn_out = ferrox_core::causal_gqa_attention_sinks(
+                                &q_batch[b * q_width..(b + 1) * q_width],
+                                &cache_k[..cache_elems],
+                                &cache_v[..cache_elems],
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                seq_len_b,
+                                window,
+                                &oai.attn_sinks,
+                            );
+                            dest.copy_from_slice(&attn_out);
+                        });
+                    out
+                } else {
+                    causal_gqa_attention_prefill_shared_kv_windowed(
+                        &q_batch,
+                        cache_k,
+                        cache_v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        batch_size,
+                        base_seq_len,
+                        softcap,
+                        window,
+                    )
+                };
+
+                // Every query in this batch has now been answered, so the
+                // rows behind the window are rows nothing will read again
+                // (#61). This is why eviction is not inside `KvCache::push`:
+                // `base_seq_len` above was captured BEFORE the batch's
+                // pushes and every query's KV length is derived from it, so
+                // a drop between the push loop and here would attend the
+                // whole prompt over shifted keys.
+                //
+                // Per layer rather than after the stack, and that is where
+                // most of the prefill saving is: a windowed layer hands its
+                // prompt rows back before the next layer allocates its own,
+                // so a 32k prompt holds ONE layer's full history at a time
+                // instead of every windowed layer's at once.
+                self.evict_layer_kv(l, cache);
+
+                let mut projected_batch =
+                    layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+                if let Some(oai) = oai {
+                    for row in projected_batch.chunks_mut(hidden_dim) {
+                        for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
+                            *x += b;
                         }
                     }
-                    l += 1;
-                    continue;
                 }
+                let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
+                    projected_batch
+                        .chunks(hidden_dim)
+                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                        .collect::<Vec<_>>()
+                } else {
+                    projected_batch
+                };
+                residual_add(
+                    &mut hidden_batch,
+                    &projected_batch,
+                    self.config.residual_scale,
+                );
+            } // 'attention
+
+            // deci.cpp:147-149: no FFN, no norm, no residual add.
+            if shape.ffn_dim == 0 {
+                l += 1;
+                continue;
             }
-
-            // RoPE per token is independent; parallelize for CPU pp512.
-            q_batch
-                .par_chunks_mut(q_width)
-                .zip(k_batch.par_chunks_mut(kv_width))
-                .enumerate()
-                .for_each(|(b, (q_row, k_row))| {
-                    let pos = start_pos + b;
-                    for h in 0..n_heads {
-                        self.apply_rope_head_layer(
-                            &mut q_row[h * head_dim..(h + 1) * head_dim],
-                            pos,
-                            l,
-                        );
-                    }
-                    for h in 0..n_kv_heads {
-                        self.apply_rope_head_layer(
-                            &mut k_row[h * head_dim..(h + 1) * head_dim],
-                            pos,
-                            l,
-                        );
-                    }
-                });
-            // `maincoder` / `hunyuan-moe` norm HERE instead. Reachable
-            // only on the host path, which is why
-            // `layer_supports_metal_attn` refuses the layer outright
-            // rather than letting the Metal arms above consume a batch
-            // that has not been normed yet.
-            self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            // Elementwise, so the whole Q batch in one call. Like the
-            // multi-sequence path, this body did not apply it at all
-            // until the decoration audit. It is placed AFTER the Metal
-            // arms above deliberately: none of the seven fused launches
-            // has an `attention_scale` uniform, and Q never returns to
-            // the host inside `launch_prefill_dense_layer` /
-            // `launch_prefill_dense_stack` for it to be scaled. The
-            // refusal that keeps those arms out of reach when
-            // `attention_scale` is set is in `layer_supports_metal_attn`.
-            self.apply_attention_scale(&mut q_batch);
-
-            // ROWS, not positions: it is added to `b + 1` below to give
-            // each query in the batch the length of the KV it attends
-            // over, which is a count of resident rows.
-            let base_seq_len = cache.rows();
-            for b in 0..batch_size {
-                cache
-                    .push(
-                        &k_batch[b * kv_width..(b + 1) * kv_width],
-                        &v_batch[b * kv_width..(b + 1) * kv_width],
-                    )
-                    .expect("unbounded/planned KvCache growth is infallible");
-            }
-
-            // Prefill attention over the just-written KV prefix. Parallel
-            // over query positions — the serial loop was a dominant CPU
-            // pp512 bottleneck (each query still attends only its causal
-            // prefix; K/V slices are immutable after the pushes above).
-            let cache_k = &cache.k;
-            let cache_v = &cache.v;
-            let softcap = self.config.attn_logit_softcap;
-            let window = self.config.layer_sliding_window(l);
-            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-            // gpt-oss takes the per-query path on every layer, windowed
-            // or not: the blocked kernel has no sink term. Everything
-            // else goes through the blocked kernel, which is Rayon over
-            // `[query-block x head]` against one shared KV buffer,
-            // windowed or not. SWA layers used to take a per-query
-            // `causal_gqa_attention_windowed_softcap` instead, which is
-            // `online_attn_accumulate`: two scalar `exp` and a
-            // head_dim-wide rescale per KV position, with the head axis
-            // serial inside each task. On Gemma-3-1B (22 of 26 layers
-            // are SWA) that arm was 19.6% of non-idle CPU `pp512`
-            // samples while doing the *same* KV work as this one - at
-            // `pp512` the 512-wide window covers the whole prompt.
-            let attn_out_batch = if let Some(oai) = oai {
-                let mut out = vec![0f32; batch_size * q_width];
-                out.par_chunks_mut(q_width)
-                    .enumerate()
-                    .for_each(|(b, dest)| {
-                        let seq_len_b = base_seq_len + b + 1;
-                        let cache_elems = seq_len_b * kv_width;
-                        let attn_out = ferrox_core::causal_gqa_attention_sinks(
-                            &q_batch[b * q_width..(b + 1) * q_width],
-                            &cache_k[..cache_elems],
-                            &cache_v[..cache_elems],
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            seq_len_b,
-                            window,
-                            &oai.attn_sinks,
-                        );
-                        dest.copy_from_slice(&attn_out);
-                    });
-                out
-            } else {
-                causal_gqa_attention_prefill_shared_kv_windowed(
-                    &q_batch,
-                    cache_k,
-                    cache_v,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    batch_size,
-                    base_seq_len,
-                    softcap,
-                    window,
-                )
-            };
-
-            // Every query in this batch has now been answered, so the
-            // rows behind the window are rows nothing will read again
-            // (#61). This is why eviction is not inside `KvCache::push`:
-            // `base_seq_len` above was captured BEFORE the batch's
-            // pushes and every query's KV length is derived from it, so
-            // a drop between the push loop and here would attend the
-            // whole prompt over shifted keys.
-            //
-            // Per layer rather than after the stack, and that is where
-            // most of the prefill saving is: a windowed layer hands its
-            // prompt rows back before the next layer allocates its own,
-            // so a 32k prompt holds ONE layer's full history at a time
-            // instead of every windowed layer's at once.
-            self.evict_layer_kv(l, cache);
-
-            let mut projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-            if let Some(oai) = oai {
-                for row in projected_batch.chunks_mut(hidden_dim) {
-                    for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
-            let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
-                projected_batch
-                    .chunks(hidden_dim)
-                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                    .collect::<Vec<_>>()
-            } else {
-                projected_batch
-            };
-            residual_add(
-                &mut hidden_batch,
-                &projected_batch,
-                self.config.residual_scale,
-            );
 
             // --- MoE FFN block ---
             let normed2_batch: Vec<f32> = hidden_batch
@@ -4405,8 +4455,6 @@ impl Decoder {
 
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
 
         // [batch, hidden], flattened row-major.
         let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
@@ -4414,117 +4462,137 @@ impl Decoder {
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
         for (l, layer) in self.layers.iter().enumerate() {
+            // THIS layer's head counts; see the prefill body.
+            let shape = self.config.layer_shape(l);
+            let (n_heads, n_kv_heads) = (shape.attention.n_heads(), shape.attention.n_kv_heads());
             // --- attention block ---
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
                 .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
-
-            // One shared activation-quant pass for q/k/v (plan 1e): the
-            // three projections read the same normed batch, so quantize it
-            // once instead of once per projection. A kind mismatch inside
-            // the group just re-quantizes locally.
-            let qkv_acts = layer
-                .attn
-                .q_proj
-                .quantize_batch_acts(&normed_batch, batch_size);
-            let mut q_batch = layer.attn.q_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            let mut v_batch = layer.attn.v_proj.apply_batch_with_acts(
-                &normed_batch,
-                batch_size,
-                qkv_acts.as_ref(),
-            );
-            drop(qkv_acts);
-
-            let q_width = n_heads * head_dim;
-            let kv_width = n_kv_heads * head_dim;
-
-            self.apply_qkv_bias_and_clamp(
-                layer,
-                &mut q_batch,
-                &mut k_batch,
-                &mut v_batch,
-                q_width,
-                kv_width,
-            );
-
-            self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
-
-            for b in 0..batch_size {
-                let pos = positions[b];
-                let q_row = &mut q_batch[b * q_width..(b + 1) * q_width];
-                for h in 0..n_heads {
-                    self.apply_rope_head_layer(
-                        &mut q_row[h * head_dim..(h + 1) * head_dim],
-                        pos,
-                        l,
-                    );
-                }
-                let k_row = &mut k_batch[b * kv_width..(b + 1) * kv_width];
-                for h in 0..n_kv_heads {
-                    self.apply_rope_head_layer(
-                        &mut k_row[h * head_dim..(h + 1) * head_dim],
-                        pos,
-                        l,
-                    );
-                }
-            }
-            self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            // Applied to the whole Q batch at once because it is
-            // elementwise. This path did not apply it at all until the
-            // decoration audit: `attention_scale` reached only
-            // `forward_token`'s CPU arm and `forward_token_paged`, so a
-            // checkpoint carrying one answered at one temperature when
-            // decoded alone and another when batched with its neighbours.
-            self.apply_attention_scale(&mut q_batch);
-
             let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
-            let mut attn_out_batch = vec![0f32; batch_size * q_width];
-            for b in 0..batch_size {
-                let attn_out = self.push_and_attend(
-                    kv,
-                    b,
-                    l,
-                    &k_batch[b * kv_width..(b + 1) * kv_width],
-                    &v_batch[b * kv_width..(b + 1) * kv_width],
-                    &q_batch[b * q_width..(b + 1) * q_width],
-                    oai,
-                );
-                attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
-            }
 
-            let mut projected_batch = layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-            if let Some(oai) = oai {
-                for row in projected_batch.chunks_mut(hidden_dim) {
-                    for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
-                        *x += b;
+            'attention: {
+                match shape.attention {
+                    crate::layer_shapes::AttnShape::Absent => break 'attention,
+                    crate::layer_shapes::AttnShape::Linear => {
+                        let projected = layer.attn.o_proj.apply_batch(&normed_batch, batch_size);
+                        residual_add(&mut hidden_batch, &projected, self.config.residual_scale);
+                        break 'attention;
+                    }
+                    crate::layer_shapes::AttnShape::Gqa { .. } => {}
+                }
+
+                // One shared activation-quant pass for q/k/v (plan 1e): the
+                // three projections read the same normed batch, so quantize it
+                // once instead of once per projection. A kind mismatch inside
+                // the group just re-quantizes locally.
+                let qkv_acts = layer
+                    .attn
+                    .q_proj
+                    .quantize_batch_acts(&normed_batch, batch_size);
+                let mut q_batch = layer.attn.q_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                let mut k_batch = layer.attn.k_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                let mut v_batch = layer.attn.v_proj.apply_batch_with_acts(
+                    &normed_batch,
+                    batch_size,
+                    qkv_acts.as_ref(),
+                );
+                drop(qkv_acts);
+
+                let q_width = n_heads * head_dim;
+                let kv_width = n_kv_heads * head_dim;
+
+                self.apply_qkv_bias_and_clamp(
+                    layer,
+                    &mut q_batch,
+                    &mut k_batch,
+                    &mut v_batch,
+                    q_width,
+                    kv_width,
+                );
+
+                self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
+
+                for b in 0..batch_size {
+                    let pos = positions[b];
+                    let q_row = &mut q_batch[b * q_width..(b + 1) * q_width];
+                    for h in 0..n_heads {
+                        self.apply_rope_head_layer(
+                            &mut q_row[h * head_dim..(h + 1) * head_dim],
+                            pos,
+                            l,
+                        );
+                    }
+                    let k_row = &mut k_batch[b * kv_width..(b + 1) * kv_width];
+                    for h in 0..n_kv_heads {
+                        self.apply_rope_head_layer(
+                            &mut k_row[h * head_dim..(h + 1) * head_dim],
+                            pos,
+                            l,
+                        );
                     }
                 }
+                self.apply_qk_norms_post_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
+                // Applied to the whole Q batch at once because it is
+                // elementwise. This path did not apply it at all until the
+                // decoration audit: `attention_scale` reached only
+                // `forward_token`'s CPU arm and `forward_token_paged`, so a
+                // checkpoint carrying one answered at one temperature when
+                // decoded alone and another when batched with its neighbours.
+                self.apply_attention_scale(&mut q_batch);
+
+                let mut attn_out_batch = vec![0f32; batch_size * q_width];
+                for b in 0..batch_size {
+                    let attn_out = self.push_and_attend(
+                        kv,
+                        b,
+                        l,
+                        &k_batch[b * kv_width..(b + 1) * kv_width],
+                        &v_batch[b * kv_width..(b + 1) * kv_width],
+                        &q_batch[b * q_width..(b + 1) * q_width],
+                        oai,
+                    );
+                    attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
+                }
+
+                let mut projected_batch =
+                    layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
+                if let Some(oai) = oai {
+                    for row in projected_batch.chunks_mut(hidden_dim) {
+                        for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
+                            *x += b;
+                        }
+                    }
+                }
+                let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
+                    projected_batch
+                        .chunks(hidden_dim)
+                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                        .collect::<Vec<_>>()
+                } else {
+                    projected_batch
+                };
+                residual_add(
+                    &mut hidden_batch,
+                    &projected_batch,
+                    self.config.residual_scale,
+                );
+            } // 'attention
+
+            if shape.ffn_dim == 0 {
+                continue;
             }
-            let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
-                projected_batch
-                    .chunks(hidden_dim)
-                    .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                    .collect::<Vec<_>>()
-            } else {
-                projected_batch
-            };
-            residual_add(
-                &mut hidden_batch,
-                &projected_batch,
-                self.config.residual_scale,
-            );
 
             // --- MoE FFN block ---
             let normed2_batch: Vec<f32> = hidden_batch
@@ -4698,9 +4766,7 @@ mod tests {
     fn forward_pass_produces_finite_logits_of_correct_shape() {
         let vocab = 10;
         let decoder = Decoder::new_random_small(tiny_test_config(), 2, vocab);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         let logits = decoder.forward_token(3, 0, &mut caches);
         assert_eq!(logits.len(), vocab);
@@ -4723,15 +4789,11 @@ mod tests {
     #[test]
     fn gpu_vram_budget_bytes_with_nothing_placed_matches_the_default() {
         let mut decoder = Decoder::new_random_small(tiny_test_config(), 2, 10);
-        let mut caches_default: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches_default: Vec<KvCache> = decoder.config.new_kv_caches();
         let default_logits = decoder.forward_token(3, 0, &mut caches_default);
 
         decoder.gpu_vram_budget_bytes = Some(0);
-        let mut caches_zero_budget: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches_zero_budget: Vec<KvCache> = decoder.config.new_kv_caches();
         let zero_budget_logits = decoder.forward_token(3, 0, &mut caches_zero_budget);
 
         assert_eq!(
@@ -4823,9 +4885,7 @@ mod tests {
     #[test]
     fn kv_cache_grows_by_one_position_per_layer_per_step() {
         let decoder = Decoder::new_random_small(tiny_test_config(), 3, 5);
-        let mut caches: Vec<KvCache> = (0..3)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         decoder.forward_token(0, 0, &mut caches);
         decoder.forward_token(1, 1, &mut caches);
@@ -4839,12 +4899,8 @@ mod tests {
     #[test]
     fn same_token_same_position_is_deterministic() {
         let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder.config.new_kv_caches();
+        let mut caches_b: Vec<KvCache> = decoder.config.new_kv_caches();
 
         let out_a = decoder.forward_token(4, 0, &mut caches_a);
         let out_b = decoder.forward_token(4, 0, &mut caches_b);
@@ -4854,9 +4910,7 @@ mod tests {
     #[test]
     fn multi_step_decode_stays_finite_across_positions() {
         let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         for pos in 0..16 {
             let logits = decoder.forward_token(pos % 8, pos, &mut caches);
@@ -5056,9 +5110,7 @@ mod tests {
 
         let mut seq_decoder = Decoder::new_random_small(config.clone(), n_layers, vocab);
         prepare(&mut seq_decoder);
-        let mut seq_caches: Vec<KvCache> = (0..n_layers)
-            .map(|_| KvCache::new(seq_decoder.config.n_kv_heads, seq_decoder.config.head_dim))
-            .collect();
+        let mut seq_caches: Vec<KvCache> = seq_decoder.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -5069,14 +5121,7 @@ mod tests {
         // is deterministic, so this is a like-for-like comparison.
         let mut batch_decoder = Decoder::new_random_small(config, n_layers, vocab);
         prepare(&mut batch_decoder);
-        let mut batch_caches: Vec<KvCache> = (0..n_layers)
-            .map(|_| {
-                KvCache::new(
-                    batch_decoder.config.n_kv_heads,
-                    batch_decoder.config.head_dim,
-                )
-            })
-            .collect();
+        let mut batch_caches: Vec<KvCache> = batch_decoder.config.new_kv_caches();
         let batched = batch_decoder.forward_batch(&tokens, 0, &mut batch_caches);
 
         assert_eq!(sequential.len(), batched.len());
@@ -5157,9 +5202,7 @@ mod tests {
         let prompt = [3usize, 1, 4, 1, 5];
         let continuation = [9usize, 2, 6, 5];
 
-        let mut caches: Vec<KvCache> = (0..n_layers)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let mut plain = vec![decoder.forward_batch_last(&prompt, 0, &mut caches)];
         for (i, &tok) in continuation.iter().enumerate() {
             plain.push(decoder.forward_token(tok, prompt.len() + i, &mut caches));
@@ -5495,9 +5538,7 @@ mod tests {
         prepare(&mut decoder);
         let decoder = decoder;
 
-        let mut caches: Vec<KvCache> = (0..n_layers)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let steps = [3usize, 5, 7, 2, 9, 1];
         let mut plain_logits = Vec::new();
         for (pos, &tok) in steps.iter().enumerate() {
@@ -5556,9 +5597,7 @@ mod tests {
         let tokens = [1usize, 3, 5, 2, 7];
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -5570,9 +5609,7 @@ mod tests {
         // this is a fair like-for-like comparison against a fresh
         // cache rather than reusing decoder_a's now-mutated cache.
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         assert_eq!(batched.len(), sequential.len());
@@ -5600,15 +5637,11 @@ mod tests {
         let tokens = vec![1usize, 4, 7, 2, 9];
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let all_rows = decoder_a.forward_batch(&tokens, 0, &mut caches_a);
 
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let last = decoder_b.forward_batch_last(&tokens, 0, &mut caches_b);
 
         let expected = all_rows.last().expect("one row per prompt token");
@@ -5631,9 +5664,7 @@ mod tests {
         }
 
         // Empty prompt is the degenerate case both paths must survive.
-        let mut caches_c: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_c: Vec<KvCache> = decoder_b.config.new_kv_caches();
         assert!(decoder_b
             .forward_batch_last(&[], 0, &mut caches_c)
             .is_empty());
@@ -5682,9 +5713,7 @@ mod tests {
             let mut contiguous: Vec<Vec<KvCache>> = histories
                 .iter()
                 .map(|h| {
-                    let mut caches: Vec<KvCache> = (0..n_layers)
-                        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                        .collect();
+                    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
                     for (pos, &tok) in h.iter().enumerate() {
                         decoder.forward_token(tok, pos, &mut caches);
                     }
@@ -5751,9 +5780,7 @@ mod tests {
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
         let mut independent_logits: Vec<Vec<f32>> = Vec::new();
         for history in seq_histories.iter() {
-            let mut caches: Vec<KvCache> = (0..2)
-                .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-                .collect();
+            let mut caches: Vec<KvCache> = decoder_a.config.new_kv_caches();
             let mut logits = Vec::new();
             for (pos, &tok) in history.iter().enumerate() {
                 logits = decoder_a.forward_token(tok, pos, &mut caches);
@@ -5766,11 +5793,7 @@ mod tests {
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
         let mut per_seq_caches: Vec<Vec<KvCache>> = seq_histories
             .iter()
-            .map(|_| {
-                (0..2)
-                    .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-                    .collect()
-            })
+            .map(|_| decoder_b.config.new_kv_caches())
             .collect();
 
         // Feed every sequence's prefix (all but its last token)
@@ -5915,11 +5938,7 @@ mod tests {
             cfg.attention_scale = Some(8.0);
             cfg
         };
-        let fresh_caches = |d: &Decoder| -> Vec<KvCache> {
-            (0..d.layers.len())
-                .map(|_| KvCache::new(d.config.n_kv_heads, d.config.head_dim))
-                .collect()
-        };
+        let fresh_caches = |d: &Decoder| -> Vec<KvCache> { d.config.new_kv_caches() };
 
         // Same seed -> identical weights, so the only difference between
         // these three decoders is the config field under test.
@@ -5986,9 +6005,7 @@ mod tests {
             let mut per_seq: Vec<Vec<KvCache>> = histories
                 .iter()
                 .map(|h| {
-                    let mut caches: Vec<KvCache> = (0..n_layers)
-                        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                        .collect();
+                    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
                     for (pos, &tok) in h.iter().enumerate() {
                         decoder.forward_token(tok, pos, &mut caches);
                     }
@@ -6160,9 +6177,7 @@ mod tests {
             layer.attn.q_norm = Some((0..q_width).map(|i| 1.0 + i as f32 * 0.1).collect());
             layer.attn.k_norm = Some((0..kv_width).map(|i| 0.5 + i as f32 * 0.05).collect());
         }
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -6174,9 +6189,7 @@ mod tests {
             layer.attn.q_norm = Some((0..q_width).map(|i| 1.0 + i as f32 * 0.1).collect());
             layer.attn.k_norm = Some((0..kv_width).map(|i| 0.5 + i as f32 * 0.05).collect());
         }
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         assert_eq!(batched.len(), sequential.len());
@@ -6214,12 +6227,8 @@ mod tests {
             layer.attn.k_norm = Some(vec![2.0; kv_width]);
         }
 
-        let mut caches_a: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(without_norm.config.n_kv_heads, without_norm.config.head_dim))
-            .collect();
-        let mut caches_b: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(with_norm.config.n_kv_heads, with_norm.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = without_norm.config.new_kv_caches();
+        let mut caches_b: Vec<KvCache> = with_norm.config.new_kv_caches();
 
         let mut out_a = Vec::new();
         let mut out_b = Vec::new();
@@ -6267,9 +6276,7 @@ mod tests {
             layer.attn.k_bias = Some((0..kv_width).map(|i| -0.2 + i as f32 * 0.03).collect());
             layer.attn.v_bias = Some((0..kv_width).map(|i| 0.1 - i as f32 * 0.01).collect());
         }
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -6282,9 +6289,7 @@ mod tests {
             layer.attn.k_bias = Some((0..kv_width).map(|i| -0.2 + i as f32 * 0.03).collect());
             layer.attn.v_bias = Some((0..kv_width).map(|i| 0.1 - i as f32 * 0.01).collect());
         }
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         assert_eq!(batched.len(), sequential.len());
@@ -6314,12 +6319,8 @@ mod tests {
             layer.attn.v_bias = Some(vec![0.5; kv_width]);
         }
 
-        let mut caches_a: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(without_bias.config.n_kv_heads, without_bias.config.head_dim))
-            .collect();
-        let mut caches_b: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(with_bias.config.n_kv_heads, with_bias.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = without_bias.config.new_kv_caches();
+        let mut caches_b: Vec<KvCache> = with_bias.config.new_kv_caches();
 
         let mut out_a = Vec::new();
         let mut out_b = Vec::new();
@@ -6344,17 +6345,13 @@ mod tests {
         let tokens = [2usize, 4, 6];
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, 8);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         for (pos, &t) in tokens.iter().enumerate() {
             decoder_a.forward_token(t, pos, &mut caches_a);
         }
 
         let decoder_b = Decoder::new_random_small(cfg, 2, 8);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         for (ca, cb) in caches_a.iter().zip(caches_b.iter()) {
@@ -6382,9 +6379,7 @@ mod tests {
     fn dense_layer_forward_pass_produces_finite_logits_of_correct_shape() {
         let vocab = 10;
         let decoder = Decoder::new_random_small(tiny_dense_test_config(), 2, vocab);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         let logits = decoder.forward_token(3, 0, &mut caches);
         assert_eq!(logits.len(), vocab);
@@ -6401,9 +6396,7 @@ mod tests {
         let tokens = [1usize, 3, 5, 2, 7];
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         let sequential: Vec<Vec<f32>> = tokens
             .iter()
             .enumerate()
@@ -6411,9 +6404,7 @@ mod tests {
             .collect();
 
         let decoder_b = Decoder::new_random_small(cfg, 2, vocab);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         let batched = decoder_b.forward_batch(&tokens, 0, &mut caches_b);
 
         assert_eq!(batched.len(), sequential.len());
@@ -6435,9 +6426,7 @@ mod tests {
         // depend on this being real for every model shape, not just
         // genuinely-MoE ones.
         let decoder = Decoder::new_random_small(tiny_dense_test_config(), 1, 8);
-        let mut caches: Vec<KvCache> = (0..1)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         decoder.forward_token(0, 0, &mut caches);
         decoder.forward_token(1, 1, &mut caches);
@@ -6451,9 +6440,7 @@ mod tests {
     #[test]
     fn forward_batch_with_empty_tokens_returns_empty() {
         let decoder = Decoder::new_random_small(tiny_test_config(), 2, 8);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let out = decoder.forward_batch(&[], 0, &mut caches);
         assert!(out.is_empty());
     }
@@ -6468,17 +6455,13 @@ mod tests {
         let cfg = tiny_test_config();
 
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, 8);
-        let mut caches_a: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<KvCache> = decoder_a.config.new_kv_caches();
         decoder_a.forward_token(1, 0, &mut caches_a);
         decoder_a.forward_token(3, 1, &mut caches_a);
         let seq_next = decoder_a.forward_token(5, 2, &mut caches_a);
 
         let decoder_b = Decoder::new_random_small(cfg, 2, 8);
-        let mut caches_b: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder_b.config.n_kv_heads, decoder_b.config.head_dim))
-            .collect();
+        let mut caches_b: Vec<KvCache> = decoder_b.config.new_kv_caches();
         decoder_b.forward_token(1, 0, &mut caches_b);
         let batch_next = decoder_b.forward_batch(&[3, 5], 1, &mut caches_b);
 
@@ -6499,9 +6482,7 @@ mod tests {
     fn placement_plan_reflects_real_observed_expert_activations() {
         let cfg = tiny_test_config(); // 6 experts, top-2 active/token
         let decoder = Decoder::new_random_small(cfg, 2, 16);
-        let mut caches: Vec<KvCache> = (0..2)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
         let n_calls = 20;
         for pos in 0..n_calls {
@@ -6651,7 +6632,7 @@ mod metal_rope_tests {
             "...and the prefill dense stack"
         );
         assert!(
-            !Decoder::metal_can_serve_scalars(&scaled),
+            !Decoder::metal_can_serve_model(&scaled),
             "the shared predicate is what all four read"
         );
     }
@@ -6687,7 +6668,82 @@ mod metal_rope_tests {
             !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &clamped),
             "...and the prefill dense stack"
         );
-        assert!(!Decoder::metal_can_serve_scalars(&clamped));
+        assert!(!Decoder::metal_can_serve_model(&clamped));
+    }
+
+    /// Per-layer shapes keep every fused Metal path off the model,
+    /// through the same predicate.
+    ///
+    /// The fused launches take ONE `n_heads` argument and one
+    /// `MetalKvBuffers` geometry per run of layers, and the Metal KV
+    /// plane is sized once from the scalars. A deci or openelm layer
+    /// served by any of them would be projected and cached at another
+    /// layer's width -- the disagreement the two fences above exist
+    /// for, on a shape rather than a scalar. Only reachable in a
+    /// `--features metal` build.
+    #[test]
+    fn per_layer_shapes_keep_the_model_off_every_fused_metal_path() {
+        use crate::layer_shapes::{AttnShape, LayerShape, LayerShapes};
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut shaped = plain;
+        shaped.layer_shapes = LayerShapes::PerLayer(vec![LayerShape {
+            attention: AttnShape::Gqa {
+                n_heads: shaped.n_heads,
+                n_kv_heads: shaped.n_kv_heads,
+            },
+            ffn_dim: shaped.moe.expert_ffn_dim,
+        }]);
+        let d = Decoder::new_random_small(shaped.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a per-layer table, even one whose single entry agrees with the scalars, must \
+             refuse the fused attention: the stacks hold one geometry"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &shaped),
+            "...and the prefill dense stack"
+        );
+        assert!(!Decoder::metal_can_serve_model(&shaped));
+    }
+
+    /// An FFN activation no fused kernel spells keeps the model off
+    /// every fused Metal path, through the same predicate.
+    ///
+    /// Six launch sites used to derive the kernels' `gelu: bool` as
+    /// `!is_swiglu()`, which would have run the ungated ReLU-squared FFN
+    /// (`arcee`) as GELU; `GluAct::fused_kernel_gelu_flag` is `None`
+    /// there now, and this is the fence that keeps a layer from being
+    /// half-served. Only reachable in a `--features metal` build.
+    #[test]
+    fn an_activation_no_kernel_spells_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        plain.ffn_activation = crate::config::FfnActivation::Swiglu;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.layer_supports_metal_attn(&d.layers[0]));
+
+        let mut ungated = plain;
+        ungated.ffn_activation = crate::config::FfnActivation::ReluSqr;
+        let d = Decoder::new_random_small(ungated.clone(), 1, 32);
+        assert!(!d.layer_supports_metal_attn(&d.layers[0]));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &ungated
+        ));
+        assert!(!Decoder::metal_can_serve_model(&ungated));
+        assert_eq!(
+            GluAct::from(ungated.ffn_activation).fused_kernel_gelu_flag(),
+            None
+        );
     }
 
     /// A Gemma-3-4B-shaped config: `rope_scaling {linear, factor 8}`
