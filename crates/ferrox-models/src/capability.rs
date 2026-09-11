@@ -617,6 +617,40 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // 57-59), which `layer_shapes::read_u64_per_layer` reads where
     // `GgufValue::as_u64` used to die on them.
     "openelm",
+    // tests/gated_attention_graphs.rs: the GATED-ATTENTION pair, two
+    // rows on one seam (`crate::attn_gate`). `afmoe.cpp:73,154,183-185`,
+    // `laguna.cpp:110-124,211,246-257` and `step35.cpp:96,268-284` each
+    // project a gate from the SAME normed input Q/K/V read and multiply
+    // the attention output by it BEFORE `wo`; they differ in the
+    // activation (sigmoid / softplus), in the width (per element / per
+    // head / decided by the tensor's shape) and in whether the tensor
+    // may be absent. Read side by side before being called one cause:
+    // the three graphs, six create sites measured over all 140.
+    //
+    // `afmoe` (afmoe.cpp:73,120,154,183-185): sigmoid, per element,
+    // REQUIRED. The other afmoe-only fact is `:120`, `sqrt(n_embd)` on
+    // the embeddings from arithmetic -- the only non-Gemma graph that
+    // does it (`embeddings_scaled_by_sqrt_n_embd`). Everything else it
+    // needs it already had, and the fixture carries all of it: dual
+    // norms on both blocks, per-head QK norm before RoPE, leading
+    // dense, `exp_probs_b`, one shared expert, sigmoid gating with NO
+    // key (`:29-30`), the NoPE layer from `crate::rope_layers`, and a
+    // window with its own `rope.freq_base_swa`. NEOX RoPE
+    // (llama-model.cpp:2676-2677).
+    "afmoe",
+    // `laguna` (laguna.cpp:110-124,211,246-257): SOFTPLUS, per head OR
+    // per element -- `:112-123` reads the width off the stored tensor
+    // and aborts on any other -- REQUIRED. Two fixtures, one per width:
+    // the M.1 shape (no window, per element, uniform heads) and the
+    // XS.2 shape (window, period 4 dense-first, per head, and
+    // `head_count` as a per-layer ARRAY, which `crate::layer_shapes`
+    // carries). Two things stay refused by name in `loader.rs`, each
+    // from a fixture that has it: a window together with a RoPE
+    // scaling (`:48,184-192` run the sliding layers with YaRN off, the
+    // Olmo-3 rule), and `rope.dimension_count_swa` (`:50`) differing
+    // from `rope.dimension_count`, a second rotary width no host body
+    // takes yet. NEOX RoPE (llama-model.cpp:2676-2677).
+    "laguna",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1047,36 +1081,36 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     (
         "mimo2",
         TriageClass::NewCode,
-        "attention sinks on a non-gpt-oss architecture. NO LONGER a blocker: the per-layer \
-         shapes -- :47-49 and :111-112 read n_head / n_head_kv PER LAYER, which \
-         `crate::layer_shapes` carries now (audited on `deci` and `openelm`), and mimo2 is \
-         in its reach table. What remains: src/models/mimo2.cpp:58 creates `attn_sinks` per \
-         layer, and ferrox implements sinks only inside the gpt-oss path and, per \
-         docs/MODELS.md, on CPU only; :16 and :181 scale the attention output by \
-         {arch}.attention.value_scale (a key ferrox neither reads nor gates); :6-12 makes \
-         SWA unconditional with a per-layer is_swa ARRAY rather than a period; and :19,:76-82 \
-         add NEXTN/MTP layers with a `layer_out_norm`. Any one of the first two would \
-         disqualify it; the dense-or-MoE-per-layer choice at :63-72 is the only other part \
+        "NEXTN/MTP layers that every export carries, and a per-layer sliding-window ARRAY. \
+         NO LONGER a blocker: the attention sinks -- src/models/mimo2.cpp:58 creates \
+         `attn_sinks` `{n_head}` and :177 passes it into the SAME `build_attn_mha` \
+         (`ggml_soft_max_add_sinks`, llama-graph.cpp:2600) that `openai-moe.cpp:115` does, \
+         and `AttnWeights::sinks` is loaded by tensor presence on the generic path now \
+         rather than by the gpt-oss name (CPU; the fused Metal launches refuse a layer with \
+         sinks, as they did for gpt-oss). NO LONGER a blocker: the per-layer shapes -- \
+         :47-49 and :111-112 read n_head / n_head_kv PER LAYER, which `crate::layer_shapes` \
+         carries. What remains, and it is what a REAL MiMo-V2 file looks like: \
+         conversion/mimo.py:22,27,167 ALWAYS appends three NEXTN blocks inside block_count \
+         and writes `nextn_predict_layers = 3`, which `unsupported_feature_keys` refuses \
+         (:19,:75-83 load them with a `layer_out_norm`); mimo.py:148-153 ALWAYS writes \
+         `attention.sliding_window_pattern` as the per-layer `hybrid_layer_pattern` ARRAY \
+         (:12 `get_key_or_arr(..., is_swa_impl, n_layer)`, :6 SWA unconditional), which \
+         ferrox refuses as an array and would misread as a period if scalar; :14-17 and \
+         :180-183 scale the attention output by `{arch}.attention.value_scale` when the \
+         config sets `attention_value_scale` (mimo.py:163-165), a key ferrox neither reads \
+         nor gates; and mimo.py:154 writes `attention.value_length` from `v_head_dim` \
+         separately from the key width, which ferrox refuses when the two differ. The \
+         dense-or-MoE-per-layer choice at :200-223 and the fused-or-split QKV at :127-155 \
          ferrox already has",
     ),
-    (
-        "afmoe",
-        TriageClass::NewCode,
-        "gated attention. src/models/afmoe.cpp:73 creates `wqkv_gate` \
-         (LLM_TENSOR_ATTN_GATE), a learned gate applied to the attention output that the \
-         generic decoder has no slot for. It also \
-         scales the embeddings by sqrt(n_embd) at :120, which ferrox does only for the Gemma \
-         family. THIRD, and the quiet one: :8 reads expert_gating_func as OPTIONAL and \
-         :29-30 defaults it to SIGMOID when absent, while ferrox's fallback \
-         (loader.rs:375, SIGMOID_GATING_ARCHITECTURES) defaults to softmax for any \
-         architecture not on its list -- so a checkpoint omitting the key would be routed \
-         through the wrong scoring function. That last one is the `deepseek` shape and would \
-         need fixing even if the rest were free. NO LONGER a blocker: the NoPE layers. \
-         :137-138 skips RoPE where `(il + 1) % n_no_rope_layer_step == 0` with the field at \
-         its llama-hparams.h:203 default of 4, and `crate::rope_layers` carries afmoe as \
-         exactly that (latent until the rest closes; `smollm3` is the same variant and is \
-         audited on it)",
-    ),
+    // `afmoe` was HERE, NEW CODE on the gated attention (`afmoe.cpp:73`)
+    // and the `sqrt(n_embd)` embedding scale (`:120`). Both are
+    // implemented -- `crate::attn_gate` and
+    // `embeddings_scaled_by_sqrt_n_embd` -- and the row is audited on a
+    // libllama-golden fixture (`tests/gated_attention_graphs.rs`). Its
+    // sigmoid default for `expert_gating_func` (`:29-30`) had been in
+    // `SIGMOID_GATING_ARCHITECTURES` since 2026-09-01; the fixture
+    // declares no gating key so that default is what it measures.
     (
         "apertus",
         TriageClass::NewCode,
@@ -1113,41 +1147,43 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // HunyuanVLTextModel, whose model_arch is HUNYUAN_VL. The
     // HUNYUAN_DENSE converter (:254-281) does the same arithmetic in
     // Python and writes the already-scaled base instead.
-    (
-        "laguna",
-        TriageClass::NewCode,
-        "gated attention and a second rotary width. NO LONGER a blocker: the per-layer head \
-         counts. conversion/laguna.py:79 writes `head_count` as a LIST and \
-         src/models/laguna.cpp:87-88,176-177 read n_head(i) / n_head_kv(i) per layer; \
-         `crate::layer_shapes` carries that now (audited on `deci` and `openelm`), and \
-         laguna is in its reach table. What remains: :124 creates `wqkv_gate`, the \
-         gated-attention tensor afmoe has and the generic decoder has no slot for; :50 \
-         reads LLM_KV_ROPE_DIMENSION_COUNT_SWA into `n_rot_swa`, so the sliding-window \
-         layers rotate a DIFFERENT number of dimensions than the full-attention layers (its \
-         own comment at :43-45: full layers YaRN over 64 dims, SWA layers plain RoPE over \
-         128) -- note this is `llama-hparams.cpp:85-91`'s two-valued `is_swa(il) ? \
-         n_rot_swa : n_rot_full`, not a per-layer array, so it is a `rope_dim_swa` field \
-         and not another seam; and :55-56 defaults expert_gating_func to SIGMOID when the \
-         key is absent where ferrox would default to softmax. `default_swa_layout` already \
-         has laguna as dense_first period 4, which is correct and is not the blocker",
-    ),
+    // `laguna` was HERE, NEW CODE on the gated attention (`laguna.cpp:124`,
+    // softplus, per head or per element) and a second rotary width
+    // (`:50`). The gate is `crate::attn_gate` and the row is audited on
+    // two libllama-golden fixtures, one per width
+    // (`tests/gated_attention_graphs.rs`). The second rotary width is a
+    // REFUSAL by name in `loader.rs` -- a file whose
+    // `rope.dimension_count_swa` differs from `rope.dimension_count` --
+    // and so is a window with a RoPE scaling (`:48,184-192`, the Olmo-3
+    // rule, `swa_layers_unscaled_rope`), each from a fixture that has
+    // it. Real Laguna-M.1 has neither; real Laguna-XS.2 has both and
+    // stops at the first.
     (
         "step35",
         TriageClass::NewCode,
-        "per-layer SwiGLU clamp arrays and a gated attention. NO LONGER a blocker: the \
-         per-layer head counts -- :76-78,122-124 (loader) and :208-209,388-389 (graph) read \
-         n_head / the KV widths PER LAYER, which `crate::layer_shapes` carries now (audited \
-         on `deci` and `openelm`), and step35 is in its reach table. NARROWED: the \
-         \"per-layer rotary width\" at src/models/step35.cpp:65-70 (`n_rot_max` as the max \
-         of `hparams.n_rot(i)`) is `llama-hparams.cpp:85-91`'s two-valued `is_swa(il) ? \
-         n_rot_swa : n_rot_full`, not an array, so it is a `rope_dim_swa` field rather \
-         than a seam; :9 first halves n_rot_full. What remains: per-layer SwiGLU clamp \
-         arrays for the routed and shared experts (:28-29, LLM_KV_SWIGLU_CLAMP_EXP / \
-         _SHEXP), where ferrox's only clamp is the gpt-oss scalar; a `wqkv_gate` (:96); a \
-         per-layer is_swa ARRAY rather than a period (:26), which ferrox reads only as a \
-         scalar; NEXTN/MTP layers with trunk-only and MTP-only load modes (:32-49); and \
-         expert_gating_func defaulting to SIGMOID when absent (:19-20) where ferrox \
-         defaults to softmax",
+        "per-layer SwiGLU clamp arrays and a per-layer sliding-window ARRAY. NO LONGER a \
+         blocker: the gated attention -- src/models/step35.cpp:96 creates `wqkv_gate` `{n_embd, n_head_l}`, \
+         OPTIONAL, and :268-284 multiply the attention output by `sigmoid(gate)` per head \
+         before `wo`; `crate::attn_gate` carries step35 as exactly that (sigmoid, per head, \
+         optional), the sigmoid corner audited on `afmoe` and the per-head corner on \
+         `laguna`. NO LONGER a blocker: the per-layer head counts -- :76-78,122-124 (loader) \
+         and :208-209,388-389 (graph) read n_head / the KV widths PER LAYER, which \
+         `crate::layer_shapes` carries (audited on `deci` and `openelm`). What remains, and \
+         every real Step-3.5 export has all of it: per-layer SwiGLU clamp arrays for the \
+         routed and the shared experts (:28-29, LLM_KV_SWIGLU_CLAMP_EXP / _SHEXP; \
+         conversion/step3.py:207-220 writes both), applied at llama-graph.cpp:2146-2164 \
+         (routed) and :1751-1768 (shared AND the dense layers, which share `build_ffn`) as \
+         `clamp(up, -l, l)` times `min(silu(gate), l)`, where ferrox's only clamp is the \
+         gpt-oss scalar with a different formula; `attention.sliding_window_pattern` as a \
+         PER-LAYER BOOL ARRAY (:26 `get_key_or_arr(..., is_swa_impl, n_layer)`; step3.py:172, \
+         179 always writes the array), which ferrox refuses when it is an array and would \
+         misread as a PERIOD if it were a scalar -- for this architecture a scalar 1 means \
+         every layer slides, not every layer is full; the full-attention layers rotating HALF \
+         the declared width (:9 halves `n_rot_full` AFTER llama-model.cpp:1222 seeded \
+         `n_rot_swa` from it, so `n_rot(il)` is the full width on sliding layers and half on \
+         the rest, `crate::swa_geometry`'s refusal from the other direction); and NEXTN/MTP \
+         layers (:32-49, step3.py:222-223), which `unsupported_feature_keys` refuses. The \
+         SIGMOID default for expert_gating_func (:19-20) is in SIGMOID_GATING_ARCHITECTURES",
     ),
     // `mistral`, `mixtral` and `yi` were HERE, UNKNOWN on
     // NO_UPSTREAM_ARCH. The question that verdict asked -- "is there a
@@ -1387,6 +1423,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // (`tests/per_layer_shape_graphs.rs`). NEOX RoPE:
             // llama-model.cpp:2650.
             "openelm",
+            // Were NEW CODE in `NEOX_ROPE_TRIAGED` on the gated
+            // attention, audited now on `crate::attn_gate`
+            // (`tests/gated_attention_graphs.rs`). NEOX RoPE:
+            // llama-model.cpp:2676-2677.
+            "afmoe",
+            "laguna",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2323,9 +2365,9 @@ pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
         // with n_swa = 128, so without this every layer ran with a
         // 128-token history.
         "exaone-moe" => last_dense(4),
-        // src/models/afmoe.cpp:17. `afmoe` refuses for other reasons
-        // today, so this one is latent rather than live, and pinned
-        // here so it stays right if that changes.
+        // src/models/afmoe.cpp:17. LIVE: `afmoe` is audited, and its
+        // fixture's window is narrower than the prompt
+        // (`tests/gated_attention_graphs.rs`).
         "afmoe" => last_dense(4),
         // src/models/plamo3.cpp:9. LIVE: `plamo3` is audited, and its
         // fixture drives a period of 2 from the file with a window
@@ -2431,6 +2473,26 @@ pub fn swa_rope_scale_follows_model(arch: &str) -> bool {
             | "gpt-oss"     // openai-moe.cpp:14
             | "smallthinker" // smallthinker.cpp:14
     )
+}
+
+/// True when this architecture's graph multiplies every token
+/// embedding by `sqrt(n_embd)` as ARITHMETIC, reading no key for it.
+///
+/// Measured over all 140 `src/models/*.cpp` for
+/// `ggml_scale(ctx0, inpL, sqrtf(...n_embd...))`: every Gemma graph
+/// (`gemma.cpp:49`, `gemma2.cpp:70`, `gemma3.cpp:93`, `gemma3n.cpp:104`,
+/// `gemma4.cpp:155`, `gemma-embedding.cpp:85`) and exactly ONE other,
+/// `afmoe.cpp:120` ("MuP scaling"). The Gemma side was a `family`
+/// match in `loader.rs`; `afmoe` is not a Gemma and does the same
+/// thing, so the fact is a table here rather than a second `if`
+/// beside the first.
+///
+/// This is about the ARITHMETIC, not the key. A file for one of these
+/// declaring `{arch}.embedding_scale` describes something its graph
+/// does not do, and `scalar_multipliers::multiplier_support` --
+/// which lists none of them -- refuses the key before this is asked.
+pub fn embeddings_scaled_by_sqrt_n_embd(arch: &str, family: DecoderFamily) -> bool {
+    matches!(family, DecoderFamily::GemmaFamily) || arch == "afmoe"
 }
 
 /// llama.cpp's `hparams.f_attention_scale`, but only when it DIFFERS
@@ -2851,7 +2913,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 15,
+            seen == 13,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2891,11 +2953,17 @@ mod audit_tests {
              attention -- and `deci` and `openelm` closed together on the per-layer shape \
              seam (`crate::layer_shapes`, tests/per_layer_shape_graphs.rs), which the scan \
              that sized it says reaches `laguna`, `mimo2` and `step35` too, each of which \
-             still needs something else. What is left is 14 NEW CODE and one UNKNOWN \
-             (`phi4`). The NEW CODE rows that have closed are `olmo2`, `exaone4`, the \
-             three Granite rows, `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci` and \
-             `openelm`, and each closure but `olmo`'s and `arcee`'s took more than one \
-             row at a time because each found ONE cause behind several refusals"
+             still needed something else, and 15 until `afmoe` and `laguna` closed together \
+             on the gated attention (`crate::attn_gate`, tests/gated_attention_graphs.rs) \
+             -- one op with two free parameters behind three verdicts, read side by side \
+             before being called one cause; `step35` keeps its clamp arrays and window \
+             array and says the gate is done, and `mimo2`'s sinks moved off the gpt-oss \
+             name onto the tensor without closing it. What is left is 12 NEW CODE and one \
+             UNKNOWN (`phi4`). The NEW CODE rows that have closed are `olmo2`, `exaone4`, \
+             the three Granite rows, `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`, \
+             `openelm`, `afmoe` and `laguna`, and each closure but `olmo`'s and `arcee`'s \
+             took more than one row at a time because each found ONE cause behind several \
+             refusals"
         );
     }
 

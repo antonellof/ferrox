@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 15,
+        n, 13,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -99,7 +99,11 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          and 18 until `arcee` closed on the ungated ReLU-squared FFN \
          (`FfnActivation::ReluSqr`, tests/ungated_ffn_graphs.rs) and `deci` and `openelm` \
          closed together on the per-layer shape seam (`ferrox_models::layer_shapes`, \
-         tests/per_layer_shape_graphs.rs) \
+         tests/per_layer_shape_graphs.rs), and 15 until `afmoe` and `laguna` closed \
+         together on the gated attention (`ferrox_models::attn_gate`, \
+         tests/gated_attention_graphs.rs) -- ONE cause behind THREE verdicts, read side by \
+         side and found to be one op with two free parameters; `step35`, the third, still \
+         needs its per-layer clamp arrays and window array and says so \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -351,7 +355,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 15);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 13);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -619,7 +623,10 @@ fn the_per_layer_shape_seam_closed_two_rows_and_its_reach_is_recorded_on_the_res
         assert!(unaudited_triage(arch).is_none(), "{arch}");
         assert!(per_layer_shapes_read_by_llama_cpp(arch), "{arch}");
     }
-    for arch in ["laguna", "mimo2", "step35"] {
+    // `laguna` was the third row here and closed the next day on the
+    // gated attention; it reads per-layer heads and is served.
+    assert!(is_audited_generic("laguna") && per_layer_shapes_read_by_llama_cpp("laguna"));
+    for arch in ["mimo2", "step35"] {
         let t = unaudited_triage(arch).expect("still refuses");
         assert_eq!(t.class, TriageClass::NewCode);
         assert!(
@@ -820,14 +827,29 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
             "two per-layer RoPE variants",
         ),
         ("talkie", TriageClass::NewCode, "NO norm weights"),
-        ("mimo2", TriageClass::NewCode, "attention sinks"),
+        // `mimo2`'s leading blocker WAS "attention sinks on a
+        // non-gpt-oss architecture". Sinks are loaded by tensor
+        // presence now (`AttnWeights::sinks`), and what is left is what
+        // every real MiMo-V2 export carries: three NEXTN blocks and a
+        // per-layer window array (`conversion/mimo.py:22,153,167`).
+        (
+            "mimo2",
+            TriageClass::NewCode,
+            "NEXTN/MTP layers that every export",
+        ),
         // Batch 5. `plamo3` was here, FIXTURE-AWAY. Building its
         // fixture found the verdict was wrong by one tensor name -- it
         // is the only architecture upstream that spells its two
         // post-norms without a `.weight` suffix -- so the arm landed in
         // `loader.rs` and it is audited now
         // (`tests/fixture_away_graphs.rs`).
-        ("afmoe", TriageClass::NewCode, "gated attention"),
+        // `afmoe` and `laguna` were HERE, NEW CODE on the gated
+        // attention. `ferrox_models::attn_gate` implements it for all
+        // three graphs that have it, and both rows are audited on
+        // libllama-golden fixtures (`tests/gated_attention_graphs.rs`);
+        // `the_gated_attention_seam_closed_two_rows_and_narrowed_the_third`
+        // below pins that, and pins that `step35` now says the gate is
+        // not what stops it.
         ("apertus", TriageClass::NewCode, "xIELU"),
         // `exaone-moe` was HERE, NEW CODE on "GLOBAL layers get no
         // RoPE". That is `exaone4.cpp:116` with `swa_type` pinned to
@@ -844,7 +866,6 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         // no verdict --
         // `the_qk_norm_ordering_arm_is_no_longer_anybody_s_leading_blocker`
         // below is what pins that.
-        ("laguna", TriageClass::NewCode, "second rotary width"),
         (
             "step35",
             TriageClass::NewCode,
@@ -913,7 +934,11 @@ fn the_per_layer_rope_gate_is_no_longer_anybody_s_leading_blocker() {
         "exaone-moe closed on the per-layer RoPE gate"
     );
     assert!(unaudited_triage("exaone-moe").is_none());
-    for arch in ["afmoe", "smallthinker"] {
+    // `afmoe` was the second row here and closed on the gated attention
+    // the day after; its fixture's layer 3 is the unrotated one.
+    assert!(is_audited_generic("afmoe") && unaudited_triage("afmoe").is_none());
+    {
+        let arch = "smallthinker";
         let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
         assert!(
             t.blocker.contains("NO LONGER a blocker: the NoPE layers"),
@@ -937,6 +962,64 @@ fn the_per_layer_rope_gate_is_no_longer_anybody_s_leading_blocker() {
             "`{arch}` is not in PER_LAYER_ROPE_GATES"
         );
     }
+}
+
+/// The gated attention was the LEADING blocker of two rows (`afmoe`,
+/// `laguna`) and a listed blocker of a third (`step35`), and
+/// `ferrox_models::attn_gate` implements it for all three graphs that
+/// have it. So: the two are audited and carry no verdict, and `step35`
+/// must now say the gate is NOT what stops it -- a verdict that keeps
+/// naming an implemented feature as a blocker is the shape this suite
+/// exists to catch. `mimo2`'s leading blocker moved the same way: the
+/// sinks are a tensor-presence fact now and its verdict leads with what
+/// every real export actually carries.
+#[test]
+fn the_gated_attention_seam_closed_two_rows_and_narrowed_the_third() {
+    use ferrox_models::attn_gate::{attn_gate_spec, GatePresence, ATTN_GATE_ARCHS};
+    for arch in ["afmoe", "laguna"] {
+        assert!(
+            is_audited_generic(arch) && unaudited_triage(arch).is_none(),
+            "`{arch}` closed on the gated attention and must carry no verdict"
+        );
+    }
+    let t = unaudited_triage("step35").expect("step35 still refuses");
+    assert!(
+        t.blocker
+            .contains("NO LONGER a blocker: the gated attention"),
+        "`step35` must say the gate is implemented: {}",
+        t.blocker
+    );
+    assert!(
+        !t.blocker
+            .starts_with("per-layer SwiGLU clamp arrays and a gated attention"),
+        "`step35` still leads with a feature ferrox implements: {}",
+        t.blocker
+    );
+    assert_eq!(
+        attn_gate_spec("step35").map(|s| s.presence),
+        Some(GatePresence::Optional),
+        "step35.cpp:96 creates the gate TENSOR_NOT_REQUIRED"
+    );
+    // The census names the three, so the verdicts and the table cannot
+    // drift apart about which rows carry the op.
+    for arch in ["afmoe", "laguna", "step35"] {
+        assert!(
+            ATTN_GATE_ARCHS.iter().any(|(n, _)| *n == arch),
+            "`{arch}` is not in ATTN_GATE_ARCHS"
+        );
+    }
+    let t = unaudited_triage("mimo2").expect("mimo2 still refuses");
+    assert!(
+        t.blocker
+            .contains("NO LONGER a blocker: the attention sinks"),
+        "`mimo2` must say sinks are a tensor-presence fact now: {}",
+        t.blocker
+    );
+    assert!(
+        !t.blocker.starts_with("attention sinks"),
+        "`mimo2` still leads with a feature ferrox implements: {}",
+        t.blocker
+    );
 }
 
 /// Every one of the 47 now carries a verdict, and the four classes are
@@ -964,7 +1047,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 14, 1),
+        (0, 0, 12, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -987,7 +1070,13 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          were closable by it alone and three (`laguna`, `mimo2`, `step35`) say so and \
          name what else they need. `arcee` closed ALONE for the opposite reason to \
          `olmo`'s: its cause IS shared (five graphs pass LLM_FFN_RELU_SQR) but the constant \
-         that shared it with `plm` had missed `plm`'s MLA attention. \
+         that shared it with `plm` had missed `plm`'s MLA attention, and 14 to 12 when \
+         `afmoe` and `laguna` closed together on the gated attention \
+         (`ferrox_models::attn_gate`) -- one op with two free parameters behind three \
+         verdicts, read side by side first; `step35` keeps the other two things its \
+         verdict names, and `mimo2`'s sinks moved off the gpt-oss name onto the tensor \
+         without closing it, because every real export carries NEXTN blocks and a \
+         per-layer window array. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -996,5 +1085,5 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 15);
+    assert_eq!(fixture + arm + new_code + unknown, 13);
 }

@@ -41,9 +41,10 @@
 //!
 //! What it does NOT close, and says so: `nanbeige` rewrites the arrays
 //! to walk its physical layers more than once (`nanbeige.cpp:13-31`);
-//! `laguna`, `mimo2` and `step35` read per-layer heads AND something
-//! else (a gated attention tensor, attention sinks, per-layer clamp
-//! arrays); the hybrid recurrent rows (`jamba`, `lfm2`, `nemotron-h`,
+//! `mimo2` and `step35` read per-layer heads AND something else
+//! (NEXTN layers and a per-layer window array, per-layer clamp
+//! arrays); `laguna` closed the day after, when its other thing (the
+//! gated attention, `crate::attn_gate`) landed; the hybrid recurrent rows (`jamba`, `lfm2`, `nemotron-h`,
 //! `plamo2`, `granite-hybrid`, `kimi-linear`) use `n_head_kv(i) == 0`
 //! to mean "this layer is recurrent", a different graph entirely.
 
@@ -87,18 +88,21 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
     ),
     (
         "laguna",
-        "NOT closed by this seam: laguna.cpp:87-88,176-177 read heads per layer AND :124 \
-         creates wqkv_gate, :50 reads a second rotary width",
+        "generic. laguna.cpp:87-88 (loader) and :176-177 (graph) read n_head(i) per layer; \
+         KV heads uniform (:86). Closed with the gated attention (`crate::attn_gate`); the \
+         second rotary width at :50 is refused by name (`crate::swa_geometry`)",
     ),
     (
         "mimo2",
-        "NOT closed by this seam: mimo2.cpp:47-49,111-112 read heads per layer AND :58 \
-         creates attn_sinks, :16,181 apply value_scale",
+        "NOT closed by this seam: mimo2.cpp:47-49,111-112 read heads per layer AND :12 reads \
+         a per-layer is_swa array, :19 NEXTN layers, :16,181 apply value_scale (the sinks \
+         at :58 are `AttnWeights::sinks` now)",
     ),
     (
         "step35",
         "NOT closed by this seam: step35.cpp:76-78,208-209 read heads per layer AND :28-29 \
-         read per-layer clamp arrays, :96 creates wqkv_gate",
+         read per-layer clamp arrays, :26 a per-layer is_swa array (the gate at :96 is \
+         `crate::attn_gate` now)",
     ),
     (
         "nanbeige",
@@ -422,6 +426,8 @@ pub(crate) fn load_non_gqa_attention(
         // The FFN's post-norm lives on this struct; a layer with no
         // attention may still have one, so the table decides.
         post_ffn_norm: NormSites::load_post_norm(norm_sites.post_ffn, file, layer)?,
+        output_gate: None,
+        sinks: None,
     })
 }
 
@@ -716,6 +722,8 @@ mod tests {
             v_bias: None,
             post_attn_norm: None,
             post_ffn_norm: None,
+            output_gate: None,
+            sinks: None,
         };
         assert!(check_gqa_projection_widths(0, shape, head_dim, hidden, &build(24, 12)).is_ok());
         // K sized for 3 KV heads on a 2-KV-head layer.
@@ -742,7 +750,7 @@ mod tests {
             .filter(|(_, n)| n.starts_with("generic"))
             .map(|(a, _)| *a)
             .collect();
-        assert_eq!(generic, ["deci", "openelm", "plamo3"]);
+        assert_eq!(generic, ["deci", "openelm", "plamo3", "laguna"]);
         assert!(per_layer_shapes_read_by_llama_cpp("deci"));
         assert!(!per_layer_shapes_read_by_llama_cpp("granite"));
     }

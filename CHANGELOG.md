@@ -31,6 +31,15 @@ are the ones worth reading twice.
   as `content: ""` and reloaded as an empty turn. The store keeps
   `reasoning_content` beside `content`; records written before the
   field read back unchanged.
+- **A leading-dense MoE file that omits `expert_shared_count` loaded
+  with its shared experts unread.** The inference probed `blk.0` for a
+  `_shexp` tensor, and layer 0 of such a model is dense. `laguna.cpp:20`
+  assigns the count before reading a key its converter never writes,
+  so a real Laguna export would have run without its REQUIRED shared
+  expert on every MoE layer. The probe is the first MoE layer now.
+- `afmoe` scales its embeddings by `sqrt(n_embd)` from arithmetic, the
+  only non-Gemma graph that does (measured over all 140); the Gemma
+  family match in the loader is a table with two rows now.
 
 ### Added
 
@@ -55,6 +64,35 @@ are the ones worth reading twice.
   token-for-token against llama.cpp master on DeepSeek-R1-Distill at
   temperature 0. Studio's sampling panel carries the field. Replaces the
   501 that refused the field by name.
+  rather than starting over. Default off; the channel-grammar families
+  and a content continuation for an always-open family are 501 by name.
+- `reasoning_budget_tokens` / `thinking_budget_tokens` are refused by
+  name (501) except `-1`, rather than silently dropped. llama.cpp
+  enforces the budget in its sampler; ferrox has no such sampler yet.
+- **`afmoe` and `laguna` run with evidence**, 42 to 44, on one seam:
+  the learned attention output gate (`attn_gate.rs`). llama.cpp's three
+  gating graphs were read side by side and are one op with two free
+  parameters, the activation (sigmoid / softplus) and the width (per
+  channel / per head, read off the tensor), so the type has two axes
+  and a table. Three libllama-golden fixtures, KL 7.03e-13, 1.51e-13,
+  9.57e-14. `step35`, the third graph, keeps its clamp arrays and window
+  array and says the gate is done.
+- Attention sinks are a tensor-presence fact (`AttnWeights::sinks`)
+  rather than a gpt-oss name check: four llama.cpp graphs pass the
+  tensor into the one `build_attn_mha`. gpt-oss still requires it and
+  the fused Metal launches still refuse a layer that has one, by the
+  tensor. `mimo2` does not close on it, because every real export
+  carries MTP blocks and a per-layer window array.
+- Every fused Metal attention launch takes its view of a layer's
+  weights from ONE exhaustive destructure of `AttnWeights`, so a field
+  added there does not compile until the Metal side says whether the
+  kernels serve it.
+- A sliding-window geometry the full-attention layers do not share --
+  `rope.dimension_count_swa`, `attention.key_length_swa`,
+  `attention.value_length_swa` -- is refused by name for every
+  architecture (`swa_geometry.rs`); it loaded and was ignored before.
+  The Olmo-3 "window plus scaling" refusal is one table for `olmo2`,
+  `mellum` and `laguna` rather than one `if`.
 
 ## [0.20.0] - 2026-09-11
 

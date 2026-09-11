@@ -104,6 +104,27 @@ pub struct AttnWeights {
     pub post_attn_norm: Option<Vec<f32>>,
     /// Gemma 2+/3 post-FFN RMSNorm (`blk.N.post_ffw_norm.weight`).
     pub post_ffn_norm: Option<Vec<f32>>,
+    /// The learned output gate, `blk.N.attn_gate.weight`, applied to the
+    /// attention output before `o_proj` (`afmoe`, `laguna`, `step35`).
+    /// See [`crate::attn_gate`] for the two axes it varies on and the
+    /// one input it always reads. `None` for every architecture whose
+    /// graph has no such op; a file carrying the tensor on one of those
+    /// is refused as unconsumed rather than gated.
+    pub output_gate: Option<crate::attn_gate::AttnGate>,
+    /// `blk.N.attn_sinks.weight`, one learned logit per query head that
+    /// joins every softmax and contributes nothing to the output
+    /// (`ggml_soft_max_add_sinks`, `llama-graph.cpp:2600`).
+    ///
+    /// Used to live on the gpt-oss side table alone, which spelled the
+    /// rule as "arch is gpt-oss". Four llama.cpp graphs pass this
+    /// tensor into `build_attn` -- `openai-moe.cpp:115`,
+    /// `mimo2.cpp:177`, `dflash.cpp`, `deepseek4.cpp` -- through the
+    /// SAME `build_attn_mha` path, so the rule is "the tensor is
+    /// present". gpt-oss requires it (`openai-moe.cpp:44`) and
+    /// `loader.rs` still refuses a gpt-oss file without one; the fused
+    /// Metal launches refuse any layer that has one, by the exhaustive
+    /// destructure in `Decoder::metal_attn_view`.
+    pub sinks: Option<Vec<f32>>,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -361,13 +382,17 @@ pub struct LayerWeights {
 /// checkpoint either has the whole gpt-oss graph or none of it, so
 /// `Decoder::gpt_oss.is_some()` is a single, checkable predicate for
 /// "this model needs the gpt-oss path", which is what the CPU-only and
-/// paged-attention refusals below key off. Scattering five independent
+/// paged-attention refusals below key off. Scattering four independent
 /// `Option`s would make "half the graph is wired" representable, and
 /// that state is precisely the silent-wrong-answer bug this work exists
 /// to remove.
+///
+/// The attention sinks used to be the fifth field here and are
+/// [`AttnWeights::sinks`] now, because they are NOT gpt-oss-only:
+/// `mimo2.cpp:58,177` passes the same tensor into the same
+/// `build_attn_mha`. What keeps the whole-graph rule intact is that
+/// the loader refuses a gpt-oss file whose sinks are absent.
 pub struct GptOssLayer {
-    /// `blk.N.attn_sinks.weight`, one learned logit per query head.
-    pub attn_sinks: Vec<f32>,
     /// `blk.N.attn_output.bias`, added after the output projection.
     pub o_bias: Vec<f32>,
     /// `blk.N.ffn_gate_inp.bias`, added to the router logits.
@@ -633,6 +658,8 @@ impl Decoder {
                 v_bias: None,
                 post_attn_norm: None,
                 post_ffn_norm: None,
+                output_gate: None,
+                sinks: None,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -826,11 +853,19 @@ impl Decoder {
         if !Self::metal_can_serve_model(&self.config) {
             return false;
         }
-        // gpt-oss: no Metal kernel implements attention sinks, so the
-        // fused stacks would compute a *different* attention than the
-        // CPU path for the same weights. Keep this family on CPU rather
-        // than letting the two backends disagree. See `Decoder::gpt_oss`.
+        // gpt-oss: no Metal kernel adds the `o_bias` or runs the biased
+        // router, so the fused stacks would compute a *different* graph
+        // than the CPU path for the same weights. Keep this family on
+        // CPU rather than letting the two backends disagree. See
+        // `Decoder::gpt_oss`. Its attention sinks are refused one line
+        // down, by the tensor rather than by the name.
         if self.gpt_oss.is_some() {
+            return false;
+        }
+        // The output gate and the attention sinks: `metal_attn_view` is
+        // the one place that knows which `AttnWeights` fields the
+        // launches serve, and it answers `None` for a layer they cannot.
+        if self.metal_attn_view(layer).is_none() {
             return false;
         }
         if !matches!(self.config.rope_layout, RopeLayout::Norm | RopeLayout::Neox) {
@@ -942,17 +977,68 @@ impl Decoder {
         })
     }
 
-    /// Optional QKV bias / QK-norm ops for the Metal attn paths.
+    /// What the fused Metal attention launches can take from one
+    /// layer's attention weights, or `None` when the layer carries
+    /// something none of them applies.
+    ///
+    /// An EXHAUSTIVE destructure with no `..`, on purpose: every field
+    /// of [`AttnWeights`] is named here and either handed to
+    /// [`ferrox_metal::attn::AttnExtras`], consumed by the launch some
+    /// other way (the four projections, the pre-norm, the post-norms
+    /// that `layer_needs_metal_stack` routes to the stack), or the
+    /// reason for the `None`. A field added to `AttnWeights` therefore
+    /// fails to compile until this function says which of the three it
+    /// is. The output gate and the attention sinks are the two the
+    /// launches cannot serve: both sit between the softmax and `wo`,
+    /// which the kernels fuse with no host round-trip, so a launch that
+    /// ignored them would answer differently from the host bodies for
+    /// the same weights -- the fifth and sixth things found written into
+    /// the stacks unconditionally, after the final norm, the rotation,
+    /// the residual scale and the activation.
+    #[cfg(feature = "metal")]
+    fn metal_attn_view<'a>(
+        &self,
+        layer: &'a LayerWeights,
+    ) -> Option<ferrox_metal::attn::AttnExtras<'a>> {
+        let AttnWeights {
+            q_proj: _,
+            k_proj: _,
+            v_proj: _,
+            o_proj: _,
+            norm_weight: _,
+            q_norm,
+            k_norm,
+            q_bias,
+            k_bias,
+            v_bias,
+            post_attn_norm: _,
+            post_ffn_norm: _,
+            output_gate,
+            sinks,
+        } = &layer.attn;
+        if output_gate.is_some() || sinks.is_some() {
+            return None;
+        }
+        Some(ferrox_metal::attn::AttnExtras {
+            q_bias: q_bias.as_deref(),
+            k_bias: k_bias.as_deref(),
+            v_bias: v_bias.as_deref(),
+            q_norm: q_norm.as_deref(),
+            k_norm: k_norm.as_deref(),
+            attn_logit_softcap: self.config.attn_logit_softcap,
+        })
+    }
+
+    /// Optional QKV bias / QK-norm ops for the Metal attn paths, for a
+    /// layer [`Self::layer_supports_metal_attn`] has admitted. The
+    /// `expect` can only fire when a launch site runs without asking
+    /// that predicate, which is the drift this file's eligibility
+    /// checks exist to stop, and a panic there beats a silent answer
+    /// without the gate or the sinks.
     #[cfg(feature = "metal")]
     fn metal_attn_extras<'a>(&self, layer: &'a LayerWeights) -> ferrox_metal::attn::AttnExtras<'a> {
-        ferrox_metal::attn::AttnExtras {
-            q_bias: layer.attn.q_bias.as_deref(),
-            k_bias: layer.attn.k_bias.as_deref(),
-            v_bias: layer.attn.v_bias.as_deref(),
-            q_norm: layer.attn.q_norm.as_deref(),
-            k_norm: layer.attn.k_norm.as_deref(),
-            attn_logit_softcap: self.config.attn_logit_softcap,
-        }
+        self.metal_attn_view(layer)
+            .expect("layer_supports_metal_attn admits this layer, so its weights have a Metal view")
     }
 
     /// GPU expert residency only when Metal attention stays on-device
@@ -1679,6 +1765,19 @@ impl Decoder {
         mutex
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// True once a fused Metal attention launch has allocated this
+    /// decoder's per-layer Metal KV, i.e. once a token has actually been
+    /// served by a fused launch rather than by the host bodies.
+    ///
+    /// For tests that switch Metal ON and need to know whether the
+    /// switch reached a kernel: a model the eligibility predicates keep
+    /// on the host answers `false` forever, and a test asserting logits
+    /// alone could not tell that from a launch that happened to agree.
+    #[cfg(feature = "metal")]
+    pub fn metal_attn_kv_allocated(&self) -> bool {
+        Self::lock_metal_attn_kv(&self.metal_attn_kv).is_some()
     }
 
     /// store, continuous-batch / CPU readers). Safe no-op without Metal KV.
@@ -4182,7 +4281,7 @@ impl Decoder {
                 let cache_v = &cache.v;
                 let softcap = self.config.attn_logit_softcap;
                 let window = self.config.layer_sliding_window(l);
-                // gpt-oss takes the per-query path on every layer, windowed
+                // A layer with sinks takes the per-query path, windowed
                 // or not: the blocked kernel has no sink term. Everything
                 // else goes through the blocked kernel, which is Rayon over
                 // `[query-block x head]` against one shared KV buffer,
@@ -4194,7 +4293,7 @@ impl Decoder {
                 // are SWA) that arm was 19.6% of non-idle CPU `pp512`
                 // samples while doing the *same* KV work as this one - at
                 // `pp512` the 512-wide window covers the whole prompt.
-                let attn_out_batch = if let Some(oai) = oai {
+                let mut attn_out_batch = if let Some(sinks) = layer.attn.sinks.as_deref() {
                     let mut out = vec![0f32; batch_size * q_width];
                     out.par_chunks_mut(q_width)
                         .enumerate()
@@ -4210,7 +4309,7 @@ impl Decoder {
                                 head_dim,
                                 seq_len_b,
                                 window,
-                                &oai.attn_sinks,
+                                sinks,
                             );
                             dest.copy_from_slice(&attn_out);
                         });
@@ -4245,23 +4344,13 @@ impl Decoder {
                 // instead of every windowed layer's at once.
                 self.evict_layer_kv(l, cache);
 
-                let mut projected_batch =
-                    layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-                if let Some(oai) = oai {
-                    for row in projected_batch.chunks_mut(hidden_dim) {
-                        for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
-                            *x += b;
-                        }
-                    }
-                }
-                let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
-                    projected_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                        .collect::<Vec<_>>()
-                } else {
-                    projected_batch
-                };
+                let projected_batch = self.attn_out_to_residual_rows(
+                    l,
+                    layer,
+                    &normed_batch,
+                    &mut attn_out_batch,
+                    batch_size,
+                );
                 residual_add(
                     &mut hidden_batch,
                     &projected_batch,
@@ -4417,10 +4506,10 @@ impl Decoder {
         kv: &mut MultiSeqKv<'_>,
         b: usize,
         l: usize,
+        layer: &LayerWeights,
         k: &[f32],
         v: &[f32],
         q: &[f32],
-        oai: Option<&GptOssLayer>,
     ) -> Vec<f32> {
         let step = match kv {
             // `Batched`, not `Decode`: the CUDA resident per-layer KV
@@ -4432,7 +4521,7 @@ impl Decoder {
                 stores,
             },
         };
-        self.push_and_attend_row(step, l, k, v, q, oai)
+        self.push_and_attend_row(step, l, layer, k, v, q)
     }
 
     /// The body of [`Self::forward_multi_seq_kv`], already running on a
@@ -4558,31 +4647,21 @@ impl Decoder {
                         kv,
                         b,
                         l,
+                        layer,
                         &k_batch[b * kv_width..(b + 1) * kv_width],
                         &v_batch[b * kv_width..(b + 1) * kv_width],
                         &q_batch[b * q_width..(b + 1) * q_width],
-                        oai,
                     );
                     attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
                 }
 
-                let mut projected_batch =
-                    layer.attn.o_proj.apply_batch(&attn_out_batch, batch_size);
-                if let Some(oai) = oai {
-                    for row in projected_batch.chunks_mut(hidden_dim) {
-                        for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
-                            *x += b;
-                        }
-                    }
-                }
-                let projected_batch = if let Some(post) = &layer.attn.post_attn_norm {
-                    projected_batch
-                        .chunks(hidden_dim)
-                        .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
-                        .collect::<Vec<_>>()
-                } else {
-                    projected_batch
-                };
+                let projected_batch = self.attn_out_to_residual_rows(
+                    l,
+                    layer,
+                    &normed_batch,
+                    &mut attn_out_batch,
+                    batch_size,
+                );
                 residual_add(
                     &mut hidden_batch,
                     &projected_batch,
@@ -5068,18 +5147,21 @@ mod tests {
         }
     }
 
-    /// The whole gpt-oss side table: attention sinks, the O bias, the
-    /// router bias and the per-expert biases `gpt_oss_ffn` reads.
+    /// The whole gpt-oss graph: attention sinks on every layer's
+    /// attention weights, and the side table -- the O bias, the router
+    /// bias and the per-expert biases `gpt_oss_ffn` reads.
     fn with_gpt_oss_graph(d: &mut Decoder) {
         let hidden = d.config.hidden_dim;
         let n_heads = d.config.n_heads;
         let n_experts = d.config.moe.n_experts;
         let ffn = d.config.moe.expert_ffn_dim;
         let n_layers = d.layers.len();
+        for (l, layer) in d.layers.iter_mut().enumerate() {
+            layer.attn.sinks = Some((0..n_heads).map(|h| 0.1 + (l + h) as f32 * 0.05).collect());
+        }
         d.gpt_oss = Some(GptOssWeights {
             layers: (0..n_layers)
-                .map(|l| GptOssLayer {
-                    attn_sinks: (0..n_heads).map(|h| 0.1 + (l + h) as f32 * 0.05).collect(),
+                .map(|_| GptOssLayer {
                     o_bias: (0..hidden).map(|j| 0.02 * (j as f32 - 8.0)).collect(),
                     router_bias: (0..n_experts).map(|e| 0.03 * e as f32).collect(),
                     expert_bias: (0..n_experts)
@@ -6744,6 +6826,59 @@ mod metal_rope_tests {
             GluAct::from(ungated.ffn_activation).fused_kernel_gelu_flag(),
             None
         );
+    }
+
+    /// An attention output gate or a set of attention sinks keeps THAT
+    /// LAYER off every fused Metal attention launch, through the one
+    /// exhaustive destructure in `metal_attn_view`.
+    ///
+    /// Both sit between the softmax and `wo`, which the fused kernels
+    /// run with no host round-trip; a launch that ignored either would
+    /// answer differently from the host bodies for the same weights.
+    /// The gate is `afmoe` / `laguna` (`crate::attn_gate`); the sinks
+    /// used to be refused by the gpt-oss NAME, and this pins that they
+    /// are refused by the TENSOR now, on a model that is not gpt-oss.
+    /// Only reachable in a `--features metal` build.
+    #[test]
+    fn an_output_gate_or_attention_sinks_keep_the_layer_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let mut d = Decoder::new_random_small(plain.clone(), 2, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+        assert!(d.metal_attn_view(&d.layers[1]).is_some());
+
+        // A gate on layer 0 only.
+        let (n_heads, hidden) = (plain.n_heads, plain.hidden_dim);
+        d.layers[0].attn.output_gate = Some(crate::attn_gate::AttnGate {
+            proj: WeightMatrix::F32(Tensor::new(
+                vec![0.1; n_heads * hidden],
+                vec![n_heads, hidden],
+            )),
+            act: crate::attn_gate::GateAct::Sigmoid,
+            width: crate::attn_gate::GateWidth::PerHead,
+        });
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a gate no Metal kernel applies must refuse the fused attention"
+        );
+        assert!(d.metal_attn_view(&d.layers[0]).is_none());
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[1]),
+            "the fence is per layer: the ungated layer is still served"
+        );
+
+        // Sinks on layer 1, with `gpt_oss` still `None`.
+        d.layers[1].attn.sinks = Some(vec![0.5; n_heads]);
+        assert!(d.gpt_oss.is_none());
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[1]),
+            "sinks are refused by the tensor, not by the gpt-oss name"
+        );
+        assert!(d.metal_attn_view(&d.layers[1]).is_none());
     }
 
     /// A Gemma-3-4B-shaped config: `rope_scaling {linear, factor 8}`

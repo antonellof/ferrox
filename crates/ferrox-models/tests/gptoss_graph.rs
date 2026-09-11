@@ -166,8 +166,16 @@ fn gpt_oss_loader_wires_the_whole_graph() {
         .as_ref()
         .expect("gpt-oss checkpoint must take the gpt-oss path");
     assert_eq!(g.layers.len(), decoder.layers.len());
+    // The sinks live on the layer's attention weights now, loaded by
+    // tensor presence (`AttnWeights::sinks`); gpt-oss requires them
+    // and the loader refuses a gpt-oss file without one.
+    for layer in &decoder.layers {
+        assert_eq!(
+            layer.attn.sinks.as_ref().map(Vec::len),
+            Some(decoder.config.n_heads)
+        );
+    }
     for layer in &g.layers {
-        assert_eq!(layer.attn_sinks.len(), decoder.config.n_heads);
         assert_eq!(layer.o_bias.len(), decoder.config.hidden_dim);
         assert_eq!(layer.router_bias.len(), decoder.config.moe.n_experts);
         assert_eq!(layer.expert_bias.len(), decoder.config.moe.n_experts);
@@ -218,9 +226,12 @@ fn gpt_oss_golden_is_not_vacuous() {
     // 1. No attention sinks (the term ferrox had nowhere at all).
     {
         let mut decoder = load();
-        for layer in decoder.gpt_oss.as_mut().unwrap().layers.iter_mut() {
+        for layer in decoder.layers.iter_mut() {
             layer
-                .attn_sinks
+                .attn
+                .sinks
+                .as_mut()
+                .expect("gpt-oss layers carry sinks")
                 .iter_mut()
                 .for_each(|s| *s = f32::NEG_INFINITY);
         }

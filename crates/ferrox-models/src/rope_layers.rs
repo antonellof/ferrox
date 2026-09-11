@@ -197,9 +197,9 @@ pub fn rope_layers(arch: &str, n_layers: usize, has_sliding_window: bool) -> Rop
             no_rope_every(NoRopePhase::FirstOfPeriod)
         }
         // `afmoe.cpp:137-138` reads the step and never assigns it, so it
-        // is the default 4. LATENT: `afmoe` refuses today for its
-        // gated-attention topology, and this row is here so it stays
-        // right if that changes.
+        // is the default 4. LIVE since 2026-09-11: `afmoe` is audited on
+        // a four-layer fixture whose layer 3 is the unrotated one
+        // (`tests/gated_attention_graphs.rs`).
         "afmoe" => no_rope_every(NoRopePhase::LastOfPeriod),
         // `llama4.cpp:11` sets the step to `n_layer` ("always use rope",
         // its own comment) only when the file declares a window of ZERO;

@@ -193,16 +193,16 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **42** do
+   logit comparison against real `libllama`, or a fixture; **44** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
    `ernie4_5-moe`, `internlm2`, `xverse`, `baichuan`, `exaone`,
    `exaone4`, `exaone-moe`, `smollm3`, `plamo3`, `granite`, `granitemoe`,
    `granite-moe`, `minicpm`, `olmo`, `dbrx`, `grok`, `arcee`, `deci`,
-   `openelm`,
+   `openelm`, `afmoe`, `laguna`,
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **15** stop with `UnauditedArchitecture`.
+   **13** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
@@ -258,7 +258,7 @@ reading nobody has done, and the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 15 have now been read on both sides (`ferrox_models::capability`,
+All 13 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -267,13 +267,13 @@ on models":
 |---|---|
 | fixture-away | 0 |
 | one match arm | 0 |
-| new code | 14 |
+| new code | 12 |
 | unknown | 1 |
 
 **Both cheap classes are empty.** `gemma` was the last fixture-away row
 and `chatglm` the last one-match-arm row; nothing still refusing is one
 fixture or one arm away. That is a better answer than the count alone:
-the cheap wins are spent, and what is left is 14 rows needing a
+the cheap wins are spent, and what is left is 12 rows needing a
 different graph plus one name nobody can get a file for.
 
 It was 47 until the triage itself removed one. Reading
@@ -329,23 +329,97 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (14).** A different attention or residual structure. The
-recurring shapes, rather than 14 separate stories:
+**New code (12).** A different attention or residual structure. The
+recurring shapes, rather than 12 separate stories:
 
 The column moved for the first time on 2026-09-10, three times: 26 to
-24, 24 to 21, then 21 to 20, and on 2026-09-11 three times more, 20 to
-19, 19 to 17 and 17 to 14. The first two took several rows at once, and
-for the same reason -- each found ONE cause behind several refusals.
-The fourth did too, and the count hides it: the per-layer RoPE gate
-closed THREE refusals and only one of them (`exaone-moe`) was ever in
-this column. The fifth is a different lesson, below: `grok` and `dbrx`
-each closed by extending a seam that had landed the day before, and the
-clamp one of them needed closed a refusal-by-name on a third row. The
-sixth is two lessons at once: `deci` and `openelm` closed together on a
-seam whose reach was MEASURED across all 140 graphs before it was
-built, and `arcee` closed alone because the constant that said it
-shared a cause with `plm` had been read from one file and not the
-other.
+24, 24 to 21, then 21 to 20, and on 2026-09-11 four times more, 20 to
+19, 19 to 17, 17 to 14 and 14 to 12. The first two took several rows at
+once, and for the same reason -- each found ONE cause behind several
+refusals. The fourth did too, and the count hides it: the per-layer
+RoPE gate closed THREE refusals and only one of them (`exaone-moe`) was
+ever in this column. The fifth is a different lesson, below: `grok` and
+`dbrx` each closed by extending a seam that had landed the day before,
+and the clamp one of them needed closed a refusal-by-name on a third
+row. The sixth is two lessons at once: `deci` and `openelm` closed
+together on a seam whose reach was MEASURED across all 140 graphs
+before it was built, and `arcee` closed alone because the constant that
+said it shared a cause with `plm` had been read from one file and not
+the other. The seventh is the sixth's lesson applied to the sixth's
+leftovers: the per-layer shape seam had narrowed `afmoe`, `laguna` and
+`step35` to the same last word, `wqkv_gate`, and reading the three
+graphs side by side found one op with two free parameters rather than
+one graph -- two rows closed on it and the third says so.
+
+`afmoe` and `laguna` were the GATED-ATTENTION pair, and `step35` is
+the third graph with the op. llama.cpp's `LLM_TENSOR_ATTN_GATE`
+(`blk.N.attn_gate.weight`) is created by six of the 140 graphs
+(measured); three of those -- `qwen3next`, `qwen35`, `qwen35moe` --
+keep the gated delta-net's `z` projection under that name, a different
+op on a different engine, which is why the seam is keyed by
+architecture and not by tensor presence. In the three that gate their
+softmax attention the gate is projected from the SAME normed input
+Q/K/V read and multiplied into the attention output after the
+softmax-weighted V sum and before `wo` -- identical -- and what differs
+is the activation (`afmoe.cpp:183` and `step35.cpp:272` sigmoid,
+`laguna.cpp:246` SOFTPLUS), the width (`afmoe.cpp:73` one value per
+channel, `step35.cpp:96` one per head broadcast over `head_dim`,
+`laguna.cpp:110-124` either, read off the stored tensor with an abort
+for anything else) and whether the tensor may be absent
+(`step35.cpp:96` `TENSOR_NOT_REQUIRED`). So `ferrox_models::attn_gate`
+has two axes, `GateAct` and `GateWidth`, a per-architecture table that
+pins the activation and the ADMISSIBLE widths, and a loader that reads
+the width off the tensor and refuses one the table does not admit. It
+is applied in ONE function for the row body and the two batched host
+bodies -- which collapsed the three hand-written `o_proj` / `o_bias` /
+`post_attn_norm` tails onto it, so the gate was added to one place
+rather than three -- and refused on every fused Metal launch by an
+EXHAUSTIVE destructure of `AttnWeights` (`Decoder::metal_attn_view`),
+so a field added to that struct does not compile until the Metal side
+says whether the kernels serve it. Three libllama-golden fixtures
+(`tests/gated_attention_graphs.rs`): `afmoe` (sigmoid / per element,
+KL 7.03e-13), `laguna` in its M.1 shape (softplus / per element, KL
+1.51e-13) and in its XS.2 shape (softplus / per head, a `head_count`
+ARRAY so the per-head gate is sized by each layer's own count, a window
+with its own base, KL 9.57e-14). Building them found two more things.
+`afmoe.cpp:120` scales its embeddings by `sqrt(n_embd)` from arithmetic,
+the only non-Gemma graph that does (measured) -- one table now,
+`capability::embeddings_scaled_by_sqrt_n_embd`, where the Gemma side
+had been a family match in the loader. And the loader's shared-expert
+inference probed `blk.0` for a `_shexp` tensor when the count key was
+absent, which answered 0 for every leading-dense model: `laguna.cpp:20`
+assigns `n_expert_shared = 1` before reading a key its converter never
+writes, and its layer 0 is dense, so a real Laguna export would have
+loaded with its three REQUIRED shared-expert tensors unread on every
+MoE layer. The probe is the first MoE layer now. Two Laguna things stay
+refused by name, each from a fixture libllama runs: a
+`rope.dimension_count_swa` differing from `rope.dimension_count`
+(`llama-hparams.cpp:85-91` gives the sliding layers their own rotary
+width; `ferrox_models::swa_geometry` refuses it together with the two
+`_swa` head-width keys, for every architecture), and a window together
+with a RoPE scaling (`laguna.cpp:48,181-193` run the sliding layers
+with YaRN off -- the Olmo-3 rule, one table now for `olmo2`, `mellum`
+and `laguna` where it had been `arch == "olmo2"`). Real Laguna-M.1 has
+neither; real Laguna-XS.2 has both and stops at the first. `step35`
+keeps the two things its verdict now leads with (per-layer SwiGLU clamp
+arrays, a per-layer window ARRAY) plus its halved full-layer rotary
+width and its MTP blocks, and says the gate is done.
+
+`mimo2`'s sinks moved the same way without closing the row. Four
+graphs pass `attn_sinks` into the one `build_attn_mha`
+(`openai-moe.cpp:115`, `mimo2.cpp:177`, `dflash`, `deepseek4`), so the
+rule is "the tensor is present", not "the architecture is gpt-oss":
+`AttnWeights::sinks` is loaded by presence on the generic path, the
+gpt-oss loader checks it was (the tensor is REQUIRED there), and the
+fused Metal launches refuse a layer with sinks by the same exhaustive
+destructure -- by the tensor, on a model that is not gpt-oss, which a
+test pins. What stops `mimo2` is what every real export carries:
+`conversion/mimo.py` ALWAYS appends three NEXTN blocks inside
+`block_count` and writes `nextn_predict_layers = 3`, and ALWAYS writes
+`attention.sliding_window_pattern` as the per-layer `hybrid_layer_pattern`
+ARRAY, which for this architecture is a per-layer bool even as a scalar
+(`get_key_or_arr(..., is_swa_impl, n_layer)` broadcasts it) and not a
+period.
 
 `olmo2` and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and
 no `ffn_norm` at all, both sublayers reading the raw residual, each
@@ -562,14 +636,16 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 
 | Shape | Architectures |
 |---|---|
-| Per-layer head counts or FFN width | CLOSED (`ferrox_models::layer_shapes`): `deci` and `openelm` run on it; `laguna`, `step35` and `mimo2` still refuse for the rows below and their verdicts say so |
+| Per-layer head counts or FFN width | CLOSED (`ferrox_models::layer_shapes`): `deci`, `openelm` and `laguna` run on it; `step35` and `mimo2` still refuse for the rows below and their verdicts say so |
 | A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `talkie`, `bitnet` (`olmo`, `olmo2`, `exaone4` and `dbrx` were here and are CLOSED) |
 | LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`) and weighted (`dbrx`) forms; the bias group below still refuses for more than the norm |
-| Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all six (`ferrox_models::rope_layers`): `exaone-moe`, `smollm3` and EXAONE-4 32B run on it; `smallthinker` and `afmoe` still refuse for the rows below and their verdicts say so |
+| Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all six (`ferrox_models::rope_layers`): `exaone-moe`, `smollm3`, EXAONE-4 32B and `afmoe` run on it; `smallthinker` still refuses for the rows below and its verdict says so |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
 | Hardcoded scales applied even when the GGUF carries no key | `mistral3` (`grok` was here and is CLOSED on the MiniCPM defaults hook) |
-| A gated attention tensor (`wqkv_gate`) | `laguna`, `step35`, `afmoe` |
-| Attention sinks outside gpt-oss | `mimo2` |
+| A gated attention tensor (`wqkv_gate`) | CLOSED (`ferrox_models::attn_gate`): `afmoe` and `laguna` run on it; `step35` still refuses for the rows below and its verdict says so |
+| Attention sinks outside gpt-oss | CLOSED as a tensor-presence fact (`AttnWeights::sinks`, CPU; the fused Metal launches refuse the layer); `mimo2` still refuses for the rows below |
+| A per-layer sliding-window ARRAY (`is_swa_impl`), and NEXTN/MTP blocks inside `block_count` that every export carries | `mimo2`, `step35` |
+| Per-layer SwiGLU clamp arrays (`swiglu_clamp_exp` / `_shexp`) | `step35` |
 | An ungated or non-SwiGLU FFN | CLOSED for the ungated ReLU-squared form (`FfnActivation::ReluSqr`): `arcee` runs on it; `plm` shares the FFN and refuses on MLA attention; `apertus` is xIELU |
 | Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature), `plm` (MLA attention on a dense model) |
 

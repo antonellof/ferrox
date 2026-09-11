@@ -8,6 +8,7 @@
 //! support. Dedicated primitives live in `glm52_*`, `deepseek_v4_*`,
 //! `kimi_*` modules.
 
+pub mod attn_gate;
 pub mod bert_encoder;
 pub mod bert_gguf_loader;
 pub mod block_residual;
@@ -78,6 +79,7 @@ pub mod sampler_order;
 pub mod sampling;
 pub mod scalar_multipliers;
 pub mod speculative;
+pub mod swa_geometry;
 pub mod t5_engine;
 pub mod tensor_role;
 pub mod tokenizer;
