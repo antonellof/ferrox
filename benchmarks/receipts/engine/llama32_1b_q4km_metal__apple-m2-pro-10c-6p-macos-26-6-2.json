@@ -7,9 +7,9 @@
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.35,
-  "host_load_1min_start": 1.47,
+  "ferrox_version": "0.20.0",
+  "host_load_1min_end": 1.62,
+  "host_load_1min_start": 1.41,
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
@@ -35,7 +35,7 @@
   },
   "id": "llama32_1b_q4km",
   "kind": "engine",
-  "load_s": 0.03670375,
+  "load_s": 0.037102292,
   "model_path": "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -45,27 +45,27 @@
   "tests": [
     {
       "ferrox_samples": [
-        1813.3171698774104,
-        1818.5108937433356,
-        1814.8611250189417
+        1819.4751380680457,
+        1811.0516640476808,
+        1814.0270906097107
       ],
-      "ferrox_stddev": 2.177648497707409,
-      "ferrox_tps": 1814.8611250189417,
-      "gap": 1.0413579165625,
-      "llama_tps": 1889.92,
+      "ferrox_stddev": 3.4879044792295413,
+      "ferrox_tps": 1814.0270906097107,
+      "gap": 1.0408499463838672,
+      "llama_tps": 1888.13,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        153.4667447641346,
-        151.4586548193656,
-        151.09622239364742
+        157.66411586081568,
+        156.15373023410046,
+        158.08158121101604
       ],
-      "ferrox_stddev": 1.0426013832116987,
-      "ferrox_tps": 151.4586548193656,
-      "gap": 0.9819841604785156,
-      "llama_tps": 148.73,
+      "ferrox_stddev": 0.8281271674487485,
+      "ferrox_tps": 157.66411586081568,
+      "gap": 0.9464423733028124,
+      "llama_tps": 149.22,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }

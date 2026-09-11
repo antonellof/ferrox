@@ -11,13 +11,14 @@ Measured against llama.cpp on the same host and the same GGUF with
 is faster.
 
 - **Dense GQA**: TinyLlama, Llama 3.2, SmolLM2, Qwen2.5/Qwen3,
-  Gemma-2/3/4, Phi-4-mini. Re-measured on 2026-09-09 on a quiet M2 Pro:
-  **12 of 14 comparable Metal `tg128` rows are faster than llama.cpp**
-  (SmolLM2-135M **0.64×**, Qwen2.5-0.5B **0.65×**, Qwen3-0.6B **0.76×**,
-  Gemma-3-1B **0.80×**, TinyLlama **0.86×**, down to Llama-3.1-8B and
-  Phi-4-mini at **0.98×**). The two that are not: Llama-3.2-3B at 1.03×
-  and Gemma-2-2B at **1.11×**, which is the worst Metal row. Dense Metal
-  prefill spans **1.01× to 1.10×**. **CPU is a different story and is
+  Gemma-2/3/4, Phi-4-mini, Mistral-7B. Re-measured on 2026-09-11 on a
+  quiet M2 Pro after the Metal kernel work in #208: **every one of the
+  16 comparable Metal `tg128` rows is faster than llama.cpp**, from
+  SmolLM2-135M and Qwen2.5-0.5B at **0.60×** through Qwen3-0.6B
+  **0.61×**, Gemma-3-1B **0.68×**, TinyLlama **0.83×**, Phi-4-mini
+  **0.88×**, up to OLMoE at **0.96×** as the closest row. Gemma-2-2B,
+  the worst row two days earlier at 1.11×, reads **0.94×**. Dense Metal
+  prefill spans **0.99× to 1.09×**. **CPU is a different story and is
   behind on every row**: prefill 6.3× to 10.1× and decode 1.06× to
   1.92× on x86, though the AVX2 GEMM tier that closes the prefill half
   landed unmeasured.
@@ -435,8 +436,8 @@ checked against the code rather than asserted. The gap is the roadmap.
 
 Two honest notes. Ferrox runs on Apple Metal, which that description
 does not cover, and Metal is where it is fastest: every `pp512` row is
-1.01x to 1.10x against llama.cpp and **12 of 14** comparable `tg128`
-rows are faster. And the single largest gap is not on this table:
+0.99x to 1.09x against llama.cpp and **every one of the 16** comparable
+`tg128` rows is faster. And the single largest gap is not on this table:
 running a model that does not fit in memory works as policy and not as
 execution.
 

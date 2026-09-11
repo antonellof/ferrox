@@ -7,9 +7,9 @@
   "engine_env": {
     "FERROX_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.17.1",
-  "host_load_1min_end": 1.38,
-  "host_load_1min_start": 1.32,
+  "ferrox_version": "0.20.0",
+  "host_load_1min_end": 1.8,
+  "host_load_1min_start": 1.69,
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
@@ -35,7 +35,7 @@
   },
   "id": "qwen3_06b_q8",
   "kind": "engine",
-  "load_s": 0.040841583,
+  "load_s": 0.0399685,
   "model_path": "models/hf_test/Qwen3-0.6B-Q8_0.gguf",
   "quant": "quantized",
   "quiet_host": true,
@@ -45,27 +45,27 @@
   "tests": [
     {
       "ferrox_samples": [
-        3204.2731987110938,
-        3449.8955099421273,
-        3484.1269369244956
+        3371.6364847470786,
+        3564.1534569939113,
+        3534.841531466227
       ],
-      "ferrox_stddev": 124.64180909030625,
-      "ferrox_tps": 3449.8955099421273,
-      "gap": 1.0178134351839843,
-      "llama_tps": 3511.35,
+      "ferrox_stddev": 84.69412996570374,
+      "ferrox_tps": 3534.841531466227,
+      "gap": 0.9901094487107813,
+      "llama_tps": 3499.88,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
       "ferrox_samples": [
-        151.75678485467287,
-        153.16242261670521,
-        151.69452706127376
+        192.05483175049218,
+        190.62077519953186,
+        187.54648607057524
       ],
-      "ferrox_stddev": 0.6777750292559089,
-      "ferrox_tps": 151.75678485467287,
-      "gap": 0.7626018178417969,
-      "llama_tps": 115.73,
+      "ferrox_stddev": 1.8806899623217135,
+      "ferrox_tps": 190.62077519953186,
+      "gap": 0.609272519631875,
+      "llama_tps": 116.14,
       "test": "tg128",
       "workload_digest": "044655d19aa3baa5"
     }
