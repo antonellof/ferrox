@@ -14,167 +14,36 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLDevice, MTLSize};
 use std::ptr::NonNull;
 
+/// One RMSNorm kernel for every row shape the stacks encode, templated
+/// on whether a residual add precedes the norm (ggml F=3) and on the
+/// output type (f32, or f16 straight into the prefill GEMM's staging).
+/// Row `r` is threadgroup `r`, so the single-row decode call is the
+/// batch call with one threadgroup.
+///
+/// WHY THE FLOAT4 LOOP IS THE WHOLE POINT. The previous kernels read
+/// one float per thread per iteration with a runtime trip count, and
+/// an Apple GPU issues those loads in order: every iteration paid a
+/// full memory latency, ~0.4 us, so a 2304-wide norm at 256 threads
+/// was 9 iterations x 2 loops x 0.4 us = 14.2 us serialized
+/// (`crate::kernel_bench`) against llama.cpp's 3.2 us for the same
+/// op. float4 loads and a threadgroup sized to the row make it one or
+/// two iterations. The scalar path stays for a width that is not a
+/// multiple of four, where a `float4*` into row `r` would not be
+/// 16-byte aligned, and every caller's byte offset is `row * n * 4`,
+/// so `n % 4 == 0` is the one alignment fact that decides both.
 const RMS_NORM_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void rms_norm_f32(
-    device const float* x [[buffer(0)]],
-    device const float* weight [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    constant float& eps [[buffer(4)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg [[threads_per_threadgroup]],
-    uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tiisg [[thread_index_in_simdgroup]],
-    threadgroup float* scratch [[threadgroup(0)]]
-) {
-    float partial = 0.0f;
-    for (uint i = tid; i < n; i += tg) {
-        float v = x[i];
-        partial += v * v;
-    }
-    partial = simd_sum(partial);
-    if (tiisg == 0u) {
-        scratch[sgitg] = partial;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = 0.0f;
-    const uint nsg = (tg + 31u) / 32u;
-    if (tiisg < nsg) {
-        total = scratch[tiisg];
-    }
-    total = simd_sum(total);
-    float inv_rms = rsqrt(total / float(n) + eps);
-    for (uint i = tid; i < n; i += tg) {
-        out[i] = x[i] * inv_rms * weight[i];
-    }
-}
-
-// One threadgroup per row — avoids B separate dispatches on prefill.
-kernel void rms_norm_f32_batch(
-    device const float* x [[buffer(0)]],
-    device const float* weight [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    constant float& eps [[buffer(4)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg [[threads_per_threadgroup]],
-    uint row [[threadgroup_position_in_grid]],
-    uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tiisg [[thread_index_in_simdgroup]],
-    threadgroup float* scratch [[threadgroup(0)]]
-) {
-    device const float* xr = x + row * n;
-    device float* orow = out + row * n;
-    float partial = 0.0f;
-    for (uint i = tid; i < n; i += tg) {
-        float v = xr[i];
-        partial += v * v;
-    }
-    partial = simd_sum(partial);
-    if (tiisg == 0u) {
-        scratch[sgitg] = partial;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = 0.0f;
-    const uint nsg = (tg + 31u) / 32u;
-    if (tiisg < nsg) {
-        total = scratch[tiisg];
-    }
-    total = simd_sum(total);
-    float inv_rms = rsqrt(total / float(n) + eps);
-    for (uint i = tid; i < n; i += tg) {
-        orow[i] = xr[i] * inv_rms * weight[i];
-    }
-}
-
-// RMSNorm writing half (skip separate f32→f16 before mul_mm_sg_f16).
-kernel void rms_norm_f32_to_f16_batch(
-    device const float* x [[buffer(0)]],
-    device const float* weight [[buffer(1)]],
-    device half* out [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    constant float& eps [[buffer(4)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg [[threads_per_threadgroup]],
-    uint row [[threadgroup_position_in_grid]],
-    uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tiisg [[thread_index_in_simdgroup]],
-    threadgroup float* scratch [[threadgroup(0)]]
-) {
-    device const float* xr = x + row * n;
-    device half* orow = out + row * n;
-    float partial = 0.0f;
-    for (uint i = tid; i < n; i += tg) {
-        float v = xr[i];
-        partial += v * v;
-    }
-    partial = simd_sum(partial);
-    if (tiisg == 0u) {
-        scratch[sgitg] = partial;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = 0.0f;
-    const uint nsg = (tg + 31u) / 32u;
-    if (tiisg < nsg) {
-        total = scratch[tiisg];
-    }
-    total = simd_sum(total);
-    float inv_rms = rsqrt(total / float(n) + eps);
-    for (uint i = tid; i < n; i += tg) {
-        orow[i] = half(xr[i] * inv_rms * weight[i]);
-    }
-}
-"#;
-
-const ADD_RMS_NORM_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void add_rms_norm_f32(
+// ADD: `h[row] += add[row]` first (h is then the residual stream and
+// is written back); otherwise `h` is read only and `add` is unused.
+// OUT4/OUT: float4/float, or half4/half for the prefill GEMM.
+template <bool ADD, typename OUT4, typename OUT>
+kernel void rms_norm_rows(
     device float* h [[buffer(0)]],
     device const float* add [[buffer(1)]],
     device const float* weight [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant uint& n [[buffer(4)]],
-    constant float& eps [[buffer(5)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg [[threads_per_threadgroup]],
-    uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tiisg [[thread_index_in_simdgroup]],
-    threadgroup float* scratch [[threadgroup(0)]]
-) {
-    float partial = 0.0f;
-    for (uint i = tid; i < n; i += tg) {
-        float v = h[i] + add[i];
-        h[i] = v;
-        partial += v * v;
-    }
-    partial = simd_sum(partial);
-    if (tiisg == 0u) {
-        scratch[sgitg] = partial;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = 0.0f;
-    const uint nsg = (tg + 31u) / 32u;
-    if (tiisg < nsg) {
-        total = scratch[tiisg];
-    }
-    total = simd_sum(total);
-    float inv_rms = rsqrt(total / float(n) + eps);
-    for (uint i = tid; i < n; i += tg) {
-        out[i] = h[i] * inv_rms * weight[i];
-    }
-}
-
-// One threadgroup per row (prefill B tokens).
-kernel void add_rms_norm_f32_batch(
-    device float* h [[buffer(0)]],
-    device const float* add [[buffer(1)]],
-    device const float* weight [[buffer(2)]],
-    device float* out [[buffer(3)]],
+    device OUT* out [[buffer(3)]],
     constant uint& n [[buffer(4)]],
     constant float& eps [[buffer(5)]],
     uint tid [[thread_position_in_threadgroup]],
@@ -186,12 +55,30 @@ kernel void add_rms_norm_f32_batch(
 ) {
     device float* hr = h + row * n;
     device const float* ar = add + row * n;
-    device float* orow = out + row * n;
+    device OUT* orow = out + row * n;
+    const bool vec4 = (n % 4u) == 0u;
     float partial = 0.0f;
-    for (uint i = tid; i < n; i += tg) {
-        float v = hr[i] + ar[i];
-        hr[i] = v;
-        partial += v * v;
+    if (vec4) {
+        device float4* h4 = (device float4*)hr;
+        device const float4* a4 = (device const float4*)ar;
+        const uint n4 = n / 4u;
+        for (uint i = tid; i < n4; i += tg) {
+            float4 v = h4[i];
+            if (ADD) {
+                v += a4[i];
+                h4[i] = v;
+            }
+            partial += dot(v, v);
+        }
+    } else {
+        for (uint i = tid; i < n; i += tg) {
+            float v = hr[i];
+            if (ADD) {
+                v += ar[i];
+                hr[i] = v;
+            }
+            partial += v * v;
+        }
     }
     partial = simd_sum(partial);
     if (tiisg == 0u) {
@@ -205,53 +92,27 @@ kernel void add_rms_norm_f32_batch(
     }
     total = simd_sum(total);
     float inv_rms = rsqrt(total / float(n) + eps);
-    for (uint i = tid; i < n; i += tg) {
-        orow[i] = hr[i] * inv_rms * weight[i];
+    if (vec4) {
+        device const float4* h4 = (device const float4*)hr;
+        device const float4* w4 = (device const float4*)weight;
+        device OUT4* o4 = (device OUT4*)orow;
+        const uint n4 = n / 4u;
+        for (uint i = tid; i < n4; i += tg) {
+            o4[i] = OUT4(h4[i] * inv_rms * w4[i]);
+        }
+    } else {
+        for (uint i = tid; i < n; i += tg) {
+            orow[i] = OUT(hr[i] * inv_rms * weight[i]);
+        }
     }
 }
 
-// Same, writing half — folds the f32→f16 staging convert that used to sit
-// between this norm and `mul_mm_sg_f16` into the norm's own store loop.
-// Saves one dispatch and, more importantly, one barrier per layer.
-kernel void add_rms_norm_f32_to_f16_batch(
-    device float* h [[buffer(0)]],
-    device const float* add [[buffer(1)]],
-    device const float* weight [[buffer(2)]],
-    device half* out [[buffer(3)]],
-    constant uint& n [[buffer(4)]],
-    constant float& eps [[buffer(5)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg [[threads_per_threadgroup]],
-    uint row [[threadgroup_position_in_grid]],
-    uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tiisg [[thread_index_in_simdgroup]],
-    threadgroup float* scratch [[threadgroup(0)]]
-) {
-    device float* hr = h + row * n;
-    device const float* ar = add + row * n;
-    device half* orow = out + row * n;
-    float partial = 0.0f;
-    for (uint i = tid; i < n; i += tg) {
-        float v = hr[i] + ar[i];
-        hr[i] = v;
-        partial += v * v;
-    }
-    partial = simd_sum(partial);
-    if (tiisg == 0u) {
-        scratch[sgitg] = partial;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = 0.0f;
-    const uint nsg = (tg + 31u) / 32u;
-    if (tiisg < nsg) {
-        total = scratch[tiisg];
-    }
-    total = simd_sum(total);
-    float inv_rms = rsqrt(total / float(n) + eps);
-    for (uint i = tid; i < n; i += tg) {
-        orow[i] = half(hr[i] * inv_rms * weight[i]);
-    }
-}
+typedef decltype(rms_norm_rows<false, float4, float>) rms_norm_f32_t;
+typedef decltype(rms_norm_rows<false, half4, half>) rms_norm_f16_t;
+template [[host_name("rms_norm_f32")]] kernel rms_norm_f32_t rms_norm_rows<false, float4, float>;
+template [[host_name("add_rms_norm_f32")]] kernel rms_norm_f32_t rms_norm_rows<true, float4, float>;
+template [[host_name("rms_norm_f32_to_f16")]] kernel rms_norm_f16_t rms_norm_rows<false, half4, half>;
+template [[host_name("add_rms_norm_f32_to_f16")]] kernel rms_norm_f16_t rms_norm_rows<true, half4, half>;
 "#;
 
 const RMS_NORM_PER_HEAD_KERNEL_SRC: &str = r#"
@@ -305,42 +166,22 @@ pub(crate) fn encode_rms_norm_at(
     n: u32,
     eps: f32,
 ) -> Result<(), MetalError> {
-    let pipe = ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32")?;
-    encoder.setComputePipelineState(&pipe.0);
-    let tg = 256u32;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(x), x_off_bytes, 0);
-        encoder.setBuffer_offset_atIndex(Some(weight), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(out), out_off_bytes, 2);
-        let mut n_u = n;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
-        let mut eps_f = eps;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        // One float per simdgroup (simd_sum path).
-        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
-    }
-    dispatch_counted(
+    encode_norm_rows(
         encoder,
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
+        device,
+        NormRows {
+            h: x,
+            h_off_bytes: x_off_bytes,
+            add: None,
+            weight,
+            out,
+            out_off_bytes,
+            out_half: false,
+            n,
+            rows: 1,
+            eps,
         },
-        MTLSize {
-            width: tg as usize,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
+    )
 }
 
 /// Batched RMSNorm: one threadgroup per row of length `n` (`batch` rows).
@@ -357,47 +198,22 @@ pub(crate) fn encode_rms_norm_batch(
     batch: u32,
     eps: f32,
 ) -> Result<(), MetalError> {
-    if batch == 0 {
-        return Ok(());
-    }
-    if batch == 1 {
-        return encode_rms_norm(encoder, device, x, weight, out, n, eps);
-    }
-    let pipe = ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_batch")?;
-    encoder.setComputePipelineState(&pipe.0);
-    let tg = 256u32;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(x), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(weight), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(out), 0, 2);
-        let mut n_u = n;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
-        let mut eps_f = eps;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
-    }
-    dispatch_counted(
+    encode_norm_rows(
         encoder,
-        MTLSize {
-            width: batch as usize,
-            height: 1,
-            depth: 1,
+        device,
+        NormRows {
+            h: x,
+            h_off_bytes: 0,
+            add: None,
+            weight,
+            out,
+            out_off_bytes: 0,
+            out_half: false,
+            n,
+            rows: batch,
+            eps,
         },
-        MTLSize {
-            width: tg as usize,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
+    )
 }
 
 /// Batched RMSNorm writing `half` rows (prefill → `mul_mm_sg_f16`).
@@ -407,53 +223,31 @@ pub(crate) fn encode_rms_norm_f32_to_f16_batch(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     x: &ProtocolObject<dyn MTLBuffer>,
     weight: &ProtocolObject<dyn MTLBuffer>,
-    out_h: &ProtocolObject<dyn MTLBuffer>,
+    out: &ProtocolObject<dyn MTLBuffer>,
     n: u32,
     batch: u32,
     eps: f32,
 ) -> Result<(), MetalError> {
-    if batch == 0 {
-        return Ok(());
-    }
-    let pipe = ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_to_f16_batch")?;
-    encoder.setComputePipelineState(&pipe.0);
-    let tg = 256u32;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(x), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(weight), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(out_h), 0, 2);
-        let mut n_u = n;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
-            4,
-            3,
-        );
-        let mut eps_f = eps;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
-    }
-    dispatch_counted(
+    encode_norm_rows(
         encoder,
-        MTLSize {
-            width: batch as usize,
-            height: 1,
-            depth: 1,
+        device,
+        NormRows {
+            h: x,
+            h_off_bytes: 0,
+            add: None,
+            weight,
+            out,
+            out_off_bytes: 0,
+            out_half: true,
+            n,
+            rows: batch,
+            eps,
         },
-        MTLSize {
-            width: tg as usize,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
+    )
 }
 
 /// `h += add`, then `out = rms_norm(h) * weight`. One dispatch replaces
-/// [`encode_vec_add`] + [`encode_rms_norm`].
+/// [`crate::elem::encode_vec_add`] + [`encode_rms_norm`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_add_rms_norm(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -465,43 +259,7 @@ pub(crate) fn encode_add_rms_norm(
     n: u32,
     eps: f32,
 ) -> Result<(), MetalError> {
-    let pipe = ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32")?;
-    encoder.setComputePipelineState(&pipe.0);
-    let tg = 256u32;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(h), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(add), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(weight), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
-        let mut n_u = n;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        let mut eps_f = eps;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
-            4,
-            5,
-        );
-        // One float per simdgroup (tg/32).
-        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
-    }
-    dispatch_counted(
-        encoder,
-        MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg as usize,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
+    encode_add_rms_norm_batch(encoder, device, h, add, weight, out, n, 1, eps)
 }
 
 /// Batched [`encode_add_rms_norm`]: `h[row] += add[row]`, then
@@ -518,58 +276,28 @@ pub(crate) fn encode_add_rms_norm_batch(
     batch: u32,
     eps: f32,
 ) -> Result<(), MetalError> {
-    if batch == 0 {
-        return Ok(());
-    }
-    if batch == 1 {
-        return encode_add_rms_norm(encoder, device, h, add, weight, out, n, eps);
-    }
-    let pipe = ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32_batch")?;
-    encoder.setComputePipelineState(&pipe.0);
-    let tg = 256u32;
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(h), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(add), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(weight), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
-        let mut n_u = n;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
-            4,
-            4,
-        );
-        let mut eps_f = eps;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
-            4,
-            5,
-        );
-        encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
-    }
-    dispatch_counted(
+    encode_norm_rows(
         encoder,
-        MTLSize {
-            width: batch as usize,
-            height: 1,
-            depth: 1,
+        device,
+        NormRows {
+            h,
+            h_off_bytes: 0,
+            add: Some(add),
+            weight,
+            out,
+            out_off_bytes: 0,
+            out_half: false,
+            n,
+            rows: batch,
+            eps,
         },
-        MTLSize {
-            width: tg as usize,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
+    )
 }
 
 /// [`encode_add_rms_norm_batch`] storing `half` — the fused residual add +
 /// FFN RMSNorm + f32→f16 staging convert the dense prefill layer needs
 /// before `mul_mm_sg_f16`. `h` is still updated in f32 (it is the residual
 /// stream); only `out` is half. Saves one dispatch and one barrier/layer.
-///
-/// Unlike [`encode_add_rms_norm_batch`] there is no `batch == 1` fallback:
-/// the one-threadgroup-per-row kernel is correct at any batch and the only
-/// caller (the prefill stack) rejects `batch < 4` anyway.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_add_rms_norm_f32_to_f16_batch(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -582,39 +310,102 @@ pub(crate) fn encode_add_rms_norm_f32_to_f16_batch(
     batch: u32,
     eps: f32,
 ) -> Result<(), MetalError> {
-    if batch == 0 {
+    encode_norm_rows(
+        encoder,
+        device,
+        NormRows {
+            h,
+            h_off_bytes: 0,
+            add: Some(add),
+            weight,
+            out,
+            out_off_bytes: 0,
+            out_half: true,
+            n,
+            rows: batch,
+            eps,
+        },
+    )
+}
+
+/// One RMSNorm dispatch over `rows` contiguous rows of `n`, as the
+/// eight public encoders above spell it.
+struct NormRows<'a> {
+    h: &'a ProtocolObject<dyn MTLBuffer>,
+    h_off_bytes: usize,
+    /// `Some`: `h += add` before the norm, and `h` is written back.
+    add: Option<&'a ProtocolObject<dyn MTLBuffer>>,
+    weight: &'a ProtocolObject<dyn MTLBuffer>,
+    out: &'a ProtocolObject<dyn MTLBuffer>,
+    out_off_bytes: usize,
+    /// `out` is `half` rows rather than `f32`.
+    out_half: bool,
+    n: u32,
+    rows: u32,
+    eps: f32,
+}
+
+/// The kernel entry point for a (residual add, output type) pair. One
+/// table, read by the encoder and by the prefill warm-up.
+fn norm_kernel_name(add: bool, out_half: bool) -> &'static str {
+    match (add, out_half) {
+        (false, false) => "rms_norm_f32",
+        (true, false) => "add_rms_norm_f32",
+        (false, true) => "rms_norm_f32_to_f16",
+        (true, true) => "add_rms_norm_f32_to_f16",
+    }
+}
+
+/// Threads per row: enough that the float4 loop runs once or twice,
+/// never fewer than a simdgroup, never more than Metal allows. `n` here
+/// is the element count the loop strides over (float4s, or floats on
+/// the scalar path).
+fn norm_threadgroup(n: u32) -> u32 {
+    let per_thread_units = if n.is_multiple_of(4) { n / 4 } else { n };
+    per_thread_units
+        .div_ceil(2)
+        .next_power_of_two()
+        .clamp(32, 1024)
+}
+
+fn encode_norm_rows(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    r: NormRows<'_>,
+) -> Result<(), MetalError> {
+    if r.rows == 0 {
         return Ok(());
     }
-    let pipe = ensure_pipeline(
-        device,
-        ADD_RMS_NORM_KERNEL_SRC,
-        "add_rms_norm_f32_to_f16_batch",
-    )?;
+    let name = norm_kernel_name(r.add.is_some(), r.out_half);
+    let pipe = ensure_pipeline(device, RMS_NORM_KERNEL_SRC, name)?;
     encoder.setComputePipelineState(&pipe.0);
-    let tg = 256u32;
+    let tg = norm_threadgroup(r.n);
     unsafe {
-        encoder.setBuffer_offset_atIndex(Some(h), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(add), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(weight), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(out), 0, 3);
-        let mut n_u = n;
+        encoder.setBuffer_offset_atIndex(Some(r.h), r.h_off_bytes, 0);
+        // Without a residual the kernel never reads index 1; `h` is a
+        // valid buffer to leave bound there.
+        encoder.setBuffer_offset_atIndex(Some(r.add.unwrap_or(r.h)), r.h_off_bytes, 1);
+        encoder.setBuffer_offset_atIndex(Some(r.weight), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(r.out), r.out_off_bytes, 3);
+        let mut n_u = r.n;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
             4,
             4,
         );
-        let mut eps_f = eps;
+        let mut eps_f = r.eps;
         encoder.setBytes_length_atIndex(
             NonNull::new(&mut eps_f as *mut f32 as *mut _).unwrap(),
             4,
             5,
         );
+        // One float per simdgroup (simd_sum path).
         encoder.setThreadgroupMemoryLength_atIndex(((tg as usize) / 32) * 4, 0);
     }
     dispatch_counted(
         encoder,
         MTLSize {
-            width: batch as usize,
+            width: r.rows as usize,
             height: 1,
             depth: 1,
         },
@@ -693,25 +484,145 @@ pub(crate) fn encode_rms_norm_per_head_batch(
 pub(crate) fn warm_prefill_norm_pipelines(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
 ) -> Result<(), MetalError> {
-    ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32")?;
-    ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_batch")?;
-    ensure_pipeline(device, RMS_NORM_KERNEL_SRC, "rms_norm_f32_to_f16_batch")?;
-    ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32")?;
-    ensure_pipeline(device, ADD_RMS_NORM_KERNEL_SRC, "add_rms_norm_f32_batch")?;
-    ensure_pipeline(
-        device,
-        ADD_RMS_NORM_KERNEL_SRC,
-        "add_rms_norm_f32_to_f16_batch",
-    )?;
+    for add in [false, true] {
+        for out_half in [false, true] {
+            ensure_pipeline(device, RMS_NORM_KERNEL_SRC, norm_kernel_name(add, out_half))?;
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elem::tests::{read_f32, upload};
+    use crate::elem::tests::{alloc, read_f32, upload};
     use crate::gpu::shared_metal;
     use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+
+    fn read_f16_as_f32(buf: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Vec<f32> {
+        let ptr = buf.contents();
+        let bits = unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const u16, n) };
+        bits.iter()
+            .map(|&b| half::f16::from_bits(b).to_f32())
+            .collect()
+    }
+
+    /// One kernel serves eight encoders, and the width decides which
+    /// of its two loops runs: float4 when `n % 4 == 0`, scalar
+    /// otherwise, because a `float4*` into row `r` of a width that is
+    /// not a multiple of four is not 16-byte aligned. Every (width,
+    /// rows, residual, output type) the stacks reach is checked
+    /// against a CPU reference here, including widths that take the
+    /// scalar path, widths wide enough that the float4 loop runs more
+    /// than once at the largest threadgroup, and a residual whose
+    /// write-back into `h` is part of the contract.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn every_norm_shape_matches_the_cpu_reference() {
+        let shared = shared_metal().expect("metal");
+        let device = &shared.device;
+        let eps = 1e-6f32;
+        for &n in &[2304usize, 8192, 130, 37, 4] {
+            for &rows in &[1usize, 3] {
+                for add in [false, true] {
+                    for half_out in [false, true] {
+                        let h0: Vec<f32> = (0..n * rows)
+                            .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+                            .collect();
+                        let a: Vec<f32> =
+                            (0..n * rows).map(|i| ((i as f32) * 0.11).cos()).collect();
+                        let w: Vec<f32> = (0..n).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+                        let mut h_cpu = h0.clone();
+                        if add {
+                            for (h, a) in h_cpu.iter_mut().zip(a.iter()) {
+                                *h += *a;
+                            }
+                        }
+                        let mut want = vec![0.0f32; n * rows];
+                        for r in 0..rows {
+                            let row = &h_cpu[r * n..(r + 1) * n];
+                            let ms = row.iter().map(|v| v * v).sum::<f32>() / n as f32;
+                            let inv = 1.0 / (ms + eps).sqrt();
+                            for i in 0..n {
+                                want[r * n + i] = row[i] * inv * w[i];
+                            }
+                        }
+                        let h_buf = upload(device, &h0).unwrap();
+                        let a_buf = upload(device, &a).unwrap();
+                        let w_buf = upload(device, &w).unwrap();
+                        let out = alloc(device, n * rows).unwrap();
+                        let cmd = shared.queue.commandBuffer().unwrap();
+                        let enc = cmd.computeCommandEncoder().unwrap();
+                        let r = NormRows {
+                            h: &h_buf,
+                            h_off_bytes: 0,
+                            add: add.then_some(&*a_buf),
+                            weight: &w_buf,
+                            out: &out,
+                            out_off_bytes: 0,
+                            out_half: half_out,
+                            n: n as u32,
+                            rows: rows as u32,
+                            eps,
+                        };
+                        encode_norm_rows(&enc, device, r).unwrap();
+                        enc.endEncoding();
+                        cmd.commit();
+                        cmd.waitUntilCompleted();
+                        let got = if half_out {
+                            read_f16_as_f32(&out, n * rows)
+                        } else {
+                            read_f32(&out, n * rows)
+                        };
+                        let tol = if half_out { 2e-3 } else { 1e-5 };
+                        for (i, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                            assert!(
+                                (g - e).abs() <= tol * e.abs().max(1.0),
+                                "n={n} rows={rows} add={add} half={half_out} elem {i}: got {g} want {e}"
+                            );
+                        }
+                        let h_after = read_f32(&h_buf, n * rows);
+                        for (i, (g, e)) in h_after.iter().zip(h_cpu.iter()).enumerate() {
+                            assert!(
+                                (g - e).abs() <= 1e-6 * e.abs().max(1.0),
+                                "n={n} rows={rows} add={add}: residual stream elem {i}: got {g} want {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The threadgroup is sized so the float4 loop runs at most twice
+    /// and never below a simdgroup or above Metal's limit.
+    #[test]
+    fn norm_threadgroup_is_a_simdgroup_multiple_that_runs_the_loop_at_most_twice() {
+        assert_eq!(
+            norm_threadgroup(2304),
+            512,
+            "576 float4s over 512 threads: 2 passes"
+        );
+        assert_eq!(
+            norm_threadgroup(4096),
+            512,
+            "1024 float4s: exactly 2 passes"
+        );
+        assert_eq!(norm_threadgroup(8192), 1024, "capped at Metal's maximum");
+        assert_eq!(norm_threadgroup(64), 32, "never below one simdgroup");
+        assert_eq!(
+            norm_threadgroup(130),
+            128,
+            "scalar path: 130 floats over 128"
+        );
+        for n in [4, 37, 130, 2304, 3072, 8192, 16384] {
+            let tg = norm_threadgroup(n);
+            assert!(
+                tg.is_power_of_two() && (32..=1024).contains(&tg),
+                "n={n}: tg={tg}"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "needs a real Metal GPU"]
