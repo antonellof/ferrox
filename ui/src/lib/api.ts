@@ -330,14 +330,31 @@ export type Usage = {
   cached_tokens?: number | null;
 };
 
-export type ChatMessage = { role: string; content: string };
+export type ChatMessage = {
+  role: string;
+  content: string;
+  /**
+   * A replayed assistant turn's chain of thought, in the server's own
+   * field. Sent only on the one turn being CONTINUED: for ordinary
+   * history the template strips it anyway, and the DeepSeek guidance
+   * is not to replay it.
+   */
+  reasoning_content?: string;
+};
 
 export type ChatRequest = {
   model: string;
   messages: ChatMessage[];
   temperature?: number;
   top_p?: number;
+  /** Omitted, the server bounds the answer by the context alone. */
   max_tokens?: number;
+  /**
+   * llama.cpp's field: render the trailing assistant message as a turn
+   * still being written, so the model carries on from where it stopped
+   * rather than starting a new one.
+   */
+  continue_final_message?: boolean;
 };
 
 /** One SSE frame's payload, as far as this client reads it. */

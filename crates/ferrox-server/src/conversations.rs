@@ -207,6 +207,18 @@ pub(crate) struct MessageNode {
     pub(crate) role: String,
     #[serde(default)]
     pub(crate) content: String,
+    /// A reasoning model's chain of thought, kept BESIDE `content` the
+    /// way `/v1/chat/completions` returns it, never folded in.
+    ///
+    /// An R1 answer that ran out of `max_tokens` while thinking is
+    /// entirely `reasoning_content`; stored as `content: ""` it came
+    /// back from a reload as an empty assistant turn, with the thinking
+    /// gone. Absent on the wire and on disk when there is none, so a
+    /// record written before this field existed reads back unchanged
+    /// (`default`), and a client that does not think never sees the
+    /// key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_content: Option<String>,
     /// Stamped by the server on append. A client-supplied time would be
     /// a claim; this is a fact about when the server was told.
     pub(crate) created_at: u64,
@@ -324,6 +336,11 @@ pub(crate) struct NewMessage {
     pub(crate) role: String,
     #[serde(default)]
     pub(crate) content: String,
+    /// See [`MessageNode::reasoning_content`]. An empty string is
+    /// stored as absent: the field means "this turn thought", and an
+    /// empty thought is no thought.
+    #[serde(default)]
+    pub(crate) reasoning_content: Option<String>,
     #[serde(default)]
     pub(crate) metadata: Option<serde_json::Value>,
 }
@@ -817,6 +834,20 @@ fn append_messages(
                 format!("a message holds at most {MAX_CONTENT_BYTES} bytes of content"),
             ));
         }
+        // The same ceiling, applied to the thought on its own rather
+        // than to the sum: a long thought must not make a short answer
+        // unstorable, and vice versa. The conversation-wide byte
+        // ceiling still bounds the two together.
+        let reasoning_content = message.reasoning_content.filter(|r| !r.is_empty());
+        if reasoning_content
+            .as_ref()
+            .is_some_and(|r| r.len() > MAX_CONTENT_BYTES)
+        {
+            return Err(StoreError::too_large(
+                "message_too_large",
+                format!("a message holds at most {MAX_CONTENT_BYTES} bytes of reasoning_content"),
+            ));
+        }
         if let Some(parent) = message.parent_id.as_deref() {
             if !existing.contains(parent) && !staged_ids.contains(parent) {
                 return Err(StoreError::invalid(
@@ -836,6 +867,7 @@ fn append_messages(
             parent_id: message.parent_id,
             role: message.role,
             content: message.content,
+            reasoning_content,
             created_at: now,
             metadata: message.metadata,
         });
@@ -1054,6 +1086,7 @@ mod tests {
             parent_id: parent.map(str::to_string),
             role: role.to_string(),
             content: content.to_string(),
+            reasoning_content: None,
             metadata: None,
         }
     }
@@ -1381,6 +1414,81 @@ mod tests {
             store.list().is_empty(),
             "memory must not hold a conversation that never reached disk"
         );
+    }
+
+    /// The defect: an R1 answer cut off inside its thought is ALL
+    /// `reasoning_content`, and a store with no such field kept an
+    /// empty assistant turn. The thought now survives a restart, and
+    /// an empty one is stored as nothing rather than as `""`.
+    #[test]
+    fn a_chain_of_thought_survives_a_restart_beside_its_answer() {
+        let dir = TempDir::new("reasoning");
+        let id = {
+            let store = store(&dir);
+            let mut thought = msg("a1", Some("u1"), "assistant", "");
+            thought.reasoning_content = Some("Let me think about".to_string());
+            let mut blank = msg("a2", Some("a1"), "assistant", "answer");
+            blank.reasoning_content = Some(String::new());
+            store
+                .create(created(vec![
+                    msg("u1", None, "user", "why"),
+                    thought,
+                    blank,
+                ]))
+                .unwrap()
+                .id
+        };
+        let conversation = store(&dir).get(&id).unwrap();
+        assert_eq!(
+            conversation.messages[1].reasoning_content.as_deref(),
+            Some("Let me think about")
+        );
+        assert_eq!(conversation.messages[1].content, "");
+        assert_eq!(
+            conversation.messages[2].reasoning_content, None,
+            "an empty thought is no thought"
+        );
+        let on_disk = std::fs::read_to_string(dir.0.join(format!("{id}.json"))).unwrap();
+        assert_eq!(
+            on_disk.matches("reasoning_content").count(),
+            1,
+            "the key is written only where there is a thought: {on_disk}"
+        );
+    }
+
+    /// A file written before the field existed carries no
+    /// `reasoning_content` at all, and must load as it did then.
+    #[test]
+    fn a_record_from_before_reasoning_was_stored_loads_unchanged() {
+        let dir = TempDir::new("pre-reasoning");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(
+            dir.0.join("conv_0000000000000000.json"),
+            br#"{"id":"conv_0000000000000000","created_at":1,"updated_at":1,"head_id":"a1",
+                "messages":[{"id":"u1","parent_id":null,"role":"user","content":"hi","created_at":1},
+                {"id":"a1","parent_id":"u1","role":"assistant","content":"hello","created_at":1}]}"#,
+        )
+        .unwrap();
+        let conversation = store(&dir).get("conv_0000000000000000").unwrap();
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(conversation.messages[1].content, "hello");
+        assert_eq!(conversation.messages[1].reasoning_content, None);
+    }
+
+    #[test]
+    fn an_oversized_thought_is_refused_like_an_oversized_answer() {
+        let dir = TempDir::new("big-thought");
+        let store = store(&dir);
+        let mut thought = msg("m1", None, "assistant", "short");
+        thought.reasoning_content = Some("x".repeat(MAX_CONTENT_BYTES + 1));
+        let err = store.create(created(vec![thought])).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::TooLarge {
+                code: "message_too_large",
+                ..
+            }
+        ));
     }
 
     #[test]

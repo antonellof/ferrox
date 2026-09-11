@@ -79,6 +79,8 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400 |
 | `ignore_eos` | Ferrox extension: run past the model's own end-of-generation tokens so the request produces exactly `max_tokens`. A serving-benchmark knob. Suppresses the model's set only. A caller's own `stop` strings still end the answer |
 | `reasoning_content` (both ways) | Ferrox extension: a reasoning model's chain of thought, split out of `content` on the way out and replayable on the way in (`reasoning` is accepted as an alias) |
+| `continue_final_message` | Supported, llama.cpp's field and value set: `true` (auto), `"reasoning_content"` or `"content"`. The trailing assistant message is rendered as a turn still being written, thought included, so the model carries on from where it stopped. **Default off**, where llama.cpp's server defaults to continuing any trailing assistant message (`--prefill-assistant`); the harmony and ATEM channel formats, a content continuation for an always-open family, and a turn with tool calls are **501 by name** |
+| `reasoning_budget_tokens` / `thinking_budget_tokens` | **501 by name** except `-1` (llama.cpp's "unrestricted", which is what this server does). llama.cpp enforces the budget in its sampler by force-feeding the closing tag; there is no such sampler here yet, and a budget silently dropped would be indistinguishable from one honoured. `0` says to use `reasoning_effort: "none"` instead |
 
 ### Where a completion stops
 

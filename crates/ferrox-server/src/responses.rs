@@ -652,6 +652,8 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         // Stateless surface: history comes in `input`, in full, on every
         // turn.
         session_id: None,
+        continue_final_message: None,
+        reasoning_budget_tokens: None,
         logprobs: None,
         top_logprobs: None,
         n: None,

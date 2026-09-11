@@ -243,6 +243,26 @@ Nothing here ever presents a partial answer as a finished one: if the
 reconnect and the poll both fail, or the replay window has moved past
 where the client stopped, it surfaces as a truncation error.
 
+## A cut-off answer says so, and can be continued
+
+`max_tokens` defaults to **no cap**: the request carries none, and the
+server bounds the answer by the context window alone, which is
+llama.cpp's `n_predict: -1` and its own web UI's default. It used to be
+512, and a reasoning model spends more than that thinking on an ordinary
+question, so the budget ran out inside the thought, the server correctly
+answered `finish_reason: "length"` with no content, and the transcript
+showed a Thinking block and then nothing. A saved 512 from that default
+is dropped on load; any other saved value is kept as the choice it was.
+
+A `length` finish now renders as a cut-off under the message, with the
+token count, and a **Continue** button. Continue is assistant-ui's own
+regenerate carrying the partial parts in its run config: the adapter
+sends the cut-off turn back as the trailing assistant message with
+`continue_final_message: true` (llama.cpp's field), seeds the new message
+with what was already there, and the server renders the turn as one
+still being written, thought re-opened, so the model carries on rather
+than starting over. The cut-off version stays as the previous branch.
+
 ## Three things not to undo
 
 - **No client stopwatch.** Every number under an answer comes from the

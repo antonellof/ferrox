@@ -6,6 +6,7 @@ import {
   ErrorPrimitive,
   MessagePrimitive,
   ThreadPrimitive,
+  useAui,
   useAuiState,
 } from "@assistant-ui/react";
 import {
@@ -16,15 +17,22 @@ import {
   CircleAlert,
   Copy,
   Pencil,
+  Play,
   RefreshCw,
   Square,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { FerroxMark } from "@/components/logo";
+import { fmtInt } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { MarkdownText } from "@/screens/chat/markdown";
 import { ReasoningPart } from "@/screens/chat/reasoning";
-import type { AnswerStats } from "@/screens/chat/runtime";
+import {
+  canContinue,
+  continuationRun,
+  partsText,
+  type AnswerStats,
+} from "@/screens/chat/runtime";
 
 // The transcript, the composer, autoscroll, branching and the abort
 // signal are assistant-ui's. What is written here is presentation plus
@@ -47,10 +55,64 @@ function useStats(): AnswerStats | undefined {
 
 const OUTCOME_LABEL: Record<AnswerStats["outcome"], string | null> = {
   ok: null,
+  length: "cut off at the token limit",
   "stopped-by-you": "stopped by you",
   "stopped-by-server": "stopped",
   error: "failed",
 };
+
+/**
+ * The state that used to be silence, and the way out of it.
+ *
+ * A reasoning model that runs out of `max_tokens` inside its thought
+ * returns thinking and no answer, and the transcript showed exactly
+ * that: a "Thinking" block and then nothing, with no indication that
+ * anything had been cut. This says so, and offers to carry on.
+ *
+ * Continue is a reload -- assistant-ui's own regenerate -- carrying the
+ * partial parts in its run config, so the adapter sends them back as
+ * the trailing assistant turn with `continue_final_message` and seeds
+ * the new message with them. The cut-off version stays reachable as
+ * the previous branch, the same way a regenerated answer does; nothing
+ * is overwritten.
+ */
+function CutOff() {
+  const aui = useAui();
+  const stats = useStats();
+  const isRunning = useAuiState((s) => s.thread.isRunning);
+  const content = useAuiState((s) => s.message.content);
+  if (!stats || !canContinue(stats.outcome)) return null;
+
+  const from = partsText(content);
+  const generated = stats.usage?.completion_tokens;
+  const detail =
+    stats.outcome === "length"
+      ? `The token limit ran out${
+          typeof generated === "number"
+            ? ` after ${fmtInt(generated)} tokens`
+            : ""
+        }${
+          from.reasoning && !from.text
+            ? ", inside the model's thinking, so there is no answer yet"
+            : ", so this answer is incomplete"
+        }. Raise max_tokens in Sampling, or carry on from here.`
+      : "This answer was stopped before it finished.";
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-warn/35 bg-warn-soft px-3 py-2 text-xs text-warn">
+      <span className="min-w-0 flex-1">{detail}</span>
+      <Button
+        variant="default"
+        size="sm"
+        disabled={isRunning}
+        onClick={() => aui.message.reload({ runConfig: continuationRun(from) })}
+      >
+        <Play />
+        Continue
+      </Button>
+    </div>
+  );
+}
 
 function StatLine() {
   const stats = useStats();
@@ -159,6 +221,7 @@ const AssistantMessage: FC = () => (
           </div>
         </MessagePrimitive.Error>
 
+        <CutOff />
         <StatLine />
 
         <div className="mt-1 flex items-center gap-0.5 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">

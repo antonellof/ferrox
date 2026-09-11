@@ -671,6 +671,10 @@ fn prepare_prompt(prompt: &PromptFields, model: String, max_tokens: usize) -> Pr
         thinking: prompt.thinking.clone(),
         // Stateless surface: Claude Code resends the whole conversation.
         session_id: None,
+        // Anthropic's API prefills a trailing assistant turn; this lowering
+        // does not ask for that yet -- see `continuation`.
+        continue_final_message: None,
+        reasoning_budget_tokens: None,
         logprobs: None,
         top_logprobs: None,
         n: None,

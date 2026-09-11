@@ -141,10 +141,77 @@ pub(crate) fn refuse_logit_bias(value: Option<&Value>, route: &str) -> Result<()
     )))
 }
 
+/// Refuse llama.cpp's `reasoning_budget_tokens` (alias
+/// `thinking_budget_tokens`) BY NAME.
+///
+/// llama.cpp enforces it in the sampler (`common/reasoning-budget.cpp`):
+/// once N generated tokens have followed the thinking opener, the
+/// closer -- optionally preceded by `reasoning_budget_message` -- is
+/// force-fed one token per step, so the answer always gets what is
+/// left of `max_tokens`. ferrox has one sampler hook both decode loops
+/// share (`sample_step::sample_next`) and no budget state in it, so a
+/// budget here would be dropped; a caller who asked for a 2,000-token
+/// thought and got an unbounded one with a 200 could not tell.
+///
+/// `-1` is llama.cpp's "unrestricted" and is exactly what this server
+/// does, so it is accepted; `null` likewise. `0` is llama.cpp's "end
+/// thinking immediately", which this server spells `reasoning_effort:
+/// "none"` or `thinking: {"type": "disabled"}`, and the refusal says
+/// so rather than sending the caller to read the source.
+pub(crate) fn refuse_reasoning_budget(value: Option<&Value>, route: &str) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_null() || value.as_i64() == Some(-1) {
+        return Ok(());
+    }
+    if value.as_i64() == Some(0) {
+        return Err(unsupported_feature(&format!(
+            "`reasoning_budget_tokens: 0` (end thinking immediately) is not implemented on \
+             {route}; to serve the request without a chain of thought send `reasoning_effort: \
+             \"none\"` or `thinking: {{\"type\": \"disabled\"}}` instead."
+        )));
+    }
+    Err(unsupported_feature(&format!(
+        "`reasoning_budget_tokens` (a token budget for the chain of thought, enforced by \
+         llama.cpp in its sampler) is not implemented on {route}; only -1, unrestricted, is \
+         accepted. It is refused rather than ignored: a dropped budget is indistinguishable \
+         from an honoured one. Bound the whole completion with `max_tokens`, or continue a \
+         cut-off answer with `continue_final_message`."
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    /// The value llama.cpp calls unrestricted is what this server does
+    /// anyway; every other value would be dropped, so it is refused.
+    #[test]
+    fn a_reasoning_budget_is_refused_unless_it_is_unrestricted() {
+        for accepted in [serde_json::json!(-1), serde_json::Value::Null] {
+            refuse_reasoning_budget(Some(&accepted), "/v1/chat/completions")
+                .expect("unrestricted is what ferrox does");
+        }
+        refuse_reasoning_budget(None, "/v1/chat/completions").expect("absent");
+        for refused in [
+            serde_json::json!(0),
+            serde_json::json!(2000),
+            serde_json::json!("x"),
+        ] {
+            let (status, body) = refuse_reasoning_budget(Some(&refused), "/v1/chat/completions")
+                .expect_err("refused");
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{refused}");
+            assert!(
+                body.0["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("reasoning_budget_tokens"),
+                "{refused}: the refusal must name the field"
+            );
+        }
+    }
 
     #[test]
     fn a_real_bias_is_refused_by_name() {

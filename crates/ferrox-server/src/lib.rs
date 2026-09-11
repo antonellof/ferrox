@@ -41,6 +41,7 @@ mod cancel;
 mod chat_template;
 mod cli;
 mod completion;
+mod continuation;
 mod conversations;
 mod decode_task;
 mod embeddings;
@@ -950,6 +951,20 @@ struct ChatCompletionRequest {
     /// history, not the whole conversation.
     #[serde(default)]
     session_id: Option<String>,
+    /// llama.cpp's `continue_final_message`: render the LAST message,
+    /// which must be an assistant turn, as a turn still being written
+    /// rather than a closed one, so the model carries on from where
+    /// it stopped. `true`, `"reasoning_content"` or `"content"`; the
+    /// whole rule, its refusals included, is [`continuation`].
+    #[serde(default, deserialize_with = "continuation::deserialize_optional")]
+    continue_final_message: Option<continuation::Continuation>,
+    /// llama.cpp's reasoning budget, declared ONLY so it can be refused
+    /// by name -- see
+    /// [`crate::unsupported_sampling::refuse_reasoning_budget`].
+    /// Undeclared, serde would drop it and a caller who asked for a
+    /// 2,000-token thought would get an unbounded one with a 200.
+    #[serde(default, alias = "thinking_budget_tokens")]
+    reasoning_budget_tokens: Option<serde_json::Value>,
     /// OpenAI fields we explicitly reject rather than silently ignore.
     #[serde(default)]
     logprobs: Option<bool>,
@@ -1089,6 +1104,35 @@ impl ChatCompletionRequest {
     /// the client hasn't explicitly disabled it via `tool_choice:
     /// "none"` -- see `ToolChoice`'s doc comment for what the other
     /// values do (nothing different from `"auto"`).
+    /// The prompt this request decodes from: the history rendered
+    /// whole, or continued from its last message when the caller asked
+    /// for that. ONE call for both the buffered and the streaming
+    /// handler, so the two cannot disagree about what a trailing
+    /// assistant message means.
+    ///
+    /// `served_model` is the name `OutputPosture::resolve` will read the
+    /// output with, so the continuation is written in the same family's
+    /// markers the parser will look for.
+    fn render_prompt(
+        &self,
+        history: &[ChatMessage],
+        template: &chat_template::PromptTemplate,
+        kwargs: serde_json::Map<String, serde_json::Value>,
+        served_model: &str,
+    ) -> Result<String, ApiError> {
+        match self.continue_final_message {
+            None => prompt_from_messages(history, template, &self.tools, kwargs),
+            Some(mode) => continuation::prompt_continuing_final_message(
+                history,
+                template,
+                &self.tools,
+                kwargs,
+                crate::policy::parser::ReasoningFormat::infer(served_model),
+                mode,
+            ),
+        }
+    }
+
     fn tools_active(&self) -> bool {
         !self.tools.is_empty()
             && !matches!(&self.tool_choice, Some(ToolChoice::Mode(m)) if m == "none")
@@ -1306,6 +1350,10 @@ impl ChatCompletionRequest {
             ));
         }
         unsupported_sampling::refuse_logit_bias(self.logit_bias.as_ref(), "/v1/chat/completions")?;
+        unsupported_sampling::refuse_reasoning_budget(
+            self.reasoning_budget_tokens.as_ref(),
+            "/v1/chat/completions",
+        )?;
         // Parsed here as well as in `sampling_knobs` so a bad chain is
         // a 400/501 before any prompt is rendered. The same function
         // both times, so there is no second opinion to drift from.
@@ -2749,7 +2797,7 @@ async fn chat_completions_full(
     let history = resolve_history(&state, &req);
     let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
-    let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
+    let prompt = req.render_prompt(&history, &template, kwargs, active.name())?;
     // Resolved BEFORE the lookup, because the constraint is part of the
     // key: a grammar, JSON mode and `ignore_eos` all change the answer
     // and none of them changes the prompt, so a cache consulted first
@@ -2874,7 +2922,7 @@ async fn chat_completions_stream(
     let history = resolve_history(&state, &req);
     let template = active.generative()?.chat_template();
     let kwargs = req.resolve_template_kwargs(&template);
-    let prompt = prompt_from_messages(&history, &template, &req.tools, kwargs)?;
+    let prompt = req.render_prompt(&history, &template, kwargs, active.name())?;
     let model_name = req.model.clone();
     let session_id = req.session_id.clone();
     let sessions = state.sessions.clone();
@@ -8430,6 +8478,77 @@ mod tests {
             "stop",
         );
         assert_eq!(message.reasoning_content, None);
+    }
+
+    /// The request-level half of `continuation`: the field reaches the
+    /// render, and the family is taken from the SERVED model, the same
+    /// name the output parser reads. A trailing assistant turn without
+    /// the field still renders as history plus a fresh turn.
+    #[test]
+    fn continue_final_message_reaches_the_render_under_the_served_models_family() {
+        let r1 = chat_template::PromptTemplate::from_gguf_metadata(
+            Some("{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}{% if add_generation_prompt %}<|assistant|><think>\n{% endif %}"),
+            Some("qwen2"),
+            false,
+            true,
+            None,
+            None,
+        );
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "why"},
+                {"role": "assistant", "content": "", "reasoning_content": "Let me"},
+            ],
+        });
+        let plain = chat_request(body.clone());
+        let prompt = plain
+            .render_prompt(
+                &plain.messages,
+                &r1,
+                serde_json::Map::new(),
+                "DeepSeek-R1-Distill",
+            )
+            .expect("renders");
+        assert_eq!(prompt, "<|user|>why<|assistant|><|assistant|><think>\n");
+
+        let mut continued = body;
+        continued["continue_final_message"] = serde_json::json!(true);
+        let req = chat_request(continued);
+        let prompt = req
+            .render_prompt(
+                &req.messages,
+                &r1,
+                serde_json::Map::new(),
+                "DeepSeek-R1-Distill",
+            )
+            .expect("renders");
+        assert_eq!(prompt, "<|user|>why<|assistant|><think>Let me");
+        // Under a served model with no reasoning family the same body
+        // is a refusal, not a guess.
+        let (status, _) = req
+            .render_prompt(&req.messages, &r1, serde_json::Map::new(), "Llama-3.2-3B")
+            .expect_err("no family to write the thought in");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// llama.cpp's budget field, under both of its spellings, is a 501
+    /// before any prompt is rendered.
+    #[test]
+    fn a_reasoning_budget_is_refused_by_name_under_both_spellings() {
+        for key in ["reasoning_budget_tokens", "thinking_budget_tokens"] {
+            let req = chat_request(serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                key: 2000,
+            }));
+            let (status, body) = req.validate_supported_fields().expect_err(key);
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{key}");
+            assert!(body.0["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reasoning_budget_tokens"));
+        }
     }
 
     #[test]

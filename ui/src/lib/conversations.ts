@@ -24,6 +24,12 @@ export type StoredMessage = {
   parent_id: string | null;
   role: ConversationRole;
   content: string;
+  /**
+   * A reasoning model's chain of thought, beside the answer rather
+   * than inside it. Absent on records written before the store had the
+   * field, and on every turn that did not think.
+   */
+  reasoning_content?: string | null;
   created_at: number;
   metadata?: Record<string, unknown> | null;
 };
@@ -64,6 +70,7 @@ export type NewMessage = {
   parent_id: string | null;
   role: ConversationRole;
   content: string;
+  reasoning_content?: string;
   metadata?: Record<string, unknown>;
 };
 
@@ -141,15 +148,37 @@ export type ExportedRepository = {
 
 const ROLES: ReadonlySet<string> = new Set(["user", "assistant", "system"]);
 
+/** Parts of one kind, concatenated. */
+function textOfKind(
+  content: readonly { type: string; text?: string }[],
+  kind: "text" | "reasoning",
+): string {
+  return content
+    .filter((part) => part.type === kind && typeof part.text === "string")
+    .map((part) => part.text as string)
+    .join("");
+}
+
 /** Text parts, concatenated. Anything else in the message is not text
- * and is not what a transcript stores. */
+ * and is not what a transcript stores as the answer. */
 export function plainText(
   content: readonly { type: string; text?: string }[],
 ): string {
-  return content
-    .filter((part) => part.type === "text" && typeof part.text === "string")
-    .map((part) => part.text as string)
-    .join("");
+  return textOfKind(content, "text");
+}
+
+/**
+ * Reasoning parts, concatenated.
+ *
+ * Stored in its own field, never folded into the answer. An R1 turn cut
+ * off inside its thinking is ALL reasoning; stored as `content: ""` it
+ * came back from a reload as an empty bubble with the thinking gone,
+ * which is the defect this exists to close.
+ */
+export function plainReasoning(
+  content: readonly { type: string; text?: string }[],
+): string {
+  return textOfKind(content, "reasoning");
 }
 
 /**
@@ -209,11 +238,13 @@ export function pendingAppend(
     const parentId = item.parentId;
     if (parentId !== null && !reachable.has(parentId)) continue;
     reachable.add(message.id);
+    const reasoning = plainReasoning(message.content);
     messages.push({
       id: message.id,
       parent_id: parentId,
       role: message.role as ConversationRole,
       content: plainText(message.content),
+      ...(reasoning ? { reasoning_content: reasoning } : {}),
       ...(message.metadata ? { metadata: message.metadata } : {}),
     });
   }
@@ -235,14 +266,38 @@ export function hasWork(pending: Pending, storedHead: string | null): boolean {
   return pending.headId !== null && pending.headId !== storedHead;
 }
 
+/** The status an assistant node gets back, from the outcome its own
+ * metadata recorded. */
+export type RestoredStatus =
+  | { type: "complete"; reason: "stop" }
+  | { type: "incomplete"; reason: "length" | "cancelled" };
+
+/**
+ * `status` is reconstructed rather than stored: the store has no
+ * business keeping a copy of a fact that is already in the metadata it
+ * carries. The outcome is what the runtime wrote under
+ * `metadata.custom.stats`, and it is what decides whether a reloaded
+ * answer offers Continue -- a cut-off turn restored as complete would
+ * lose the way out of it.
+ */
+export function restoredStatus(
+  metadata: Record<string, unknown> | null | undefined,
+): RestoredStatus {
+  const outcome = (
+    metadata as { custom?: { stats?: { outcome?: unknown } } } | undefined
+  )?.custom?.stats?.outcome;
+  if (outcome === "length") return { type: "incomplete", reason: "length" };
+  if (outcome === "stopped-by-you" || outcome === "stopped-by-server")
+    return { type: "incomplete", reason: "cancelled" };
+  return { type: "complete", reason: "stop" };
+}
+
 /**
  * The stored tree, in the shape `ExportedMessageRepository
  * .fromBranchableArray` takes.
  *
- * `status` is reconstructed rather than stored: an assistant node is
- * complete unless its own metadata says the run was stopped, and the
- * store has no business keeping a copy of a fact that is already in the
- * metadata it carries.
+ * Thinking comes back as a reasoning part ABOVE the text, the order it
+ * was shown in; a turn that never thought grows no empty part.
  */
 export function toBranchable(conversation: Conversation): {
   items: {
@@ -250,9 +305,12 @@ export function toBranchable(conversation: Conversation): {
     message: {
       id: string;
       role: ConversationRole;
-      content: { type: "text"; text: string }[];
+      content: (
+        | { type: "text"; text: string }
+        | { type: "reasoning"; text: string }
+      )[];
       createdAt: Date;
-      status?: { type: "complete"; reason: "stop" };
+      status?: RestoredStatus;
       metadata?: Record<string, unknown>;
     };
   }[];
@@ -264,10 +322,15 @@ export function toBranchable(conversation: Conversation): {
       message: {
         id: node.id,
         role: node.role,
-        content: [{ type: "text" as const, text: node.content }],
+        content: [
+          ...(node.reasoning_content
+            ? [{ type: "reasoning" as const, text: node.reasoning_content }]
+            : []),
+          { type: "text" as const, text: node.content },
+        ],
         createdAt: new Date(node.created_at * 1000),
         ...(node.role === "assistant"
-          ? { status: { type: "complete" as const, reason: "stop" as const } }
+          ? { status: restoredStatus(node.metadata) }
           : {}),
         ...(node.metadata ? { metadata: node.metadata } : {}),
       },
