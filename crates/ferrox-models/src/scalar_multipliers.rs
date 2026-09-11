@@ -30,6 +30,7 @@
 //! | `granite` | `granite.cpp:5-10` | yes | yes | divide | yes |
 //! | `granitemoe` | `granite-moe.cpp:3-10` | yes | yes | divide | yes |
 //! | `minicpm` | `minicpm.cpp:5-14` | yes | yes | divide | **no** |
+//! | `grok` | `grok.cpp:5-27` | yes | **no** | **multiply** | `attention.output_scale` |
 //!
 //! **Gemma is not in that table, and that is the interesting part.** It
 //! scales its embeddings by `sqrt(n_embd)` and, at 27B, overrides its
@@ -67,30 +68,75 @@
 //! That key is still refused for `minicpm`, by the derived list, which
 //! is what deriving it is for.
 //!
+//! **Grok is the MiniCPM shape with two more columns moved.**
+//! `grok.cpp:5-12` seeds SEVEN hyper-parameters before `:14-27` let the
+//! file override each with `required = false`, so a Grok-1 export that
+//! declares none of them is still scaled by all of them and
+//! `unsupported_scaling_keys` sees an ordinary file. The converter
+//! (`conversion/grok.py:34-57`) writes every one of them for a fresh
+//! export; the defaults are llama.cpp's own comment, "defaults for old
+//! GGUFs". Four of the seven are this module's business:
+//!
+//! ```text
+//! hparams.f_logit_scale            = 0.5773502691896257f;   // 1/sqrt(3)
+//! hparams.f_embedding_scale        = 78.38367176906169f;    // sqrt(6144)
+//! hparams.f_attn_out_scale         = 0.08838834764831845f;  // 1/sqrt(128)
+//! hparams.f_attn_logit_softcapping = 30.0f;
+//! ```
+//!
+//! and the graph applies them differently from Granite in two places.
+//! `grok.cpp:211` is `ggml_scale(cur, f_logit_scale)` -- a MULTIPLY,
+//! [`LogitScaleUse::AsIs`], the third variant this header used to name
+//! as deliberately absent. And the attention scale is not
+//! `{arch}.attention.scale` at all: `grok.cpp` never reads that key. It
+//! reads `{arch}.attention.output_scale` (`LLM_KV_ATTENTION_OUTPUT_SCALE`,
+//! `:18`) and applies it INSIDE the softcap, passing `kq_scale = 1.0f`
+//! to `build_attn` (`:137`) and letting `llama-graph.cpp:2572-2582` do
+//! `kq = 30 * tanh(kq * f_attn_out_scale / 30)` before the softmax.
+//! That is arithmetically "pre-scale Q by `f_attn_out_scale`, then
+//! softcap at 30", which is what `ModelConfig::attention_scale` plus
+//! `ModelConfig::attn_logit_softcap` already compute, so the key
+//! resolves into the SAME slot as Granite's `attention.scale` and
+//! [`AttentionScaleKey`] records which spelling each architecture
+//! reads. (llama.cpp forces flash attention OFF for Grok,
+//! `llama-context.cpp:3544-3547`, precisely because its FA path has no
+//! room for that fold; the non-FA branch is the reference.)
+//!
+//! The other three of the seven are not multipliers. The softcap
+//! default of 30 is [`MultiplierDefaults::attn_logit_softcap`], on the
+//! same variant so that ONE hook carries everything `grok.cpp:5-12`
+//! seeds; `yarn_beta_fast = 8.0f` (:5, against `llama-hparams.h:137`'s
+//! 32) is [`MultiplierDefaults::yarn_beta_fast`] for the same reason;
+//! and `f_router_logit_softcapping` (:10,:20) plus `attn_temp_length`
+//! (:23) are read and then applied NOWHERE -- no other reference to
+//! either field exists under `src/` (measured), so ferrox reads neither
+//! and refuses neither.
+//!
+//! `residual_scale` stays refused for `grok`: the graph has no residual
+//! multiplier, and the derived list keeps saying so.
+//!
 //! One row is deliberately NOT here, and it is not one table entry away:
 //!
 //! * **Command-R / Cohere2** apply `f_logit_scale` as a MULTIPLY rather
 //!   than a divide (`command-r.cpp:136-138`), which is
-//!   [`LogitScaleUse`]'s missing third variant. But their blocker is not
-//!   the multiplier: `command-r.cpp:66-119` feeds both branches the same
-//!   normed input and sums `inpL + attn_out + ffn_out` once, over
-//!   LayerNorm rather than RMSNorm. The multiplier work does not bring
-//!   them closer.
+//!   [`LogitScaleUse::AsIs`] now that `grok` needed it. But their
+//!   blocker is not the multiplier: `command-r.cpp:66-119` feeds both
+//!   branches the same normed input and sums `inpL + attn_out + ffn_out`
+//!   once, over LayerNorm rather than RMSNorm. The multiplier work does
+//!   not bring them closer.
 //!
-//! **`{arch}.attention.scale` does not live in this module's output.**
-//! It resolves into the `ModelConfig::attention_scale` slot Gemma-27B
-//! already uses, because that slot's contract -- "pre-scale Q and pass
-//! 1.0 to the kernel" -- is exactly what llama.cpp's `kq_scale` needs
-//! and having two fields for one number is the shape this repo keeps
-//! paying for.
+//! **Neither attention key lives in this module's output.** Both
+//! `{arch}.attention.scale` and `{arch}.attention.output_scale` resolve
+//! into the `ModelConfig::attention_scale` slot Gemma-27B already uses,
+//! because that slot's contract -- "pre-scale Q and pass 1.0 to the
+//! kernel" -- is exactly what llama.cpp's `kq_scale` needs and having
+//! two fields for one number is the shape this repo keeps paying for.
 
 /// How an architecture's graph turns `{arch}.logit_scale` into a
 /// multiplier on the lm_head's output.
 ///
 /// The direction is a per-architecture fact with no key, so it is
-/// resolved HERE and the decoder only ever multiplies. A third variant
-/// (`AsIs`, Command-R's `ggml_scale(cur, f_logit_scale)`) is named in
-/// the module header and deliberately absent until a row needs it.
+/// resolved HERE and the decoder only ever multiplies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogitScaleUse {
     /// The graph never scales its logits.
@@ -107,6 +153,54 @@ pub enum LogitScaleUse {
     /// than a `required` flag beside the table that could come to
     /// disagree with it.
     Reciprocal,
+    /// Grok / Command-R: `ggml_scale(cur, f_logit_scale)` (`grok.cpp:211`,
+    /// `command-r.cpp:136-138`). The value IS the multiplier.
+    ///
+    /// The same positivity rule as [`Self::Reciprocal`], for the same
+    /// reason: a Metal decode stack may fold the lm_head into an argmax
+    /// only while every post-head transform is monotone increasing, and
+    /// a zero would blank the whole vocabulary rather than divide by it.
+    AsIs,
+}
+
+/// Which GGUF key, if any, an architecture reads its attention scale
+/// from.
+///
+/// Two spellings, one slot. Granite reads `{arch}.attention.scale`
+/// (`LLM_KV_ATTENTION_SCALE`, `granite.cpp:8`) and passes it to
+/// `build_attn` as `kq_scale`. Grok reads
+/// `{arch}.attention.output_scale` (`LLM_KV_ATTENTION_OUTPUT_SCALE`,
+/// `grok.cpp:18`), passes `kq_scale = 1.0f`, and applies the value
+/// inside its tanh softcap (`llama-graph.cpp:2579`). Both are "the
+/// score is `q . k * s`", and both resolve into
+/// `ModelConfig::attention_scale`. Which key is a per-architecture fact
+/// with no key of its own, so it is here, and
+/// [`crate::capability::unsupported_scaling_keys`] derives from it that
+/// the spelling an architecture does NOT read stays refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttentionScaleKey {
+    /// The graph uses the kernels' own `1/sqrt(head_dim)` and reads no
+    /// key.
+    #[default]
+    NotRead,
+    /// `{arch}.attention.scale`, with `0.0` as llama.cpp's own "unset"
+    /// sentinel (`granite.cpp:225`).
+    Scale,
+    /// `{arch}.attention.output_scale`, applied as-is: `grok.cpp` has no
+    /// sentinel test on it, so a declared zero really scales every
+    /// score by zero there, and does here.
+    OutputScale,
+}
+
+impl AttentionScaleKey {
+    /// The key suffix this architecture reads, for the loader.
+    pub fn suffix(self) -> Option<&'static str> {
+        match self {
+            Self::NotRead => None,
+            Self::Scale => Some("attention.scale"),
+            Self::OutputScale => Some("attention.output_scale"),
+        }
+    }
 }
 
 /// The value a multiplier takes when the file declares no key.
@@ -139,6 +233,23 @@ pub enum MultiplierDefaults {
     /// No `attention.scale` default: MiniCPM does not read that key at
     /// all, so `f_attention_scale` keeps llama.cpp's own `0.0f`.
     MiniCpm,
+    /// Grok: `grok.cpp:5-12` assigns seven hyper-parameters BEFORE
+    /// `:14-27` let the file override them. The four this module
+    /// resolves:
+    ///
+    /// ```text
+    /// f_logit_scale            = 0.5773502691896257f;   // multiplied, :211
+    /// f_embedding_scale        = 78.38367176906169f;
+    /// f_attn_out_scale         = 0.08838834764831845f;  // inside the softcap
+    /// f_attn_logit_softcapping = 30.0f;
+    /// ```
+    ///
+    /// No `residual_scale`: the graph has none. The softcap and
+    /// `yarn_beta_fast = 8.0f` (:5) are not multipliers and are exposed
+    /// as [`Self::attn_logit_softcap`] / [`Self::yarn_beta_fast`] rather
+    /// than as fields of [`DeclaredMultipliers`], so that ONE variant
+    /// still carries everything the C file seeds.
+    Grok,
 }
 
 impl MultiplierDefaults {
@@ -164,6 +275,44 @@ impl MultiplierDefaults {
                 embedding: Some(12.0),
                 attention: None,
             },
+            Self::Grok => DeclaredMultipliers {
+                logit: Some(0.577_350_3),
+                residual: None,
+                embedding: Some(78.383_67),
+                attention: Some(0.088_388_35),
+            },
+        }
+    }
+
+    /// The attention logit softcap the graph applies when the file
+    /// declares no `{arch}.attn_logit_softcapping`.
+    ///
+    /// `grok.cpp:9` seeds 30.0 before `:19` reads the key with
+    /// `required = false`; `llama-hparams.h:110` gives every other
+    /// architecture 50.0, which only Gemma-2 (`attn_soft_cap = true`)
+    /// ever applies -- and Gemma-2's converter always writes the key.
+    /// `None` here means "the file is the only source", which for the
+    /// generic path means no softcap.
+    pub fn attn_logit_softcap(self) -> Option<f32> {
+        match self {
+            Self::FromFileOnly | Self::MiniCpm => None,
+            Self::Grok => Some(30.0),
+        }
+    }
+
+    /// YaRN's `beta_fast` when the file declares
+    /// `rope.scaling.type = yarn` and no `rope.scaling.yarn.beta_fast`.
+    ///
+    /// `grok.cpp:5` seeds 8.0 against `llama-hparams.h:137`'s 32.0
+    /// before `:26` lets the file override it. Only Grok-2 exports
+    /// declare YaRN (`conversion/grok.py:42-49`) and they write the key,
+    /// so this matters for a hand-written file; it is here so that the
+    /// default is ONE fact beside the others rather than a literal in
+    /// the RoPE loader that a future row would restate.
+    pub fn yarn_beta_fast(self) -> Option<f32> {
+        match self {
+            Self::FromFileOnly | Self::MiniCpm => None,
+            Self::Grok => Some(8.0),
         }
     }
 
@@ -223,8 +372,8 @@ pub struct MultiplierSupport {
     pub residual: bool,
     /// What the graph does with `{arch}.logit_scale`.
     pub logit: LogitScaleUse,
-    /// `{arch}.attention.scale` replaces the kernels' `1/sqrt(head_dim)`.
-    pub attention: bool,
+    /// Which key, if any, replaces the kernels' `1/sqrt(head_dim)`.
+    pub attention: AttentionScaleKey,
     /// What the graph applies for a key the file does NOT declare.
     pub defaults: MultiplierDefaults,
 }
@@ -236,7 +385,7 @@ impl MultiplierSupport {
         embedding: false,
         residual: false,
         logit: LogitScaleUse::NotApplied,
-        attention: false,
+        attention: AttentionScaleKey::NotRead,
         defaults: MultiplierDefaults::FromFileOnly,
     };
 
@@ -247,7 +396,7 @@ impl MultiplierSupport {
         embedding: true,
         residual: true,
         logit: LogitScaleUse::Reciprocal,
-        attention: true,
+        attention: AttentionScaleKey::Scale,
         defaults: MultiplierDefaults::FromFileOnly,
     };
 
@@ -260,8 +409,21 @@ impl MultiplierSupport {
         embedding: true,
         residual: true,
         logit: LogitScaleUse::Reciprocal,
-        attention: false,
+        attention: AttentionScaleKey::NotRead,
         defaults: MultiplierDefaults::MiniCpm,
+    };
+
+    /// `grok`. Embedding and logit multipliers with the logit one
+    /// MULTIPLIED (`grok.cpp:211`), the attention scale from
+    /// `attention.output_scale` (`:18`, applied at
+    /// `llama-graph.cpp:2579`), no residual multiplier, and every one
+    /// of them seeded before the file is read.
+    pub const GROK: Self = Self {
+        embedding: true,
+        residual: false,
+        logit: LogitScaleUse::AsIs,
+        attention: AttentionScaleKey::OutputScale,
+        defaults: MultiplierDefaults::Grok,
     };
 }
 
@@ -279,6 +441,7 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     ("granitemoe", MultiplierSupport::GRANITE),
     ("granite-moe", MultiplierSupport::GRANITE),
     ("minicpm", MultiplierSupport::MINICPM),
+    ("grok", MultiplierSupport::GROK),
 ];
 
 /// Which multipliers ferrox applies for `arch`.
@@ -311,6 +474,8 @@ pub struct DeclaredMultipliers {
     pub logit: Option<f32>,
     pub residual: Option<f32>,
     pub embedding: Option<f32>,
+    /// Whichever key [`MultiplierSupport::attention`] names -- the
+    /// loader reads exactly that one.
     pub attention: Option<f32>,
 }
 
@@ -334,7 +499,9 @@ pub struct ResolvedMultipliers {
 pub enum MultiplierError {
     /// The architecture reads `{arch}.logit_scale` as REQUIRED
     /// (`granite.cpp:7`, `granite-moe.cpp:5`) and the file has no such
-    /// key. llama.cpp throws on this file too.
+    /// key. llama.cpp throws on this file too. Unreachable for an
+    /// architecture with a default, which is what makes the default a
+    /// default.
     MissingRequiredLogitScale,
     /// A `logit_scale` of zero would divide by zero, and a negative one
     /// would REORDER the vocabulary -- which matters beyond the logits
@@ -354,9 +521,10 @@ impl MultiplierError {
                  the same file"
             ),
             MultiplierError::NonPositiveLogitScale(v) => format!(
-                "`{arch}.logit_scale` = {v}: the graph divides every logit by it \
-                 (src/models/granite.cpp:180), so zero is a division by zero and a negative \
-                 value reorders the vocabulary"
+                "`{arch}.logit_scale` = {v}: the graph scales every logit by it \
+                 (src/models/granite.cpp:180 divides, src/models/grok.cpp:211 multiplies), so \
+                 zero blanks or divides away the whole vocabulary and a negative value \
+                 reorders it"
             ),
         }
     }
@@ -424,17 +592,32 @@ pub fn resolve(
             // already computes, with no needless multiply per token.
             scale_or_none(Some(1.0 / v))
         }
+        LogitScaleUse::AsIs => {
+            let v = logit.ok_or(MultiplierError::MissingRequiredLogitScale)?;
+            if v <= 0.0 {
+                return Err(MultiplierError::NonPositiveLogitScale(v));
+            }
+            scale_or_none(Some(v))
+        }
     };
 
-    // `0.0` is this key's ONLY sentinel (`granite.cpp:225`); 1.0 is a
-    // real override. See `scale_or_none`, which must not be used here.
-    let attention_scale = if support.attention {
-        attention.filter(|&v| v != 0.0).filter(|&v| {
-            let kernel = 1.0 / (dims.head_dim as f32).sqrt();
-            (v - kernel).abs() > f32::EPSILON * kernel.max(1.0)
-        })
-    } else {
-        None
+    // An override that restates the kernels' own `1/sqrt(head_dim)`
+    // resolves to `None` for either key: arithmetically identical, and
+    // `Some` here fences the model off every fused Metal attention
+    // launch for nothing. Real Grok-1 is exactly this case --
+    // `0.0883883... == 1/sqrt(128)` at head_dim 128.
+    let restates_kernel = |v: &f32| {
+        let kernel = 1.0 / (dims.head_dim as f32).sqrt();
+        (v - kernel).abs() > f32::EPSILON * kernel.max(1.0)
+    };
+    let attention_scale = match support.attention {
+        AttentionScaleKey::NotRead => None,
+        // `0.0` is this key's ONLY sentinel (`granite.cpp:225`); 1.0 is
+        // a real override. See `scale_or_none`, which must not be used
+        // here.
+        AttentionScaleKey::Scale => attention.filter(|&v| v != 0.0).filter(restates_kernel),
+        // No sentinel at all: `grok.cpp` applies whatever it holds.
+        AttentionScaleKey::OutputScale => attention.filter(restates_kernel),
     };
 
     Ok(ResolvedMultipliers {
@@ -733,5 +916,135 @@ mod tests {
             vec![11.0, 22.0, 33.0],
             "no scale must be exactly the unscaled add, not a multiply by 1.0"
         );
+    }
+
+    /// A Grok file declaring NOTHING resolves to `grok.cpp:5-12`'s
+    /// seven seeds -- the four this module carries, with the logit one
+    /// NOT inverted.
+    ///
+    /// `head_dim` is 6 here so that the attention default (`1/sqrt(128)`)
+    /// does not restate the kernels' own scale and survives into the
+    /// config; on real Grok-1 (head_dim 128) it does restate it and
+    /// resolves to `None`, which the second half pins.
+    #[test]
+    fn a_grok_file_declaring_nothing_is_scaled_by_all_of_grok_cpps_defaults() {
+        let got = resolve(
+            MultiplierSupport::GROK,
+            DeclaredMultipliers::default(),
+            dims(6),
+        )
+        .expect("defaults resolve");
+        assert_eq!(got.embedding_scale, Some(78.383_67));
+        assert_eq!(
+            got.logit_multiplier,
+            Some(0.577_350_3),
+            "grok.cpp:211 MULTIPLIES by f_logit_scale; a reciprocal here would be 1.732"
+        );
+        assert_eq!(got.attention_scale, Some(0.088_388_35));
+        assert_eq!(got.residual_scale, None, "grok has no residual multiplier");
+
+        // Real Grok-1: head_dim 128, and 1/sqrt(128) IS the kernels'
+        // scale, so the slot stays free and the fused Metal attention
+        // stays eligible.
+        let real = resolve(
+            MultiplierSupport::GROK,
+            DeclaredMultipliers::default(),
+            MultiplierDims {
+                head_dim: 128,
+                n_layer: 64,
+                n_embd: 6144,
+            },
+        )
+        .expect("resolves");
+        assert_eq!(real.attention_scale, None);
+
+        // The non-multiplier seeds ride the same variant.
+        assert_eq!(MultiplierDefaults::Grok.attn_logit_softcap(), Some(30.0));
+        assert_eq!(MultiplierDefaults::Grok.yarn_beta_fast(), Some(8.0));
+        assert_eq!(MultiplierDefaults::MiniCpm.attn_logit_softcap(), None);
+        assert_eq!(MultiplierDefaults::FromFileOnly.yarn_beta_fast(), None);
+    }
+
+    /// The file wins over the Grok defaults, key by key.
+    ///
+    /// A hook merged the other way round agrees with llama.cpp on every
+    /// file that omits the keys and disagrees on every file that carries
+    /// them -- which is every fresh export, since `conversion/grok.py`
+    /// writes all of them.
+    #[test]
+    fn a_grok_file_declaring_its_keys_overrides_every_default() {
+        let got = resolve(
+            MultiplierSupport::GROK,
+            DeclaredMultipliers {
+                logit: Some(2.5),
+                residual: None,
+                embedding: Some(3.0),
+                attention: Some(0.25),
+            },
+            dims(6),
+        )
+        .expect("resolves");
+        assert_eq!(got.logit_multiplier, Some(2.5), "multiplied as-is");
+        assert_eq!(got.embedding_scale, Some(3.0));
+        assert_eq!(got.attention_scale, Some(0.25));
+    }
+
+    /// `attention.output_scale` has no "off" sentinel, unlike
+    /// `attention.scale`: `grok.cpp` applies whatever it holds.
+    ///
+    /// A declared zero therefore scales every score by zero here, as it
+    /// does in llama.cpp, rather than falling back to the kernels' scale
+    /// the way Granite's key does at `granite.cpp:225`.
+    #[test]
+    fn the_output_scale_key_has_no_sentinel_and_the_scale_key_does() {
+        let grok = resolve(
+            MultiplierSupport::GROK,
+            DeclaredMultipliers {
+                attention: Some(0.0),
+                ..Default::default()
+            },
+            dims(6),
+        )
+        .expect("resolves");
+        assert_eq!(grok.attention_scale, Some(0.0));
+
+        let granite = resolve(
+            MultiplierSupport::GRANITE,
+            DeclaredMultipliers {
+                logit: Some(2.0),
+                attention: Some(0.0),
+                ..Default::default()
+            },
+            dims(6),
+        )
+        .expect("resolves");
+        assert_eq!(granite.attention_scale, None);
+
+        assert_eq!(
+            AttentionScaleKey::OutputScale.suffix(),
+            Some("attention.output_scale")
+        );
+        assert_eq!(AttentionScaleKey::Scale.suffix(), Some("attention.scale"));
+        assert_eq!(AttentionScaleKey::NotRead.suffix(), None);
+    }
+
+    /// An `AsIs` logit scale is refused when non-positive, like the
+    /// reciprocal one: zero blanks the vocabulary and a negative value
+    /// reorders it.
+    #[test]
+    fn a_non_positive_as_is_logit_scale_is_refused() {
+        for bad in [0.0f32, -0.5] {
+            assert_eq!(
+                resolve(
+                    MultiplierSupport::GROK,
+                    DeclaredMultipliers {
+                        logit: Some(bad),
+                        ..Default::default()
+                    },
+                    dims(6),
+                ),
+                Err(MultiplierError::NonPositiveLogitScale(bad))
+            );
+        }
     }
 }

@@ -520,18 +520,51 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // no `attn_norm`, no `ffn_norm`, no `output_norm`.
     //
     // Its lm_head is TIED with a fallback (:21-25) and its RoPE is NORM
-    // (llama-model.cpp:2585). The one thing it needs that ferrox does
-    // not have is a CLAMP: `olmo.cpp:5` reads
+    // (llama-model.cpp:2585). Its CLAMP -- `olmo.cpp:5` reads
     // `{arch}.attention.clamp_kqv`, `llama-graph.cpp:1611-1652` applies
-    // it to Q, K and V inside `build_qkv`, and
-    // `conversion/olmo.py:23-25` really writes it for the checkpoints
-    // whose HF config has a `clip_qkv` (OLMo-7B-Twin-2T, OLMo-1.7-7B;
-    // the original OLMo-7B has none). A file declaring a positive clamp
-    // is refused by name (`crate::clamp_kqv`) with a fixture that
-    // carries the key, the `baichuan`-13B precedent: an architecture
-    // admitted for the checkpoints it really covers, not for all of
-    // them.
+    // it to Q, K and V inside `build_qkv`, and `conversion/olmo.py:23-25`
+    // really writes it for OLMo-7B-Twin-2T and OLMo-1.7-7B -- was a
+    // refusal by name and is implemented now (`crate::clamp_kqv`), with
+    // the clamped fixture matched against libllama rather than refused:
+    // `dbrx` below needed the same clamp as a REQUIRED key.
     "olmo",
+    // tests/dbrx_graphs.rs: DBRX, NEW CODE on three blockers that each
+    // extended a seam landed the day before. `dbrx.cpp:69-71`, `:110-112`
+    // and `:140-142` norm with `LLM_NORM` and a weight but no bias, which
+    // is `crate::norm::NormOp::LayerNorm` -- the variant the OLMo-1 work
+    // deliberately left unwritten until a row called it; `dbrx.cpp:5`
+    // reads `attention.clamp_kqv` as REQUIRED, which `crate::clamp_kqv`
+    // applies after the bias through the ONE helper every host body
+    // shares (`decoder/qkv_bias.rs`); and `dbrx.cpp:34,110-113` keep the
+    // pre-FFN norm under `blk.N.attn_output_norm`, which
+    // `crate::norm_sites` reads into the same slot `gpt-oss` keeps under
+    // `post_attention_norm`. Fused `attn_qkv` (:31), NEOX RoPE
+    // (llama-model.cpp:2617), SiLU MoE with softmax gating and top-k
+    // renormalisation (:115-125), untied lm_head (:24).
+    "dbrx",
+    // tests/grok_graphs.rs: Grok-1, NEW CODE on the MiniCPM shape --
+    // `grok.cpp:5-12` seeds SEVEN hyper-parameters before `:14-27` let
+    // the file override them, so a file declaring none is still scaled
+    // by all of them and a key-presence gate sees nothing.
+    // `scalar_multipliers::MultiplierDefaults::Grok` is that hook:
+    // `embedding_scale` (78.38), `logit_scale` as a MULTIPLY (:211, the
+    // `LogitScaleUse::AsIs` variant the module had named as absent),
+    // `attention.output_scale` (0.0884, a fifth key that resolves into
+    // the `attention_scale` slot) and the attention softcap default of
+    // 30. The attention itself is `kq_scale = 1.0f` (:137) with the
+    // real scale inside the tanh (llama-graph.cpp:2572-2582), which is
+    // exactly "pre-scale Q, then softcap"; `router_logit_softcapping`
+    // and `attention.temperature_length` are read at :20,:23 and applied
+    // NOWHERE in the graph (measured: no other reference in `src/`), so
+    // ferrox ignores them the same way. `blk.N.attn_output_norm` is the
+    // POST-attention norm here (:143-146, before the residual add at
+    // :148) and `layer_output_norm` / `post_ffw_norm` the post-FFN one
+    // (:75-78, :185-188): a `crate::norm_sites` row. GELU MoE with
+    // softmax gating (:158-168), NEOX RoPE (llama-model.cpp:2616),
+    // tied-with-fallback lm_head (:46-51). Grok-2's parallel dense FFN
+    // (`:171-184`, `sqrt(2)/2` on the sum) is refused BY NAME in
+    // `loader.rs`, so this row is admitted for Grok-1.
+    "grok",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -584,7 +617,7 @@ pub fn is_post_norm_only(arch: &str) -> bool {
 /// [`POST_NORM_ONLY_ARCHITECTURES`]: the difference is the norm
 /// FUNCTION, not the residual wiring, and a name cannot be on both
 /// lists (`loader.rs`'s
-/// `the_three_norm_slot_lists_cannot_name_the_same_architecture`).
+/// `the_norm_slot_and_function_lists_cannot_contradict`).
 ///
 /// **This list will not grow, and that is a measured claim rather than
 /// an expectation.** Every `build_norm` call in all of llama.cpp's
@@ -594,20 +627,48 @@ pub fn is_post_norm_only(arch: &str) -> bool {
 /// which is a non-parametric RMSNorm -- a different function, and a row
 /// this list does not serve.
 ///
-/// The LayerNorm *function* is shared, and that is a different list
-/// that does not exist yet: `dbrx` (unaudited, NEW CODE) and the
-/// `nemotron` / `orion` / `stablelm` / `codeshell` / `jais2` /
-/// `starcoder` / `starcoder2` / `phimoe` bias group all normalise with
-/// `LLM_NORM` and a learned weight, most of them with a bias too. None
-/// of them is closed by this variant, because a `LayerNorm(weight,
-/// bias)` with no caller would be a variant that rots -- see
-/// `crate::norm::NormOp`.
+/// The LayerNorm *function* with a learned weight is a different list,
+/// [`WEIGHTED_LAYER_NORM`], and it exists now because `dbrx` gave it a
+/// caller.
 pub const NON_PARAMETRIC_LAYER_NORM: &[&str] = &["olmo"];
 
 /// Does this architecture normalise without any learned parameters?
 /// See [`NON_PARAMETRIC_LAYER_NORM`].
 pub fn uses_non_parametric_layer_norm(arch: &str) -> bool {
     NON_PARAMETRIC_LAYER_NORM.contains(&arch)
+}
+
+/// Architectures that normalise with a **LayerNorm with a learned
+/// weight and no bias** -- `build_norm(x, w, NULL, LLM_NORM, il)` -- at
+/// every norm site.
+///
+/// `dbrx`: `src/models/dbrx.cpp:4` reads `LLM_KV_ATTENTION_LAYERNORM_EPS`
+/// (not the RMS one) and the graph passes `LLM_NORM` with a weight and
+/// a null bias at all three sites -- `:69-71` pre-attention, `:110-112`
+/// pre-FFN (on `attn_out_norm`, its pre-FFN tensor; see
+/// `crate::norm_sites`) and `:140-142` final. `dbrx.cpp:29,34,23`
+/// create the three weights and no bias tensor at all.
+///
+/// The variant is `crate::norm::NormOp::LayerNorm`. It was deliberately
+/// not written alongside the parameterless one, because every row that
+/// needed it refused for more than the norm; `dbrx` needed two more
+/// things and both were one implementation each (`crate::clamp_kqv`,
+/// `crate::norm_sites`), which is what made it worth landing.
+///
+/// **What this list does NOT close**, so nobody adds a name on the
+/// strength of "it is LayerNorm too": the `nemotron` / `orion` /
+/// `stablelm` / `codeshell` / `jais2` / `starcoder` / `starcoder2` /
+/// `phimoe` group all create `*_norm.bias` as REQUIRED and `build_norm`
+/// adds it after the multiply. That is a `LayerNorm(w, b)` variant this
+/// enum does not have, and each of those rows refuses for something
+/// else on top -- ALiBi, learned positions, a parallel residual --
+/// which is why the bias form still has no caller.
+pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx"];
+
+/// Does this architecture normalise with a weighted LayerNorm?
+/// See [`WEIGHTED_LAYER_NORM`].
+pub fn uses_weighted_layer_norm(arch: &str) -> bool {
+    WEIGHTED_LAYER_NORM.contains(&arch)
 }
 
 /// How the generic `Decoder` / `ModelConfig::from_gguf` path treats a
@@ -1022,38 +1083,22 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // measurement: libllama refuses all three strings outright. They
     // are refused as strings now, not triaged as architectures. See
     // NO_UPSTREAM_ARCH.
-    (
-        "grok",
-        TriageClass::NewCode,
-        "grok-1 hardcodes five constants BEFORE letting an optional key override them \
-         (src/models/grok.cpp:5-21): logit_scale = 0.5773502691896257 (1/sqrt(3)), \
-         embedding_scale = 78.38367176906169, attn_out_scale = 0.08838834764831845 \
-         (1/sqrt(128)), and attn / router logit softcapping both 30.0. A GGUF omitting every \
-         key is still scaled by all five, so a key-presence gate such as \
-         `unsupported_scaling_keys` cannot see them -- the same blind spot `minicpm` is \
-         refused for. On top of that the graph is not the generic one: attention runs with \
-         kq_scale = 1.0f (:137) and folds the real scale into a tanh softcap instead \
-         (llama-graph.cpp:2579-2581), every layer computes BOTH a dense GELU FFN and a GELU \
-         MoE and sums them scaled by sqrt(2)/2 (:171-184), and `blk.N.attn_output_norm` \
-         (:62, LLM_TENSOR_ATTN_OUT_NORM = \"blk.%d.attn_output_norm\", llama-arch.cpp:423) is \
-         a tensor name ferrox never reads. Router logit softcapping has no ferrox concept at \
-         all. `uses_geglu` already covers grok's GELU, which is necessary and nowhere near \
-         sufficient",
-    ),
-    (
-        "dbrx",
-        TriageClass::NewCode,
-        "LayerNorm, not RMSNorm. src/models/dbrx.cpp:4 reads LLM_KV_ATTENTION_LAYERNORM_EPS \
-         (not the RMS one) and the graph normalises with `LLM_NORM` at all three sites -- \
-         :69-71 pre-attention, :110-112 pre-FFN, :140-142 final -- which subtracts the mean; \
-         ferrox has only `rms_norm(x, w, eps)`, a different function of the same tensors on \
-         every layer. Note this is NOT caught by the required-bias refusal group: dbrx \
-         creates no norm bias tensors at all, so the marker that group keys on is absent \
-         while the normalisation is still LayerNorm. It also requires \
-         {arch}.attention.clamp_kqv (:5, REQUIRED) and carries no `ffn_norm` -- \
-         `attn_out_norm` (:34) IS the pre-FFN norm (:110-113), the gpt-oss slot again but \
-         under the unread name `blk.%d.attn_output_norm`",
-    ),
+    // `grok` and `dbrx` were HERE, both NEW CODE, and both closed on
+    // seams that had landed the day before. `grok`'s verdict named
+    // five hardcoded defaults (`grok.cpp:5-12` -- there are seven at
+    // this checkout), a `kq_scale = 1.0f` attention with the real
+    // scale folded into a tanh softcap, and `blk.N.attn_output_norm`
+    // as an unread tensor name: the defaults are a
+    // `scalar_multipliers::MultiplierDefaults` variant like MiniCPM's,
+    // the attention is `attention_scale` plus the existing softcap, and
+    // the tensor name is a `crate::norm_sites` row. Its Grok-2 shape --
+    // a dense GELU FFN summed with the MoE at sqrt(2)/2 (`:171-184`)
+    // -- is refused BY NAME in `loader.rs`, so the row is admitted for
+    // Grok-1. `dbrx`'s verdict named the weighted LayerNorm, the
+    // REQUIRED `attention.clamp_kqv`, and `attn_output_norm` as its
+    // pre-FFN norm: `crate::norm::NormOp::LayerNorm`, `crate::clamp_kqv`
+    // (which closed `olmo`'s clip_qkv sub-refusal with it) and the
+    // same `norm_sites` table. See `AUDITED_GENERIC_GQA`.
     (
         "smallthinker",
         TriageClass::NewCode,
@@ -1163,8 +1208,9 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `llama_model_rope_type` puts LLM_ARCH_OLMO in the
         // consecutive-pairs group (llama-model.cpp:2585), which is also
         // why `conversion/olmo.py:33-36` permutes q_proj and k_proj the
-        // way `LlamaModel` does. A file declaring a positive
-        // `olmo.attention.clamp_kqv` is refused by name in `loader.rs`.
+        // way `LlamaModel` does. Its `olmo.attention.clamp_kqv` was
+        // refused by name and is applied now (`crate::clamp_kqv`),
+        // since `dbrx` needed the same clamp.
         v.push(gqa_norm("olmo"));
         // `smollm3` was refused OUTRIGHT, in the "No RoPE at all" group
         // below, and it was the only row there whose graph is the plain
@@ -1253,6 +1299,18 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // `crate::qkv_fused` applies now. Qwen-1 only; qwen2 and
             // later store the split spelling and were already audited.
             "qwen",
+            // Were NEW CODE in `NEOX_ROPE_TRIAGED` and are audited now,
+            // each on seams that landed the day before: `dbrx` on the
+            // weighted LayerNorm (`crate::norm`), the QKV clamp
+            // (`crate::clamp_kqv`) and the `attn_output_norm` slot
+            // (`crate::norm_sites`); `grok` on the defaults hook
+            // (`scalar_multipliers::MultiplierDefaults::Grok`), the
+            // scale-inside-softcap attention and the same `norm_sites`
+            // table. NEOX RoPE: llama-model.cpp:2616-2617 put both in
+            // the `n_rot/2`-offset group. `tests/dbrx_graphs.rs`,
+            // `tests/grok_graphs.rs`.
+            "dbrx",
+            "grok",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2115,9 +2173,10 @@ pub fn swa_disabled_by_arch(arch: &str, n_layers: usize) -> bool {
 /// but `grok` is `DecoderFamily::StandardGqa`, so ferrox handed it
 /// SwiGLU and would have computed a different FFN on every layer.
 ///
-/// Latent only because `grok` is not in [`AUDITED_GENERIC_GQA`] and so
-/// refuses today. It would have become wrong the moment somebody
-/// audited it, which is the worst possible time to find out.
+/// It was latent while `grok` refused as unaudited, and it is LIVE
+/// now: `tests/grok_graphs.rs` compares the GELU experts against
+/// libllama, at the GeGLU tolerance that llama.cpp's f16 GELU table
+/// forces on every GeGLU row.
 ///
 /// The other `LLM_FFN_GELU` users upstream -- `bert`, `bloom`,
 /// `codeshell`, `falcon`, `gpt2`, `gptneox`, `mpt`, `phi2`, `starcoder`,
@@ -2334,9 +2393,26 @@ pub fn attention_scale_override(
     (scale != kernel_scale).then_some(scale)
 }
 
+/// Architectures outside the Gemma family whose graph applies the two
+/// logit softcaps ferrox implements -- `attn_logit_softcapping` on the
+/// attention scores and `final_logit_softcapping` after the lm_head.
+///
+/// `grok`: `llama-graph.cpp:2572-2582` applies
+/// `30 * tanh(kq * f_attn_out_scale / 30)` before the softmax, which is
+/// ferrox's `attn_logit_softcap` over a Q pre-scaled by
+/// `ModelConfig::attention_scale`; `grok.cpp:214-218` applies the final
+/// softcap when the file declares one (default 0, off). The converter
+/// (`conversion/grok.py:34`) writes `attn_logit_softcapping` for EVERY
+/// Grok export, so without this list no real Grok file could load.
+///
+/// The Gemma family is not here because it is exempted as a family
+/// below; a name here is one whose graph was read for both softcaps.
+pub const LOGIT_SOFTCAP_ARCHITECTURES: &[&str] = &["grok"];
+
 /// Metadata keys that, when present with a nonzero value, require math
 /// ferrox's generic decoder does not implement *unless* the architecture
-/// profile opts into those features (Gemma family).
+/// profile opts into those features (Gemma family), or the architecture
+/// is named in [`LOGIT_SOFTCAP_ARCHITECTURES`] for the softcaps.
 pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
     let profile = resolve_profile(arch);
     // Gemma family implements softcap + SWA pattern; others still refuse.
@@ -2344,11 +2420,12 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
         return Vec::new();
     }
     let key = |suffix: &str| format!("{arch}.{suffix}");
-    vec![
-        (
+    let mut out = Vec::new();
+    if !LOGIT_SOFTCAP_ARCHITECTURES.contains(&arch) {
+        out.push((
             key("attention.logit_softcapping"),
             "attention logit soft-capping (Gemma 2+); not implemented in the generic decoder",
-        ),
+        ));
         // The spelling llama.cpp's converters ACTUALLY write
         // (`llama-arch.cpp:213` is `%s.attn_logit_softcapping`). The
         // line above is a spelling no converter emits, so this gate has
@@ -2363,14 +2440,16 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
         //
         // A gate that cannot fire is not a gate, and it looked exactly
         // like one.
-        (
+        out.push((
             key("attn_logit_softcapping"),
             "attention logit soft-capping (Gemma 2+); not implemented in the generic decoder",
-        ),
-        (
+        ));
+        out.push((
             key("final_logit_softcapping"),
             "final logit soft-capping (Gemma 2+); not implemented in the generic decoder",
-        ),
+        ));
+    }
+    out.push(
         // NextN / MTP layers are INSIDE `block_count`, and llama.cpp
         // does not run them: `hparams.n_layer()` is
         // `n_layer_all - n_layer_nextn` and every architecture that
@@ -2392,32 +2471,33 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
              them (n_layer = n_layer_all - n_layer_nextn); the generic decoder would run \
              them as ordinary decoder layers",
         ),
-        // `{arch}.attention.sliding_window_pattern` WAS refused here,
-        // with the reason "not implemented in the generic decoder".
-        // That reason was false, and had been for some time: the
-        // alternating pattern lives in `ModelConfig::layer_sliding_window`,
-        // which implements BOTH phases and which `gpt-oss` -- a
-        // `StandardGqa` row, not a Gemma one -- has relied on since it
-        // was audited against libllama.
-        //
-        // What the gate really did was make the loader's own read of
-        // that key (`swa_pattern`) unreachable for every non-Gemma
-        // architecture: llama.cpp lets the file override the
-        // architecture's hardcoded period, ferrox refused any file that
-        // tried. `plamo3` is the case that proves it -- its converter
-        // writes the key verbatim (`conversion/plamo.py:178`) -- and
-        // `tests/fixture_away_graphs.rs` now drives a period of 2 out of
-        // a plamo3 fixture and compares against llama.cpp's own graph on
-        // all three forward paths, with the phase and the window
-        // sabotaged separately.
-        //
-        // The real gap the key can hide is NOT the pattern: it is that
-        // llama.cpp accepts the value as a scalar OR an n_layer-long
-        // ARRAY (`ml.get_key_or_arr`), and ferrox carries one scalar
-        // period. `loader.rs` refuses an array-valued pattern by name,
-        // where the value can actually be inspected, instead of
-        // refusing every file that has the key at all.
-    ]
+    );
+    // `{arch}.attention.sliding_window_pattern` WAS refused here,
+    // with the reason "not implemented in the generic decoder".
+    // That reason was false, and had been for some time: the
+    // alternating pattern lives in `ModelConfig::layer_sliding_window`,
+    // which implements BOTH phases and which `gpt-oss` -- a
+    // `StandardGqa` row, not a Gemma one -- has relied on since it
+    // was audited against libllama.
+    //
+    // What the gate really did was make the loader's own read of
+    // that key (`swa_pattern`) unreachable for every non-Gemma
+    // architecture: llama.cpp lets the file override the
+    // architecture's hardcoded period, ferrox refused any file that
+    // tried. `plamo3` is the case that proves it -- its converter
+    // writes the key verbatim (`conversion/plamo.py:178`) -- and
+    // `tests/fixture_away_graphs.rs` now drives a period of 2 out of
+    // a plamo3 fixture and compares against llama.cpp's own graph on
+    // all three forward paths, with the phase and the window
+    // sabotaged separately.
+    //
+    // The real gap the key can hide is NOT the pattern: it is that
+    // llama.cpp accepts the value as a scalar OR an n_layer-long
+    // ARRAY (`ml.get_key_or_arr`), and ferrox carries one scalar
+    // period. `loader.rs` refuses an array-valued pattern by name,
+    // where the value can actually be inspected, instead of
+    // refusing every file that has the key at all.
+    out
 }
 
 /// Scalar multipliers a checkpoint can declare in **metadata** that the
@@ -2457,7 +2537,7 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
 /// `1.0`, while llama.cpp's `f_attention_scale` uses `0.0` as its
 /// "unset, use 1/sqrt(head_dim)" sentinel.
 pub fn unsupported_scaling_keys(arch: &str) -> Vec<(String, &'static str, f32)> {
-    use crate::scalar_multipliers::LogitScaleUse;
+    use crate::scalar_multipliers::{AttentionScaleKey, LogitScaleUse};
     let support = crate::scalar_multipliers::multiplier_support(arch);
     let key = |suffix: &str| format!("{arch}.{suffix}");
     let mut out = Vec::new();
@@ -2482,10 +2562,25 @@ pub fn unsupported_scaling_keys(arch: &str) -> Vec<(String, &'static str, f32)> 
             1.0,
         ));
     }
-    if !support.attention {
+    // Two spellings of one slot, and an architecture reads at most one
+    // of them: the OTHER stays refused. `grok` reads `output_scale` and
+    // never `scale`; Granite the reverse; everyone else neither.
+    if support.attention != AttentionScaleKey::Scale {
         out.push((
             key("attention.scale"),
             "explicit attention score scale (Granite `attention_multiplier`); the generic decoder always uses 1/sqrt(head_dim)",
+            0.0,
+        ));
+    }
+    if support.attention != AttentionScaleKey::OutputScale {
+        // Applied as-is by the one graph that reads it (`grok.cpp`, no
+        // sentinel), so there is no value that means "off" -- the
+        // no-op here is the kernels' own scale expressed as a key, which
+        // no converter writes for a non-Grok architecture. A file
+        // declaring ANY other value is refused.
+        out.push((
+            key("attention.output_scale"),
+            "attention output scale (Grok `attn_output_multiplier`, applied inside its tanh softcap); the generic decoder always uses 1/sqrt(head_dim)",
             0.0,
         ));
     }
@@ -2663,7 +2758,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 20,
+            seen == 18,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2692,11 +2787,16 @@ mod audit_tests {
              cause behind three refusals, and the count moved by one only because the \
              other two were not in it: EXAONE-4 32B was refused BY NAME in loader.rs \
              and `smollm3` sat in the \"No RoPE at all\" DedicatedOnly group, so both \
-             raise the audited number without lowering this one. What is left is 19 NEW \
-             CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have closed are \
-             `olmo2`, `exaone4`, the three Granite rows and `exaone-moe`, and each \
-             closure but `olmo`'s took more than one row at a time because each found \
-             ONE cause behind several refusals"
+             raise the audited number without lowering this one, and 20 until `grok` \
+             and `dbrx` closed together on seams that had landed the day before -- the \
+             defaults hook and the norm-site table for `grok`, the LayerNorm variant, \
+             the QKV clamp and the same table for `dbrx` (tests/grok_graphs.rs, \
+             tests/dbrx_graphs.rs) -- with the clamp also closing `olmo`'s clip_qkv \
+             refusal by name. What is left is 17 NEW CODE and one UNKNOWN (`phi4`). The \
+             NEW CODE rows that have closed are `olmo2`, `exaone4`, the three Granite \
+             rows, `exaone-moe`, `grok` and `dbrx`, and each closure but `olmo`'s took \
+             more than one row at a time because each found ONE cause behind several \
+             refusals"
         );
     }
 
@@ -2713,14 +2813,14 @@ mod audit_tests {
         // `headline()` below, because a class with no rows still has to
         // render distinctly the day something lands in it again.
         //
-        // `dbrx`, which used to be `olmo`. Both are LayerNorm rows and
-        // that is why the sample moved: `olmo`'s norm is
-        // NON-PARAMETRIC and is implemented now
-        // (`crate::norm::NormOp::LayerNormNoParams`), while `dbrx`'s has
-        // a learned weight, no `ffn_norm` at all, and a REQUIRED
-        // `attention.clamp_kqv` -- three blockers, none of which the
-        // `olmo` work reached.
-        let new_code = unaudited_refusal_detail("dbrx");
+        // `smallthinker`, which used to be `dbrx`, which used to be
+        // `olmo`: the sample keeps moving because the rows keep
+        // closing. `olmo`'s non-parametric LayerNorm, then `dbrx`'s
+        // weighted one plus its clamp and its `attn_output_norm` slot,
+        // are all implemented now. `smallthinker` routes on the raw
+        // layer input and runs ReLU experts, and nothing landed so far
+        // reaches either.
+        let new_code = unaudited_refusal_detail("smallthinker");
         // `phi4` is the only UNKNOWN row left: `mistral`, `mixtral` and
         // `yi` used to be the other three and are refused as strings
         // now (see `NO_UPSTREAM_ARCH`).
@@ -2747,7 +2847,7 @@ mod audit_tests {
         // The blocker itself, not only the class label, has to be in the
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
-        assert!(new_code.contains("dbrx.cpp:4"), "{new_code}");
+        assert!(new_code.contains("smallthinker.cpp:111"), "{new_code}");
         assert!(unknown.contains("LLM_ARCH_NAMES"), "{unknown}");
         // The two empty classes still have to be distinguishable.
         let labels = [
@@ -2940,6 +3040,82 @@ mod tests {
     fn gemma_family_does_not_fail_closed_on_softcap_keys() {
         assert!(unsupported_feature_keys("gemma3").is_empty());
         assert!(!unsupported_feature_keys("llama").is_empty());
+    }
+
+    /// `grok` applies both softcaps, so neither key refuses it -- while
+    /// every OTHER gate in that list still does, and every name on the
+    /// softcap list is an audited row.
+    ///
+    /// The first half is what lets a real Grok file load at all:
+    /// `conversion/grok.py:34` writes `attn_logit_softcapping` for every
+    /// export. The second half is what keeps the exemption from
+    /// widening into "softcaps are fine everywhere": `llama` must still
+    /// refuse them, and the NextN gate must still reach `grok`.
+    #[test]
+    fn grok_is_exempt_from_the_softcap_keys_and_nothing_else() {
+        let keys: Vec<String> = unsupported_feature_keys("grok")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        for softcap in [
+            "grok.attention.logit_softcapping",
+            "grok.attn_logit_softcapping",
+            "grok.final_logit_softcapping",
+        ] {
+            assert!(
+                !keys.iter().any(|k| k == softcap),
+                "{softcap} must not refuse grok"
+            );
+        }
+        assert!(
+            keys.iter().any(|k| k == "grok.nextn_predict_layers"),
+            "the non-softcap gates still apply: {keys:?}"
+        );
+        let llama: Vec<String> = unsupported_feature_keys("llama")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(llama.iter().any(|k| k == "llama.attn_logit_softcapping"));
+        for arch in LOGIT_SOFTCAP_ARCHITECTURES {
+            assert!(
+                is_audited_generic(arch),
+                "`{arch}` is on LOGIT_SOFTCAP_ARCHITECTURES without a fixture proving both \
+                 softcaps"
+            );
+        }
+    }
+
+    /// The derived scaling refusals for `grok`: the two keys its graph
+    /// does not read stay refused, the three it reads do not, and the
+    /// OTHER attention spelling is refused for Granite.
+    ///
+    /// This is the half of `AttentionScaleKey` that a hand-written list
+    /// could have got wrong silently: `attention.output_scale` had no
+    /// refusal at all before `grok`, so a Granite file declaring it
+    /// would have loaded and been ignored.
+    #[test]
+    fn the_scaling_refusals_for_grok_are_derived_from_its_attention_key() {
+        let refused = |arch: &str| -> Vec<String> {
+            unsupported_scaling_keys(arch)
+                .into_iter()
+                .map(|(k, _, _)| k)
+                .collect()
+        };
+        let grok = refused("grok");
+        assert_eq!(
+            grok,
+            vec![
+                "grok.residual_scale".to_string(),
+                "grok.attention.scale".to_string()
+            ],
+            "{grok:?}"
+        );
+        let granite = refused("granite");
+        assert_eq!(granite, vec!["granite.attention.output_scale".to_string()]);
+        let llama = refused("llama");
+        assert!(llama.contains(&"llama.attention.output_scale".to_string()));
+        assert!(llama.contains(&"llama.attention.scale".to_string()));
+        assert_eq!(llama.len(), 5, "{llama:?}");
     }
 
     /// Parallel attention+FFN residual is not a tensor and not a

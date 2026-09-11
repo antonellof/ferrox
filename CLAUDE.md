@@ -12,37 +12,42 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-11. **37** architectures run with
+Honest position, re-audited 2026-09-11. **39** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 20 unaudited refusals are now TRIAGED, and the refusal says which of
+The 18 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 19 need new code, 1 is unknown with the question stated. Five
+away**, 17 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
-`olmo` on 2026-09-10, and `exaone-moe` on 2026-09-11, each with a
-libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
-to 28 to 25 to 22 to 21 to 20; the step from 28 to 25 was moving the
-three alias rows off the generic path rather than a closure. `minicpm`
-moved too and is not in that count: it was refused BY NAME, never as
-unaudited, so it raises the audited number without lowering the
-refusing one. `smollm3` and EXAONE-4 32B closed with `exaone-moe` and
-are the same case, one a DedicatedOnly refusal and the other a refusal
-by name.
+`olmo` on 2026-09-10, and `exaone-moe`, `grok` and `dbrx` on
+2026-09-11, each with a libllama-golden fixture, which is what moved 46
+to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21 to 20 to 18; the step
+from 28 to 25 was moving the three alias rows off the generic path
+rather than a closure. `minicpm` moved too and is not in that count: it
+was refused BY NAME, never as unaudited, so it raises the audited number
+without lowering the refusing one. `smollm3` and EXAONE-4 32B closed
+with `exaone-moe` and are the same case, one a DedicatedOnly refusal and
+the other a refusal by name; the clamped OLMo-1 checkpoints closed with
+`dbrx` the same way.
 BOTH cheap classes being EMPTY is the honest headline: nothing still
 refusing is one fixture or one arm away, so every row that is left
 needs a different graph.
 
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
-times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 a fourth
-time, 20 to 19. The first two took several rows at once for the same
-reason, and it is the lesson: each found ONE cause behind several
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 twice more,
+20 to 19 and 19 to 17. The first two took several rows at once for the
+same reason, and it is the lesson: each found ONE cause behind several
 refusals. The fourth did too and the column hides it: the per-layer
 RoPE gate closed THREE refusals and only `exaone-moe` was in the column.
+The fifth is the lesson's other half: `grok` and `dbrx` each closed by
+extending a seam that had landed the day BEFORE -- the MiniCPM defaults
+hook, the `NormOp` enum, the norm-slot decision -- by one column, and
+the clamp `dbrx` needed closed a third row's refusal-by-name with it.
 
 `olmo` is the exception that says what the rule is really made of. It
 closed ALONE, and before writing a line of code the question "what else
@@ -56,10 +61,13 @@ rows the search was aimed at (`openelm`, `bitnet`, `arcee`, `mellum`,
 still-plausible. What IS shared is the LayerNorm *function* with a
 learned weight: `dbrx` plus the `nemotron` / `orion` / `stablelm` /
 `codeshell` / `jais2` / `starcoder` / `starcoder2` / `phimoe` bias
-group. None of them is one variant away, because each refuses for more
-than the norm, so that variant was deliberately NOT written --
-`capability::NON_PARAMETRIC_LAYER_NORM` records the whole finding where
-the next person will look.
+group. At the time none of them was one variant away, because each
+refused for more than the norm, so that variant was deliberately NOT
+written. The next day `dbrx` became the caller: its other two blockers
+were one implementation each, so `NormOp::LayerNorm` (weight, no bias)
+landed WITH a row that uses it, and the bias form still has no caller
+and still does not exist -- `capability::WEIGHTED_LAYER_NORM` records
+which rows it does not close and why.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are ONE residual
 topology: no `attn_norm` and no `ffn_norm` tensor, both sublayers
@@ -77,11 +85,17 @@ THIRD shape, pre-norm with a non-parametric LayerNorm, and closed on
 because `Decoder::final_norm` is one too -- OLMo-1's final norm has no
 weights either, and the fused Metal stacks had `Some(&self.final_norm)`
 written into them unconditionally. Its `attention.clamp_kqv` stayed a
-REFUSAL: `llama-graph.cpp:1611-1652` clamps Q, K and V by it,
-`conversion/olmo.py:23-25` really writes it for OLMo-7B-Twin-2T and
+REFUSAL for one day: `llama-graph.cpp:1611-1652` clamps Q, K and V by
+it, `conversion/olmo.py:23-25` really writes it for OLMo-7B-Twin-2T and
 OLMo-1.7-7B, and a second fixture measures that llama.cpp's own logits
-move when it is present, so the row is admitted for the checkpoints it
-covers rather than all of them.
+move when it is present. It was refused rather than implemented because
+the three host bodies each applied the QKV bias in their own loop and a
+clamp added to some of them would have been the dominant bug shape
+again; when `dbrx` needed the same clamp as a REQUIRED key, the three
+loops collapsed onto one helper (`decoder/qkv_bias.rs`) and the clamp
+became a line in it, the fused Metal launches fenced off through the
+same predicate as `residual_scale`. That second fixture now matches
+libllama on all three paths instead of evidencing a refusal.
 
 `granite`, `granitemoe` and the `granite-moe` alias closed together for
 the same kind of reason: they differ in the FFN, not in the four scalar
@@ -115,6 +129,33 @@ merged the wrong way round would agree with llama.cpp on exactly the
 files that prove it exists. Command-R is still not close, because its
 blocker is a parallel residual over LayerNorm rather than the
 multiplier.
+
+`grok` closed on 2026-09-11 on that same hook, one day after it landed,
+and the verdict had predicted it: `grok.cpp:5-12` seeds SEVEN
+hyper-parameters before `:14-27` let the file override them. Two of
+them needed a column the table did not have -- `logit_scale` is a
+MULTIPLY there (`:211`, the `AsIs` variant the module had named as
+deliberately absent) and the attention scale comes from a fifth key,
+`attention.output_scale`, applied INSIDE the tanh softcap with
+`kq_scale = 1.0f` (`:137`, `llama-graph.cpp:2572-2582`), which is
+"pre-scale Q, then softcap" and so the existing `attention_scale` slot
+plus the existing softcap, no new attention code. Two more of the seven
+(`router_logit_softcapping`, `attention.temperature_length`) are read
+by llama.cpp and applied NOWHERE in its graph -- measured, no other
+reference under `src/` -- so ferrox neither applies nor refuses them.
+`dbrx` closed the same day on the three blockers its verdict named, and
+one of them is why `ferrox-models/src/norm_sites.rs` exists:
+`blk.N.attn_output_norm` is `dbrx`'s PRE-FFN norm (`dbrx.cpp:34,110-113`)
+and `grok`'s POST-attention norm (`grok.cpp:62,143-148`), one tensor
+name feeding two different sites, decided by architecture. The loader
+had restated the norm-slot decision as an `if` chain at every site;
+it is one table now, read at all five. Both rows are GeGLU-or-clamp
+shaped in their evidence: DBRX KL 3.4e-12; Grok KL 4.7e-10 and 1.6e-10
+on the no-key and all-keys fixtures, at the GeGLU tolerance because
+llama.cpp's f16 GELU table is the approximate side -- measured by
+making ferrox's GELU emulate the table, at which point both files agree
+to 1e-7. Grok-2's parallel dense FFN (`grok.cpp:171-184`) stays refused
+by name from a fixture that has it, so the row is admitted for Grok-1.
 
 `exaone-moe`, `smollm3` and EXAONE-4 32B closed together on 2026-09-11
 on the PER-LAYER RoPE gate, and the claim that they are one cause was
@@ -269,7 +310,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 37
+Those files are why llama.cpp has 140 architectures and ferrox has 39
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

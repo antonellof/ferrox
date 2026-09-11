@@ -396,24 +396,29 @@ fn a_minicpm_file_declaring_an_attention_scale_is_refused() {
     );
 }
 
-/// The derived refusal list covers exactly the one key MiniCPM does not
+/// The derived refusal list covers exactly the keys MiniCPM does not
 /// read.
 ///
 /// `unsupported_scaling_keys` is the COMPLEMENT of
 /// `scalar_multipliers::multiplier_support`, not a second hand-written
 /// list, and this is the assertion that says so for this row: three keys
-/// implemented means three keys gone from the list, and the fourth still
-/// on it. Two hand-maintained lists is how this repo once refused a key
-/// it implemented and implemented a key it refused.
+/// implemented means three keys gone from the list, and the two
+/// attention spellings still on it -- `attention.scale`, which MiniCPM
+/// does not read, and `attention.output_scale`, which only `grok` does.
+/// Two hand-maintained lists is how this repo once refused a key it
+/// implemented and implemented a key it refused.
 #[test]
-fn the_derived_refusal_list_holds_only_the_key_minicpm_does_not_read() {
+fn the_derived_refusal_list_holds_only_the_keys_minicpm_does_not_read() {
     let keys: Vec<String> = ferrox_models::capability::unsupported_scaling_keys("minicpm")
         .into_iter()
         .map(|(k, _, _)| k)
         .collect();
     assert_eq!(
         keys,
-        vec!["minicpm.attention.scale".to_string()],
+        vec![
+            "minicpm.attention.scale".to_string(),
+            "minicpm.attention.output_scale".to_string()
+        ],
         "{keys:?}"
     );
 }

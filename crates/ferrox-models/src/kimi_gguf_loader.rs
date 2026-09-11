@@ -965,6 +965,7 @@ mod tests {
             final_logit_softcap: None,
             embedding_scale: None,
             residual_scale: None,
+            clamp_kqv: None,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

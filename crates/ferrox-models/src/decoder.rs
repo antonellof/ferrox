@@ -18,6 +18,7 @@ mod ffn_act;
 pub mod kv_window;
 mod lm_head;
 mod qk_norm;
+mod qkv_bias;
 mod rope;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -775,16 +776,20 @@ impl Decoder {
         }
     }
 
-    /// The scalar multipliers no Metal kernel applies, as ONE predicate
+    /// The per-model scalars no Metal kernel applies, as ONE predicate
     /// the four Metal eligibility checks share.
     ///
-    /// Today that is `residual_scale` alone. Every fused launch that
-    /// folds a residual add in -- the dense decode stack, the resident
-    /// MoE decode stack, and both prefill stacks -- adds the branch
-    /// output to the stream on device, with no uniform for a multiplier,
-    /// so a Granite layer served by any of them would be scaled by the
-    /// host bodies and not by the GPU: the same weights answering
-    /// differently depending on which backend took the token. That is
+    /// Two today. `residual_scale`: every fused launch that folds a
+    /// residual add in -- the dense decode stack, the resident MoE
+    /// decode stack, and both prefill stacks -- adds the branch output
+    /// to the stream on device, with no uniform for a multiplier, so a
+    /// Granite layer served by any of them would be scaled by the host
+    /// bodies and not by the GPU. `clamp_kqv`: the fused launches apply
+    /// the QKV bias inside their kernels (`AttnExtras`) and clamp
+    /// nothing, so a DBRX or clamped-OLMo layer served by any of them
+    /// would run unclamped projections while the host bodies clamp
+    /// (`decoder/qkv_bias.rs`). Either way it is the same weights
+    /// answering differently depending on which backend took the token,
     /// the exact failure `attention_scale` is fenced off for next door.
     ///
     /// It is one function rather than four spellings because the GPU
@@ -793,7 +798,7 @@ impl Decoder {
     /// the whole-stack decode NONE.
     #[cfg(feature = "metal")]
     fn metal_can_serve_scalars(config: &ModelConfig) -> bool {
-        config.residual_scale.is_none()
+        config.residual_scale.is_none() && config.clamp_kqv.is_none()
     }
 
     /// True when this layer can use the fused Metal attention block
@@ -3880,27 +3885,14 @@ impl Decoder {
             );
             drop(qkv_acts);
 
-            if let Some(bias) = &layer.attn.q_bias {
-                for row in q_batch.chunks_mut(q_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
-            if let Some(bias) = &layer.attn.k_bias {
-                for row in k_batch.chunks_mut(kv_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
-            if let Some(bias) = &layer.attn.v_bias {
-                for row in v_batch.chunks_mut(kv_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
+            self.apply_qkv_bias_and_clamp(
+                layer,
+                &mut q_batch,
+                &mut k_batch,
+                &mut v_batch,
+                q_width,
+                kv_width,
+            );
 
             self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             // Host-side `mscale`, applied before either backend ropes.
@@ -4457,27 +4449,14 @@ impl Decoder {
             let q_width = n_heads * head_dim;
             let kv_width = n_kv_heads * head_dim;
 
-            if let Some(bias) = &layer.attn.q_bias {
-                for row in q_batch.chunks_mut(q_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
-            if let Some(bias) = &layer.attn.k_bias {
-                for row in k_batch.chunks_mut(kv_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
-            if let Some(bias) = &layer.attn.v_bias {
-                for row in v_batch.chunks_mut(kv_width) {
-                    for (x, b) in row.iter_mut().zip(bias.iter()) {
-                        *x += b;
-                    }
-                }
-            }
+            self.apply_qkv_bias_and_clamp(
+                layer,
+                &mut q_batch,
+                &mut k_batch,
+                &mut v_batch,
+                q_width,
+                kv_width,
+            );
 
             self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
             self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
@@ -6675,6 +6654,40 @@ mod metal_rope_tests {
             !Decoder::metal_can_serve_scalars(&scaled),
             "the shared predicate is what all four read"
         );
+    }
+
+    /// A `clamp_kqv` keeps every fused Metal path off the model too,
+    /// through the same predicate.
+    ///
+    /// The fused launches apply the QKV bias inside their kernels via
+    /// `AttnExtras` and clamp nothing, while the host bodies clamp
+    /// after the bias (`decoder/qkv_bias.rs`). A DBRX layer served by a
+    /// fused launch would therefore run unclamped projections -- the
+    /// disagreement the residual-scale fence exists for, on a different
+    /// scalar. Only reachable in a `--features metal` build.
+    #[test]
+    fn a_qkv_clamp_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut clamped = plain;
+        clamped.clamp_kqv = Some(8.0);
+        let d = Decoder::new_random_small(clamped.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a clamp no Metal kernel applies must refuse the fused attention"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &clamped),
+            "...and the prefill dense stack"
+        );
+        assert!(!Decoder::metal_can_serve_scalars(&clamped));
     }
 
     /// A Gemma-3-4B-shaped config: `rope_scaling {linear, factor 8}`

@@ -89,8 +89,8 @@
 
 mod common;
 use common::{
-    assert_all_three_paths_match, graph_caches, graph_fixture_path, load_graph_fixture, worst_vs,
-    GRAPH_PROMPT, GRAPH_TOL,
+    assert_all_three_paths_match, graph_caches, graph_fixture_path, kl_vs_golden,
+    load_graph_fixture, worst_vs, GRAPH_PROMPT, GRAPH_TOL,
 };
 use ferrox_models::{Decoder, LoadError, ModelConfig, RopeLayout};
 use ferrox_moe::GatingFunction;
@@ -222,31 +222,6 @@ fn golden(arch: &str) -> &'static [f32] {
         "granitemoe" | "granite-moe" => &GRANITEMOE_GOLDEN,
         other => panic!("no golden for `{other}`"),
     }
-}
-
-/// `KL(llama.cpp || ferrox)` over the softmax of the two logit vectors,
-/// in nats.
-///
-/// The max absolute logit difference is what
-/// `assert_all_three_paths_match` gates on, because it is the sharper
-/// instrument on a 48-wide synthetic vocabulary. KL is reported beside
-/// it because it is the number `ferrox parity` speaks in and the one a
-/// reader can compare against the K-quant drift in
-/// `docs/plans/llama-cpp-gap-inventory.md` §10 -- a comparison that only
-/// means anything if both sides are quoted in the same unit.
-fn kl_vs_golden(got: &[f32], golden: &[f32]) -> f64 {
-    let softmax = |v: &[f32]| -> Vec<f64> {
-        let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-        let exp: Vec<f64> = v.iter().map(|&x| (x as f64 - max).exp()).collect();
-        let sum: f64 = exp.iter().sum();
-        exp.into_iter().map(|e| e / sum).collect()
-    };
-    let p = softmax(golden);
-    let q = softmax(got);
-    p.iter()
-        .zip(q.iter())
-        .map(|(&p, &q)| if p > 0.0 { p * (p / q).ln() } else { 0.0 })
-        .sum()
 }
 
 #[test]

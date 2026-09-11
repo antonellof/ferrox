@@ -193,15 +193,15 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **37** do
+   logit comparison against real `libllama`, or a fixture; **39** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
    `ernie4_5-moe`, `internlm2`, `xverse`, `baichuan`, `exaone`,
    `exaone4`, `exaone-moe`, `smollm3`, `plamo3`, `granite`, `granitemoe`,
-   `granite-moe`, `minicpm`, `olmo`,
+   `granite-moe`, `minicpm`, `olmo`, `dbrx`, `grok`,
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **20** stop with `UnauditedArchitecture`.
+   **18** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
@@ -245,7 +245,7 @@ unmeasured, because measuring it needs a quiet host.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. None of the 21 is a fixture or a single
+"Unaudited" is not one thing. None of the 18 is a fixture or a single
 match arm away any more: they need an attention implementation or a
 reading nobody has done, and the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
@@ -257,7 +257,7 @@ reading nobody has done, and the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 21 have now been read on both sides (`ferrox_models::capability`,
+All 18 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -266,13 +266,13 @@ on models":
 |---|---|
 | fixture-away | 0 |
 | one match arm | 0 |
-| new code | 20 |
+| new code | 17 |
 | unknown | 1 |
 
 **Both cheap classes are empty.** `gemma` was the last fixture-away row
 and `chatglm` the last one-match-arm row; nothing still refusing is one
 fixture or one arm away. That is a better answer than the count alone:
-the cheap wins are spent, and what is left is 20 rows needing a
+the cheap wins are spent, and what is left is 17 rows needing a
 different graph plus one name nobody can get a file for.
 
 It was 47 until the triage itself removed one. Reading
@@ -328,15 +328,18 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (19).** A different attention or residual structure. The
-recurring shapes, rather than 19 separate stories:
+**New code (17).** A different attention or residual structure. The
+recurring shapes, rather than 17 separate stories:
 
 The column moved for the first time on 2026-09-10, three times: 26 to
-24, 24 to 21, then 21 to 20, and on 2026-09-11 a fourth, 20 to 19. The
-first two took several rows at once, and for the same reason -- each
-found ONE cause behind several refusals. The fourth did too, and the
-count hides it: the per-layer RoPE gate closed THREE refusals and only
-one of them (`exaone-moe`) was ever in this column.
+24, 24 to 21, then 21 to 20, and on 2026-09-11 twice more, 20 to 19 and
+19 to 17. The first two took several rows at once, and for the same
+reason -- each found ONE cause behind several refusals. The fourth did
+too, and the count hides it: the per-layer RoPE gate closed THREE
+refusals and only one of them (`exaone-moe`) was ever in this column.
+The fifth is a different lesson, below: `grok` and `dbrx` each closed
+by extending a seam that had landed the day before, and the clamp one
+of them needed closed a refusal-by-name on a third row.
 
 `olmo2` and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and
 no `ffn_norm` at all, both sublayers reading the raw residual, each
@@ -402,26 +405,77 @@ hope: every `build_norm` call in all 140 of llama.cpp's
 all three hits are `olmo.cpp`. `openelm`, `bitnet`, `arcee`, `mellum`,
 `nanbeige` and `deci` were the candidates and none of them qualifies.
 The LayerNorm *function* is shared -- `dbrx` and the bias group below --
-but none of those is one variant away, so a weighted-LayerNorm variant
-would have had no caller and was deliberately not written
-(`capability::NON_PARAMETRIC_LAYER_NORM` carries the whole finding).
-Half of OLMo-1's verdict stayed a refusal, and it is the half that read
-like an aside: `olmo.cpp:5` reads `{arch}.attention.clamp_kqv`,
-`llama-graph.cpp:1611-1652` clamps Q, K and V by it inside `build_qkv`,
-and `conversion/olmo.py:23-25` writes it for every checkpoint whose HF
-config has a `clip_qkv` -- OLMo-7B-Twin-2T and OLMo-1.7-7B do, at 8.0;
-the original OLMo-7B does not. A second fixture measures that llama.cpp
-answers differently with it, so it is not a no-op that could be
-ignored.
+but at the time none of those was one variant away, so a
+weighted-LayerNorm variant would have had no caller and was deliberately
+not written. Half of OLMo-1's verdict stayed a refusal, and it is the
+half that read like an aside: `olmo.cpp:5` reads
+`{arch}.attention.clamp_kqv`, `llama-graph.cpp:1611-1652` clamps Q, K
+and V by it inside `build_qkv`, and `conversion/olmo.py:23-25` writes it
+for every checkpoint whose HF config has a `clip_qkv` -- OLMo-7B-Twin-2T
+and OLMo-1.7-7B do, at 8.0; the original OLMo-7B does not. A second
+fixture measures that llama.cpp answers differently with it, so it is
+not a no-op that could be ignored. Both halves of that paragraph turned
+out to be one day old.
+
+`dbrx` and `grok` closed on 2026-09-11, each by extending a seam that
+had landed the day before, and that is the whole reason they were cheap
+enough to take. `dbrx`'s three blockers were the weighted LayerNorm --
+the variant the `olmo` work had refused to write without a caller, and
+`dbrx` is the caller (`NormOp::LayerNorm`, `dbrx.cpp:69-71,110-112,
+140-142`) -- a REQUIRED `attention.clamp_kqv` (`dbrx.cpp:5`), and its
+pre-FFN norm stored as `blk.N.attn_output_norm` (`:34,110-113`). The
+clamp was the expensive one and the one worth the most: the three host
+bodies each applied the QKV bias in their own hand-written loop, which
+is exactly why the OLMo clamp had been refused rather than implemented
+(a clamp added to some copies and not the others is this repo's
+dominant bug shape), so the three loops collapsed onto one helper
+(`decoder/qkv_bias.rs`) and the clamp is a line in it, with the fused
+Metal launches fenced off through the same predicate as
+`residual_scale`. The clamped OLMo fixture, which used to evidence a
+refusal, now matches libllama on all three paths (KL 1e-11 class), so
+OLMo-7B-Twin-2T and OLMo-1.7-7B run. KL on the DBRX fixture: 3.4e-12,
+max |delta| 6.1e-6. A DBRX file without the clamp key is refused, as
+libllama refuses it (`key not found in model: dbrx.attention.clamp_kqv`,
+measured).
+
+`grok` was the MiniCPM shape and the verdict said so: `grok.cpp:5-12`
+seeds SEVEN hyper-parameters before `:14-27` let the file override them,
+so a Grok-1 export declaring none is still scaled by all of them.
+`MultiplierDefaults::Grok` is the hook, on the same table as MiniCPM's,
+and two of the seven needed a column the table did not have:
+`logit_scale` is a MULTIPLY (`grok.cpp:211`, `LogitScaleUse::AsIs`, the
+variant the module had named as absent), and the attention scale comes
+from `{arch}.attention.output_scale`, applied INSIDE the tanh softcap
+with `kq_scale = 1.0f` (`:137`, `llama-graph.cpp:2572-2582`) -- which is
+arithmetically "pre-scale Q, then softcap", i.e. the `attention_scale`
+slot plus the softcap Gemma-2 already uses, so no new attention code.
+The other two keys Grok reads, `router_logit_softcapping` and
+`attention.temperature_length`, are applied NOWHERE in llama.cpp's
+graph (no other reference under `src/`, measured), so ferrox neither
+applies nor refuses them. `attn_output_norm` is Grok's POST-attention
+norm -- the same tensor name `dbrx` stores its pre-FFN norm under --
+which is why `ferrox_models::norm_sites` exists: one table for which
+tensor feeds which site, replacing the `if` chain the loader restated
+at every site. Two fixtures, as MiniCPM needed: one declaring NO key
+(the only shape that can tell the hook from its absence) and one
+declaring every key at a value far from its default (pinning that the
+file wins; a hook merged the wrong way round agrees with llama.cpp on
+exactly the files that prove it exists). KL 4.7e-10 and 1.6e-10, max
+|delta| 6.3e-5 and 4.0e-5 -- at the GeGLU tolerance, and measured to be
+entirely llama.cpp's f16 GELU table: with ferrox's GELU made to emulate
+the table both files agree to 1.0e-7 / 1.5e-7. Grok-2's parallel dense
+FFN (`grok.cpp:171-184`, summed with the experts at `sqrt(2)/2`) is
+refused by name from a fixture that has it, so the row is admitted for
+Grok-1.
 
 | Shape | Architectures |
 |---|---|
 | Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
-| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `talkie`, `bitnet`, `dbrx` (`olmo`, `olmo2` and `exaone4` were here and are CLOSED) |
-| LayerNorm rather than RMSNorm | `dbrx` (with a learned weight; `olmo`'s non-parametric one is CLOSED) |
+| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `talkie`, `bitnet` (`olmo`, `olmo2`, `exaone4` and `dbrx` were here and are CLOSED) |
+| LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`) and weighted (`dbrx`) forms; the bias group below still refuses for more than the norm |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all six (`ferrox_models::rope_layers`): `exaone-moe`, `smollm3` and EXAONE-4 32B run on it; `smallthinker` and `afmoe` still refuse for the rows below and their verdicts say so |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
-| Hardcoded scales applied even when the GGUF carries no key | `grok`, `mistral3` |
+| Hardcoded scales applied even when the GGUF carries no key | `mistral3` (`grok` was here and is CLOSED on the MiniCPM defaults hook) |
 | An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |
 | Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
 

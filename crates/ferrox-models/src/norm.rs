@@ -83,6 +83,29 @@
 //! `capability::NON_PARAMETRIC_LAYER_NORM`, which says so where the next
 //! person will look.
 //!
+//! # [`NormOp::LayerNorm`]: `dbrx`, the row that gave the variant a caller
+//!
+//! The LayerNorm FUNCTION is shared more widely than the parameterless
+//! corner: `dbrx` and the `nemotron` / `orion` / `stablelm` /
+//! `codeshell` / `jais2` / `starcoder` / `starcoder2` / `phimoe` group
+//! all normalise with `LLM_NORM` and a learned weight. This variant was
+//! deliberately NOT written beside `LayerNormNoParams`, because at that
+//! point every one of those rows refused for more than the norm, and a
+//! variant with no caller silently rots. `dbrx` is the caller:
+//! `src/models/dbrx.cpp:69-71`, `:110-112` and `:140-142` are
+//! `build_norm(x, w, NULL, LLM_NORM, il)` -- weight, no bias -- and its
+//! other two blockers, `{arch}.attention.clamp_kqv` and a pre-FFN norm
+//! stored as `blk.N.attn_output_norm`, took one implementation each
+//! (`crate::clamp_kqv`, `crate::norm_sites`).
+//!
+//! **Weight but no bias, on purpose.** Every other row in that group
+//! creates `*_norm.bias` as REQUIRED and `build_norm` adds it after the
+//! multiply. That is a fourth variant, `LayerNorm(w, b)`, and it is
+//! absent for the reason this one was absent before `dbrx`: no admitted
+//! row calls it. [`NormFunction`] is where the choice is made per
+//! architecture; a bias means a variant there and at every match on
+//! this enum, which is the compile error that is wanted.
+//!
 //! # Why this is a type and not a `bool` on `ModelConfig`
 //!
 //! The RMSNorm weights are handed to fused Metal kernels that apply the
@@ -116,13 +139,16 @@ pub enum NormOp {
     /// Non-parametric LayerNorm: subtract the mean, divide by the
     /// standard deviation, no learned weight and no bias.
     ///
-    /// `olmo` (OLMo-1) and nothing else in llama.cpp. There is no
-    /// `LayerNorm(Vec<f32>)` beside this because no architecture ferrox
-    /// admits needs one: the weighted-LayerNorm rows (`dbrx`,
-    /// `nemotron`, `orion`, `stablelm`, ...) all refuse for other
-    /// reasons too, and a variant with no caller is a variant that
-    /// silently rots.
+    /// `olmo` (OLMo-1) and nothing else in llama.cpp. The weighted form
+    /// is [`NormOp::LayerNorm`], which arrived only when `dbrx` gave it
+    /// a caller; the biased form still has none.
     LayerNormNoParams,
+    /// LayerNorm with a learned weight and no bias:
+    /// `(x - mean) / sqrt(var + eps) * w`.
+    ///
+    /// `dbrx` (`dbrx.cpp:69-71`, `:110-112`, `:140-142`). See the
+    /// module docs for why there is no `(w, b)` variant beside it.
+    LayerNorm(Vec<f32>),
     /// No norm at all: the branch reads the raw residual.
     ///
     /// `olmo2` and `exaone4`. NOT "an RMSNorm whose weights are all
@@ -148,6 +174,17 @@ impl NormOp {
         match self {
             Self::Rms(w) => rms_norm(x, w, eps),
             Self::LayerNormNoParams => layer_norm_no_params(x, eps),
+            Self::LayerNorm(w) => {
+                // `build_norm` (llama-graph.cpp): `ggml_norm`, then
+                // `ggml_mul(cur, mw)` -- the same centred vector as the
+                // parameterless variant, scaled per element.
+                let mut out = layer_norm_no_params(x, eps);
+                debug_assert_eq!(out.len(), w.len());
+                for (o, w) in out.iter_mut().zip(w.iter()) {
+                    *o *= w;
+                }
+                out
+            }
             Self::None => x.to_vec(),
         }
     }
@@ -161,8 +198,64 @@ impl NormOp {
     pub fn rms_weights(&self) -> Option<&[f32]> {
         match self {
             Self::Rms(w) => Some(w),
-            Self::LayerNormNoParams | Self::None => None,
+            Self::LayerNormNoParams | Self::LayerNorm(_) | Self::None => None,
         }
+    }
+}
+
+/// The norm FUNCTION an architecture applies at its parametric sites --
+/// the `LLM_NORM` / `LLM_NORM_RMS` argument of `build_norm`, plus
+/// whether there is a weight to hand it.
+///
+/// One answer per architecture, read at every site. The loader used to
+/// decide this with a chain of `if` branches restated at the
+/// pre-attention, pre-FFN and final sites: three places that had to
+/// agree about one thing. `crate::norm_sites` resolves it ONCE through
+/// [`norm_function`] and the three sites read the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormFunction {
+    /// `LLM_NORM_RMS` with a weight. The generic path's default.
+    Rms,
+    /// `LLM_NORM` with a weight and no bias: `dbrx`
+    /// (`capability::WEIGHTED_LAYER_NORM`).
+    LayerNorm,
+    /// `LLM_NORM` with neither: `olmo`
+    /// (`capability::NON_PARAMETRIC_LAYER_NORM`).
+    LayerNormNoParams,
+}
+
+impl NormFunction {
+    /// The [`NormOp`] for one site, reading its weight through `load`
+    /// only when this function has a weight to read.
+    ///
+    /// The closure rather than a `Vec<f32>` argument is the point:
+    /// `LayerNormNoParams` never calls it, so a file that carries no
+    /// norm tensor (OLMo-1 ships none) is never asked for one, and a
+    /// site cannot be handed a weight its function would drop.
+    pub fn resolve<E>(self, load: impl FnOnce() -> Result<Vec<f32>, E>) -> Result<NormOp, E> {
+        Ok(match self {
+            Self::Rms => NormOp::Rms(load()?),
+            Self::LayerNorm => NormOp::LayerNorm(load()?),
+            Self::LayerNormNoParams => NormOp::LayerNormNoParams,
+        })
+    }
+}
+
+/// Which norm function `arch` applies, from the two capability lists
+/// that name the exceptions.
+///
+/// Both lists are consulted here and nowhere else, so an architecture
+/// on both would be answered ONE way rather than by whichever branch
+/// came first -- and `crate::loader`'s
+/// `the_norm_slot_and_function_lists_cannot_contradict` pins that the
+/// situation never arises.
+pub fn norm_function(arch: &str) -> NormFunction {
+    if crate::capability::uses_non_parametric_layer_norm(arch) {
+        NormFunction::LayerNormNoParams
+    } else if crate::capability::uses_weighted_layer_norm(arch) {
+        NormFunction::LayerNorm
+    } else {
+        NormFunction::Rms
     }
 }
 
@@ -308,5 +401,81 @@ mod tests {
         );
         assert_eq!(NormOp::None.rms_weights(), None);
         assert_eq!(NormOp::LayerNormNoParams.rms_weights(), None);
+        assert_eq!(NormOp::LayerNorm(vec![2.0, 3.0]).rms_weights(), None);
+    }
+
+    /// The weighted LayerNorm is the parameterless one times its
+    /// weight, element by element -- `build_norm`'s `ggml_norm` then
+    /// `ggml_mul(cur, mw)`.
+    ///
+    /// Checked against the composition rather than against a rewrite of
+    /// the arithmetic, because the composition IS the claim: if the
+    /// variant ever centred differently from `LayerNormNoParams`, `olmo`
+    /// and `dbrx` would disagree about what `LLM_NORM` means.
+    #[test]
+    fn the_weighted_layer_norm_is_the_parameterless_one_times_its_weight() {
+        let x = vec![3.0f32, -4.0, 12.0, 0.5];
+        let w = vec![0.5f32, -2.0, 1.5, 4.0];
+        let eps = 1e-5;
+        let got = NormOp::LayerNorm(w.clone()).apply(&x, eps);
+        let base = NormOp::LayerNormNoParams.apply(&x, eps);
+        for ((g, b), w) in got.iter().zip(base.iter()).zip(w.iter()) {
+            assert!((g - b * w).abs() < 1e-6, "got {got:?}, base {base:?}");
+        }
+    }
+
+    /// ... and it is NOT an RMSNorm with the same weight, which is the
+    /// substitution a loader makes by reading `dbrx`'s `attn_norm.weight`
+    /// into the slot every other architecture uses.
+    #[test]
+    fn the_weighted_layer_norm_is_not_an_rmsnorm_with_the_same_weight() {
+        let x = vec![3.0f32, -4.0, 12.0, 0.5];
+        let w = vec![0.5f32, -2.0, 1.5, 4.0];
+        let eps = 1e-5;
+        let ln = NormOp::LayerNorm(w.clone()).apply(&x, eps);
+        let rms = NormOp::Rms(w).apply(&x, eps);
+        let worst = ln
+            .iter()
+            .zip(rms.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst > 0.1, "the two norms differ by only {worst}");
+    }
+
+    /// `NormFunction` maps each capability list to exactly one variant,
+    /// and the default is RMS.
+    #[test]
+    fn the_norm_function_is_read_off_the_capability_lists() {
+        assert_eq!(norm_function("olmo"), NormFunction::LayerNormNoParams);
+        assert_eq!(norm_function("dbrx"), NormFunction::LayerNorm);
+        for arch in ["llama", "qwen3", "olmo2", "gemma3", "grok"] {
+            assert_eq!(norm_function(arch), NormFunction::Rms, "{arch}");
+        }
+        let w = || -> Result<Vec<f32>, ()> { Ok(vec![1.0, 2.0]) };
+        assert_eq!(
+            NormFunction::LayerNorm.resolve(w),
+            Ok(NormOp::LayerNorm(vec![1.0, 2.0]))
+        );
+        assert_eq!(
+            NormFunction::Rms.resolve(w),
+            Ok(NormOp::Rms(vec![1.0, 2.0]))
+        );
+    }
+
+    /// The parameterless function never asks the file for a weight.
+    ///
+    /// OLMo-1 files carry no norm tensor at all, so a loader that read
+    /// one "just in case" would fail on every real checkpoint; and a
+    /// loader that read one and dropped it would hide a file that is
+    /// not what the architecture string says.
+    #[test]
+    fn the_parameterless_function_never_reads_a_weight() {
+        let mut asked = false;
+        let got = NormFunction::LayerNormNoParams.resolve(|| -> Result<Vec<f32>, ()> {
+            asked = true;
+            Err(())
+        });
+        assert_eq!(got, Ok(NormOp::LayerNormNoParams));
+        assert!(!asked, "the loader closure must not run");
     }
 }

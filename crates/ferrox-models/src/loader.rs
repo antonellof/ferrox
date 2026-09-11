@@ -197,35 +197,9 @@ const NO_TOPK_RENORMALIZE_ARCHITECTURES: &[&str] = &["deepseek", "olmoe", "qwen2
 /// (tests/one_match_arm_graphs.rs) now compares them.
 const FFN_LENGTH_COUNTS_GATE_AND_UP: &[&str] = &["qwen"];
 
-/// Architectures that store their **pre-FFN** norm under the tensor name
-/// `blk.N.post_attention_norm.weight` and carry no `blk.N.ffn_norm`.
-///
-/// Gemma writes the same tensor name for a genuinely different norm: it
-/// is applied to the attention output *inside* the attention residual,
-/// and Gemma also carries `ffn_norm`. Reading one file's tensor with the
-/// other's meaning silently moves a whole RMSNorm to the wrong side of a
-/// residual add, so the meaning is decided by architecture, not by which
-/// tensors happen to be present.
-///
-/// - `gpt-oss`: `openai-moe.cpp` norms `ffn_inp` with `attn_post_norm`.
-/// - `seed_oss`: `src/models/seed-oss.cpp:36-37` creates `attn_norm` and
-///   `attn_post_norm` and **no** `ffn_norm`, and `:113-115` norms
-///   `ffn_inp` -- the post-attention residual -- with `attn_post_norm`.
-///
-/// This is deliberately NOT `arch == "gpt-oss"`, which is what it used
-/// to be. That one flag also gated gpt-oss's five extra per-layer
-/// tensors (sinks, biases, the SwiGLU clamp), and widening it would have
-/// handed `seed_oss` attention sinks it does not have. Two facts, two
-/// predicates. `the_norm_slot_list_and_the_audit_list_agree` pins that a
-/// name added here is a name somebody actually read a graph for.
-const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] = &["gpt-oss", "seed_oss"];
-
-/// Does this architecture keep its pre-FFN norm in the
-/// `post_attention_norm` slot? See
-/// [`PRE_FFN_NORM_IS_POST_ATTENTION_NORM`].
-fn pre_ffn_norm_is_post_attention_norm(arch: &str) -> bool {
-    PRE_FFN_NORM_IS_POST_ATTENTION_NORM.contains(&arch)
-}
+// The norm-slot lists (`PRE_FFN_NORM_IS_POST_ATTENTION_NORM` and its
+// siblings) live in `crate::norm_sites`, beside the table that reads
+// them; the tests below still walk them.
 
 /// Architectures whose checkpoints carry `{arch}.leading_dense_block_count`
 /// while their reference graph never branches on it: **every** layer is
@@ -716,6 +690,18 @@ impl ModelConfig {
                 )
             });
 
+        // The metadata-declared scalar multipliers, resolved once for
+        // whichever subset this architecture's reference graph applies.
+        // See `crate::scalar_multipliers`; the keys the graph does NOT
+        // apply were already refused above, by a list derived from the
+        // same table. Read first because its `defaults` also seed the
+        // softcap below: `grok.cpp:5-12` assigns all of them in one
+        // place, and so does this.
+        let multiplier_support = crate::scalar_multipliers::multiplier_support(&arch);
+
+        // The file's softcap, then the architecture's default for a
+        // file that declares none (`grok.cpp:9`), then llama.cpp's own
+        // "off". `> 0.0` is what every graph tests before applying one.
         let attn_logit_softcap = metadata_f32_any(
             file,
             &[
@@ -723,21 +709,23 @@ impl ModelConfig {
                 key("attn_logit_softcapping"),
             ],
         )
+        .or(multiplier_support.defaults.attn_logit_softcap())
         .filter(|&v| v > 0.0);
         let final_logit_softcap =
             metadata_f32_any(file, &[key("final_logit_softcapping")]).filter(|&v| v > 0.0);
 
-        // The four metadata-declared scalar multipliers, resolved once
-        // for whichever subset this architecture's reference graph
-        // applies. See `crate::scalar_multipliers`; the keys the graph
-        // does NOT apply were already refused above, by a list derived
-        // from the same table.
-        let multiplier_support = crate::scalar_multipliers::multiplier_support(&arch);
         let declared = crate::scalar_multipliers::DeclaredMultipliers {
             logit: metadata_f32_any(file, &[key("logit_scale")]),
             residual: metadata_f32_any(file, &[key("residual_scale")]),
             embedding: metadata_f32_any(file, &[key("embedding_scale")]),
-            attention: metadata_f32_any(file, &[key("attention.scale")]),
+            // Exactly the spelling this architecture's graph reads --
+            // `attention.scale` for Granite, `attention.output_scale`
+            // for Grok -- and nothing for the rest. The other spelling
+            // was refused above, by the same table.
+            attention: multiplier_support
+                .attention
+                .suffix()
+                .and_then(|suffix| metadata_f32_any(file, &[key(suffix)])),
         };
         let multipliers = crate::scalar_multipliers::resolve(
             multiplier_support,
@@ -807,15 +795,24 @@ impl ModelConfig {
             return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
         }
 
-        // OLMo-1 clamps Q, K and V by `{arch}.attention.clamp_kqv`
-        // inside the shared `build_qkv`. ferrox clamps no projection
-        // anywhere, so a file declaring a positive clamp stops here
-        // rather than running unclamped. See `crate::clamp_kqv`, which
-        // also records that the OLMo converter really writes this key.
-        if let Some(reason) = crate::clamp_kqv::clamped_refusal(
+        // OLMo-1 and DBRX clamp Q, K and V by `{arch}.attention.clamp_kqv`
+        // inside the shared `build_qkv`. Resolved here for the
+        // architectures whose loader reads the key, REQUIRED where
+        // llama.cpp's is (`dbrx.cpp:5`), and applied by the one helper
+        // every host body shares (`decoder/qkv_bias.rs`). See
+        // `crate::clamp_kqv`, which also records that both converters
+        // really write this key.
+        let clamp_kqv = crate::clamp_kqv::resolve_clamp(
             &arch,
             metadata_f32_any(file, &[key("attention.clamp_kqv")]),
-        ) {
+        )
+        .map_err(|e| LoadError::UnsupportedFeature(arch.clone(), e.message(&arch)))?;
+
+        // Grok-2 runs a dense GELU FFN in parallel with its experts and
+        // scales the sum (`grok.cpp:171-184`); ferrox has no slot for
+        // that and stops rather than reading the dense FFN into the
+        // nearest one. See `crate::parallel_dense_ffn`.
+        if let Some(reason) = crate::parallel_dense_ffn::parallel_dense_refusal(&arch, file) {
             return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
         }
 
@@ -1122,6 +1119,7 @@ impl ModelConfig {
             final_logit_softcap,
             embedding_scale,
             residual_scale: multipliers.residual_scale,
+            clamp_kqv,
             logit_multiplier: multipliers.logit_multiplier,
             attention_scale,
             rope_attn_factor,
@@ -1242,9 +1240,17 @@ fn yarn_scaling_from_gguf(
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(default)
     };
+    // `llama-hparams.h:137` seeds `yarn_beta_fast = 32.0f` for every
+    // architecture and `grok.cpp:5` reseeds it to 8.0 before the key is
+    // read; the table that holds Grok's other defaults holds that one
+    // too, so it is not a second literal here.
+    let beta_fast_default = crate::scalar_multipliers::multiplier_support(arch)
+        .defaults
+        .yarn_beta_fast()
+        .unwrap_or(32.0);
     Some(ferrox_core::attention::YarnScaling {
         factor,
-        beta_fast: beta("beta_fast", 32.0),
+        beta_fast: beta("beta_fast", beta_fast_default),
         beta_slow: beta("beta_slow", 1.0),
         orig_max_pos,
         // No GGUF key carries the reference's `truncate` flag, and its
@@ -1368,53 +1374,6 @@ pub(crate) fn load_f32_vec_optional(
         return Ok(None);
     }
     Ok(Some(load_f32_vec(file, name)?))
-}
-
-/// A norm weight that some converters spell `<base>.weight` and others
-/// spell just `<base>`.
-///
-/// This exists for exactly one pair of tensors, `post_attention_norm`
-/// and `post_ffw_norm`, and it is this repo's dominant bug shape in
-/// llama.cpp's own trees: TWO SPELLINGS OF ONE NAME, WITH NOTHING
-/// ENFORCING AGREEMENT.
-///
-/// `LLM_TN` appends `.weight` only when it is given a suffix
-/// (`src/llama-arch.cpp:898-910`). Every architecture that creates these
-/// two tensors passes one -- `tn(LLM_TENSOR_ATTN_POST_NORM, "weight",
-/// i)` in gemma2, gemma3, glm4, exaone4, afmoe and the rest -- EXCEPT
-/// `plamo3`, which uses the two-argument overload
-/// (`src/models/plamo3.cpp:52,55`) and therefore asks for
-/// `blk.N.post_attention_norm` with no suffix at all.
-///
-/// The converter agrees with it, by a second accident that happens to
-/// line up: `gguf-py/gguf/tensor_mapping.py:368,434` give the PLaMo
-/// entries as `model.layers.layers.{bid}.post_mixer_norm.weight` and
-/// `...post_mlp_norm.weight` -- keys that already END in `.weight`.
-/// `TensorNameMap.get_type_and_name` (:2585-2594) tries an exact match
-/// FIRST and only falls back to stripping a suffix, so those two match
-/// exactly and the mapped name is emitted with nothing appended.
-///
-/// So a real PLaMo-3 GGUF carries `blk.N.post_attention_norm` and
-/// `blk.N.post_ffw_norm`, and every Gemma-lineage GGUF carries the same
-/// two names with `.weight`. Reading only one spelling means one of the
-/// two families always fails on a missing tensor. ferrox read only
-/// `.weight`, which is why `plamo3` could not have loaded a real
-/// checkpoint -- fail-closed rather than wrong, but not "a fixture
-/// away", which is what its triage verdict said.
-///
-/// Both spellings are accepted rather than one being chosen per
-/// architecture, because the choice is a property of the file and
-/// nothing in the metadata declares it. Neither present is still
-/// `None`.
-pub(crate) fn load_norm_vec_either_spelling(
-    file: &impl TensorSource,
-    base: &str,
-) -> Result<Option<Vec<f32>>, LoadError> {
-    let suffixed = format!("{base}.weight");
-    if file.find_tensor(&suffixed).is_some() {
-        return load_f32_vec_optional(file, &suffixed);
-    }
-    load_f32_vec_optional(file, base)
 }
 
 /// Slice `n` rows starting at `start` out of a quantized matrix without
@@ -2104,42 +2063,30 @@ impl Decoder {
         let file = ShardedGguf::open(path)?;
 
         // gpt-oss carries five per-layer tensors the generic GQA layer
-        // structs have no home for, and reuses `post_attention_norm` for
-        // a *different* norm slot than Gemma does. Both are decided by
-        // the architecture string, so resolve them once here. See
-        // `crate::decoder::GptOssWeights` and
-        // `PRE_FFN_NORM_IS_POST_ATTENTION_NORM`.
+        // structs have no home for. That is decided by the architecture
+        // string, so resolve it once here. See
+        // `crate::decoder::GptOssWeights`.
         //
-        // These used to be ONE flag, `arch == "gpt-oss"`, standing for
-        // two unrelated facts. Splitting them is what let `seed_oss` --
-        // which shares the norm slot and has none of the extra tensors
-        // -- be admitted without also being handed attention sinks.
+        // This used to be ONE flag with the norm-slot fact below,
+        // `arch == "gpt-oss"`, standing for two unrelated facts.
+        // Splitting them is what let `seed_oss` -- which shares the norm
+        // slot and has none of the extra tensors -- be admitted without
+        // also being handed attention sinks.
         let arch = file
             .metadata_str("general.architecture")
             .unwrap_or_default()
             .to_string();
         let is_gpt_oss = arch == "gpt-oss";
-        let post_attn_norm_is_pre_ffn_norm = pre_ffn_norm_is_post_attention_norm(&arch);
-        // The post-norm-only residual topology: no `attn_norm` and no
-        // `ffn_norm` tensors, both sublayers reading the raw residual.
-        // `crate::norm` holds the graph and the two llama.cpp files
-        // it was read from.
-        //
-        // The two lists cannot overlap: for gpt-oss / seed_oss
-        // `post_attention_norm` IS the pre-FFN norm, which a topology
-        // with no pre-FFN norm cannot also have. That is pinned as a
-        // test (`the_two_norm_slot_lists_cannot_name_the_same_architecture`)
-        // rather than asserted here, so it fails in CI instead of only
-        // on a debug load of a file nobody has.
-        let post_norm_only = crate::capability::is_post_norm_only(&arch);
-        // The THIRD shape: pre-norm like llama, but with a
-        // non-parametric LayerNorm and no norm tensor anywhere in the
-        // file. `olmo` and nothing else -- see
-        // `capability::NON_PARAMETRIC_LAYER_NORM`, which says how that
-        // was measured. Resolved once here and read at all three norm
-        // sites, so the pre-attention, pre-FFN and final norms cannot
-        // come to disagree about which function this model uses.
-        let no_param_layer_norm = crate::capability::uses_non_parametric_layer_norm(&arch);
+        // Which tensor each of the five norm sites is stored under and
+        // which FUNCTION norms it, resolved ONCE. Four shapes reach this
+        // loader -- the plain pre-norm layer, the post-norm-only
+        // topology (`olmo2`, `exaone4`), the non-parametric LayerNorm
+        // (`olmo`) and the weighted LayerNorm (`dbrx`) -- and three
+        // architectures keep a norm under a name another architecture
+        // uses for a different site (`gpt-oss` / `seed_oss`, `dbrx`,
+        // `grok`). `crate::norm_sites` is the one table for all of it;
+        // this loader used to restate the decision at every site.
+        let norm_sites = crate::norm_sites::NormSites::for_arch(&arch);
         let mut gpt_oss_layers: Vec<crate::decoder::GptOssLayer> = Vec::new();
 
         // One store for the whole model (keys are (layer, expert)),
@@ -2196,23 +2143,9 @@ impl Decoder {
                 k_proj,
                 v_proj,
                 o_proj: load_weight_matrix(&file, &format!("blk.{l}.attn_output.weight"))?,
-                // Three shapes, and the file's tensor list is what
-                // separates them. `olmo2` / `exaone4` have no
-                // `attn_norm` and project Q/K/V off the raw residual
-                // (`capability::POST_NORM_ONLY_ARCHITECTURES`); `olmo`
-                // norms first but has no weight to norm WITH
-                // (`capability::NON_PARAMETRIC_LAYER_NORM`); everything
-                // else on this path carries `blk.N.attn_norm.weight`.
-                norm_weight: if post_norm_only {
-                    crate::norm::NormOp::None
-                } else if no_param_layer_norm {
-                    crate::norm::NormOp::LayerNormNoParams
-                } else {
-                    crate::norm::NormOp::Rms(load_f32_vec(
-                        &file,
-                        &format!("blk.{l}.attn_norm.weight"),
-                    )?)
-                },
+                // Which tensor, which function, and whether there is a
+                // norm here at all: all three answered by the table.
+                norm_weight: norm_sites.load_pre_norm(norm_sites.attn, &file, Some(l))?,
                 q_norm,
                 k_norm,
                 // Qwen2/Qwen2-MoE-family real QKV bias (`attn_{q,k,v}.bias`,
@@ -2223,20 +2156,15 @@ impl Decoder {
                 q_bias,
                 k_bias,
                 v_bias,
-                // gpt-oss ships `post_attention_norm` but applies it in
-                // Gemma's *other* slot: llama.cpp's openai-moe graph
-                // norms `ffn_inp` with it after the attention residual,
-                // i.e. it is the pre-FFN norm, not a post-attention one.
-                // It is read below into `MoeWeights::norm_weight`.
-                post_attn_norm: if post_attn_norm_is_pre_ffn_norm {
-                    None
-                } else {
-                    // Both spellings; see `load_norm_vec_either_spelling`.
-                    load_norm_vec_either_spelling(&file, &format!("blk.{l}.post_attention_norm"))?
-                },
-                post_ffn_norm: load_norm_vec_either_spelling(
+                post_attn_norm: crate::norm_sites::NormSites::load_post_norm(
+                    norm_sites.post_attn,
                     &file,
-                    &format!("blk.{l}.post_ffw_norm"),
+                    l,
+                )?,
+                post_ffn_norm: crate::norm_sites::NormSites::load_post_norm(
+                    norm_sites.post_ffn,
+                    &file,
+                    l,
                 )?,
             };
 
@@ -2437,40 +2365,11 @@ impl Decoder {
                 shared_experts,
                 shared_expert_gate,
                 exp_probs_bias,
-                norm_weight: if post_norm_only {
-                    // No `ffn_norm` tensor: the FFN reads the raw
-                    // post-attention residual (olmo2.cpp:169,
-                    // exaone4.cpp:159).
-                    crate::norm::NormOp::None
-                } else if no_param_layer_norm {
-                    // `olmo.cpp:104-106`: the same non-parametric
-                    // LayerNorm as the attention slot, on the
-                    // post-attention residual.
-                    crate::norm::NormOp::LayerNormNoParams
-                } else if post_attn_norm_is_pre_ffn_norm {
-                    // Same two spellings as above, and the same helper,
-                    // so the pre-FFN-norm slot cannot drift away from
-                    // the post-attention one about what a file may be
-                    // called. gpt-oss and seed_oss both write `.weight`
-                    // today; sharing the rule is what stops that being
-                    // a thing to rediscover.
-                    crate::norm::NormOp::Rms(
-                        load_norm_vec_either_spelling(
-                            &file,
-                            &format!("blk.{l}.post_attention_norm"),
-                        )?
-                        .ok_or_else(|| {
-                            LoadError::Gguf(GgufError::TensorNotFound(format!(
-                                "blk.{l}.post_attention_norm[.weight]"
-                            )))
-                        })?,
-                    )
-                } else {
-                    crate::norm::NormOp::Rms(load_f32_vec(
-                        &file,
-                        &format!("blk.{l}.ffn_norm.weight"),
-                    )?)
-                },
+                // The same table as the attention slot, so the two
+                // pre-norms cannot disagree about the function, and the
+                // pre-FFN tensor's NAME comes from the same row that
+                // decided the post-attention slot must not read it.
+                norm_weight: norm_sites.load_pre_norm(norm_sites.ffn, &file, Some(l))?,
                 activation_counts,
                 #[cfg(feature = "metal")]
                 packed_q4,
@@ -2485,12 +2384,9 @@ impl Decoder {
 
         // `olmo.cpp:15-36` creates no `output_norm` at all and
         // `:128-130` norms the final hidden state with a null weight, so
-        // asking for the tensor would refuse every real OLMo-1 file.
-        let final_norm = if no_param_layer_norm {
-            crate::norm::NormOp::LayerNormNoParams
-        } else {
-            crate::norm::NormOp::Rms(load_f32_vec(&file, "output_norm.weight")?)
-        };
+        // asking for the tensor would refuse every real OLMo-1 file;
+        // the table's function decides whether the read happens.
+        let final_norm = norm_sites.load_pre_norm(Some(norm_sites.output), &file, None)?;
         // Many small Llama/Gemma-family GGUFs tie the lm-head to
         // `token_embd.weight` and omit `output.weight` (llama.cpp
         // `llama_model_loader` falls back the same way). Prefer the
@@ -2991,10 +2887,11 @@ mod tests {
     /// `DecoderFamily::StandardGqa` and so was handed SwiGLU -- a
     /// different FFN on every layer.
     ///
-    /// Latent, because `grok` is not audited and refuses today. Pinned
-    /// anyway: the failure mode is that auditing it later makes it
-    /// silently wrong, and an audit is exactly when nobody thinks to
-    /// re-check the activation.
+    /// It was pinned here while `grok` still refused, because the
+    /// failure mode is that auditing it later makes it silently wrong,
+    /// and an audit is exactly when nobody thinks to re-check the
+    /// activation. `grok` is audited now (tests/grok_graphs.rs), and the
+    /// fixture's GELU experts are what that suite compares.
     #[test]
     fn the_ffn_activation_follows_the_architecture_not_the_family() {
         use crate::capability::uses_geglu;
@@ -3118,7 +3015,15 @@ mod tests {
             ),
             (
                 "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
-                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+                crate::norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+            ),
+            (
+                "PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM",
+                crate::norm_sites::PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM,
+            ),
+            (
+                "POST_NORMS_UNDER_GROK_NAMES",
+                crate::norm_sites::POST_NORMS_UNDER_GROK_NAMES,
             ),
             ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
             (
@@ -3171,7 +3076,15 @@ mod tests {
         for (table, names) in [
             (
                 "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
-                PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+                crate::norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+            ),
+            (
+                "PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM",
+                crate::norm_sites::PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM,
+            ),
+            (
+                "POST_NORMS_UNDER_GROK_NAMES",
+                crate::norm_sites::POST_NORMS_UNDER_GROK_NAMES,
             ),
             ("LEADING_DENSE_KEY_IS_INERT", LEADING_DENSE_KEY_IS_INERT),
             (
@@ -4461,54 +4374,90 @@ mod tests {
         }
     }
 
-    /// The three norm-slot lists cannot name the same architecture.
+    /// The norm-slot and norm-function lists cannot contradict each
+    /// other.
     ///
-    /// `PRE_FFN_NORM_IS_POST_ATTENTION_NORM` says "this file's
-    /// `post_attention_norm` IS the pre-FFN norm";
-    /// `capability::POST_NORM_ONLY_ARCHITECTURES` says "this
-    /// architecture has no pre-FFN norm at all";
-    /// `capability::NON_PARAMETRIC_LAYER_NORM` says "this architecture
-    /// norms at every site with no weight to norm with". They are three
-    /// branches of the same `if` in the loader, so a name on two of them
-    /// would be read two ways and the earlier branch would win silently.
-    /// Three lists that must agree about one thing, with something
-    /// enforcing it -- which is the only shape of fix that has ever held
-    /// here.
+    /// Two kinds of list feed `crate::norm_sites::NormSites::for_arch`.
+    /// The SLOT lists say which tensor a site reads:
+    /// `PRE_FFN_NORM_IS_POST_ATTENTION_NORM`,
+    /// `PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM`, `POST_NORMS_UNDER_GROK_NAMES`
+    /// and `capability::POST_NORM_ONLY_ARCHITECTURES` (no pre-norm
+    /// tensor at all). A name on two of them would have one tensor read
+    /// for two sites, or a site both present and absent, and whichever
+    /// list `for_arch` consults last would win silently. The FUNCTION
+    /// lists say how a site norms: `capability::NON_PARAMETRIC_LAYER_NORM`
+    /// and `capability::WEIGHTED_LAYER_NORM`, which are two answers to
+    /// one question and so must also be disjoint. And the parameterless
+    /// function reads no tensor, so `olmo` cannot also be on a list
+    /// that names one.
     ///
-    /// Written as an all-pairs loop rather than three hand-written
-    /// directions, because the previous version checked two and the
-    /// third list would have slipped past it in either direction.
+    /// `dbrx` is deliberately on a slot list AND a function list, which
+    /// is why this is not "every list is pairwise disjoint": where a
+    /// tensor lives and how it is applied are orthogonal facts.
+    ///
+    /// Written as loops over the lists rather than hand-written pairs,
+    /// because the previous version checked two of three and the third
+    /// would have slipped past it in either direction.
     #[test]
-    fn the_three_norm_slot_lists_cannot_name_the_same_architecture() {
-        let lists: [(&str, &[&str]); 3] = [
+    fn the_norm_slot_and_function_lists_cannot_contradict() {
+        use crate::norm_sites::{
+            POST_NORMS_UNDER_GROK_NAMES, PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM,
+            PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
+        };
+        let slot_lists: [(&str, &[&str]); 4] = [
             (
                 "PRE_FFN_NORM_IS_POST_ATTENTION_NORM",
                 PRE_FFN_NORM_IS_POST_ATTENTION_NORM,
             ),
             (
+                "PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM",
+                PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM,
+            ),
+            ("POST_NORMS_UNDER_GROK_NAMES", POST_NORMS_UNDER_GROK_NAMES),
+            (
                 "POST_NORM_ONLY_ARCHITECTURES",
                 crate::capability::POST_NORM_ONLY_ARCHITECTURES,
             ),
+        ];
+        let function_lists: [(&str, &[&str]); 2] = [
             (
                 "NON_PARAMETRIC_LAYER_NORM",
                 crate::capability::NON_PARAMETRIC_LAYER_NORM,
             ),
+            (
+                "WEIGHTED_LAYER_NORM",
+                crate::capability::WEIGHTED_LAYER_NORM,
+            ),
         ];
-        for (i, (a_name, a)) in lists.iter().enumerate() {
-            for (b_name, b) in lists.iter().skip(i + 1) {
-                for name in a.iter() {
-                    assert!(
-                        !b.contains(name),
-                        "`{name}` is on both `{a_name}` and `{b_name}`; the loader's norm-slot \
-                         `if` would read it two ways and the first branch would win silently"
-                    );
+        let disjoint = |lists: &[(&str, &[&str])]| {
+            for (i, (a_name, a)) in lists.iter().enumerate() {
+                for (b_name, b) in lists.iter().skip(i + 1) {
+                    for name in a.iter() {
+                        assert!(
+                            !b.contains(name),
+                            "`{name}` is on both `{a_name}` and `{b_name}`; \
+                             `NormSites::for_arch` would read it two ways and the list it \
+                             consults last would win silently"
+                        );
+                    }
                 }
             }
+        };
+        disjoint(&slot_lists);
+        disjoint(&function_lists);
+        for name in crate::capability::NON_PARAMETRIC_LAYER_NORM {
+            for (slot_name, slot) in &slot_lists {
+                assert!(
+                    !slot.contains(name),
+                    "`{name}` reads no norm tensor and is on `{slot_name}`, which names one"
+                );
+            }
         }
-        // Non-empty, so the loop above cannot pass by having nothing to
-        // compare. `olmo` was added to the third list and this is what
-        // says the third list exists at all.
+        // Non-empty, so the loops above cannot pass by having nothing
+        // to compare.
         assert!(!crate::capability::NON_PARAMETRIC_LAYER_NORM.is_empty());
+        assert!(!crate::capability::WEIGHTED_LAYER_NORM.is_empty());
+        assert!(!PRE_FFN_NORM_IS_ATTN_OUTPUT_NORM.is_empty());
     }
 
     /// EXAONE-4 is ONE architecture string over TWO graphs, and

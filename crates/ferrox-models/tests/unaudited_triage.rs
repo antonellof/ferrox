@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 20,
+        n, 18,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -92,9 +92,13 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          `tests/no_rope_layer_graphs.rs`) -- ONE cause behind THREE refusals, of which \
          only this row was in this count: EXAONE-4 32B was refused BY NAME in loader.rs \
          and `smollm3` sat in the \"No RoPE at all\" DedicatedOnly group, so both closed \
-         with it and neither moved this number -- rows closing is the count going DOWN \
-         for the best reason. Either an architecture was audited or reclassified (good -- \
-         update the count and the docs) or one was added (check it was triaged)"
+         with it and neither moved this number, and 20 until `grok` and `dbrx` closed \
+         together on seams landed the day before (`scalar_multipliers::MultiplierDefaults`, \
+         `norm::NormOp::LayerNorm`, `clamp_kqv`, `norm_sites`; tests/grok_graphs.rs, \
+         tests/dbrx_graphs.rs), the clamp also closing `olmo`'s clip_qkv refusal by name \
+         -- rows closing is the count going DOWN for the best reason. Either an \
+         architecture was audited or reclassified (good -- update the count and the docs) \
+         or one was added (check it was triaged)"
     );
 }
 
@@ -343,7 +347,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 20);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 18);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -409,9 +413,13 @@ fn the_untriaged_message_claims_no_class() {
 /// architecture instead of implying a uniform distance.
 #[test]
 fn batch_two_verdicts_are_pinned_to_what_was_read() {
+    // `grok` and `dbrx` were the first two rows here and are audited
+    // now (tests/grok_graphs.rs, tests/dbrx_graphs.rs): the defaults
+    // hook, the weighted LayerNorm, the QKV clamp and the norm-site
+    // table each turned out to be one column on a seam that already
+    // existed. Their absence from this list is asserted by
+    // `grok_and_dbrx_are_audited_and_carry_no_stale_verdict` below.
     let cases: &[(&str, TriageClass, &str)] = &[
-        ("grok", TriageClass::NewCode, "grok.cpp:5-21"),
-        ("dbrx", TriageClass::NewCode, "LayerNorm, not RMSNorm"),
         (
             "smallthinker",
             TriageClass::NewCode,
@@ -468,22 +476,22 @@ fn smallthinker_names_the_routing_input_and_the_nope_layers() {
     );
 }
 
-/// `dbrx` is refused for its normalisation, and the verdict says why the
-/// existing bias-tensor refusal group does NOT cover it.
+/// `grok` and `dbrx` are audited, and neither carries a verdict any
+/// more.
 ///
-/// The group keys on required `*_norm.bias` tensors as the marker of a
-/// real LayerNorm. `dbrx` creates none of them and is still LayerNorm,
-/// because llama.cpp's `LLM_NORM` subtracts the mean with or without a
-/// bias. Somebody reading only that group's comment would conclude dbrx
-/// is fine.
+/// A stale verdict on an admitted row is the `glm4moe` shape: a refusal
+/// message nobody can reach that still reads as a claim. Both rows were
+/// NEW CODE and both closed on seams landed the day before, which is the
+/// outcome the honest position says the column moves on.
 #[test]
-fn dbrx_says_why_the_bias_group_does_not_catch_it() {
-    let t = unaudited_triage("dbrx").expect("verdict");
-    assert!(
-        t.blocker.contains("creates no norm bias tensors"),
-        "dbrx's verdict must say the bias marker is absent: {}",
-        t.blocker
-    );
+fn grok_and_dbrx_are_audited_and_carry_no_stale_verdict() {
+    for arch in ["grok", "dbrx"] {
+        assert!(is_audited_generic(arch), "`{arch}` must be audited");
+        assert!(
+            unaudited_triage(arch).is_none(),
+            "`{arch}` is audited and must not also carry a verdict"
+        );
+    }
 }
 
 /// Where the refusal a user actually sees is NOT this one, the verdict
@@ -864,7 +872,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 19, 1),
+        (0, 0, 17, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -876,7 +884,12 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          20 to 19 when `exaone-moe` closed on the per-layer RoPE gate \
          (`ferrox_models::rope_layers`) -- one cause behind three refusals, but only \
          one of the three was in this column (EXAONE-4 32B was refused by name and \
-         `smollm3` was DedicatedOnly), which is why it reads like `olmo` and is not. \
+         `smollm3` was DedicatedOnly), which is why it reads like `olmo` and is not, and \
+         19 to 17 when `grok` and `dbrx` closed on seams landed the day before: the \
+         defaults hook and the norm-site table for `grok`, the weighted LayerNorm, the \
+         QKV clamp and the same table for `dbrx` -- and the clamp closed `olmo`'s \
+         clip_qkv refusal by name with it, which again moved the audited number and not \
+         this one. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -885,5 +898,5 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 20);
+    assert_eq!(fixture + arm + new_code + unknown, 18);
 }

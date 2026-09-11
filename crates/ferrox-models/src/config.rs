@@ -331,6 +331,20 @@ pub struct ModelConfig {
     /// (llama.cpp Gemma: scale Q then `build_attn(..., 1.0f)`). Prefer
     /// leaving this `None` when the override equals `1/sqrt(head_dim)`.
     pub attention_scale: Option<f32>,
+    /// Symmetric clamp on the Q, K and V projections
+    /// (`{arch}.attention.clamp_kqv`), applied after the QKV bias and
+    /// before the QK-norm and RoPE -- llama.cpp's `build_qkv`
+    /// (`llama-graph.cpp:1611-1652`).
+    ///
+    /// `Some(c)` only when the architecture's graph clamps AND the file
+    /// declares a positive value; llama.cpp's own test is `> 0.0f`, so
+    /// zero and a negative value are "no clamp" and resolve to `None`
+    /// here rather than to a clamp that zeroes every projection. The
+    /// resolution lives in [`crate::clamp_kqv`]; the decoder applies it
+    /// through ONE helper shared by every host body, and the fused
+    /// Metal launches are fenced off by `Decoder::metal_can_serve_scalars`
+    /// because no kernel implements it.
+    pub clamp_kqv: Option<f32>,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -721,6 +735,7 @@ pub fn glm_5_2() -> ModelConfig {
         final_logit_softcap: None,
         embedding_scale: None,
         residual_scale: None,
+        clamp_kqv: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -803,6 +818,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         final_logit_softcap: None,
         embedding_scale: None,
         residual_scale: None,
+        clamp_kqv: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -917,6 +933,7 @@ pub fn kimi_k3() -> ModelConfig {
         final_logit_softcap: None,
         embedding_scale: None,
         residual_scale: None,
+        clamp_kqv: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -977,6 +994,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         final_logit_softcap: None,
         embedding_scale: None,
         residual_scale: None,
+        clamp_kqv: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1032,6 +1050,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         final_logit_softcap: None,
         embedding_scale: None,
         residual_scale: None,
+        clamp_kqv: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1090,6 +1109,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         final_logit_softcap: None,
         embedding_scale: None,
         residual_scale: None,
+        clamp_kqv: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,

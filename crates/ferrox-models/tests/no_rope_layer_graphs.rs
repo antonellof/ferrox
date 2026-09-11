@@ -98,7 +98,8 @@
 
 mod common;
 use common::{
-    assert_all_three_paths_match, graph_caches, load_graph_fixture, worst_vs, GRAPH_PROMPT,
+    assert_all_three_paths_match, graph_caches, kl_vs_golden, load_graph_fixture, worst_vs,
+    GRAPH_PROMPT,
 };
 use ferrox_models::rope_layers::{NoRopePhase, RopeLayers};
 use std::num::NonZeroUsize;
@@ -267,18 +268,6 @@ fn expected_unrotated(name: &str, n_layers: usize) -> Vec<usize> {
     }
 }
 
-fn kl_divergence(p_logits: &[f32], q_logits: &[f32]) -> f64 {
-    let softmax = |l: &[f32]| -> Vec<f64> {
-        let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-        let e: Vec<f64> = l.iter().map(|&v| ((v as f64) - m).exp()).collect();
-        let z: f64 = e.iter().sum();
-        e.into_iter().map(|v| v / z).collect()
-    };
-    let p = softmax(p_logits);
-    let q = softmax(q_logits);
-    p.iter().zip(q.iter()).map(|(a, b)| a * (a / b).ln()).sum()
-}
-
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
@@ -313,7 +302,7 @@ fn report_kl_against_llama_cpp() {
         let mut kv = graph_caches(&d);
         let got = d.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv);
         let want = golden(name);
-        let kl = kl_divergence(want, &got);
+        let kl = kl_vs_golden(&got, want);
         let worst = worst_vs(&got, want);
         let top1 = if argmax(&got) == argmax(want) {
             "agrees"

@@ -14,107 +14,181 @@
 //!
 //! The fused branch clamps the fused projection once; the split branch
 //! clamps `Qcur`, `Kcur` and `Vcur` separately. Either way it happens
-//! before the reshape, before any QK-norm and before RoPE.
+//! AFTER the bias add and before the reshape, before any QK-norm and
+//! before RoPE. `build_qkv` clamps for ANY architecture whose
+//! `f_clamp_kqv` is positive, but only three `load_arch_hparams` read
+//! the key, so for every other architecture the key is dead metadata
+//! and ferrox ignores it the same way.
 //!
 //! **Three architectures read the key**, and no other: `dbrx.cpp:5`
-//! (REQUIRED), `mpt.cpp:5` and `olmo.cpp:5` (both optional). `mpt` and
-//! `dbrx` do not reach the generic decoder for other reasons -- ALiBi
-//! and a LayerNorm-plus-`attn_output_norm` graph respectively -- so
-//! `olmo` is the only row this gate is live for today, and it is live
-//! rather than theoretical: `conversion/olmo.py:23-25` writes the key
-//! whenever the HF config has a `clip_qkv`, which OLMo-7B-Twin-2T and
-//! OLMo-1.7-7B do (`8.0`) and the original OLMo-7B does not (`null`).
+//! (REQUIRED -- no `false` argument, so a DBRX file without the key is
+//! refused by llama.cpp's loader), `mpt.cpp:5` and `olmo.cpp:5` (both
+//! optional). `mpt` never reaches the generic decoder (ALiBi), so this
+//! module serves `olmo` and `dbrx`. It is live for both: the DBRX
+//! converter writes `attn_config.clip_qkv` unconditionally
+//! (`conversion/dbrx.py:28`, and every DBRX checkpoint sets it to 8),
+//! and `conversion/olmo.py:23-25` writes the key whenever the HF config
+//! has a `clip_qkv`, which OLMo-7B-Twin-2T and OLMo-1.7-7B do (`8.0`)
+//! and the original OLMo-7B does not (`null`).
 //!
-//! **ferrox has no clamp on any projection.** Implementing one is not
-//! three lines: the projections are computed in the CPU prefill body,
-//! the decode body, the continuous-batching body and the fused Metal
-//! launches, and a feature added to some of those and not the others is
-//! this repo's single most expensive defect shape -- eight model
-//! features have been lost that way, one at a time. So a file that
-//! declares a positive clamp STOPS here. A file that omits the key, or
-//! declares `0.0`, is llama.cpp's own "no clamp" and runs.
+//! **This used to be a refusal**, and the reason it was one is the
+//! reason for the shape of the implementation. The projections are
+//! computed in the CPU decode body, the prefill body and the
+//! continuous-batching body, and each of those applied the QKV bias in
+//! its own hand-written loop; a clamp added to some of them and not the
+//! others would have been this repo's single most expensive defect
+//! shape. So the three bias loops collapsed onto ONE helper,
+//! `Decoder::apply_qkv_bias_and_clamp` (`decoder/qkv_bias.rs`), and the
+//! clamp lives in that helper after the bias, where `build_qkv` puts
+//! it. The fused Metal launches apply the bias inside their kernels via
+//! `AttnExtras` and have no clamp, so `Decoder::metal_can_serve_scalars`
+//! -- the one predicate every Metal eligibility check reads -- keeps a
+//! clamped model on the host bodies rather than letting two backends
+//! answer differently from the same weights.
+//!
+//! The evidence is `tests/olmo_graphs.rs`
+//! (`olmo_clamped_tiny.gguf`, whose llama.cpp logits differ measurably
+//! from the unclamped file's) and `tests/dbrx_graphs.rs`.
 
 /// Architectures whose graph clamps Q, K and V by
 /// `{arch}.attention.clamp_kqv`.
 ///
-/// `mpt` and `dbrx` are deliberately absent even though they read the
-/// key: both resolve to `ArchPath::DedicatedOnly` and never reach the
-/// generic decoder, so listing them would be a second claim about a row
-/// this list does not serve. That is the same rule
+/// `mpt` is deliberately absent even though it reads the key: it
+/// resolves to `ArchPath::DedicatedOnly` and never reaches the generic
+/// decoder, so listing it would be a claim about a row this list does
+/// not serve -- the rule
 /// [`crate::rope_finetuned::ROPE_GATED_ON_FINETUNED`] follows for
 /// `granitehybrid`.
-pub const CLAMPED_QKV_ARCHITECTURES: &[&str] = &["olmo"];
+pub const CLAMPED_QKV_ARCHITECTURES: &[&str] = &["olmo", "dbrx"];
 
-/// The refusal reason when `arch` clamps its projections and the file
-/// declares a positive clamp, or `None` when the file may be run.
+/// The subset of [`CLAMPED_QKV_ARCHITECTURES`] whose loader reads the
+/// key as REQUIRED.
 ///
-/// `declared` is the file's value, `None` when the key is absent --
-/// llama.cpp's `0.0f` default, i.e. no clamp.
-pub fn clamped_refusal(arch: &str, declared: Option<f32>) -> Option<String> {
-    if !CLAMPED_QKV_ARCHITECTURES.contains(&arch) {
-        return None;
+/// `dbrx.cpp:5` is `ml.get_key(LLM_KV_ATTENTION_CLAMP_KQV,
+/// hparams.f_clamp_kqv)` with no `required = false`, so llama.cpp throws
+/// on a DBRX file that omits it. `olmo.cpp:5` passes `false`. Refusing
+/// the same file llama.cpp refuses is the honest answer; defaulting it
+/// to "no clamp" would run a graph the reference cannot.
+pub const CLAMP_KQV_REQUIRED: &[&str] = &["dbrx"];
+
+/// Why a file's clamp declaration cannot be honoured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClampError {
+    /// The architecture reads the key as REQUIRED and the file has none.
+    MissingRequired,
+}
+
+impl ClampError {
+    /// The sentence the loader puts in its error, naming the key.
+    pub fn message(&self, arch: &str) -> String {
+        match self {
+            ClampError::MissingRequired => format!(
+                "`{arch}.attention.clamp_kqv` is REQUIRED for this architecture \
+                 (src/models/dbrx.cpp:5 reads it with no default) and the file does not \
+                 declare it; llama.cpp refuses the same file"
+            ),
+        }
     }
-    // `> 0.0f` is llama.cpp's own test (llama-graph.cpp:1611), so zero
-    // and a negative value both mean "no clamp" there and must mean it
-    // here. Reading zero as a clamp would zero every projection.
-    let v = declared.filter(|v| *v > 0.0)?;
-    Some(format!(
-        "`{arch}.attention.clamp_kqv` = {v}. llama-graph.cpp:1611-1652 clamps the Q, K and V \
-         projections to [-{v}, {v}] inside `build_qkv`, before the reshape, the QK-norm and \
-         RoPE. ferrox has no clamp on any projection, and adding one to the CPU prefill body \
-         while missing the decode body or a fused Metal launch is the defect shape that has \
-         already cost this engine eight model features one at a time, so it stops instead. \
-         `conversion/olmo.py:23-25` writes this key whenever the HF config carries a \
-         `clip_qkv`: OLMo-7B-Twin-2T and OLMo-1.7-7B do, the original OLMo-7B does not"
-    ))
+}
+
+/// The clamp the decoder applies for `arch`, from what the file
+/// declares (`None` when the key is absent).
+///
+/// `Ok(None)` is "no clamp": an architecture whose graph never clamps,
+/// or a file declaring llama.cpp's own `0.0f` default or a negative
+/// value -- `> 0.0f` is llama.cpp's test (llama-graph.cpp:1611), so
+/// zero and a negative value both mean "no clamp" there and must mean
+/// it here. Reading zero as a clamp would zero every projection.
+pub fn resolve_clamp(arch: &str, declared: Option<f32>) -> Result<Option<f32>, ClampError> {
+    if !CLAMPED_QKV_ARCHITECTURES.contains(&arch) {
+        return Ok(None);
+    }
+    if declared.is_none() && CLAMP_KQV_REQUIRED.contains(&arch) {
+        return Err(ClampError::MissingRequired);
+    }
+    Ok(declared.filter(|v| *v > 0.0))
+}
+
+/// `ggml_clamp(x, -c, c)`, in place, over a slice that may hold one row
+/// or a whole batch: the clamp is elementwise, so the two are the same
+/// call.
+#[inline]
+pub fn clamp_in_place(x: &mut [f32], c: f32) {
+    for v in x.iter_mut() {
+        *v = v.clamp(-c, c);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The gate fires on exactly the values llama.cpp branches on.
+    /// The resolution fires on exactly the values llama.cpp branches on.
     ///
     /// The absent and zero cases are the ones worth pinning: llama.cpp's
     /// default is `0.0f` and its test is `> 0.0f`, so treating either as
-    /// a clamp would refuse the original OLMo-7B, whose `clip_qkv` is
-    /// null and whose converted file carries no key at all.
+    /// a clamp would zero every projection of the original OLMo-7B,
+    /// whose `clip_qkv` is null and whose converted file carries no key.
     #[test]
-    fn only_a_positive_clamp_refuses() {
-        assert!(clamped_refusal("olmo", Some(8.0)).is_some());
-        assert!(
-            clamped_refusal("olmo", None).is_none(),
+    fn only_a_positive_clamp_is_applied() {
+        assert_eq!(resolve_clamp("olmo", Some(8.0)), Ok(Some(8.0)));
+        assert_eq!(
+            resolve_clamp("olmo", None),
+            Ok(None),
             "an absent key is llama.cpp's 0.0 default: no clamp"
         );
-        assert!(
-            clamped_refusal("olmo", Some(0.0)).is_none(),
+        assert_eq!(
+            resolve_clamp("olmo", Some(0.0)),
+            Ok(None),
             "`> 0.0f` is llama.cpp's own test; zero means no clamp"
         );
-        assert!(
-            clamped_refusal("olmo", Some(-1.0)).is_none(),
+        assert_eq!(
+            resolve_clamp("olmo", Some(-1.0)),
+            Ok(None),
             "a negative clamp is not a clamp in llama.cpp either"
         );
     }
 
-    /// An architecture that does not clamp is unaffected, including the
-    /// two that read the key and never reach this decoder.
+    /// DBRX reads the key as REQUIRED, and only DBRX.
+    ///
+    /// `Some(0.0)` is still "no clamp" there: the key is present, which
+    /// is all `get_key` checks, and the graph's `> 0.0f` then skips it.
     #[test]
-    fn an_architecture_whose_graph_does_not_clamp_is_unaffected() {
-        for arch in ["llama", "qwen3", "olmo2", "mpt", "dbrx"] {
-            assert!(
-                clamped_refusal(arch, Some(8.0)).is_none(),
-                "{arch} must not be gated by this key here"
+    fn dbrx_refuses_a_file_that_omits_the_key_and_olmo_does_not() {
+        assert_eq!(
+            resolve_clamp("dbrx", None),
+            Err(ClampError::MissingRequired)
+        );
+        assert_eq!(resolve_clamp("dbrx", Some(8.0)), Ok(Some(8.0)));
+        assert_eq!(resolve_clamp("dbrx", Some(0.0)), Ok(None));
+        assert_eq!(resolve_clamp("olmo", None), Ok(None));
+        assert!(
+            ClampError::MissingRequired
+                .message("dbrx")
+                .contains("dbrx.attention.clamp_kqv"),
+            "the message must name the key"
+        );
+    }
+
+    /// An architecture whose graph does not clamp is unaffected, even
+    /// when the file declares the key -- llama.cpp's `load_arch_hparams`
+    /// for it never reads the key, so `f_clamp_kqv` stays 0 there.
+    #[test]
+    fn an_architecture_whose_graph_does_not_clamp_ignores_the_key() {
+        for arch in ["llama", "qwen3", "olmo2", "mpt", "grok"] {
+            assert_eq!(
+                resolve_clamp(arch, Some(8.0)),
+                Ok(None),
+                "{arch} must not be clamped by this key"
             );
         }
     }
 
-    /// The message names the key, the value and the llama.cpp line, so
-    /// a user who hits it can check the claim rather than take it.
+    /// The clamp is symmetric and leaves in-range values bit-identical.
     #[test]
-    fn the_refusal_names_the_key_the_value_and_the_line() {
-        let msg = clamped_refusal("olmo", Some(8.0)).expect("refused");
-        assert!(msg.contains("olmo.attention.clamp_kqv"), "{msg}");
-        assert!(msg.contains("llama-graph.cpp:1611-1652"), "{msg}");
-        assert!(msg.contains('8'), "{msg}");
+    fn the_clamp_is_symmetric_and_inert_inside_the_range() {
+        let mut x = vec![-9.5f32, -8.0, -0.25, 0.0, 3.0, 8.0, 12.0];
+        clamp_in_place(&mut x, 8.0);
+        assert_eq!(x, vec![-8.0, -8.0, -0.25, 0.0, 3.0, 8.0, 8.0]);
     }
 }
