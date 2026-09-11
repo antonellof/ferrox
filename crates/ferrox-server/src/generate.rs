@@ -1227,7 +1227,7 @@ fn cpu_kv_offload_enabled() -> bool {
 /// request restoring it answered fluent nonsense. Paid for only when a
 /// prefix cache is configured, because it costs one KV download per
 /// layer and nothing else in this path reads the rows back.
-fn forward_prompt_batch(
+pub(crate) fn forward_prompt_batch(
     decoder: &Decoder,
     tokens: &[usize],
     start_pos: usize,

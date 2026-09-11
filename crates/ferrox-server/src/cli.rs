@@ -203,6 +203,16 @@ pub struct ServerArgs {
     #[arg(long = "ubatch-size", visible_alias = "ub", value_name = "N")]
     ubatch_size: Option<usize>,
 
+    /// Directory slot files are saved into and restored from,
+    /// llama.cpp's `--slot-save-path`. Sets `FERROX_SLOT_SAVE_PATH`.
+    ///
+    /// `POST /slots/{id_slot}?action=save|restore` refuses with a 501
+    /// naming this flag while it is unset, exactly as llama.cpp does
+    /// (`tools/server/server-context.cpp:4538`): a server that would
+    /// write KV state to disk should have been told where.
+    #[arg(long = "slot-save-path", value_name = "DIR")]
+    slot_save_path: Option<PathBuf>,
+
     /// Start even though another ferrox process is already holding a
     /// model. Off by default: two models on one box do not share it,
     /// they thrash it, and both serve slower than either would alone.
@@ -547,6 +557,19 @@ pub(crate) fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
         unsafe { std::env::set_var("FERROX_CB_MAX_SEQS", n.to_string()) };
     }
 
+    if let Some(dir) = &args.slot_save_path {
+        if !dir.is_dir() {
+            anyhow::bail!(
+                "--slot-save-path {} is not a directory. Slots are written into it by name, so \
+                 a path that does not exist would be discovered on the first save rather than \
+                 at startup",
+                dir.display()
+            );
+        }
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var("FERROX_SLOT_SAVE_PATH", dir) };
+    }
+
     for (flag, value) in [
         ("--batch-size", args.batch_size),
         ("--ubatch-size", args.ubatch_size),
@@ -674,6 +697,26 @@ mod tests {
             let err = apply_cli_overrides(&args).unwrap_err().to_string();
             assert!(err.contains(flag), "{flag}: {err}");
         }
+    }
+
+    /// A path that is not a directory is refused at startup rather
+    /// than on the first save. The repo's rule about gates applies to
+    /// flags too: a `--slot-save-path` pointing at nothing looks
+    /// configured until somebody tries to use it, hours later.
+    #[test]
+    fn a_slot_save_path_that_is_not_a_directory_is_refused_at_startup() {
+        let args = ServerArgs::try_parse_from(
+            ["ferrox-server", "--slot-save-path", "/definitely/not/here"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        let err = apply_cli_overrides(&args).unwrap_err().to_string();
+        assert!(err.contains("--slot-save-path"), "{err}");
+        assert!(
+            std::env::var("FERROX_SLOT_SAVE_PATH").is_err(),
+            "a refused path must not have been lowered to the environment first"
+        );
     }
 
     #[test]

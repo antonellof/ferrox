@@ -593,6 +593,7 @@ fn run_load_task(state: Arc<AppState>, task: Arc<Task>, id: String, path: String
         loaded,
         batcher,
         ceiling,
+        checkpoint_path: Some(PathBuf::from(&path)),
     })));
     state.set_last_load_error(None);
     // Dropped here, outside the swap's write lock and after it: any

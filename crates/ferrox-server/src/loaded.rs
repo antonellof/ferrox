@@ -32,6 +32,7 @@
 //! [`ActiveModel`] itself, so `/v1/models` and `/health` report an
 //! encoder as the loaded model rather than reporting nothing.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -80,6 +81,19 @@ pub(crate) struct ActiveModel {
     /// this model's `batcher`, so the batched and private decode paths
     /// admit on one object.
     pub(crate) ceiling: Option<Arc<budget::ContextCeiling>>,
+    /// The checkpoint file this model was loaded from, when it came
+    /// from one.
+    ///
+    /// Held for [`crate::slots`], which fingerprints the checkpoint so
+    /// a saved KV slot cannot be restored onto different weights.
+    /// `FERROX_MODEL_PATH` would be the wrong source for that:
+    /// `/admin/models/load` swaps the model without touching it, so a
+    /// slot saved after a swap would be stamped with the identity of
+    /// the checkpoint the process *started* on. Like `ceiling`, this is
+    /// a property of the model and travels with it.
+    ///
+    /// `None` for the synthetic fallback and for a Kimi directory.
+    pub(crate) checkpoint_path: Option<PathBuf>,
 }
 
 /// `FERROX_MODEL_NAME`, cached because `name()` returns a `&str` and is

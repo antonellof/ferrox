@@ -195,6 +195,18 @@ pub const V1_CACHE_REBUILD: &str = "/v1/cache/rebuild";
 /// cannot race the last sampled token.
 pub const ADMIN_PREPARE_STOP: &str = "/v1/admin/prepare-stop";
 
+/// Save or restore one slot's KV state, llama.cpp's
+/// `POST /slots/:id_slot?action=save|restore`.
+///
+/// A template like [`V1_STREAM`], and absent from [`ALL`] for the same
+/// reason: a caller probing a literal `{id_slot}` would get a 404.
+pub const SLOTS_ID: &str = "/slots/{id_slot}";
+
+/// The concrete slot path for one slot id.
+pub fn slots_id(id_slot: u32) -> String {
+    SLOTS_ID.replace("{id_slot}", &id_slot.to_string())
+}
+
 /// The concrete cancel path for one task id.
 pub fn admin_task_cancel(task_id: &str) -> String {
     ADMIN_TASK_CANCEL.replace("{task_id}", task_id)
@@ -213,9 +225,10 @@ pub fn v1_stream_poll(request_id: &str) -> String {
 /// Every fixed route above, for clients that want to enumerate the
 /// surface (and for the round-trip test below).
 ///
-/// [`ADMIN_TASK_CANCEL`], [`V1_STREAM`] and [`V1_STREAM_POLL`] are
-/// deliberately absent: they are templates, and a caller iterating this
-/// list to probe paths would get a 404 for a literal `{task_id}`.
+/// [`ADMIN_TASK_CANCEL`], [`V1_STREAM`], [`V1_STREAM_POLL`] and
+/// [`SLOTS_ID`] are deliberately absent: they are templates, and a
+/// caller iterating this list to probe paths would get a 404 for a
+/// literal `{task_id}`.
 pub const ALL: &[&str] = &[
     HEALTH,
     METRICS,

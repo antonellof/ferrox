@@ -67,6 +67,7 @@ mod sampling_knobs;
 mod security;
 mod serving;
 mod session;
+mod slots;
 mod sse;
 mod stats;
 mod stop;
@@ -282,6 +283,18 @@ impl Model {
                     .collect();
                 Some(m.decoder.forward_hidden_batch(tokens, 0, &mut caches))
             }
+            Model::Kimi(_) | Model::Mla(_) | Model::Gemma4(_) | Model::Glm52(_) => None,
+        }
+    }
+
+    /// The generic GGUF decoder, when that is what is loaded.
+    ///
+    /// `None` for the dedicated engines (Kimi, MLA, Gemma-4, GLM-5.2):
+    /// they hold their own KV in their own shape, and
+    /// [`crate::slots`]'s file format describes the generic one.
+    pub(crate) fn gguf_decoder(&self) -> Option<&Arc<Decoder>> {
+        match self {
+            Model::Gguf(m) => Some(&m.decoder),
             Model::Kimi(_) | Model::Mla(_) | Model::Gemma4(_) | Model::Glm52(_) => None,
         }
     }
@@ -3288,6 +3301,100 @@ async fn chat_completions_stream(
 /// handler's, and the one path that did match would have panicked on
 /// `MissingPathParams`. Anything with a placeholder must go through
 /// here.
+/// Every route that sits behind `FERROX_API_KEY`, as ONE list.
+///
+/// Extracted because there were two of these: this one and a
+/// hand-written copy in the test module, which had already drifted --
+/// the test router was missing `/metrics`, `/cache/stats`, both rerank
+/// spellings and half of `/admin`, so an HTTP test could pass against a
+/// route the real server does not serve, or 404 on one it does. That is
+/// this repo's dominant bug shape (two structures that must agree, with
+/// nothing enforcing it) sitting inside the test harness, where it is
+/// worst: it makes the tests agree with themselves.
+///
+/// `/health` is deliberately NOT here. It is the one route that must
+/// stay reachable without a key, and it is registered separately for
+/// that reason.
+fn protected_routes() -> Router<Arc<AppState>> {
+    use ferrox_api::routes;
+
+    Router::new()
+        .route(routes::V1_MODELS, get(list_models))
+        // The Responses surface decodes tokens, so it sits behind the
+        // same key as `/v1/chat/completions`: it must cost what
+        // decoding tokens costs.
+        .route(routes::V1_RESPONSES, post(responses::responses))
+        .route(
+            &axum_path(routes::V1_RESPONSE),
+            get(responses::responses_get),
+        )
+        .route(
+            &axum_path(routes::V1_RESPONSE_CANCEL),
+            post(responses::responses_cancel),
+        )
+        .route(&axum_path(routes::SLOTS_ID), post(slots::post_slot))
+        .route(routes::V1_STATS, get(serving_stats))
+        .route(routes::V1_REQUESTS, get(recent_requests))
+        .route(routes::V1_CACHE_STATUS, get(cache_admin::cache_status))
+        .route(routes::V1_CACHE_REBUILD, post(cache_admin::cache_rebuild))
+        .route(routes::ADMIN_PREPARE_STOP, post(cache_admin::prepare_stop))
+        .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
+        // Behind the same key as the endpoint that started the work:
+        // an unauthenticated caller must not be able to stop someone
+        // else's generation by guessing at request ids.
+        .route(routes::V1_CANCEL, post(cancel_generation))
+        // Reconnect and the polling fallback, both behind the same key
+        // as the request that filled the buffer: the replay window holds
+        // the model's output, so reading it must cost what producing it
+        // cost.
+        .route(&axum_path(routes::V1_STREAM), get(resume::resume))
+        .route(&axum_path(routes::V1_STREAM_POLL), get(resume::poll))
+        .route(routes::V1_MESSAGES, post(anthropic::messages))
+        .route(
+            routes::V1_MESSAGES_COUNT_TOKENS,
+            post(anthropic::count_tokens),
+        )
+        .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
+        // llama.cpp's NATIVE completion endpoint, under both spellings
+        // it mounts. Not an alias of the line above: different request
+        // fields, a different response object, and a stream that ends
+        // without `[DONE]`. See `crate::completion`.
+        .route(routes::COMPLETION, post(completion::completion))
+        .route(routes::COMPLETIONS, post(completion::completion))
+        .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
+        .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
+        // llama.cpp's unprefixed spelling of the same two, on the SAME
+        // handlers -- not copies. The `/v1/` prefix was ferrox's
+        // invention (OpenAI has no tokenize endpoint), so every
+        // llama.cpp client was getting a 404 that named nothing. Behind
+        // the key with their twins: they read the loaded vocabulary.
+        .route(routes::TOKENIZE, post(openai_extra::tokenize))
+        .route(routes::DETOKENIZE, post(openai_extra::detokenize))
+        .route(routes::V1_EMBEDDINGS, post(embeddings::embeddings))
+        // Cross-encoder reranking, under the `/v1` spelling Cohere and
+        // Jina clients use and the unprefixed one llama.cpp mounts.
+        // Same handler: this really is an alias, not a second dialect.
+        .route(routes::V1_RERANK, post(rerank::rerank))
+        .route(routes::RERANK, post(rerank::rerank))
+        .route(routes::CACHE_STATS, get(cache_stats))
+        .route(routes::METRICS, get(metrics))
+        // The control surface. Registered inside `protected` on
+        // purpose: these routes change what the server serves and write
+        // to disk, so they get the same FERROX_API_KEY gate as /v1/*
+        // and never the unauthenticated treatment /health has.
+        .route(routes::ADMIN_MODELS, get(admin::models))
+        .route(routes::ADMIN_MODELS_LOAD, post(admin::load_model))
+        .route(routes::ADMIN_MODELS_UNLOAD, post(admin::unload_model))
+        .route(routes::ADMIN_DOWNLOAD, post(admin::download))
+        .route(routes::ADMIN_TASKS, get(admin::tasks))
+        .route(&admin::cancel_route(), post(admin::cancel_task))
+        .route(routes::ADMIN_STATS, get(admin::stats))
+        // Server-side conversation storage, mounted here so it inherits
+        // the same key gate as the endpoint that generated the text it
+        // stores. Routes and store both live in `conversations`.
+        .merge(conversations::router())
+}
+
 fn axum_path(template: &str) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -3615,10 +3722,11 @@ fn build_app_state(
     detection: Arc<health::Detection>,
 ) -> AppState {
     let StartupModels { loaded, embedding } = models;
+    let configured_path = std::env::var("FERROX_MODEL_PATH").ok();
     let (loaded, batcher, ceiling) = activate_loaded_model(
         loaded,
         enable_continuous_batching,
-        std::env::var("FERROX_MODEL_PATH").ok().as_deref(),
+        configured_path.as_deref(),
         paged_kv.as_ref(),
     );
     // The startup model's admin id is whichever discovered entry sits
@@ -3644,6 +3752,7 @@ fn build_app_state(
             loaded,
             batcher,
             ceiling,
+            checkpoint_path: configured_path.as_deref().map(PathBuf::from),
         }))),
         paged_kv,
         load_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -4447,80 +4556,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
     // is nothing to mount here and `/` stays a 404.
     let public = Router::new().route(routes::HEALTH, get(health));
 
-    let mut protected = Router::new()
-        .route(routes::V1_MODELS, get(list_models))
-        // The Responses surface decodes tokens, so it sits behind the
-        // same key as `/v1/chat/completions`: it must cost what
-        // decoding tokens costs.
-        .route(routes::V1_RESPONSES, post(responses::responses))
-        .route(
-            &axum_path(routes::V1_RESPONSE),
-            get(responses::responses_get),
-        )
-        .route(
-            &axum_path(routes::V1_RESPONSE_CANCEL),
-            post(responses::responses_cancel),
-        )
-        .route(routes::V1_STATS, get(serving_stats))
-        .route(routes::V1_REQUESTS, get(recent_requests))
-        .route(routes::V1_CACHE_STATUS, get(cache_admin::cache_status))
-        .route(routes::V1_CACHE_REBUILD, post(cache_admin::cache_rebuild))
-        .route(routes::ADMIN_PREPARE_STOP, post(cache_admin::prepare_stop))
-        .route(routes::V1_CHAT_COMPLETIONS, post(chat_completions))
-        // Behind the same key as the endpoint that started the work:
-        // an unauthenticated caller must not be able to stop someone
-        // else's generation by guessing at request ids.
-        .route(routes::V1_CANCEL, post(cancel_generation))
-        // Reconnect and the polling fallback, both behind the same key
-        // as the request that filled the buffer: the replay window holds
-        // the model's output, so reading it must cost what producing it
-        // cost.
-        .route(&axum_path(routes::V1_STREAM), get(resume::resume))
-        .route(&axum_path(routes::V1_STREAM_POLL), get(resume::poll))
-        .route(routes::V1_MESSAGES, post(anthropic::messages))
-        .route(
-            routes::V1_MESSAGES_COUNT_TOKENS,
-            post(anthropic::count_tokens),
-        )
-        .route(routes::V1_COMPLETIONS, post(openai_extra::completions))
-        // llama.cpp's NATIVE completion endpoint, under both spellings
-        // it mounts. Not an alias of the line above: different request
-        // fields, a different response object, and a stream that ends
-        // without `[DONE]`. See `crate::completion`.
-        .route(routes::COMPLETION, post(completion::completion))
-        .route(routes::COMPLETIONS, post(completion::completion))
-        .route(routes::V1_TOKENIZE, post(openai_extra::tokenize))
-        .route(routes::V1_DETOKENIZE, post(openai_extra::detokenize))
-        // llama.cpp's unprefixed spelling of the same two, on the SAME
-        // handlers -- not copies. The `/v1/` prefix was ferrox's
-        // invention (OpenAI has no tokenize endpoint), so every
-        // llama.cpp client was getting a 404 that named nothing. Behind
-        // the key with their twins: they read the loaded vocabulary.
-        .route(routes::TOKENIZE, post(openai_extra::tokenize))
-        .route(routes::DETOKENIZE, post(openai_extra::detokenize))
-        .route(routes::V1_EMBEDDINGS, post(embeddings::embeddings))
-        // Cross-encoder reranking, under the `/v1` spelling Cohere and
-        // Jina clients use and the unprefixed one llama.cpp mounts.
-        // Same handler: this really is an alias, not a second dialect.
-        .route(routes::V1_RERANK, post(rerank::rerank))
-        .route(routes::RERANK, post(rerank::rerank))
-        .route(routes::CACHE_STATS, get(cache_stats))
-        .route(routes::METRICS, get(metrics))
-        // The control surface. Registered inside `protected` on
-        // purpose: these routes change what the server serves and write
-        // to disk, so they get the same FERROX_API_KEY gate as /v1/*
-        // and never the unauthenticated treatment /health has.
-        .route(routes::ADMIN_MODELS, get(admin::models))
-        .route(routes::ADMIN_MODELS_LOAD, post(admin::load_model))
-        .route(routes::ADMIN_MODELS_UNLOAD, post(admin::unload_model))
-        .route(routes::ADMIN_DOWNLOAD, post(admin::download))
-        .route(routes::ADMIN_TASKS, get(admin::tasks))
-        .route(&admin::cancel_route(), post(admin::cancel_task))
-        .route(routes::ADMIN_STATS, get(admin::stats))
-        // Server-side conversation storage, mounted here so it inherits
-        // the same key gate as the endpoint that generated the text it
-        // stores. Routes and store both live in `conversations`.
-        .merge(conversations::router());
+    let mut protected = protected_routes();
 
     // Both off by default; set the corresponding env var to enable.
     // route_layer (not layer) so these apply only to the routes above,
@@ -4737,6 +4773,7 @@ mod tests {
                 loaded: Loaded::Generative(Arc::new(model)),
                 batcher: None,
                 ceiling: None,
+                checkpoint_path: None,
             }))),
             load_in_progress: std::sync::atomic::AtomicBool::new(false),
             tasks: Arc::new(tasks::TaskRegistry::new()),
@@ -4783,71 +4820,18 @@ mod tests {
     /// [`test_app`] over a caller-owned state, so a test can reach in
     /// and swap or unload the model behind a live router.
     fn test_app_with_state(state: Arc<AppState>) -> Router {
+        // The SAME route list the server builds, not a hand-written
+        // copy of it. The copy that used to live here had drifted from
+        // the real one, which is the failure mode that makes an HTTP
+        // test worthless: it can only ever confirm that the tests agree
+        // with the tests. See `protected_routes`.
+        //
+        // No auth, rate-limit or CORS layer: those are configured from
+        // the environment in `run`, and a test that set the environment
+        // would race every other test in the process.
         Router::new()
             .route(ferrox_api::routes::HEALTH, get(health))
-            .route(ferrox_api::routes::V1_MODELS, get(list_models))
-            .route(ferrox_api::routes::V1_RESPONSES, post(responses::responses))
-            .route(
-                &axum_path(ferrox_api::routes::V1_RESPONSE),
-                get(responses::responses_get),
-            )
-            .route(
-                &axum_path(ferrox_api::routes::V1_RESPONSE_CANCEL),
-                post(responses::responses_cancel),
-            )
-            .route(ferrox_api::routes::V1_STATS, get(serving_stats))
-            .route(ferrox_api::routes::V1_REQUESTS, get(recent_requests))
-            .route(
-                ferrox_api::routes::V1_CACHE_STATUS,
-                get(cache_admin::cache_status),
-            )
-            .route(
-                ferrox_api::routes::V1_CACHE_REBUILD,
-                post(cache_admin::cache_rebuild),
-            )
-            .route(
-                ferrox_api::routes::ADMIN_PREPARE_STOP,
-                post(cache_admin::prepare_stop),
-            )
-            .route("/v1/chat/completions", post(chat_completions))
-            .route(ferrox_api::routes::V1_MESSAGES, post(anthropic::messages))
-            .route(
-                ferrox_api::routes::V1_MESSAGES_COUNT_TOKENS,
-                post(anthropic::count_tokens),
-            )
-            .route("/v1/tokenize", post(openai_extra::tokenize))
-            .route("/v1/detokenize", post(openai_extra::detokenize))
-            // llama.cpp's unprefixed spelling, mounted here too so the
-            // tests below reach the alias through a real router rather
-            // than by calling the handler function directly.
-            .route(ferrox_api::routes::TOKENIZE, post(openai_extra::tokenize))
-            .route(
-                ferrox_api::routes::DETOKENIZE,
-                post(openai_extra::detokenize),
-            )
-            .route("/v1/embeddings", post(embeddings::embeddings))
-            .route("/v1/completions", post(openai_extra::completions))
-            // llama.cpp's native endpoint, under both of its spellings.
-            .route(ferrox_api::routes::COMPLETION, post(completion::completion))
-            .route(
-                ferrox_api::routes::COMPLETIONS,
-                post(completion::completion),
-            )
-            .route(
-                ferrox_api::routes::ADMIN_MODELS_UNLOAD,
-                post(admin::unload_model),
-            )
-            .route(ferrox_api::routes::ADMIN_TASKS, get(admin::tasks))
-            .route(ferrox_api::routes::ADMIN_STATS, get(admin::stats))
-            .route(ferrox_api::routes::V1_CANCEL, post(cancel_generation))
-            .route(
-                &axum_path(ferrox_api::routes::V1_STREAM),
-                get(resume::resume),
-            )
-            .route(
-                &axum_path(ferrox_api::routes::V1_STREAM_POLL),
-                get(resume::poll),
-            )
+            .merge(protected_routes())
             .with_state(state)
     }
 
@@ -4991,6 +4975,7 @@ mod tests {
             loaded: Loaded::Generative(Arc::new(named_test_model(name, 256))),
             batcher: None,
             ceiling: None,
+            checkpoint_path: None,
         })
         .tap_into(state)
     }
@@ -5063,6 +5048,7 @@ mod tests {
             loaded: Loaded::Generative(Arc::new(named_test_model("model-b", 256))),
             batcher: None,
             ceiling: None,
+            checkpoint_path: None,
         })));
         drop(previous);
         // The registry has let go; the in-flight request has not.
@@ -6263,6 +6249,37 @@ mod tests {
         assert_eq!(body["tasks"].as_array().unwrap().len(), 0);
     }
 
+    /// The slots route exists, is reachable, and refuses by naming the
+    /// flag that would turn it on -- rather than 404ing, which is what
+    /// an unregistered route would do and is indistinguishable from
+    /// "this build has no slots".
+    ///
+    /// The condition is reachable by default: `FERROX_SLOT_SAVE_PATH`
+    /// is unset unless an operator passes `--slot-save-path`, so this
+    /// is the answer every stock server gives.
+    #[tokio::test]
+    async fn the_slots_route_is_registered_and_refuses_by_naming_slot_save_path() {
+        assert!(
+            std::env::var("FERROX_SLOT_SAVE_PATH").is_err(),
+            "this test asserts the unconfigured behaviour"
+        );
+        let app = test_app();
+        let (status, body) = post_json_uri(
+            &app,
+            &format!("{}?action=save", ferrox_api::routes::slots_id(0)),
+            serde_json::json!({"filename": "sys.fslot", "prompt": "hi"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--slot-save-path"),
+            "{body}"
+        );
+    }
+
     async fn post_json_uri(
         app: &Router,
         uri: &str,
@@ -6649,6 +6666,7 @@ mod tests {
             loaded,
             batcher,
             ceiling,
+            checkpoint_path: None,
         })));
         let app = test_app_with_state(Arc::new(state));
 
