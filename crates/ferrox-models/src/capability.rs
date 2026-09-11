@@ -689,6 +689,24 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // it through `ModelConfig::model_ffn_act`.
     "apertus",
     "step35",
+    // tests/attn_temperature_graphs.rs: `mistral3` (mistral3.cpp:5,
+    // 14-17, 153-156), every Ministral-3 export. Its one blocker was
+    // the PER-POSITION ATTENTION TEMPERATURE, `attention.temperature_scale`,
+    // which llama-graph.cpp:163-167 turns into `log(floor(pos /
+    // floor_scale) + 1) * scale + 1` per token and the graph multiplies
+    // into Q after RoPE; `crate::attn_temperature` is the seam, with
+    // the census (three graphs of 140 build the input, this the only
+    // generic-path one) and the floor resolved as `llama-model.cpp:
+    // 1164-1165` resolves it -- `context_length` first, the YaRN key
+    // over it -- which the second fixture measures. Two corrections
+    // to its verdict: the graph is either dense or MoE on every layer
+    // with NO leading-dense split and NO shared expert (`:64-84` create
+    // `_shexp` only under an `n_ff_shexp` its hparams never set, and
+    // no graph line reads them); and `rope.scaling.yarn_log_multiplier`
+    // (`:9`) adjusts a YaRN MAGNITUDE term ferrox turned out not to
+    // apply at all -- `crate::yarn_magnitude`, evidenced on two more
+    // fixtures with the factor at 4. NORM RoPE, `1/sqrt(head_dim)`.
+    "mistral3",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -979,20 +997,20 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          half is also sized `{n_embd, n_embd}` (:40-42) rather than n_ff. Same shape as \
          `smallthinker`'s router: a branch fed from the raw layer input",
     ),
-    (
-        "mistral3",
-        TriageClass::NewCode,
-        "per-position attention temperature tuning. src/models/mistral3.cpp:5,14-17 reads \
-         {arch}.attention.temperature_scale and seeds n_attn_temp_floor_scale from \
-         n_ctx_orig_yarn, and :109-111 builds a per-position Q scale that llama-graph.cpp \
-         computes as `log(floor(pos / floor_scale) + 1) * temp_scale + 1` (:159-167). ferrox \
-         has no per-position attention scale at all and no gate on that key, so a checkpoint \
-         carrying it would load and silently drop it -- the class of defect \
-         `unsupported_scaling_keys` exists for, on a key that list does not have. :9 also \
-         reads rope.scaling.yarn_log_multiplier, and loader.rs:588's own comment records \
-         that ferrox implements only YaRN's magnitude term. The rest (:46-83, :120-210) is \
-         leading-dense + MoE + shared expert on a sequential residual, which ferrox has",
-    ),
+    // `mistral3` was HERE, NEW CODE on the PER-POSITION ATTENTION
+    // TEMPERATURE, and is audited now: `crate::attn_temperature` is the
+    // seam and `tests/attn_temperature_graphs.rs` carries five
+    // fixtures. Its verdict's "leading-dense + MoE + shared expert" was
+    // wrong on two counts (see the AUDITED entry), and its
+    // `yarn_log_multiplier` half found that YaRN's magnitude term was
+    // missing for every architecture (`crate::yarn_magnitude`). The
+    // reach was measured before a line was written: `llama4` seeds the
+    // same three constants from literals and gates the multiply on
+    // its no-RoPE layers (`llama4.cpp:15-17,175-176`), and `deepseek2`
+    // / `mistral4` read the same key with `attention.temperature_length`
+    // as the floor (`deepseek2.cpp:46-49`) -- the MLA loader REFUSES
+    // that by name now, where it used to drop it, because that engine
+    // has no golden to check an implementation against.
     (
         "nanbeige",
         TriageClass::NewCode,
@@ -1355,6 +1373,13 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // (`tests/per_layer_shape_graphs.rs`). NORM RoPE: LLM_ARCH_DECI
         // is in the consecutive-pairs group (llama-model.cpp:2576).
         v.push(gqa_norm("deci"));
+        // `mistral3` was NEW CODE in `NORM_ROPE_TRIAGED` on the
+        // per-position attention temperature, which
+        // `crate::attn_temperature` implements
+        // (`tests/attn_temperature_graphs.rs`). NORM RoPE:
+        // LLM_ARCH_MISTRAL3 is in the consecutive-pairs group
+        // (llama-model.cpp:2604), which `tests/rope_layout.rs` pins.
+        v.push(gqa_norm("mistral3"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1826,7 +1851,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             KvGqa,
             Norm,
             ArchPath::DedicatedOnly {
-                reason: "llama4 MoE + non-GQA attn -- see llama4_engine.rs tensor list",
+                reason: "llama4 MoE + chunked attention -- see llama4_engine.rs tensor list. \
+                         Its attention temperature (llama4.cpp:15-17: scale 0.1, floor 8192, \
+                         offset 1.0, from LITERALS, applied at :175-176 to the no-RoPE layers \
+                         only) is `crate::attn_temperature` plus a per-layer gate on \
+                         `ModelConfig::layer_rotates`; what it still needs is the chunked \
+                         SWA (`LLAMA_SWA_TYPE_CHUNKED`, :13) and the interleaved MoE",
             },
             WholeVector,
         ));
@@ -2939,7 +2969,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 10,
+            seen == 9,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2998,13 +3028,22 @@ mod audit_tests {
              FFN activation with these scalars`, and two bodies, xIELU and the clamped \
              SwiGLU, read side by side before being called one cause; `step35`'s \
              half-width rotary landed on `crate::swa_geometry` as a two-valued width and \
-             lifted Laguna-XS.2's `rope.dimension_count_swa` refusal by name with it. \
-             What is left is 9 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             lifted Laguna-XS.2's `rope.dimension_count_swa` refusal by name with it, and \
+             10 until `mistral3` closed on the per-position attention temperature \
+             (`crate::attn_temperature`, tests/attn_temperature_graphs.rs) -- the reach \
+             measured first: three graphs of 140 build the input, `llama4` from literals \
+             on its own engine and `deepseek2` / `mistral4` on the MLA engine, which \
+             REFUSES the key by name now where it dropped it; and its `yarn_log_multiplier` \
+             half found YaRN's magnitude term missing for EVERY architecture \
+             (`crate::yarn_magnitude`). \
+             What is left is 8 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
              closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
-             `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna` and `mellum`, and each \
-             closure but `olmo`'s, `arcee`'s and `mellum`'s took more than one row at a \
-             time because each found ONE cause behind several refusals; `mellum`'s cause \
-             IS shared and moved three verdicts, but only one of them was closable by it"
+             `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
+             `step35` and `mistral3`, and each closure but `olmo`'s, `arcee`'s, `mellum`'s \
+             and `mistral3`'s took more than one row at a time because each found ONE cause \
+             behind several refusals; `mellum`'s cause IS shared and moved three verdicts, \
+             but only one of them was closable by it, and `mistral3`'s is shared with two \
+             rows on other engines"
         );
     }
 
@@ -3203,15 +3242,15 @@ mod tests {
                 "{arch} must fail closed, not silent generic GQA"
             );
         }
-        assert!(
-            matches!(
-                resolve_architecture("llama4"),
-                Some(ArchPath::DedicatedOnly {
-                    reason: "llama4 MoE + non-GQA attn -- see llama4_engine.rs tensor list"
-                })
-            ),
-            "llama4 must fail closed, not silent generic GQA"
-        );
+        match resolve_architecture("llama4") {
+            Some(ArchPath::DedicatedOnly { reason }) => {
+                assert!(
+                    reason.contains("llama4_engine.rs") && reason.contains("attn_temperature"),
+                    "llama4's reason names its engine and the temperature seam: {reason}"
+                );
+            }
+            other => panic!("llama4 must fail closed, not silent generic GQA: {other:?}"),
+        }
         assert!(matches!(
             resolve_architecture("glm4"),
             Some(ArchPath::DedicatedOnly { .. })

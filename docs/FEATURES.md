@@ -90,6 +90,24 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **The per-position attention temperature**, and with it every
+  Ministral-3 (`mistral3`). `attention.temperature_scale` is Llama-4's
+  "attention temperature tuning" as a GGUF key: llama.cpp multiplies Q
+  after RoPE by `log(floor(pos / floor) + 1) * scale + 1` per token,
+  and the floor is `n_ctx_orig_yarn` -- `context_length` unless the
+  YaRN key overrides it. `ferrox_models::attn_temperature` is one value
+  behind `ModelConfig::attn_temperature`, applied on the three host
+  bodies and fenced off the fused Metal launches; three graphs of 140
+  build the input (measured), and the two on other engines are
+  recorded, with the MLA loader refusing Mistral-Large-3's key by name
+  where it used to drop it.
+- **YaRN's magnitude term**, for every architecture. `rope_attn_factor`
+  now carries `rope.scaling.attn_factor` times llama.cpp's
+  `get_mscale(factor, 1) / get_mscale(factor, yarn_log_multiplier)`
+  (`ferrox_models::yarn_magnitude`), which it did not before: a YaRN
+  checkpoint was roped at the right frequencies and attended with
+  logits low by `(1 + 0.1 ln factor)^2`. Same field, so the CPU helper
+  and the Metal `mscale` uniform both carry it.
 - **OLMo-1**, the third norm shape and a third variant of that same
   enum. It is pre-norm like llama, but `olmo.cpp:65-67,104-106,128-130`
   normalise with a null weight and a null bias -- a non-parametric

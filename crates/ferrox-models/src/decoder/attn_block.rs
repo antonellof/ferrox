@@ -137,6 +137,7 @@ impl Decoder {
         }
         self.apply_qk_norms_post_rope(layer, &mut q, &mut k, q_width, kv_width);
         self.apply_attention_scale(&mut q);
+        self.apply_attn_temperature(&mut q, q_width, |_| pos);
 
         let mut attn_out = self.push_and_attend_row(kv, layer_idx, layer, &k, &v, &q);
         Some(self.attn_out_to_residual_rows(layer_idx, layer, normed, &mut attn_out, 1))

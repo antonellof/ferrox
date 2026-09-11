@@ -22,8 +22,8 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `smollm3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `arcee` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `deci` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `arctic` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mistral3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `arctic` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `nanbeige` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `plm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |

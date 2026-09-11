@@ -1971,6 +1971,7 @@ mod tests {
             embedding_scale: None,
             residual_scale: None,
             clamp_kqv: None,
+            attn_temperature: None,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

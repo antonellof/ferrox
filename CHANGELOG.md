@@ -15,6 +15,51 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Added
+
+- **`mistral3` (every Ministral-3 export) runs, on the per-position
+  attention temperature seam.** `src/models/mistral3.cpp:5,14-17,153-156`
+  reads `attention.temperature_scale`, floors it on `n_ctx_orig_yarn`
+  and multiplies Q after RoPE by `log(floor(pos / floor) + 1) * scale +
+  1` per token (`llama-graph.cpp:163-167`); ferrox had no per-position
+  Q scale and no gate on the key, so a real Ministral-3 loaded and ran
+  at the wrong temperature with no error. `ferrox_models::attn_temperature`
+  is one value, one accessor and one helper on the three host bodies,
+  with the fused Metal launches fenced off through the predicate the
+  other host-only facts already share, and the census measured before
+  it was written: three graphs of 140 build the input, and the other
+  two (`llama4`, `deepseek2` / `mistral4`) are on other engines. Five
+  libllama-golden fixtures: plain, the temperature stepping twice
+  inside the prompt, the floor from `context_length` when the YaRN key
+  is absent (byte-identical upstream, measured), and two YaRN files.
+  KL 5.14e-15 to 9.16e-15. 48 audited, 9 refusing.
+
+### Fixed
+
+- **YaRN's magnitude term was not applied for ANY architecture on the
+  generic path.** `llama-context.cpp:196-231` multiplies
+  `rope.scaling.attn_factor` by `get_mscale(factor, 1) /
+  get_mscale(factor, yarn_log_multiplier)` -- `1 + 0.1 ln factor` with
+  no multiplier -- and ferrox's `rope_attn_factor` carried the key
+  alone, so every YaRN checkpoint (`*-128K` Qwen3 exports, every
+  Ministral-3) was roped at the right frequencies and the wrong
+  magnitude, with attention logits low by `(1 + 0.1 ln factor)^2`:
+  1.30x at factor 4. Found reading `mistral3.cpp:9` for
+  `rope.scaling.yarn_log_multiplier`, whose only job is to adjust a
+  term ferrox turned out not to have. `ferrox_models::yarn_magnitude`
+  folds it into the field the CPU helper and the Metal `mscale`
+  uniform already read; two fixtures at factor 4 match libllama with
+  and without the multiplier (KL 9.14e-15, 3.45e-15). Only `mistral3`
+  reads the multiplier on the generic path (measured), so it stays
+  dead metadata everywhere else, as upstream.
+- **The MLA engine (`deepseek2` / `mistral4`) silently dropped
+  Mistral-Large-3's attention temperature.** `deepseek2.cpp:46-47`
+  reads `attention.temperature_scale` and `attention.temperature_length`
+  and the graph applies them; the MLA loader read neither. It refuses
+  a nonzero scale by name now, from a fixture that carries both keys,
+  rather than implementing a multiply that engine has no golden to
+  check.
+
 ## [0.21.0] - 2026-09-11
 
 ### Fixed

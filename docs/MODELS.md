@@ -193,7 +193,7 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **47** do
+   logit comparison against real `libllama`, or a fixture; **48** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
@@ -201,8 +201,8 @@ The error always names the reason. Six things cause it:
    `exaone4`, `exaone-moe`, `smollm3`, `plamo3`, `granite`, `granitemoe`,
    `granite-moe`, `minicpm`, `olmo`, `dbrx`, `grok`, `arcee`, `deci`,
    `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35`,
-   `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **10** stop with `UnauditedArchitecture`.
+   `mistral3`, `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`).
+   The other **9** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
@@ -246,7 +246,7 @@ unmeasured, because measuring it needs a quiet host.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. None of the 10 is a fixture or a single
+"Unaudited" is not one thing. None of the 9 is a fixture or a single
 match arm away any more: they need an attention implementation or a
 reading nobody has done, and the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
@@ -258,7 +258,7 @@ reading nobody has done, and the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 10 have now been read on both sides (`ferrox_models::capability`,
+All 9 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -267,13 +267,13 @@ on models":
 |---|---|
 | fixture-away | 0 |
 | one match arm | 0 |
-| new code | 9 |
+| new code | 8 |
 | unknown | 1 |
 
 **Both cheap classes are empty.** `gemma` was the last fixture-away row
 and `chatglm` the last one-match-arm row; nothing still refusing is one
 fixture or one arm away. That is a better answer than the count alone:
-the cheap wins are spent, and what is left is 9 rows needing a
+the cheap wins are spent, and what is left is 8 rows needing a
 different graph plus one name nobody can get a file for.
 
 It was 47 until the triage itself removed one. Reading
@@ -329,12 +329,12 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (9).** A different attention or residual structure. The
-recurring shapes, rather than 9 separate stories:
+**New code (8).** A different attention or residual structure. The
+recurring shapes, rather than 8 separate stories:
 
 The column moved for the first time on 2026-09-10, three times: 26 to
-24, 24 to 21, then 21 to 20, and on 2026-09-11 six times more, 20 to
-19, 19 to 17, 17 to 14, 14 to 12, 12 to 11 and 11 to 9. The first two took several rows at
+24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times more, 20 to
+19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9 to 8. The first two took several rows at
 once, and for the same reason -- each found ONE cause behind several
 refusals. The fourth did too, and the count hides it: the per-layer
 RoPE gate closed THREE refusals and only one of them (`exaone-moe`) was
@@ -356,7 +356,78 @@ TOGETHER on the per-layer ACTIVATION PARAMETER seam, and the question
 answered by reading both graphs first -- one plumbing question, `layer
 il runs its FFN activation with these scalars`, and two activation
 bodies, with the clamp's routed-versus-dense SITE the one thing the
-second needed of the plumbing that the first did not.
+second needed of the plumbing that the first did not. The tenth is the
+reach measurement coming back with "one": `mistral3` closed ALONE on
+the per-position attention temperature because the other two graphs
+that build the input are on other engines, and its verdict's second
+half, one GGUF key, found a defect in every YaRN checkpoint on the
+generic path.
+
+`mistral3` closed on `ferrox_models::attn_temperature`, and the count
+that mattered was taken before the seam was written: `grep -ln
+'attn_temp\|temperature_scale\|build_inp_attn_scale' src/models/*.cpp`
+over all 140 graphs is `mistral3.cpp`, `llama4.cpp` and
+`deepseek2.cpp` (plus three false hits: `grok.cpp:23` reads
+`temperature_length` and applies it nowhere, `dflash.cpp:133` /
+`deepseek4.cpp:124` name a hyper-connection TENSOR, `plamo3.cpp:140`
+is a local). All three multiply Q by the same `[n_tokens]` input
+`llama-graph.cpp:163-167` fills with `log(floor((pos + offset) /
+floor_scale) + 1) * scale + 1`, AFTER RoPE and BEFORE `build_attn`
+with `kq_scale` untouched; what differs is where the three constants
+come from -- `mistral3.cpp:5,14-17` reads `attention.temperature_scale`
+and floors on `hparams.n_ctx_orig_yarn`, `deepseek2.cpp:46-47` reads
+the same scale with `attention.temperature_length` as the floor,
+`llama4.cpp:15-17` seeds 0.1 / 8192 / 1.0 from literals and applies
+them only to its no-RoPE layers (`:175` is an `else if` on the RoPE
+branch). So `AttnTemperature` is the three constants, `scale_at(pos)`
+is the formula in llama.cpp's own precision (single up to the floor,
+double from the log), `ModelConfig::attn_temperature` is the one
+accessor, and ONE helper applies it in the CPU row body and both
+batched host bodies, taking the row's position as a function so the
+three bodies' three spellings of "which position is row `b`" are three
+callers of one loop. No fused Metal launch has a per-token Q scale, so
+`metal_can_serve_model` -- the predicate `residual_scale`, `clamp_kqv`
+and the per-layer shapes already share -- keeps such a model on the
+host bodies. The floor is the part a reader gets wrong:
+`llama-model.cpp:1164-1165` seeds `n_ctx_orig_yarn` from
+`context_length` BEFORE the YaRN key overrides it, so a Ministral with
+no `original_context_length` floors on its context length, and a
+fixture with exactly that shape measures it -- libllama's logits are
+byte-identical to the file that declares the key. KL 9.16e-15 on both,
+with a floor of 2 that steps TWICE inside the six-token prompt, and
+5.14e-15 on the plain file. The MLA engine (`deepseek2` / `mistral4`,
+which is Mistral-Large-3) REFUSES a nonzero scale by name now, where
+it used to load and drop both keys: it has no golden to check an
+implementation against, so an implementation there would be a guess.
+`llama4`'s verdict says the temperature is this seam plus a per-layer
+gate, and names what it still needs.
+
+Two corrections came with it. The verdict had described `mistral3` as
+"leading-dense + MoE + shared expert": `mistral3.cpp:64-84` is EITHER
+dense OR MoE on every layer (no `leading_dense_block_count` is read),
+and its `_shexp` tensors are created only under an `n_ff_shexp` its
+hparams never set and are read by no line of its graph -- a `mistral3`
+file is a `llama` file with three keys, which is what every real
+Ministral-3 is. And `mistral3.cpp:9` reads
+`rope.scaling.yarn_log_multiplier`, whose only job is to adjust YaRN's
+MAGNITUDE term -- and ferrox did not apply that term for ANY
+architecture. `llama-context.cpp:196-231` multiplies
+`rope.scaling.attn_factor` by `get_mscale(factor, 1) /
+get_mscale(factor, log_mul)` (`1 + 0.1 ln factor` with no multiplier)
+on top of ggml's own `rope_yarn` term, which it cancels; ferrox's
+`rope_attn_factor` carried the key alone. Every YaRN checkpoint on the
+generic path -- the `*-128K` Qwen3 exports among them -- was roped at
+the right frequencies and the wrong magnitude, both q and k, so
+attention logits low by `(1 + 0.1 ln factor)^2`, 1.30x at factor 4.
+`ferrox_models::yarn_magnitude` folds the term into the same field the
+CPU helper and the Metal `mscale` uniform already read, and two
+fixtures with the factor at 4 evidence both arms against libllama:
+KL 9.14e-15 without the multiplier and 3.45e-15 with it at 0.5, where
+libllama's own log line reads `yarn_attn_factor = 1.0648`. Only
+`mistral3` reads the multiplier on the generic path (measured;
+`deepseek2`, `deepseek32` and `glm-dsa` apply it inside their own
+`kq_scale` on other engines), so the key is dead metadata for every
+other architecture here as upstream.
 
 `apertus` and `step35` were the PER-LAYER-ACTIVATION pair.
 `apertus.cpp:6-9` reads `xielu.alpha_n`, `xielu.alpha_p`, `xielu.beta`
@@ -774,7 +845,7 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 | LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`) and weighted (`dbrx`) forms; the bias group below still refuses for more than the norm |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all six (`ferrox_models::rope_layers`): `exaone-moe`, `smollm3`, EXAONE-4 32B and `afmoe` run on it; `smallthinker` still refuses for the rows below and its verdict says so |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
-| Hardcoded scales applied even when the GGUF carries no key | `mistral3` (`grok` was here and is CLOSED on the MiniCPM defaults hook) |
+| Hardcoded scales applied even when the GGUF carries no key | none left (`grok` was here and is CLOSED on the MiniCPM defaults hook; `mistral3` was here by mistake -- its scale comes from a key -- and is CLOSED) |
 | A gated attention tensor (`wqkv_gate`) | CLOSED (`ferrox_models::attn_gate`): `afmoe`, `laguna` and `step35` run on it |
 | Attention sinks outside gpt-oss | CLOSED as a tensor-presence fact (`AttnWeights::sinks`, CPU; the fused Metal launches refuse the layer); `mimo2` still refuses for the rows below |
 | A per-layer sliding-window ARRAY (`is_swa_impl`) | CLOSED (`ferrox_models::swa_layers`): `mellum` and `step35` run on it and the EXAONE / Olmo-3 over-refusal is lifted; `mimo2` still refuses for the rows below and its verdict says so |
@@ -783,7 +854,8 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 | An FFN activation whose PARAMETERS vary by layer (xIELU's four arrays; the SwiGLU clamp arrays by site) | CLOSED (`ferrox_models::act_layers`): `apertus` and `step35` run on it |
 | A second rotary width on the sliding layers (`n_rot(il)`: `rope.dimension_count_swa`, or `step35`'s halved full width) | CLOSED (`ModelConfig::rope_dim_swa`, `ferrox_models::swa_geometry`): `step35` and the Laguna-XS.2 shape run on it; the two `_swa` HEAD-width keys stay refused by name, and two widths with per-band divisors are refused for any architecture but `step35` |
 | An ungated or non-SwiGLU FFN | CLOSED for the ungated ReLU-squared form (`FfnActivation::ReluSqr`) and for xIELU (`FfnActivation::Xielu`): `arcee` and `apertus` run on them; `plm` shares the ReLU-squared FFN and refuses on MLA attention |
-| Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mistral3` (per-position attention temperature), `plm` (MLA attention on a dense model); `mellum` was here on "two per-layer RoPE variants", which is the Olmo-3 rule refused by name, and is CLOSED |
+| A per-position attention temperature | CLOSED (`ferrox_models::attn_temperature`): `mistral3` runs on it; `deepseek2` / `mistral4` (Mistral-Large-3) refuse it by name on the MLA engine and `llama4` needs a per-layer gate on it beside its chunked attention |
+| Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `plm` (MLA attention on a dense model); `mellum` was here on "two per-layer RoPE variants", which is the Olmo-3 rule refused by name, and is CLOSED; `mistral3` was here on the temperature and is CLOSED |
 
 **Unknown (1).** `phi4` is the only row left here. It is not in
 llama.cpp's `LLM_ARCH_NAMES` -- `src/llama-arch.cpp` carries `phi3` and

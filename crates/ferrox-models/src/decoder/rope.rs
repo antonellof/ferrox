@@ -22,6 +22,11 @@
 //!   channels of q and k, the second is llama.cpp's `f_attention_scale`
 //!   pre-baked into Q. `attention_scale` reached two of four host sites
 //!   before it became one helper.
+//! * **The per-position attention temperature.** A THIRD multiplier on
+//!   Q, and the only one that varies by token
+//!   (`crate::attn_temperature`); it is applied where `attention_scale`
+//!   is, by one helper taking the row's position, so that the three
+//!   host bodies cannot disagree about which position a row is at.
 
 use ferrox_core::attention::{
     apply_rope, apply_rope_interleaved, apply_rope_interleaved_with_freq_factors,
@@ -169,6 +174,32 @@ impl Decoder {
         for v in q.iter_mut() {
             *v *= compensate;
         }
+    }
+
+    /// llama.cpp's per-position attention temperature
+    /// (`ModelConfig::attn_temperature`), applied to a `[rows, q_width]`
+    /// Q batch after RoPE and the post-RoPE QK-norm, where
+    /// `mistral3.cpp:153-156` multiplies `Qcur` by the `[n_tokens]`
+    /// input -- every head and channel of a token's Q by that token's
+    /// scalar.
+    ///
+    /// Takes the position as a function of the row, because the three
+    /// host bodies spell it three ways (`pos`, `start_pos + b`,
+    /// `positions[b]`) and a helper that took a slice would have made
+    /// the prefill body allocate one to say `start_pos + b`. A
+    /// `[n_tokens]` input is exactly what llama.cpp hands the graph,
+    /// so this is the same shape, not a rearrangement of it.
+    #[inline]
+    pub(crate) fn apply_attn_temperature(
+        &self,
+        q: &mut [f32],
+        q_width: usize,
+        pos_of_row: impl Fn(usize) -> usize,
+    ) {
+        let Some(temp) = self.config.attn_temperature else {
+            return;
+        };
+        temp.apply_rows(q, q_width, pos_of_row);
     }
 }
 
