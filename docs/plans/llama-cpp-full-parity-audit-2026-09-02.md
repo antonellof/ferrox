@@ -19,7 +19,7 @@
 | Source files (C++/CUDA/Metal) | **1,103** mapped | **308** Rust files, **~230k** lines | Structural: 140 per-arch graphs vs 1 decoder |
 | Architecture graphs | **140** hand-written | **16** audited + 4 dedicated engines | **P0** — 124 graphs unported |
 | Backends | CPU, CUDA, Metal, Vulkan, SYCL, HIP, OpenCL, … | CPU, Metal, CUDA (partial), Vulkan (beachhead) | **P0** Vulkan; **P1** CUDA GEMM |
-| CLI tools | 15+ binaries | 21+ subcommands; most core tools present | **P2** imatrix, batched-bench (gguf-split ported 2026-09-09) |
+| CLI tools | 15+ binaries | 22+ subcommands; most core tools present | **P2** batched-bench (gguf-split ported 2026-09-09, imatrix 2026-09-11) |
 | Logit parity (local sweep) | reference | 19 models tested | **2 WRONG**, 8 DRIFT (expected K-quant), 6 MATCH, 1 TIE-FLIP, 2 encoder skip |
 
 ### Live parity sweep (2026-09-02)
@@ -119,11 +119,11 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 | `llama-cli` | `ferrox run` | partial — flag parity mostly done |
 | `llama-server` | `ferrox serve` | partial — slot save/load missing |
 | `llama-bench` | `ferrox bench` | **ported** |
-| `llama-quantize` | `ferrox quantize` | partial — Q8_0 byte-identical; K-quants missing |
+| `llama-quantize` | `ferrox quantize` | partial — Q8_0, Q4_K_S/M, Q5_K_S/M, Q6_K byte-identical, with and without `--imatrix`; Q2_K/Q3_K, IQ tiers, MXFP4 refused by name |
 | `llama-perplexity` | `ferrox perplexity` | partial — corpus ppl; no HellaSwag |
 | `llama-tokenize` | via `ferrox parity` tokenizer sweep | partial |
 | `llama-gguf-split` | `ferrox gguf-split` | **ported**: split by tensors or size, merge, `--no-tensor-first-split`, `--dry-run` |
-| `llama-imatrix` | — | **missing** |
+| `llama-imatrix` | `ferrox imatrix` | **ported** (2026-09-11): same file format both ways, GGUF and legacy `.dat`; sums agree to the forward pass's precision, not bit for bit (see `docs/CLI.md`) |
 | `llama-batched-bench` | — | **missing** |
 | `llama-mtmd` (multimodal) | — | **missing** |
 | `llama-tts` | — | **missing** |
@@ -189,7 +189,7 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 | Partial `-ngl` | yes | all-or-nothing |
 | Streamed CB output | token stream | buffers full completion |
 | gguf-split merge/split | yes | **`ferrox gguf-split`**, both directions |
-| imatrix | yes | **missing** |
+| imatrix | yes | **`ferrox imatrix`** + `ferrox quantize --imatrix`, byte-identical output |
 
 ### 2.5 Sampling (mostly closed)
 
@@ -250,7 +250,7 @@ Ranked per [`north-star.md`](north-star.md) and [`roadmap.md`](roadmap.md).
 
 - 26 new-code architecture graphs (apertus xIELU, dbrx LayerNorm, bitnet, …)
 - Multimodal (`mtmd`), TTS, RPC
-- imatrix, batched-bench, LoRA adapters
+- batched-bench, LoRA adapters (imatrix ported 2026-09-11)
 - SYCL/HIP/OpenCL backends
 
 ---

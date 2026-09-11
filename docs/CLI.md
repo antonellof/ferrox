@@ -562,48 +562,44 @@ unevidenced.
 
 ## Quantize (`ferrox quantize`)
 
-Writes a `Q8_0` GGUF from an F32/F16/BF16 one, and **refuses every other
-target by name**.
+Writes a `Q8_0`, `Q4_K_S`, `Q4_K_M`, `Q5_K_S`, `Q5_K_M` or `Q6_K` GGUF
+from an F32/F16/BF16 one, **byte-identical to `llama-quantize`'s**,
+and refuses every other target by name.
 
 ```bash
-ferrox quantize model-f16.gguf model-q8_0.gguf --type q8_0
+ferrox quantize model-f16.gguf model-q4_k_m.gguf --type q4_k_m
+ferrox quantize model-f16.gguf model-q4_k_m.gguf --type q4_k_m --imatrix imatrix.gguf
+ferrox quantize model-f16.gguf model-q4_k.gguf   --type q4_k_m --pure   # no per-tensor mix
 ```
 
-That refusal is the point rather than a limitation to apologise for.
-ferrox READS every quant kind it runs and until now could write only
-one, so evaluating it against llama.cpp side by side meant installing
-llama.cpp to produce the file ferrox then reads. A `quantize` whose name
-implied llama.cpp's whole range while emitting Q8_0 for everything would
-be worse than the gap: a K-quant encoder that takes min and max over a
-block, where llama.cpp does an iterative scale and min fit, produces a
-file that loads and generates measurably worse text.
+The refusal is the point rather than a limitation to apologise for.
+Q2_K/Q3_K, the IQ tiers, MXFP4 and the legacy Q4_0 family each need
+their own transcription of an iterative fit, and a K-quant encoder
+that takes min and max over a block where llama.cpp does an iterative
+scale-and-min fit produces a file that loads and generates measurably
+worse text. A `quantize` whose name implied llama.cpp's whole range
+while approximating half of it would be worse than the gap.
 
-The output is **byte-identical to `llama_model_quantize()`**: 272 of 272
-tensors on `SmolLM2-135M-Instruct-f16`, same metadata, same size. Which
-tensors are quantized is transcribed from llama.cpp's
+Which tensors are quantized is transcribed from llama.cpp's
 `tensor_allows_quantization` rather than reinvented: everything 2-D
 ending in `weight`, except norms, router gates, position and token-type
 embeddings, SSM and shortconv kernels, RWKV time-mix, T5 position bias,
-multimodal patch tables and audio codebooks. `token_embd.weight` and
-`output.weight` ARE quantized here, because the arm that lifts the
-output head to Q6_K in other mixes is gated on the target not being
-Q8_0.
+multimodal patch tables and audio codebooks. The per-tensor MIX is
+llama.cpp's too: a `Q4_K_M` file has a Q6_K output head and Q6_K
+`ffn_down` on a quarter of its layers, and `--pure` is
+`llama-quantize --pure`, which skips the mix and not the keep-list.
 
-`Q4_K_S`, `Q4_K_M`, `Q5_K_M` and `Q6_K` are also written. Everything
-else (the IQ tiers, MXFP4, imatrix) is refused by name rather than
-approximated.
-
-**Q4_K is byte-identical too, and the claim that it could never be was
-wrong.** This document previously said the difference was a property of
-the compiler that built the reference: clang contracts `a*b+c` into a
-fused multiply-add for C and Rust does not, so a strict transcription
-could not match. The first half of that is true and the conclusion was
-not. The fix is to spell the contraction out. `sumlx += w*x[i]*l` in
-`ggml-quants.c` is **one** FMA, and writing it as `mul_add` in Rust
-reproduces it exactly; one unit in the last place flips
-`sumlx*sumlx > best*suml2` and rewrites an entire super-block, which is
-why 1.15% of super-blocks differed rather than a rounding-sized
-fraction.
+**Every target is byte-identical, and the claim that Q4_K could never
+be was wrong.** This document previously said the difference was a
+property of the compiler that built the reference: clang contracts
+`a*b+c` into a fused multiply-add for C and Rust does not, so a strict
+transcription could not match. The first half of that is true and the
+conclusion was not. The fix is to spell the contraction out. `sumlx +=
+w*x[i]*l` in `ggml-quants.c` is **one** FMA, and writing it as
+`mul_add` in Rust reproduces it exactly; one unit in the last place
+flips `sumlx*sumlx > best*suml2` and rewrites an entire super-block,
+which is why 1.15% of super-blocks differed rather than a
+rounding-sized fraction.
 
 Measured against `llama-quantize` b7650 over an F16 Llama-3.2-1B, whole
 model rather than a fixture:
@@ -615,19 +611,160 @@ model rather than a fixture:
 | Q5_K_M | 147 / 147 | 0 of 3,244,032 Q5_K, 0 of 1,583,104 Q6_K |
 | Q6_K | 147 / 147 | 0 of 4,827,136 Q6_K |
 
+And with an importance matrix (`--imatrix`, below), against
+`llama-quantize --imatrix` b7650 over a BF16 Qwen3-0.6B with
+`llama-imatrix`'s own file, so the weighted fit is measured on
+llama.cpp's input and not on ferrox's:
+
+| Target | Tensors identical | Super-blocks differing |
+|---|---|---|
+| Q8_0 (control; ignores the imatrix) | 311 / 311 | 0 of 23,486,464 |
+| Q4_K_S | 311 / 311 | 0 of 2,274,816 Q4_K, 0 of 53,248 Q5_K, 0 of 607,744 Q6_K |
+| Q4_K_M | 311 / 311 | 0 of 2,098,688 Q4_K, 0 of 837,120 Q6_K |
+| Q5_K_M | 311 / 311 | 0 of 2,098,688 Q5_K, 0 of 837,120 Q6_K |
+| Q6_K | 311 / 311 | 0 of 2,935,808 Q6_K |
+
+The metadata matches too, including the four `quantize.imatrix.*` keys
+llama.cpp records; the only difference between the files is the order
+of the header's key-value pairs, which ferrox writes sorted.
+
 Two things that discipline needs. Goldens must come from the
 **installed** binary: a local release build of the same b7650 source
 disagrees on exactly these knife-edge blocks, and pinned the wrong
 bytes once. And the fixture must be able to fail: the original
 synthetic one stayed green with every `mul_add` removed, so it now
 carries eight real weight blocks, one per fusion site, of which nine of
-thirteen sites redden a golden.
+thirteen sites redden a golden. The imatrix goldens
+(`encode/imatrix_golden.rs`) are two real rows from the run above and
+go red when the weight rule, the candidate grid or the `make_qp_quants`
+stage 2 is replaced by the plain path's.
+
+### `--imatrix`
+
+The importance-matrix fit is llama.cpp's `quantize_row_q4_K_impl`,
+`quantize_row_q5_K_impl` and `quantize_row_q6_K_impl`
+(`ggml/src/ggml-quants.c:1376`, `:1581`, `:1793` at b7650), and it is
+not the plain fit with a weight added. For Q4_K and Q5_K three things
+change: the per-element weight is `qw * sqrt(sigma2 + x^2)` with
+`sigma2 = 2 * mean(x^2)` over the super-block instead of
+`sqrt(mean(x^2)) + |x|` over the sub-block; the candidate grid is
+`(-0.9, 0.05, 36)` for both formats instead of each format's own; and
+the 6-bit scales and mins are fitted by `make_qp_quants` (`:899`), a
+weighted grid search with a greedy per-code refinement, instead of
+`63/max`. Q6_K's change is one argument: the raw imatrix slice goes to
+`make_qx_quants` as its `qw`. Q8_0 discards the imatrix (`:2089`). All
+of that lives in `ferrox-quant`'s `encode/fit.rs` and `encode/qp_quants.rs`
+as a parameter on the SAME super-block fit the plain path uses, not a
+second transcription.
+
+The consumer side is `llama-quant.cpp:913-934`: each tensor looks up its
+own name, a tensor with no entry is quantized unweighted with a printed
+notice (`output.weight` and `token_embd.weight` are the usual ones,
+since `llama-imatrix` collects neither without `--process-output`), and
+an entry of the wrong width is a refusal except on `token_embd.weight`.
+Either file format is accepted: the GGUF one current `llama-imatrix`
+writes, or the legacy `.dat` binary older builds wrote.
 
 One refusal to know about: a tensor whose row width is not a multiple of
 256 stops the run. llama.cpp answers that case by changing the tensor's
 TYPE, to Q5_0 or F16, and ferrox has neither encoder; padding the row
 would shift every following row on decode. SmolLM2-135M cannot be Q4_K
 quantized here for that reason, its embedding being 576 wide.
+
+## Importance matrix (`ferrox imatrix`)
+
+llama.cpp's `llama-imatrix`: runs a calibration text through the model
+and writes, per weight, the per-column sum of squared activations that
+the quantizer above weights its fit by. Same flags where they exist on
+both, same file format in both directions: a ferrox file feeds
+`llama-quantize --imatrix` and a `llama-imatrix` file feeds `ferrox
+quantize --imatrix`.
+
+```bash
+ferrox imatrix -m model-bf16.gguf -f calibration.txt -o imatrix.gguf
+ferrox imatrix -m model-bf16.gguf -f calibration.txt -o imatrix.dat --output-format dat
+ferrox imatrix -m model-bf16.gguf -f calibration.txt --chunks 64 -c 512 --process-output
+ferrox imatrix -m model-bf16.gguf -f calibration.txt -o mine.gguf --compare theirs.gguf
+```
+
+The method is `tools/imatrix/imatrix.cpp` at b7650, cited line by line
+in the module doc. What is collected (`:229-237`): the f32 input of
+every matrix multiplication whose weight is under `blk.`, plus
+`output.weight` with `--process-output`; expert weights per expert with
+one count each (`:302-317`). The rule (`:365-372`): `values[j] +=
+x[j]*x[j]` per row, `counts += rows`. The chunking (`:909-1013`): the
+whole file tokenized once with the checkpoint's BOS rule, non-overlapping
+chunks of `--ctx-size`, each chunk's first token overwritten with BOS
+when the vocabulary adds one, each chunk a forward pass over a fresh KV
+cache, at least two chunks' worth of tokens required. The file
+(`:507-615`): `general.type = imatrix`, `imatrix.datasets`,
+`imatrix.chunk_count`, `imatrix.chunk_size`, and per weight a
+`<name>.in_sum2` F32 `[n_per_row, n_mat]` and a `<name>.counts` F32
+`[1, n_mat]`, names sorted, trailing unit dimensions trimmed as ggml
+trims them.
+
+ferrox has no compute graph to hang a callback on, so the activations
+are observed at the two functions every projection goes through
+(`ferrox_core::activation_tap`), keyed by the weight's address and
+named by walking the decoder's public weight fields against the GGUF's
+tensor names. That seam exists on the CPU path only, so the run pins
+the CPU backend the way `ferrox bench --n-gpu-layers 0` does, and
+after the run every dense entry's row count is checked against the
+token count: a weight whose decoder path bypassed the tap, or was
+observed twice, is a refusal rather than a wrong file. An expert the
+text never routed to is reported as partial data, as upstream reports
+it.
+
+Deviations, all stated: one chunk per forward pass where `llama-imatrix`
+folds `n_batch / n_ctx` chunks into one batch as separate sequences
+(same rows in the same order, so the same sums); no perplexity printed,
+because `ferrox perplexity` already computes that number by llama.cpp's
+method; special-token strings in the text are always parsed, which is
+`llama-imatrix --parse-special`, because ferrox's tokenizers have no
+mode that does not; no `--in-file` combining of earlier matrices; and
+expert streaming (`Stored` experts) is refused because a streamed
+expert's weight view has no stable identity.
+
+**What matches llama.cpp's file and what does not, measured.** The
+names, the counts, the shapes and the accumulation rule are the same,
+so the files are interchangeable and `ferrox quantize --imatrix` on a
+`llama-imatrix` file is byte-identical to `llama-quantize` (table
+above). The sums are NOT bit-identical, because the activations are
+not, and `--compare` prints the gap per entry. On Qwen3-0.6B (BF16 and
+an F32 copy, same result), 8 chunks of 512 tokens of plain prose on
+which both tokenizers agree exactly:
+
+| Where | ferrox vs `llama-imatrix`, per entry |
+|---|---|
+| layer 0 `attn_q/k/v` input (RMSNorm of the embedding, no matmul yet) | max per-column relative 7e-6 |
+| layer 0 `attn_output` input (after the first attention) | 3e-3 |
+| layer 27 `ffn_down` input | 2.7e-2 (the worst of 196 entries) |
+| all entries, L2-relative | median 7.4e-4, max 6.0e-3 |
+
+So the gap enters at the attention block and compounds with depth,
+and it is the forward-pass difference between the two engines, not
+the accumulation: it is unchanged by `llama-imatrix -ctk f32 -ctv f32`
+and by BF16 versus F32 weights (llama.cpp's own two runs are
+byte-identical to each other), which rules out the KV cache type and
+the `vec_dot_type` rounding as the cause on this checkpoint. Where the
+attention arithmetic diverges is a `ferrox parity` question, not an
+imatrix one; on a K-quant checkpoint the documented Q8_K activation
+rounding would add to whatever it is. Percent-level differences in an
+importance weight are far below what moves a quantized super-block --
+the weights enter the fit as relative importances -- but that is a
+statement about the effect, not a claim the files match.
+
+Two things to check before trusting a comparison. The text must
+tokenize identically: on the repo's own markdown docs ferrox's
+Qwen2-style BPE produced 17208 tokens where `llama-tokenize
+--no-escape` produced 17209 (one token fewer somewhere in the 100
+bytes ``es open with `{{ bos_token }}`: gemma-2/3/4\n  (`<bos>`),
+Mistral-Instruct and Phi-3 (`<s>`), Llama-3``), and `llama-imatrix`'s
+own default, which does not parse special-token markers, produced
+17218 because the docs contain six `<|...|>` strings. Either
+difference shifts every chunk boundary and turns a 1e-3 comparison
+into a 1e-1 one. And it must be the same text through the same
+number of chunks, since a chunk count is a token count.
 
 ## Split and merge GGUF (`ferrox gguf-split`)
 

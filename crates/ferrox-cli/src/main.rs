@@ -13,6 +13,7 @@ mod gguf_split;
 mod hf;
 mod host_state;
 mod http;
+mod imatrix;
 mod layer_divergence;
 mod parity;
 mod perplexity;
@@ -96,16 +97,24 @@ enum Commands {
 
     /// Download a GGUF from Hugging Face, same syntax as `hf download`.
     Download(download::DownloadArgs),
-    /// Write a quantized copy of a GGUF.
+    /// Write a quantized copy of a GGUF, byte-identical to
+    /// `llama-quantize`'s.
     ///
-    /// ferrox READS every quant kind it runs and writes `Q8_0`, plus
-    /// `Q4_K_S` / `Q4_K_M` with `--pure`. Every other llama.cpp target
-    /// -- the remaining K-quants, the IQ tiers, MXFP4 -- is refused BY
-    /// NAME: their encoders are an iterative per-super-block fit, and
-    /// an approximation of one produces a file that loads and generates
-    /// measurably worse text. Use `llama-quantize` for those; ferrox
-    /// reads what it writes.
+    /// ferrox READS every quant kind it runs and WRITES `Q8_0`, `Q4_K_S`,
+    /// `Q4_K_M`, `Q5_K_S`, `Q5_K_M` and `Q6_K` -- the full llama.cpp
+    /// mix for each, or `--pure` for the target's block format
+    /// everywhere -- with or without `--imatrix`. Every other target
+    /// (Q2_K/Q3_K, the IQ tiers, MXFP4, the legacy Q4_0 family) is
+    /// refused BY NAME: each needs its own transcription of an
+    /// iterative fit, and an approximation of one produces a file that
+    /// loads and generates measurably worse text. Use `llama-quantize`
+    /// for those; ferrox reads what it writes.
     Quantize(quantize::QuantizeArgs),
+    /// Compute an importance matrix from a calibration text:
+    /// llama.cpp's `llama-imatrix`, same file format in both
+    /// directions. Feed the result to `ferrox quantize --imatrix` or to
+    /// `llama-quantize --imatrix`.
+    Imatrix(imatrix::ImatrixArgs),
     /// Split a GGUF into shards, or merge a shard set back into one
     /// file: llama.cpp's `llama-gguf-split`, same flags and same
     /// `<prefix>-NNNNN-of-MMMMM.gguf` names.
@@ -547,6 +556,7 @@ const SUBCOMMANDS: &[&str] = &[
     "layer-divergence",
     "quant-sensitivity",
     "quantize",
+    "imatrix",
     "gguf-split",
     "parity",
     "perplexity",
@@ -770,6 +780,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Pull(args) => pull::run_pull(args)?,
         Commands::Download(args) => download::run(args)?,
         Commands::Quantize(args) => quantize::run(args)?,
+        Commands::Imatrix(args) => imatrix::run(args)?,
         Commands::GgufSplit(args) => gguf_split::run(args)?,
         Commands::Inspect { path } => {
             let file = ShardedGguf::open(&path)?;
@@ -1635,6 +1646,42 @@ mod cli_tests {
                 rewritten[1]
             );
         }
+    }
+
+    /// `ferrox quantize --help` and `Target::ALL` are two structures that
+    /// must agree about which targets write, and for three PRs they did
+    /// not: the help said "Q8_0, plus Q4_K_S / Q4_K_M with --pure" while
+    /// the code wrote six targets, mixes included. So the help is checked
+    /// against the table: every target the policy accepts is named in
+    /// the subcommand's long help, and `--imatrix` is mentioned because
+    /// the encoders take one.
+    #[test]
+    fn the_quantize_help_names_every_target_the_policy_accepts() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let quantize = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "quantize")
+            .expect("quantize subcommand");
+        let help = quantize
+            .get_long_about()
+            .map(|s| s.to_string())
+            .expect("quantize has a long help");
+        for target in crate::quantize::policy::Target::ALL {
+            assert!(
+                help.contains(target.name()),
+                "quantize's help does not mention {}, which `--type` accepts",
+                target.name()
+            );
+        }
+        assert!(
+            help.contains("--imatrix"),
+            "quantize's help does not mention --imatrix"
+        );
+        assert!(
+            !help.contains("with `--pure`"),
+            "quantize's help still ties the K-quants to --pure"
+        );
     }
 
     /// The named case of the above, kept explicit because `serve` is the

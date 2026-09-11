@@ -18,6 +18,7 @@
 //! holder. The policy half is ported from FreeToken (Apache-2.0); see
 //! docs/THIRD_PARTY_NOTICES.md.
 
+pub mod activation_tap;
 pub mod attention;
 pub mod bench_profile;
 pub mod block_sparse;

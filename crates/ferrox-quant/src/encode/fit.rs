@@ -10,7 +10,12 @@
 //! * [`fit_qk_super_block`], the three-stage Q4_K/Q5_K super-block flow
 //!   (`quantize_row_q4_K_ref` at `ggml-quants.c:1280`,
 //!   `quantize_row_q5_K_ref` at `ggml-quants.c:1467`) that differs
-//!   between the two formats by exactly four numbers.
+//!   between the two formats by exactly four numbers -- and, with an
+//!   importance matrix, the flow of `quantize_row_q4_K_impl` (`:1376`)
+//!   and `quantize_row_q5_K_impl` (`:1581`), which is the SAME three
+//!   stages with a different weight rule, a different candidate grid
+//!   and a different stage 2 (`make_qp_quants`, in
+//!   [`super::qp_quants`]).
 //!
 //! One module, because the alternative is what this repo keeps paying
 //! for: a copy of `make_qkx2_quants` in each of `q4_k.rs` and `q5_k.rs`
@@ -18,6 +23,15 @@
 //! Q5_K is the same super-block fit as Q4_K with `nmax = 31` and a
 //! different candidate grid, so it is a CALL into the same code, not a
 //! second transcription with the constants changed.
+//!
+//! The imatrix path is the same rule applied once more. Upstream's
+//! `make_qkx3_quants` (`ggml-quants.c:816`) is `make_qkx2_quants` with
+//! a `weights ? weights[i] : x[i]*x[i]` fallback that no caller in the
+//! file exercises (every call passes a weight array) and `max <= min`
+//! for `max == min`, which cannot differ once `min` has been clamped to
+//! at most zero. So there is ONE [`make_qkx2_quants`] here, and
+//! [`fit_qk_super_block`] takes the per-super-block importance slice as
+//! an `Option` and switches the three things that actually differ.
 //!
 //! Deviation from upstream, shown not to change a byte by the goldens
 //! in `q4_k`, `q5_k` and `q6_k`: `nearest_int`'s
@@ -55,6 +69,7 @@
 
 use half::f16;
 
+use super::qp_quants::make_qp_quants;
 use crate::Q4_K_SCALE_BYTES;
 
 /// Elements per Q4_K/Q5_K sub-block, and sub-blocks per super-block.
@@ -332,32 +347,66 @@ pub(crate) struct QkSuperBlock {
 
 /// The candidate grid and code range that distinguish one
 /// `make_qkx2_quants`-based super-block format from another. Q4_K and
-/// Q5_K differ by these four numbers and NOTHING else, which is why
-/// they share [`fit_qk_super_block`] instead of having a transcription
+/// Q5_K differ by these numbers and NOTHING else, which is why they
+/// share [`fit_qk_super_block`] instead of having a transcription
 /// each.
 #[derive(Clone, Copy)]
 pub(crate) struct QkFit {
     /// Largest code: 15 for Q4_K, 31 for Q5_K.
     pub nmax: i32,
-    /// `rmin`, `rdelta`, `nstep` for `make_qkx2_quants`:
-    /// `(-1.0, 0.1, 20)` for Q4_K, `(-0.5, 0.1, 15)` for Q5_K.
+    /// `rmin`, `rdelta`, `nstep` for `make_qkx2_quants` on the PLAIN
+    /// path: `(-1.0, 0.1, 20)` for Q4_K, `(-0.5, 0.1, 15)` for Q5_K.
+    /// With an importance matrix both formats use [`IMATRIX_GRID`].
     pub rmin: f32,
     pub rdelta: f32,
     pub nstep: i32,
+    /// Whether the imatrix path clamps the `make_qp_quants` codes to 63
+    /// before packing them. `quantize_row_q5_K_impl`
+    /// (`ggml-quants.c:1619-1622`) does, `quantize_row_q4_K_impl`
+    /// (`:1411-1424`) does NOT, and the difference is a byte in the
+    /// file whenever a sub-block's fitted scale is negative: the code
+    /// wraps to `>= 200` in `make_qp_quants`, and Q4_K packs the wrapped
+    /// byte while Q5_K packs 63.
+    ///
+    /// UNMEASURED, and saying so is better than implying otherwise: the
+    /// plain path sees a negative sub-block scale in ~0.55% of a real
+    /// Qwen3-0.6B tensor's super-blocks, but with a real imatrix the
+    /// same checkpoint produced ZERO wrapped codes across 2,098,688
+    /// Q4_K and 2,098,688 Q5_K super-blocks (counted with a probe on
+    /// this branch), and forcing the clamp on for Q4_K left every byte
+    /// identical. The field is kept because it is what the two C
+    /// functions say, and a shared "obviously harmless" clamp would be
+    /// a silent divergence from `quantize_row_q4_K_impl` the day a
+    /// checkpoint does reach it.
+    pub imatrix_clamps_scale_codes: bool,
 }
+
+/// The candidate grid `quantize_row_q4_K_impl` and
+/// `quantize_row_q5_K_impl` both hand to the sub-block fit
+/// (`ggml-quants.c:1406` and `:1612`): `(-0.9, 0.05, 36)`, the same for
+/// both formats, unlike the plain grids in [`QkFit`].
+const IMATRIX_GRID: (f32, f32, i32) = (-0.9, 0.05, 36);
 
 /// The three-stage super-block fit `quantize_row_q4_K_ref`
 /// (`ggml-quants.c:1280`) and `quantize_row_q5_K_ref`
-/// (`ggml-quants.c:1467`) share, parameterised by [`QkFit`].
+/// (`ggml-quants.c:1467`) share, parameterised by [`QkFit`], and the
+/// three-stage fit their `_impl` twins (`:1376`, `:1581`) share when
+/// `qw` carries the importance-matrix slice for this super-block.
 ///
 /// 1. Each of the 8 sub-blocks of 32 gets an **iterative** affine fit:
 ///    the candidate inverse scales are tried, each one re-solves a
 ///    weighted least-squares for (scale, min) from the integer codes it
-///    produced, and the lowest weighted squared error wins.
+///    produced, and the lowest weighted squared error wins. Plain, the
+///    element weights are `sqrt(mean(x^2)) + |x|` over the sub-block;
+///    with an imatrix they are `qw * sqrt(sigma2 + x^2)` where `sigma2`
+///    is `2 * mean(x^2)` over the whole SUPER-block.
 /// 2. The 8 scales and 8 mins are themselves quantized to 6 bits
 ///    against the super-block's `d`/`dmin` and packed into 12 bytes.
+///    Plain, that is `63/max`; with an imatrix it is `make_qp_quants`,
+///    weighted by each sub-block's summed element weights.
 /// 3. The codes are then recomputed **against the 6-bit-rounded** scale
-///    and min, not against the fit from stage 1.
+///    and min, not against the fit from stage 1. This stage is the same
+///    on both paths.
 ///
 /// `l` is deliberately carried from stage 1 into stage 3. Stage 3 skips
 /// any sub-block whose reconstructed `d` rounded to zero (`if (!d)
@@ -367,28 +416,61 @@ pub(crate) struct QkFit {
 pub(crate) fn fit_qk_super_block(
     block: &[f32; QK_SUBS * QK_SUB_ELEMS],
     fit: QkFit,
+    qw: Option<&[f32; QK_SUBS * QK_SUB_ELEMS]>,
 ) -> QkSuperBlock {
     let mut l = [0u8; QK_SUBS * QK_SUB_ELEMS];
     let mut laux = [0u8; QK_SUB_ELEMS];
     let mut weights = [0f32; QK_SUB_ELEMS];
     let mut mins = [0f32; QK_SUBS];
     let mut scales = [0f32; QK_SUBS];
+    // Per-sub-block summed weights, `sw[j]` upstream: only the imatrix
+    // stage 2 reads them.
+    let mut sw = [0f32; QK_SUBS];
+
+    // `sigma2` for the imatrix weight rule: `2*sum_x2/QK_K` over the
+    // whole super-block, with the accumulation contracted as the C's
+    // `sum_x2 += x[l] * x[l]` is.
+    let sigma2 = qw.map(|_| {
+        let mut sum_x2 = 0f32;
+        for &v in block.iter() {
+            sum_x2 = v.mul_add(v, sum_x2);
+        }
+        2.0 * sum_x2 / (QK_SUBS * QK_SUB_ELEMS) as f32
+    });
+    let (rmin, rdelta, nstep) = match qw {
+        Some(_) => IMATRIX_GRID,
+        None => (fit.rmin, fit.rdelta, fit.nstep),
+    };
 
     let mut max_scale = 0f32; // deducting the min keeps scales positive
     let mut max_min = 0f32;
     for j in 0..QK_SUBS {
         let lo = QK_SUB_ELEMS * j;
         let xs = &block[lo..lo + QK_SUB_ELEMS];
-        qk_sub_block_weights(xs, &mut weights);
+        match (qw, sigma2) {
+            (Some(qw), Some(sigma2)) => {
+                // `weights[l] = qw[l] * sqrtf(sigma2 + x*x)`, the
+                // `sigma2 + x*x` contracted.
+                for (w, (&v, &q)) in weights.iter_mut().zip(xs.iter().zip(&qw[lo..])) {
+                    *w = q * v.mul_add(v, sigma2).sqrt();
+                }
+                let mut sumw = 0f32;
+                for &w in &weights {
+                    sumw += w;
+                }
+                sw[j] = sumw;
+            }
+            _ => qk_sub_block_weights(xs, &mut weights),
+        }
         let (scale, min) = make_qkx2_quants(
             xs,
             &weights,
             &mut l[lo..lo + QK_SUB_ELEMS],
             &mut laux,
             fit.nmax,
-            fit.rmin,
-            fit.rdelta,
-            fit.nstep,
+            rmin,
+            rdelta,
+            nstep,
             false,
         );
         scales[j] = scale;
@@ -401,55 +483,71 @@ pub(crate) fn fit_qk_super_block(
         }
     }
 
-    let inv_scale = if max_scale > 0.0 {
-        63.0 / max_scale
-    } else {
-        0.0
-    };
-    let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
     let mut packed = [0u8; Q4_K_SCALE_BYTES];
-    for j in 0..QK_SUBS {
-        // Upstream's `MIN(63, ls)`. It cannot fire on THIS path:
-        // `inv_scale` is `63/max_scale` and `max_scale` is the largest
-        // of `scales`, so the product is at most 63 plus an ulp and
-        // rounds to 63. It is kept because it is what the C says and
-        // because the imatrix variants of these encoders
-        // (`quantize_row_q4_K_impl` / `quantize_row_q5_K_impl`) reach
-        // the same packing from `make_qp_quants`, where the bound is
-        // not automatic -- but no fixture here can turn its removal
-        // red, and saying so is better than implying the goldens cover
-        // it.
-        // The cast comes BEFORE the clamp, because upstream's does:
-        //
-        //     uint8_t ls = nearest_int(inv_scale*scales[j]);
-        //     ls = MIN(63, ls);
-        //
-        // `nearest_int` returns `int`, and storing it in a `uint8_t`
-        // truncates to eight bits FIRST. Clamping to 63 and casting
-        // afterwards is the same for every value in `0..=255` and
-        // different for a negative one: C wraps -1 to 255 and then
-        // clamps to 63, this order clamps -1 to -1 and casts to 255.
-        //
-        // A negative reaches here when a sub-block's least-squares fit
-        // returns a negative scale while some other sub-block's is
-        // positive, so `inv_scale` is positive and the product is not.
-        // Upstream's comment says scales are always positive "as we are
-        // deducting the min", which is the assumption this arithmetic
-        // quietly does not rely on. Rare, and it was 0.55% of the
-        // super-blocks in a real Qwen3-0.6B tensor.
-        let ls = (nearest_int(inv_scale * scales[j]) as u8).min(63);
-        let lm = (nearest_int(inv_min * mins[j]) as u8).min(63);
-        if j < 4 {
-            packed[j] = ls;
-            packed[j + 4] = lm;
-        } else {
-            packed[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
-            packed[j - 4] |= (ls >> 4) << 6;
-            packed[j] |= (lm >> 4) << 6;
+    let (d, dmin) = match qw {
+        None => {
+            let inv_scale = if max_scale > 0.0 {
+                63.0 / max_scale
+            } else {
+                0.0
+            };
+            let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+            for j in 0..QK_SUBS {
+                // Upstream's `MIN(63, ls)`. It cannot fire on THIS path:
+                // `inv_scale` is `63/max_scale` and `max_scale` is the
+                // largest of `scales`, so the product is at most 63 plus
+                // an ulp and rounds to 63. It is kept because it is what
+                // the C says -- but no fixture here can turn its removal
+                // red, and saying so is better than implying the goldens
+                // cover it. (The imatrix arm below is where the same
+                // clamp is NOT automatic, and there it is a `QkFit`
+                // field because the two formats disagree about it.)
+                // The cast comes BEFORE the clamp, because upstream's
+                // does:
+                //
+                //     uint8_t ls = nearest_int(inv_scale*scales[j]);
+                //     ls = MIN(63, ls);
+                //
+                // `nearest_int` returns `int`, and storing it in a
+                // `uint8_t` truncates to eight bits FIRST. Clamping to 63
+                // and casting afterwards is the same for every value in
+                // `0..=255` and different for a negative one: C wraps -1
+                // to 255 and then clamps to 63, this order clamps -1 to
+                // -1 and casts to 255.
+                //
+                // A negative reaches here when a sub-block's
+                // least-squares fit returns a negative scale while some
+                // other sub-block's is positive, so `inv_scale` is
+                // positive and the product is not. Upstream's comment
+                // says scales are always positive "as we are deducting
+                // the min", which is the assumption this arithmetic
+                // quietly does not rely on. Rare, and it was 0.55% of
+                // the super-blocks in a real Qwen3-0.6B tensor.
+                let ls = (nearest_int(inv_scale * scales[j]) as u8).min(63);
+                let lm = (nearest_int(inv_min * mins[j]) as u8).min(63);
+                pack_scale_min(&mut packed, j, ls, lm);
+            }
+            (
+                f16::from_f32(max_scale / 63.0),
+                f16::from_f32(max_min / 63.0),
+            )
         }
-    }
-    let d = f16::from_f32(max_scale / 63.0);
-    let dmin = f16::from_f32(max_min / 63.0);
+        Some(_) => {
+            let mut ls = [0u8; QK_SUBS];
+            let mut lm = [0u8; QK_SUBS];
+            let d_block = make_qp_quants(&scales, &mut ls, 63, &sw);
+            let m_block = make_qp_quants(&mins, &mut lm, 63, &sw);
+            for j in 0..QK_SUBS {
+                let (mut s, mut m) = (ls[j], lm[j]);
+                if fit.imatrix_clamps_scale_codes {
+                    s = s.min(63);
+                    m = m.min(63);
+                }
+                pack_scale_min(&mut packed, j, s, m);
+            }
+            (f16::from_f32(d_block), f16::from_f32(m_block))
+        }
+    };
 
     // Stage 3 unpacks the 6-bit scale/min with the same
     // `q4_k_scale_min` the READER uses, rather than a second copy of
@@ -470,6 +568,27 @@ pub(crate) fn fit_qk_super_block(
     }
 
     QkSuperBlock { d, dmin, packed, l }
+}
+
+/// Packs sub-block `j`'s 6-bit scale and min codes into the 12-byte
+/// layout `get_scale_min_k4` reads: the first four of each in their own
+/// bytes, the last four split across the low nibbles of bytes 8..12
+/// and the top two bits of bytes 0..8.
+///
+/// One function for both stage-2 arms of [`fit_qk_super_block`],
+/// because the packing is the ONE thing the plain and imatrix paths
+/// share verbatim at that stage, and a second copy of a shift-and-mask
+/// is exactly the kind of thing that is corrected in one place.
+#[inline]
+fn pack_scale_min(packed: &mut [u8; Q4_K_SCALE_BYTES], j: usize, ls: u8, lm: u8) {
+    if j < 4 {
+        packed[j] = ls;
+        packed[j + 4] = lm;
+    } else {
+        packed[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+        packed[j - 4] |= (ls >> 4) << 6;
+        packed[j] |= (lm >> 4) << 6;
+    }
 }
 
 #[cfg(test)]
@@ -567,7 +686,9 @@ mod tests {
                 rmin: -1.0,
                 rdelta: 0.1,
                 nstep: 20,
+                imatrix_clamps_scale_codes: false,
             },
+            None,
         );
         let q5 = fit_qk_super_block(
             &block,
@@ -576,7 +697,9 @@ mod tests {
                 rmin: -0.5,
                 rdelta: 0.1,
                 nstep: 15,
+                imatrix_clamps_scale_codes: true,
             },
+            None,
         );
         assert_ne!(q4.d, q5.d);
         assert_ne!(q4.packed, q5.packed);

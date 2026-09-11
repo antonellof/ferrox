@@ -31,6 +31,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rayon = { workspace = true }
+byteorder = { workspace = true }
 # For the SIGINT handler in `ferrox chat`: Ctrl-C stops the turn rather
 # than the session. No new external dependency -- ferrox-core already
 # uses it.

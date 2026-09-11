@@ -8,11 +8,27 @@
 //! MIX -- the reason a `Q4_K_M` file has a Q6_K output head and Q6_K
 //! `ffn_down` on a quarter of its layers.
 //!
+//! `--imatrix` feeds an importance matrix (`ferrox imatrix` or
+//! `llama-imatrix`, either format) to the K-quant encoders, the way
+//! `llama-quantize --imatrix` does (`src/llama-quant.cpp:913-934`):
+//! each tensor looks its own name up, a tensor with no entry is
+//! quantized unweighted with a printed notice, and an entry of the
+//! wrong width is a refusal -- except on `token_embd.weight`, which
+//! upstream exempts because its imatrix is routinely the wrong shape.
+//! Q8_0 ignores the matrix (`ggml-quants.c:2088-2093`), and none of the
+//! mixes this tool writes read `has_imatrix` (upstream consults it only
+//! for the IQ tiers and Q4_0/Q5_0, `llama-quant.cpp:287,343,366,374`),
+//! so the plan is the same with and without one; only the bytes
+//! inside each K-quant tensor change. The four `quantize.imatrix.*`
+//! keys llama.cpp records in the output (`tools/quantize/quantize.cpp:
+//! 532-566`) are written too, with its 127-byte truncation.
+//!
 //! The pass is streaming: the input is mmap'd, tensors are re-encoded
 //! one at a time, and the output is written through a `BufWriter`. A
 //! 70B checkpoint costs the output's page cache plus one tensor's f32
 //! expansion, not the model.
 
+pub mod imatrix_input;
 pub mod policy;
 pub mod recipe;
 #[cfg(test)]
@@ -27,6 +43,7 @@ use clap::Parser;
 use ferrox_gguf::{GgmlType, GgufFile, GgufValue, GgufWriter, TensorPlan};
 use rayon::prelude::*;
 
+use imatrix_input::{imatrix_for_tensor, imatrix_metadata, load_imatrix};
 use policy::{allows_quantization, disposition, parse_target, Disposition, Target};
 use recipe::{ModelShape, Recipe};
 
@@ -77,12 +94,18 @@ pub struct QuantizeArgs {
     /// Overwrite the output if it already exists.
     #[arg(long)]
     pub force: bool,
+
+    /// Importance matrix from `ferrox imatrix` or `llama-imatrix`, in
+    /// either the GGUF or the legacy `.dat` format. Weights the K-quant
+    /// fits by measured activation energy; Q8_0 tensors are unaffected.
+    #[arg(long)]
+    pub imatrix: Option<PathBuf>,
 }
 
 /// One tensor's decided fate, and the numbers that follow from it.
-struct Planned {
-    name: String,
-    shape: Vec<u64>,
+pub(crate) struct Planned {
+    pub(crate) name: String,
+    pub(crate) shape: Vec<u64>,
     source_dtype: GgmlType,
     out_dtype: GgmlType,
     source_bytes: usize,
@@ -130,6 +153,11 @@ pub fn run(args: QuantizeArgs) -> Result<()> {
 
     let planned = plan(&file, target, args.pure)?;
 
+    let imatrix = match &args.imatrix {
+        Some(p) => Some(load_imatrix(p)?),
+        None => None,
+    };
+
     let mut metadata: BTreeMap<String, GgufValue> = file
         .metadata
         .iter()
@@ -143,6 +171,9 @@ pub fn run(args: QuantizeArgs) -> Result<()> {
         "general.quantization_version".to_string(),
         GgufValue::U32(GGML_QNT_VERSION),
     );
+    if let (Some(im), Some(p)) = (&imatrix, &args.imatrix) {
+        imatrix_metadata(&mut metadata, im, p);
+    }
 
     let src_total: u64 = planned.iter().map(|p| p.source_bytes as u64).sum();
     let out_total: u64 = planned.iter().map(|p| p.out_bytes as u64).sum();
@@ -215,7 +246,11 @@ pub fn run(args: QuantizeArgs) -> Result<()> {
         if p.copy_reason.is_some() {
             writer.write_tensor(&p.name, src)?;
         } else {
-            let encoded = encode_tensor(p, src)?;
+            let qw = match &imatrix {
+                Some(im) => imatrix_for_tensor(im, p)?,
+                None => None,
+            };
+            let encoded = encode_tensor(p, src, qw)?;
             writer.write_tensor(&p.name, &encoded)?;
         }
     }
@@ -361,11 +396,17 @@ fn plan(file: &GgufFile, target: Target, pure: bool) -> Result<Vec<Planned>> {
 /// row-wise and flat tilings identical -- but relying on that instead
 /// of tiling per row is how the next format, with a 256-element block,
 /// would silently break.
-fn encode_tensor(p: &Planned, src: &[u8]) -> Result<Vec<u8>> {
+///
+/// `imatrix`, when present, is `n_cols * ne2` weights: one per column,
+/// and for a 3-D expert stack one set per expert, so row `r`'s set is
+/// the one for expert `r / ne1` (`llama-quant.cpp:984`, `imatrix +
+/// i03 * n_per_row`). For a 2-D tensor that index is always 0.
+fn encode_tensor(p: &Planned, src: &[u8], imatrix: Option<&[f32]>) -> Result<Vec<u8>> {
     let n_cols = p.shape[0] as usize;
     let n_rows = (p.shape.iter().product::<u64>() as usize)
         .checked_div(n_cols)
         .unwrap_or(0);
+    let ne1 = p.shape.get(1).copied().unwrap_or(1).max(1) as usize;
     let src_row_bytes = source_bytes_per_element(p.source_dtype) * n_cols;
     let out_row_bytes = p.out_bytes / n_rows.max(1);
 
@@ -378,7 +419,11 @@ fn encode_tensor(p: &Planned, src: &[u8]) -> Result<Vec<u8>> {
             for &r in rows {
                 let row = &src[r * src_row_bytes..(r + 1) * src_row_bytes];
                 decode_source_row(p.source_dtype, row, &mut scratch)?;
-                encode_row(p.out_dtype, &scratch, &mut buf)?.ok_or_else(|| {
+                let qw = imatrix.map(|im| {
+                    let mat = r / ne1;
+                    &im[mat * n_cols..(mat + 1) * n_cols]
+                });
+                encode_row(p.out_dtype, &scratch, qw, &mut buf)?.ok_or_else(|| {
                     anyhow::anyhow!(
                         "tensor '{}' row length {n_cols} is not a whole number of {:?} blocks",
                         p.name,
@@ -406,12 +451,21 @@ fn encode_tensor(p: &Planned, src: &[u8]) -> Result<Vec<u8>> {
 /// before reaching here -- an encoder dispatch whose fallthrough
 /// silently copies or zero-fills is how a format becomes "supported" in
 /// a table and nowhere else.
-fn encode_row(ty: GgmlType, row: &[f32], out: &mut Vec<u8>) -> Result<Option<()>> {
+///
+/// `qw` is the row's importance weights. Q8_0 takes none, because
+/// `quantize_q8_0` discards its `quant_weights` (`ggml-quants.c:2089`),
+/// and passing them through would read as coverage.
+fn encode_row(
+    ty: GgmlType,
+    row: &[f32],
+    qw: Option<&[f32]>,
+    out: &mut Vec<u8>,
+) -> Result<Option<()>> {
     Ok(match ty {
         GgmlType::Q8_0 => ferrox_quant::encode_row_q8_0(row, out),
-        GgmlType::Q4K => ferrox_quant::encode_row_q4_k(row, out),
-        GgmlType::Q5K => ferrox_quant::encode_row_q5_k(row, out),
-        GgmlType::Q6K => ferrox_quant::encode_row_q6_k(row, out),
+        GgmlType::Q4K => ferrox_quant::encode_row_q4_k(row, qw, out),
+        GgmlType::Q5K => ferrox_quant::encode_row_q5_k(row, qw, out),
+        GgmlType::Q6K => ferrox_quant::encode_row_q6_k(row, qw, out),
         other => bail!(
             "the mix chose {other:?} for a tensor and `ferrox quantize` has no encoder for it. \
              This is a bug in the recipe table, not in the checkpoint: `plan` refuses an \
@@ -485,6 +539,7 @@ mod tests {
             pure: false,
             dry_run: false,
             force: true,
+            imatrix: None,
         }
     }
 
@@ -836,7 +891,7 @@ mod tests {
             .map(|v| half::f16::from_f32(*v).to_f32())
             .collect();
         for row in f16_roundtrip.chunks(256) {
-            ferrox_quant::encode_row_q4_k(row, &mut want).unwrap();
+            ferrox_quant::encode_row_q4_k(row, None, &mut want).unwrap();
         }
         assert_eq!(out.tensor_bytes("blk.0.attn_q.weight").unwrap(), &want[..]);
         std::fs::remove_dir_all(&dir).ok();
@@ -864,6 +919,75 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("Q4_K -> Q5_0"), "{msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--imatrix` end to end: the weighted bytes are what the encoder
+    /// produces for that row with that slice, they differ from the
+    /// unweighted run, and the output records the imatrix keys. The
+    /// whole-model byte identity is measured outside CI; this pins the
+    /// plumbing from flag to encoder.
+    #[test]
+    fn an_imatrix_reaches_the_encoder_and_is_recorded_in_the_metadata() {
+        let dir = tmp_dir("imatrix");
+        let src = dir.join("src.gguf");
+        let values = write_f16_source(&src, 256);
+        let im_path = dir.join("im.gguf");
+        let mut stats = BTreeMap::new();
+        stats.insert(
+            "blk.0.attn_q.weight".to_string(),
+            crate::imatrix::file::Stats {
+                values: (0..256).map(|i| 1.0 + (i % 7) as f32).collect(),
+                counts: vec![4],
+            },
+        );
+        crate::imatrix::file::write(
+            &im_path,
+            crate::imatrix::file::OutputFormat::Gguf,
+            &stats,
+            &["calib.txt".to_string()],
+            2,
+            512,
+        )
+        .unwrap();
+
+        let plain = dir.join("plain.gguf");
+        run(QuantizeArgs {
+            pure: true,
+            ..args(&src, &plain, "q4_k_s")
+        })
+        .unwrap();
+        let weighted = dir.join("weighted.gguf");
+        run(QuantizeArgs {
+            pure: true,
+            imatrix: Some(im_path.clone()),
+            ..args(&src, &weighted, "q4_k_s")
+        })
+        .unwrap();
+
+        let qw: Vec<f32> = (0..256).map(|i| (1.0 + (i % 7) as f32) / 4.0).collect();
+        let mut want = Vec::new();
+        for row in values.chunks(256) {
+            let f16_row: Vec<f32> = row
+                .iter()
+                .map(|v| half::f16::from_f32(*v).to_f32())
+                .collect();
+            ferrox_quant::encode_row_q4_k(&f16_row, Some(&qw), &mut want).unwrap();
+        }
+        let w = GgufFile::open(&weighted).unwrap();
+        let p = GgufFile::open(&plain).unwrap();
+        assert_eq!(w.tensor_bytes("blk.0.attn_q.weight").unwrap(), &want[..]);
+        assert_ne!(
+            w.tensor_bytes("blk.0.attn_q.weight").unwrap(),
+            p.tensor_bytes("blk.0.attn_q.weight").unwrap()
+        );
+        assert_eq!(w.metadata_u64("quantize.imatrix.entries_count"), Some(1));
+        assert_eq!(w.metadata_u64("quantize.imatrix.chunks_count"), Some(2));
+        assert_eq!(
+            w.metadata_str("quantize.imatrix.dataset"),
+            Some("calib.txt")
+        );
+        assert!(p.metadata_str("quantize.imatrix.file").is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

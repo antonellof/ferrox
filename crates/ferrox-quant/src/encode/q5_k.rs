@@ -30,13 +30,17 @@
 use super::fit::{fit_qk_super_block, QkFit};
 use crate::{Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMS};
 
-/// Q5_K's half of the shared super-block fit: 5-bit codes, and the
-/// `(-0.5, 0.1, 15)` candidate grid from `ggml-quants.c:1488`.
+/// Q5_K's half of the shared super-block fit: 5-bit codes, the
+/// `(-0.5, 0.1, 15)` candidate grid from `ggml-quants.c:1488`, and a
+/// clamp to 63 on the imatrix scale codes (`:1619-1622`), which is the
+/// ONE place `quantize_row_q5_K_impl` differs from
+/// `quantize_row_q4_K_impl` other than `nmax`.
 const Q5_K_FIT: QkFit = QkFit {
     nmax: 31,
     rmin: -0.5,
     rdelta: 0.1,
     nstep: 15,
+    imatrix_clamps_scale_codes: true,
 };
 
 /// Bytes of `qh` (one bit per element) in a Q5_K super-block.
@@ -44,8 +48,15 @@ const QH_BYTES: usize = Q5_K_BLOCK_ELEMS / 8;
 
 /// Encodes one Q5_K super-block (exactly [`Q5_K_BLOCK_ELEMS`] values)
 /// and appends its [`Q5_K_BLOCK_BYTES`] bytes to `out`.
-pub fn encode_block_q5_k(block: &[f32; Q5_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
-    let fitted = fit_qk_super_block(block, Q5_K_FIT);
+///
+/// `qw` is this super-block's slice of the importance matrix, or `None`
+/// for the plain fit; see [`super::q4_k::encode_block_q4_k`].
+pub fn encode_block_q5_k(
+    block: &[f32; Q5_K_BLOCK_ELEMS],
+    qw: Option<&[f32; Q5_K_BLOCK_ELEMS]>,
+    out: &mut Vec<u8>,
+) {
+    let fitted = fit_qk_super_block(block, Q5_K_FIT, qw);
 
     let mut qh = [0u8; QH_BYTES];
     let mut ql = [0u8; Q5_K_BLOCK_ELEMS / 2];
@@ -86,6 +97,9 @@ pub fn encode_block_q5_k(block: &[f32; Q5_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
 /// Encodes a whole row (or any slice whose length is a multiple of
 /// [`Q5_K_BLOCK_ELEMS`]) into Q5_K super-blocks, appending to `out`.
 ///
+/// `qw` is the row's importance-matrix weights, or `None`; see
+/// [`super::q4_k::encode_row_q4_k`] for the length rule.
+///
 /// Returns `None` when `src.len()` is not a multiple of the super-block
 /// size. llama.cpp answers that case by silently *changing type* --
 /// `convert_incompatible_tensor` rewrites a Q5_K tensor with an awkward
@@ -93,14 +107,15 @@ pub fn encode_block_q5_k(block: &[f32; Q5_K_BLOCK_ELEMS], out: &mut Vec<u8>) {
 /// ferrox has neither encoder, so this refuses instead of padding.
 /// Padding would write more elements than the tensor's shape declares
 /// and every following row would decode shifted.
-pub fn encode_row_q5_k(src: &[f32], out: &mut Vec<u8>) -> Option<()> {
+pub fn encode_row_q5_k(src: &[f32], qw: Option<&[f32]>, out: &mut Vec<u8>) -> Option<()> {
     let (blocks, rest) = src.as_chunks::<Q5_K_BLOCK_ELEMS>();
     if !rest.is_empty() {
         return None;
     }
+    let qw_blocks = super::imatrix_blocks::<Q5_K_BLOCK_ELEMS>(qw, blocks.len())?;
     out.reserve(blocks.len() * Q5_K_BLOCK_BYTES);
-    for block in blocks {
-        encode_block_q5_k(block, out);
+    for (i, block) in blocks.iter().enumerate() {
+        encode_block_q5_k(block, qw_blocks.map(|q| &q[i]), out);
     }
     Some(())
 }
@@ -277,7 +292,7 @@ mod tests {
     fn q5_k_matches_llama_cpp_quantize_row_q5_k_ref() {
         let x = k_quant_fixture();
         let mut got = Vec::new();
-        encode_row_q5_k(&x, &mut got).unwrap();
+        encode_row_q5_k(&x, None, &mut got).unwrap();
         assert_eq!(got.len(), LLAMA_CPP_Q5_K_GOLDEN.len());
         for (b, (g, w)) in got
             .as_chunks::<Q5_K_BLOCK_BYTES>()
@@ -297,11 +312,11 @@ mod tests {
     #[test]
     fn a_row_that_is_not_a_whole_number_of_super_blocks_is_refused() {
         let mut out = Vec::new();
-        assert!(encode_row_q5_k(&[0.5; Q5_K_BLOCK_ELEMS + 1], &mut out).is_none());
+        assert!(encode_row_q5_k(&[0.5; Q5_K_BLOCK_ELEMS + 1], None, &mut out).is_none());
         // 32 is a Q8_0 block and a Q5_K sub-block, and still not a
         // Q5_K row: the block size that matters here is 256.
-        assert!(encode_row_q5_k(&[0.5; 32], &mut out).is_none());
-        assert!(encode_row_q5_k(&[], &mut out).is_some());
+        assert!(encode_row_q5_k(&[0.5; 32], None, &mut out).is_none());
+        assert!(encode_row_q5_k(&[], None, &mut out).is_some());
     }
 
     /// Round trip through this crate's own reader, against an exact
@@ -322,7 +337,7 @@ mod tests {
     fn every_element_lands_on_its_nearest_representable_level() {
         let x = k_quant_fixture();
         let mut bytes = Vec::new();
-        encode_row_q5_k(&x, &mut bytes).unwrap();
+        encode_row_q5_k(&x, None, &mut bytes).unwrap();
         let back = dequant_q5_k(&bytes).unwrap();
         assert_eq!(back.len(), x.len());
 
@@ -360,7 +375,7 @@ mod tests {
     fn the_high_bit_plane_is_not_all_zero() {
         let x = k_quant_fixture();
         let mut bytes = Vec::new();
-        encode_row_q5_k(&x, &mut bytes).unwrap();
+        encode_row_q5_k(&x, None, &mut bytes).unwrap();
         for (b, block) in bytes.as_chunks::<Q5_K_BLOCK_BYTES>().0.iter().enumerate() {
             let qh = &block[16..16 + QH_BYTES];
             // Super-block 2 of the fixture is the all-zero / constant
