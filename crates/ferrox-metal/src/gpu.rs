@@ -5458,6 +5458,7 @@ pub fn launch_matvec_fused(
     // Reuses the dense stack's own `x` buffer when `x` IS the vector
     // that stack just returned, and uploads otherwise. One helper, not
     // one copy per consumer: see `crate::resident_act`.
+    let clock = crate::timing::SubmitClock::start();
     let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
 
     let mut weight_bufs = Vec::with_capacity(launches.len());
@@ -5489,8 +5490,10 @@ pub fn launch_matvec_fused(
         )?;
     }
     encoder.endEncoding();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
+    // The lm_head of every sampled (non-greedy) decode token runs here,
+    // in a SECOND command buffer after the dense stack. Untimed, its GPU
+    // time read as host time (GitHub issue #149).
+    crate::timing::commit_wait_note(&cmd_buf, "matvec-fused", 32, clock);
 
     let mut outs = Vec::with_capacity(launches.len());
     for (i, launch) in launches.iter().enumerate() {

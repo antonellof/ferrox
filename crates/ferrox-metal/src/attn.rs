@@ -5369,6 +5369,7 @@ pub fn launch_moe_decode_stack(
             moe_scratch_ensure_logits(device, scratch, out_l.rows)?;
         }
 
+        let clock = crate::timing::SubmitClock::start();
         let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
         // llama.cpp / dense-stack: one Concurrent encoder for the full graph,
         // barriers only via MemRanges (ggml_mem_ranges).
@@ -5476,9 +5477,7 @@ pub fn launch_moe_decode_stack(
         };
 
         encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-        crate::timing::gpu_timing_note(&cmd_buf, "moe-decode/tok", 32);
+        crate::timing::commit_wait_note(&cmd_buf, "moe-decode/tok", 32, clock);
 
         for kv in kvs.iter_mut() {
             kv.seq_len = pos + 1;
@@ -6331,6 +6330,7 @@ pub fn launch_prefill_dense_stack(
     }
 
     let setup_us = t_setup.elapsed().as_micros();
+    let clock = crate::timing::SubmitClock::start();
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     let encoder = compute_encoder_concurrent(&cmd_buf)?;
     // One tracker for the whole stack: layer N+1's first dispatch only
@@ -6365,11 +6365,8 @@ pub fn launch_prefill_dense_stack(
     }
 
     encoder.endEncoding();
-    let t_gpu = std::time::Instant::now();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
-    let gpu_us = t_gpu.elapsed().as_micros();
-    crate::timing::gpu_timing_note(&cmd_buf, "prefill-dense-stack", 1);
+    let gpu_us =
+        crate::timing::commit_wait_note(&cmd_buf, "prefill-dense-stack", 1, clock).as_micros();
 
     for kv in kvs.iter_mut() {
         kv.seq_len += batch;

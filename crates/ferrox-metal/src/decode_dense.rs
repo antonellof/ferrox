@@ -22,8 +22,9 @@ use crate::gpu::{
     shared_metal, MatvecLaunch, MetalError,
 };
 use crate::mem_ranges::MemRanges;
+use crate::timing::{commit_wait_note, SubmitClock};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+use objc2_metal::{MTLBuffer, MTLCommandEncoder, MTLCommandQueue};
 
 /// Optional attention epilogue ops applied between the QKV matvecs and
 /// RoPE, in CPU-path order: bias add (Qwen2-family `qkv_bias`), then
@@ -217,6 +218,7 @@ pub fn launch_decode_dense_stack(
         })
         .collect::<Result<Vec<_>, MetalError>>()?;
 
+    let clock = SubmitClock::start();
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     // Gemma-style post-norms ("sandwich"): these layers take the EAGER
     // residual path below, which is what makes concurrent encode safe here.
@@ -576,9 +578,7 @@ pub fn launch_decode_dense_stack(
     };
 
     encoder.endEncoding();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
-    crate::timing::gpu_timing_note(&cmd_buf, "dense-decode/tok", 32);
+    commit_wait_note(&cmd_buf, "dense-decode/tok", 32, clock);
 
     for kv in kvs.iter_mut() {
         kv.seq_len = pos + 1;
