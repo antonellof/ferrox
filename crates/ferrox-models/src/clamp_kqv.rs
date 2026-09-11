@@ -41,7 +41,7 @@
 //! `Decoder::apply_qkv_bias_and_clamp` (`decoder/qkv_bias.rs`), and the
 //! clamp lives in that helper after the bias, where `build_qkv` puts
 //! it. The fused Metal launches apply the bias inside their kernels via
-//! `AttnExtras` and have no clamp, so `Decoder::metal_can_serve_scalars`
+//! `AttnExtras` and have no clamp, so `Decoder::metal_can_serve_model`
 //! -- the one predicate every Metal eligibility check reads -- keeps a
 //! clamped model on the host bodies rather than letting two backends
 //! answer differently from the same weights.

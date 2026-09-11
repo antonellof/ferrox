@@ -683,6 +683,34 @@ pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     par_gated_chunks(gate, up, silu_mul)
 }
 
+/// ReLU, the gate nonlinearity of [`reglu`].
+pub fn relu(x: f32) -> f32 {
+    x.max(0.0)
+}
+
+/// Elementwise gated FFN combine: `relu(gate) * up`.
+///
+/// This is how the generic decoder spells llama.cpp's **ungated**
+/// `LLM_FFN_RELU_SQR` FFN (`down(relu(up(x))^2)`, `arcee.cpp:123-128`,
+/// `LLM_FFN_SEQ` with a null gate): the loader aliases `gate` to the
+/// same `up` matrix, and `relu(x) * x` is `relu(x)^2` exactly -- `x*x`
+/// for `x >= 0`, and `0 * x` for `x < 0`, which is a zero of one sign
+/// or the other and vanishes in the down-projection's sum. Keeping it a
+/// GLU form means every gated path (routed, placed, batched, slotted)
+/// serves it with no branch; the two dense hot paths skip the aliased
+/// matmul through `GluAct::ungated`.
+///
+/// No SIMD arm: `max` and a multiply auto-vectorise, and the relu forms
+/// have no exponential to amortise.
+pub fn reglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
+    assert_eq!(gate.len(), up.len());
+    par_gated_chunks(gate, up, |g, u, o| {
+        for ((o, g), u) in o.iter_mut().zip(g).zip(u) {
+            *o = relu(*g) * u;
+        }
+    })
+}
+
 /// Kimi K3's `situ` activation (`hidden_act: "situ"` in its real
 /// `config.json`, registered as `ACT2FN["situ"] -> SituAndMul` in
 /// `modeling_kimi_linear.py`): `beta*tanh(gate/beta)*sigmoid(gate) *

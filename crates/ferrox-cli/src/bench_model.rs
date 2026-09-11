@@ -579,11 +579,7 @@ fn bench_decode_gemma4(engine: &Gemma4Engine, n_gen: usize, reps: usize) -> anyh
 }
 
 pub(crate) fn fresh_caches(decoder: &Decoder) -> Vec<KvCache> {
-    decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect()
+    decoder.config.new_kv_caches()
 }
 
 /// Token ids that exist in the vocabulary but carry no linguistic

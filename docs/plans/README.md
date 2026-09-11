@@ -60,15 +60,15 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **37** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **42** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 20 |
+| Refuses as **unaudited**, now triaged | 15 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 91 (59 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 56 generic-gqa (35 of
+regenerated with `ferrox archs --write`: 150 rows, 56 generic-gqa (42 of
 them audited), 59 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
@@ -78,8 +78,8 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 20 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-19 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 15 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+14 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
 refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
@@ -89,7 +89,11 @@ seven fixture-away rows on 2026-09-03, `gemma`, `hunyuan-dense` and
 (below) plus `chatglm` -- the last one-match-arm row -- and `qwen`,
 which the same arm turned out to close only halfway, the three
 Granite rows and `olmo` (both below), and on 2026-09-11 `exaone-moe`
-(below). Each with a libllama-golden fixture. `minicpm` closed on
+(below), then `grok` and `dbrx` on seams landed the day before, then
+`arcee` on the ungated ReLU-squared FFN and `deci` and `openelm`
+together on the per-layer shape seam (`ferrox_models::layer_shapes`,
+sized by a scan of all 140 graphs before it was built). Each with a
+libllama-golden fixture. `minicpm` closed on
 2026-09-10 and is not in that arithmetic: it was refused BY NAME rather
 than as unaudited, so it raises the audited count without lowering the
 refusing one; `smollm3` and EXAONE-4 32B closed with `exaone-moe` on
@@ -103,11 +107,15 @@ strings outright and every real checkpoint of all three declares
 graphs. `phi4` is the one UNKNOWN left.
 
 **The NEW CODE column moved for the first time on 2026-09-10**, three
-times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 a fourth
-time, 20 to 19. The first two took several rows at once for the same
-reason -- each found ONE cause behind several refusals. The fourth did
-too and the count hides it: the per-layer RoPE gate closed three
-refusals, and only `exaone-moe` was in this column.
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 three times
+more, 20 to 19, 19 to 17 and 17 to 14. The first two took several rows
+at once for the same reason -- each found ONE cause behind several
+refusals. The fourth did too and the count hides it: the per-layer RoPE
+gate closed three refusals, and only `exaone-moe` was in this column.
+The sixth is the per-layer shape seam, whose reach was measured across
+all 140 graphs before it was built (`layer_shapes::PER_LAYER_SHAPE_ARCHS`
+is the record): it closed `deci` and `openelm` and narrowed `laguna`,
+`mimo2` and `step35` to what else each needs.
 
 `olmo` is the one that did not, and it is worth reading for the way the
 question was settled rather than for the row. "What else shares this

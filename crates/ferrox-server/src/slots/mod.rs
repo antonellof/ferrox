@@ -187,6 +187,21 @@ fn serving_identity(active: &ActiveModel) -> Result<(SlotIdentity, Arc<Decoder>)
             "unsupported_feature",
         ));
     };
+    // The slot file header carries ONE `n_kv_heads` for every layer
+    // (`file::encode` writes the first layer's), so a model whose layers
+    // cache different widths (`ferrox_models::layer_shapes`, deci /
+    // openelm) has no faithful encoding in this format. Refuse rather
+    // than write a header that describes only layer 0.
+    if !decoder.config.layer_shapes.is_uniform() {
+        return Err(error(
+            StatusCode::NOT_IMPLEMENTED,
+            "slots are implemented for models whose layers all cache the same KV width; this \
+             model's layers differ (per-layer head counts), and the slot file header holds one \
+             geometry"
+                .to_string(),
+            "unsupported_feature",
+        ));
+    }
     let fingerprint = identity::fingerprint_gguf(path).map_err(|e| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -462,11 +477,7 @@ async fn restore(
 /// That exact bug is recorded at `generate::forward_prompt_batch`, and
 /// this path would have reproduced it.
 fn prefill_slot(decoder: &Decoder, tokens: Vec<usize>) -> SlotPayload {
-    let mut layers: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut layers: Vec<KvCache> = decoder.config.new_kv_caches();
     let pending_logits =
         crate::generate::forward_prompt_batch(decoder, &tokens, 0, &mut layers, true);
     #[cfg(feature = "metal")]

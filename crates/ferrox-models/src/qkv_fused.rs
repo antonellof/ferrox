@@ -48,10 +48,17 @@ pub(crate) struct FusedQkvRows {
 }
 
 impl FusedQkvRows {
-    pub(crate) fn of(config: &ModelConfig) -> Self {
+    /// Layer `layer`'s spans. Per layer because `openelm.cpp:27,34`
+    /// sizes each layer's `wqkv` from that layer's own head counts; a
+    /// uniform model gives the same answer for every layer.
+    ///
+    /// Only a [`crate::layer_shapes::AttnShape::Gqa`] layer has a fused
+    /// tensor to split; the other two shapes never reach this.
+    pub(crate) fn of(config: &ModelConfig, layer: usize) -> Self {
+        let shape = config.layer_shape(layer).attention;
         Self {
-            q: config.n_heads * config.head_dim,
-            kv: config.n_kv_heads * config.head_dim,
+            q: shape.n_heads() * config.head_dim,
+            kv: shape.n_kv_heads() * config.head_dim,
         }
     }
 
@@ -113,7 +120,7 @@ pub(crate) fn load_fused_or_split_qkv(
         return Err(LoadError::Gguf(GgufError::TensorNotFound(q_name)));
     }
 
-    let rows = FusedQkvRows::of(config);
+    let rows = FusedQkvRows::of(config, layer);
     let fused = load_weight_matrix(file, &fused_name)?;
     if fused.rows() != rows.total() {
         // Phi-3 sometimes stores Q as full n_embd (== q rows when MHA).
@@ -325,7 +332,7 @@ mod tests {
     #[test]
     fn a_fused_bias_of_the_wrong_length_is_refused_by_name() {
         let cfg = config_4x2_head8();
-        let rows = FusedQkvRows::of(&cfg);
+        let rows = FusedQkvRows::of(&cfg, 0);
         assert_eq!(rows.total(), 64);
         // The WEIGHT is the right shape, so the refusal below can only
         // come from the bias.
@@ -347,7 +354,7 @@ mod tests {
     #[test]
     fn a_fused_bias_of_the_right_length_is_split_into_three() {
         let cfg = config_4x2_head8();
-        let rows = FusedQkvRows::of(&cfg);
+        let rows = FusedQkvRows::of(&cfg, 0);
         let file = fused_qkv_gguf(rows.total(), 8, Some(rows.total()));
         let Ok(p) = load_fused_or_split_qkv(&file, 0, &cfg) else {
             panic!("a fused bias of the declared length must load");
@@ -366,7 +373,7 @@ mod tests {
     #[test]
     fn a_fused_weight_with_no_bias_leaves_all_three_unset() {
         let cfg = config_4x2_head8();
-        let rows = FusedQkvRows::of(&cfg);
+        let rows = FusedQkvRows::of(&cfg, 0);
         let file = fused_qkv_gguf(rows.total(), 8, None);
         assert!(file.find_tensor("blk.0.attn_qkv.bias").is_none());
         let Ok(p) = load_fused_or_split_qkv(&file, 0, &cfg) else {

@@ -49,9 +49,7 @@ fn alternating_swa_config() -> ModelConfig {
 }
 
 fn caches(cfg: &ModelConfig) -> Vec<KvCache> {
-    (0..cfg.n_layers)
-        .map(|_| KvCache::new(cfg.n_kv_heads, cfg.head_dim))
-        .collect()
+    cfg.new_kv_caches()
 }
 
 fn argmax(logits: &[f32]) -> usize {

@@ -473,9 +473,7 @@ mod tests {
 
         // "Conversation A": process the shared prefix once, store it.
         let decoder_a = Decoder::new_random_small(cfg.clone(), 2, vocab);
-        let mut caches_a: Vec<RealKvCache> = (0..2)
-            .map(|_| RealKvCache::new(decoder_a.config.n_kv_heads, decoder_a.config.head_dim))
-            .collect();
+        let mut caches_a: Vec<RealKvCache> = decoder_a.config.new_kv_caches();
         let prefix_logits = decoder_a.forward_batch(&shared_prefix, 0, &mut caches_a);
         let mut prefix_cache = PrefixCache::new(4);
         prefix_cache.store(
@@ -498,9 +496,7 @@ mod tests {
         // Ground truth: process the ENTIRE sequence from scratch on an
         // identically-seeded decoder with a fresh empty cache.
         let decoder_c = Decoder::new_random_small(cfg, 2, vocab);
-        let mut fresh_caches: Vec<RealKvCache> = (0..2)
-            .map(|_| RealKvCache::new(decoder_c.config.n_kv_heads, decoder_c.config.head_dim))
-            .collect();
+        let mut fresh_caches: Vec<RealKvCache> = decoder_c.config.new_kv_caches();
         let from_scratch_logits = decoder_c.forward_batch(&full_sequence, 0, &mut fresh_caches);
 
         // The prefix-cache path's logits for the suffix positions must

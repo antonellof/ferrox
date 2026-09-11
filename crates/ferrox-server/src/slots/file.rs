@@ -148,6 +148,17 @@ pub(crate) fn encode(identity: &SlotIdentity, payload: &SlotPayload) -> Vec<u8> 
     let positions = first.positions();
     let n_kv_heads = first.n_kv_heads;
     let head_dim = first.head_dim;
+    // One geometry in the header, so every layer must have it. The
+    // route refuses a per-layer-shape model before reaching here
+    // (`serving_identity`); this is the writer's own check, so the
+    // format can never describe layer 0 and store layer 3.
+    assert!(
+        payload
+            .layers
+            .iter()
+            .all(|l| l.n_kv_heads == n_kv_heads && l.head_dim == head_dim),
+        "slot file format holds one KV geometry; the layers differ"
+    );
 
     let mut header = Vec::new();
     for value in [
@@ -410,6 +421,18 @@ mod tests {
             pending_logits: vec![0.5, -1.5, 2.25],
             layers,
         }
+    }
+
+    /// The header holds ONE KV geometry, so a layer set whose geometries
+    /// differ (a per-layer-shape model, `ferrox_models::layer_shapes`)
+    /// must never be encoded as if layer 0 spoke for all of them. The
+    /// route refuses such a model first; this is the writer's own guard.
+    #[test]
+    #[should_panic(expected = "one KV geometry")]
+    fn a_layer_set_with_differing_geometries_is_refused_by_the_writer() {
+        let mut p = payload();
+        p.layers[1] = KvCache::new(1, 3);
+        let _ = encode(&identity(), &p);
     }
 
     #[test]

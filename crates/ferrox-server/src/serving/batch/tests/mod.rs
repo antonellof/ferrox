@@ -76,11 +76,7 @@ fn identity_decode_text(ids: &[usize]) -> String {
 }
 
 fn sequential_ids(decoder: &Decoder, prompt: &[usize], params: &GenerationParams) -> Vec<usize> {
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let mut pos = 0;
     let mut logits = Vec::new();
     for &tok in prompt {

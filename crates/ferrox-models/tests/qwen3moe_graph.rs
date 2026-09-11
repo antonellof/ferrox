@@ -121,11 +121,7 @@ fn load() -> Decoder {
 }
 
 fn caches(decoder: &Decoder) -> Vec<KvCache> {
-    decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect()
+    decoder.config.new_kv_caches()
 }
 
 fn prefill(decoder: &Decoder) -> Vec<f32> {

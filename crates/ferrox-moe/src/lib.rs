@@ -960,12 +960,23 @@ pub fn run_expert_oai(
 /// `build_moe_ffn` does under `LLM_FFN_GELU` -- the real shape of
 /// llama.cpp's `grok` (`src/models/grok.cpp`, `LLM_FFN_GELU` passed to
 /// `build_moe_ffn`).
+///
+/// [`Reglu`](GluAct::Reglu) is `relu(gate) * up`, and it exists for an
+/// FFN that has NO gate at all: llama.cpp's `LLM_FFN_RELU_SQR` under
+/// `LLM_FFN_SEQ` with a null gate (`arcee.cpp:123-128`, also `plm`,
+/// `nemotron`, `jais2`, `nemotron-h`) is `down(relu(up(x))^2)`. The
+/// loader aliases the expert's `gate` to its `up` matrix, so
+/// `relu(gate) * up` is `relu(up)^2` on every gated path without a
+/// branch, and [`GluAct::ungated`] lets the dense hot paths skip the
+/// aliased matmul. See `ferrox_core::matmul::reglu`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GluAct {
     /// `silu(gate) * up`.
     Swiglu,
     /// `gelu(gate) * up`.
     Geglu,
+    /// `relu(gate) * up`; with `gate` aliased to `up`, `relu(up)^2`.
+    Reglu,
 }
 
 impl GluAct {
@@ -975,6 +986,7 @@ impl GluAct {
         match self {
             GluAct::Swiglu => swiglu(gate, up),
             GluAct::Geglu => geglu(gate, up),
+            GluAct::Reglu => ferrox_core::matmul::reglu(gate, up),
         }
     }
 
@@ -984,6 +996,7 @@ impl GluAct {
         match self {
             GluAct::Swiglu => ferrox_core::matmul::silu,
             GluAct::Geglu => ferrox_core::matmul::gelu,
+            GluAct::Reglu => ferrox_core::matmul::relu,
         }
     }
 
@@ -992,12 +1005,66 @@ impl GluAct {
     pub fn is_swiglu(self) -> bool {
         matches!(self, GluAct::Swiglu)
     }
+
+    /// Whether the fused dense kernels that take a `gelu: bool` uniform
+    /// may serve this activation, and what to pass them.
+    ///
+    /// `None` is a refusal, and it is the whole reason this exists: six
+    /// launch sites in `decoder.rs` used to derive that flag as
+    /// `!act.is_swiglu()`, which reads "not SwiGLU, therefore GELU" --
+    /// true while the enum had two variants and silently wrong for the
+    /// third, which those kernels would have run as GELU. A site that
+    /// asks this question cannot get a `bool` for a variant no kernel
+    /// implements.
+    pub fn fused_kernel_gelu_flag(self) -> Option<bool> {
+        match self {
+            GluAct::Swiglu => Some(false),
+            GluAct::Geglu => Some(true),
+            GluAct::Reglu => None,
+        }
+    }
+
+    /// The elementwise function this activation applies to `up` ALONE
+    /// when the loader has aliased `gate` to `up`, or `None` for a
+    /// genuinely gated activation.
+    ///
+    /// The dense hot paths (`run_expert`, the batched dense FFN) use it
+    /// to skip the aliased gate matmul. Every other path runs the gated
+    /// form on the aliased pair, which is the same arithmetic --
+    /// `reglu_with_gate_aliased_to_up_is_relu_squared` pins that.
+    pub fn ungated(self) -> Option<UngatedFn> {
+        match self {
+            GluAct::Swiglu | GluAct::Geglu => None,
+            GluAct::Reglu => Some(relu_sqr),
+        }
+    }
+}
+
+/// The elementwise function [`GluAct::ungated`] hands back.
+pub type UngatedFn = fn(&[f32]) -> Vec<f32>;
+
+/// `relu(x)^2`, elementwise: the ungated form [`GluAct::Reglu`] stands
+/// for once the gate is known to be `up` itself.
+pub fn relu_sqr(up: &[f32]) -> Vec<f32> {
+    up.iter()
+        .map(|&x| {
+            let r = ferrox_core::matmul::relu(x);
+            r * r
+        })
+        .collect()
 }
 
 /// Runs one token's hidden state through a single expert's gated FFN.
 ///
 /// `act` is not optional on purpose -- see [`GluAct`].
 pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f32> {
+    // Ungated: `gate` is an alias of `up`, so one projection is the
+    // whole FFN input. `apply` is the full matvec dispatcher (int-dot,
+    // GPU when placed), so nothing is given up by skipping the pair.
+    if let Some(f) = act.ungated() {
+        let up = expert.up.apply(hidden);
+        return expert.down.apply(&f(&up));
+    }
     #[cfg(any(feature = "cuda", feature = "metal"))]
     if act.is_swiglu() {
         // Full SwiGLU on-device (1× upload + 1× download) when dense GPU
@@ -1617,6 +1684,77 @@ mod tests {
         let out = run_expert(&hidden, &expert, GluAct::Swiglu);
         assert_eq!(out.len(), hidden_dim);
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// The aliasing invariant `GluAct::Reglu` rests on: with `gate`
+    /// the same matrix as `up`, the gated path (`relu(gate) * up`, the
+    /// one every routed/placed/batched site runs) and the ungated
+    /// shortcut (`relu(up)^2`, the one `run_expert` takes) are the same
+    /// FFN, and neither is SwiGLU.
+    ///
+    /// If a later change makes `reglu` compute something other than
+    /// `relu(gate) * up`, or `relu_sqr` something other than
+    /// `relu(up)^2`, the two disagree here before any model does.
+    #[test]
+    fn reglu_with_gate_aliased_to_up_is_relu_squared() {
+        use ferrox_core::tensor::Tensor;
+        let hidden_dim = 4;
+        let ffn_dim = 6;
+        let u: Vec<f32> = (0..ffn_dim * hidden_dim)
+            .map(|i| (i as f32 * 0.9).cos() * 2.0)
+            .collect();
+        let d: Vec<f32> = (0..hidden_dim * ffn_dim)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
+        let up = WeightMatrix::F32(Tensor::new(u.clone(), vec![ffn_dim, hidden_dim]));
+        let expert = ExpertWeights {
+            gate: WeightMatrix::F32(Tensor::new(u, vec![ffn_dim, hidden_dim])),
+            up,
+            down: WeightMatrix::F32(Tensor::new(d, vec![hidden_dim, ffn_dim])),
+        };
+        let hidden = vec![1.0, -0.5, 0.25, 2.0];
+        // Scalar reference, written independently of both paths.
+        let up_out = expert.up.apply(&hidden);
+        let want = expert.down.apply(
+            &up_out
+                .iter()
+                .map(|&x| if x > 0.0 { x * x } else { 0.0 })
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            up_out.iter().any(|&x| x < 0.0) && up_out.iter().any(|&x| x > 0.0),
+            "the projection must cross zero or relu is invisible: {up_out:?}"
+        );
+        let shortcut = run_expert(&hidden, &expert, GluAct::Reglu);
+        let gated_out = expert.gate.apply(&hidden);
+        let gated = expert.down.apply(&GluAct::Reglu.apply(&gated_out, &up_out));
+        let slotted: Vec<f32> = gated_out
+            .iter()
+            .zip(up_out.iter())
+            .map(|(g, u)| GluAct::Reglu.gate_fn()(*g) * u)
+            .collect();
+        let slotted = expert.down.apply(&slotted);
+        for (name, got) in [
+            ("run_expert", &shortcut),
+            ("apply", &gated),
+            ("gate_fn", &slotted),
+        ] {
+            for (a, b) in got.iter().zip(want.iter()) {
+                assert!((a - b).abs() < 1e-6, "{name}: {got:?} vs {want:?}");
+            }
+        }
+        let swiglu = run_expert(&hidden, &expert, GluAct::Swiglu);
+        assert!(
+            swiglu
+                .iter()
+                .zip(want.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "SwiGLU on the aliased pair must differ, or the suite cannot see the activation"
+        );
+        assert_eq!(GluAct::Reglu.fused_kernel_gelu_flag(), None);
+        assert_eq!(GluAct::Swiglu.fused_kernel_gelu_flag(), Some(false));
+        assert_eq!(GluAct::Geglu.fused_kernel_gelu_flag(), Some(true));
+        assert!(GluAct::Swiglu.ungated().is_none() && GluAct::Geglu.ungated().is_none());
     }
 
     /// A GeGLU expert must compute `gelu(gate) * up`, not SwiGLU.

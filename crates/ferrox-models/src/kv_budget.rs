@@ -986,9 +986,7 @@ mod tests {
             "the fixture must be an alternating-SWA model, or this proves nothing"
         );
 
-        let mut caches: Vec<ferrox_core::cache::KvCache> = (0..cfg.n_layers)
-            .map(|_| ferrox_core::cache::KvCache::new(cfg.n_kv_heads, cfg.head_dim))
-            .collect();
+        let mut caches: Vec<ferrox_core::cache::KvCache> = cfg.new_kv_caches();
         let step = vec![0f32; cfg.n_kv_heads * cfg.head_dim];
         for _ in 0..tokens {
             for cache in caches.iter_mut() {
@@ -1045,9 +1043,7 @@ mod tests {
             "the fixture must ALSO have dense layers: they are the half that keeps costing"
         );
 
-        let mut caches: Vec<ferrox_core::cache::KvCache> = (0..cfg.n_layers)
-            .map(|_| ferrox_core::cache::KvCache::new(cfg.n_kv_heads, cfg.head_dim))
-            .collect();
+        let mut caches: Vec<ferrox_core::cache::KvCache> = cfg.new_kv_caches();
         for (l, cache) in caches.iter_mut().enumerate() {
             if let Some(w) = residency.layer_window(l) {
                 cache.arm_window(w);

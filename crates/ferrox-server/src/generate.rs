@@ -909,17 +909,8 @@ fn acquire_pooled_caches(
     let deadline = Instant::now() + config.queue_wait;
     loop {
         let attempt: Result<Vec<KvCache>, CacheKvPoolExhausted> = decoder
-            .layers
-            .iter()
-            .map(|_| {
-                KvCache::with_pool(
-                    decoder.config.n_kv_heads,
-                    decoder.config.head_dim,
-                    Arc::clone(&config.pool),
-                    max_seq_len,
-                )
-            })
-            .collect();
+            .config
+            .new_kv_caches_with_pool(&config.pool, max_seq_len);
         let now = Instant::now();
         if attempt.is_ok() || now >= deadline {
             return attempt;
@@ -1504,13 +1495,7 @@ pub fn generate(
                 acquire_pooled_caches(decoder, config, max_seq_len)
                     .map_err(|_| DecodeError::KvPoolExhausted)?,
             ),
-            (None, None) => Kv::Contiguous(
-                decoder
-                    .layers
-                    .iter()
-                    .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                    .collect(),
-            ),
+            (None, None) => Kv::Contiguous(decoder.config.new_kv_caches()),
         };
         // Process the prompt once, capturing the *last* call's logits
         // (which already predict the first generated token) instead of
@@ -2005,21 +1990,13 @@ mod tests {
         let decoder = small_decoder();
         let tokens = vec![1usize, 2, 3, 4];
 
-        let mut fresh_caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut fresh_caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let batch_logits = decoder.forward_batch(&tokens, 0, &mut fresh_caches);
         let ground_truth_next_logits = batch_logits.last().unwrap().clone();
 
         // The exact pattern `generate` now uses: one forward_token call
         // per prompt token, keeping the last call's logits.
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let mut logits = Vec::new();
         for (pos, &tok) in tokens.iter().enumerate() {
             logits = decoder.forward_token(tok, pos, &mut caches);
@@ -2072,11 +2049,7 @@ mod tests {
         // is lossy per non-ASCII byte, so decoding token-by-token vs.
         // decoding the whole sequence at once are not equivalent; this
         // must replicate the real call pattern, not just the ids).
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let mut logits = decoder
             .forward_batch(&prompt_ids, 0, &mut caches)
             .pop()
@@ -2242,11 +2215,7 @@ mod tests {
     /// `s.bytes().next()` off that recovers 0xEF (239), not the
     /// original token id.
     fn greedy_next_token_after(decoder: &Decoder, prompt_ids: &[usize]) -> usize {
-        let mut caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let logits = decoder
             .forward_batch(prompt_ids, 0, &mut caches)
             .pop()
@@ -3185,13 +3154,7 @@ mod tests {
         share_prefixes: bool,
     ) -> PagedKvConfig {
         PagedKvConfig {
-            store: Arc::new(SharedPagedKv::new(
-                decoder.layers.len(),
-                block_size,
-                blocks,
-                decoder.config.n_kv_heads,
-                decoder.config.head_dim,
-            )),
+            store: Arc::new(decoder.config.new_paged_kv(block_size, blocks)),
             queue_wait: Duration::ZERO,
             radix: share_prefixes.then(|| {
                 Arc::new(Mutex::new(crate::policy::radix::RadixCache::new(

@@ -193,15 +193,16 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **39** do
+   logit comparison against real `libllama`, or a fixture; **42** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
    `ernie4_5-moe`, `internlm2`, `xverse`, `baichuan`, `exaone`,
    `exaone4`, `exaone-moe`, `smollm3`, `plamo3`, `granite`, `granitemoe`,
-   `granite-moe`, `minicpm`, `olmo`, `dbrx`, `grok`,
+   `granite-moe`, `minicpm`, `olmo`, `dbrx`, `grok`, `arcee`, `deci`,
+   `openelm`,
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **18** stop with `UnauditedArchitecture`.
+   **15** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
@@ -245,7 +246,7 @@ unmeasured, because measuring it needs a quiet host.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. None of the 18 is a fixture or a single
+"Unaudited" is not one thing. None of the 15 is a fixture or a single
 match arm away any more: they need an attention implementation or a
 reading nobody has done, and the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
@@ -257,7 +258,7 @@ reading nobody has done, and the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 18 have now been read on both sides (`ferrox_models::capability`,
+All 15 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -266,13 +267,13 @@ on models":
 |---|---|
 | fixture-away | 0 |
 | one match arm | 0 |
-| new code | 17 |
+| new code | 14 |
 | unknown | 1 |
 
 **Both cheap classes are empty.** `gemma` was the last fixture-away row
 and `chatglm` the last one-match-arm row; nothing still refusing is one
 fixture or one arm away. That is a better answer than the count alone:
-the cheap wins are spent, and what is left is 17 rows needing a
+the cheap wins are spent, and what is left is 14 rows needing a
 different graph plus one name nobody can get a file for.
 
 It was 47 until the triage itself removed one. Reading
@@ -328,18 +329,23 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (17).** A different attention or residual structure. The
-recurring shapes, rather than 17 separate stories:
+**New code (14).** A different attention or residual structure. The
+recurring shapes, rather than 14 separate stories:
 
 The column moved for the first time on 2026-09-10, three times: 26 to
-24, 24 to 21, then 21 to 20, and on 2026-09-11 twice more, 20 to 19 and
-19 to 17. The first two took several rows at once, and for the same
-reason -- each found ONE cause behind several refusals. The fourth did
-too, and the count hides it: the per-layer RoPE gate closed THREE
-refusals and only one of them (`exaone-moe`) was ever in this column.
-The fifth is a different lesson, below: `grok` and `dbrx` each closed
-by extending a seam that had landed the day before, and the clamp one
-of them needed closed a refusal-by-name on a third row.
+24, 24 to 21, then 21 to 20, and on 2026-09-11 three times more, 20 to
+19, 19 to 17 and 17 to 14. The first two took several rows at once, and
+for the same reason -- each found ONE cause behind several refusals.
+The fourth did too, and the count hides it: the per-layer RoPE gate
+closed THREE refusals and only one of them (`exaone-moe`) was ever in
+this column. The fifth is a different lesson, below: `grok` and `dbrx`
+each closed by extending a seam that had landed the day before, and the
+clamp one of them needed closed a refusal-by-name on a third row. The
+sixth is two lessons at once: `deci` and `openelm` closed together on a
+seam whose reach was MEASURED across all 140 graphs before it was
+built, and `arcee` closed alone because the constant that said it
+shared a cause with `plm` had been read from one file and not the
+other.
 
 `olmo2` and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and
 no `ffn_norm` at all, both sublayers reading the raw residual, each
@@ -468,16 +474,104 @@ FFN (`grok.cpp:171-184`, summed with the experts at `sqrt(2)/2`) is
 refused by name from a fixture that has it, so the row is admitted for
 Grok-1.
 
+`deci` and `openelm` were the PER-LAYER-SHAPE pair. llama.cpp reads
+`{arch}.attention.head_count`, `.head_count_kv` and
+`{arch}.feed_forward_length` as a scalar OR an `n_layer`-long array for
+every architecture (`get_key_or_arr`, `llama-model.cpp:1149-1158`),
+keeps three per-layer arrays, and hands most graphs layer 0 through
+`LLAMA_LOAD_LOCALS`. Before a line was written, all 140
+`src/models/*.cpp` were scanned for `n_head(i)`, `n_head_kv(i)`,
+`n_ff(i)`, `n_embd_k_gqa(i)`, `n_embd_v_gqa(i)`, `n_rot(i)` and the
+`_arr` fields, in both the tensor loader and the graph. Twenty-two
+files read a per-layer shape somewhere; seventeen honour one in BOTH
+places, and those are `ferrox_models::layer_shapes::PER_LAYER_SHAPE_ARCHS`
+with what each still needs: `deci`, `openelm` and `plamo3` on the
+generic path; `laguna`, `mimo2`, `step35` on the generic path but
+refused for something else; `nanbeige`, which copies the arrays to loop
+its layers; `gemma4` and `gemma4-assistant` on a dedicated engine; and
+the seven hybrid recurrent rows (`jamba`, `lfm2`, `lfm2moe`,
+`nemotron-h`, `plamo2`, `granite-hybrid`, `kimi-linear`), where
+`n_head_kv(i) == 0` means "this layer is recurrent". Three things the
+scan corrected: `n_rot(il)` is NOT an array upstream
+(`llama-hparams.cpp:85-91` is `is_swa(il) ? n_rot_swa : n_rot_full`),
+so `step35`'s and `laguna`'s "per-layer rotary width" is a two-valued
+SWA/full field and a smaller seam than this one; `granite.cpp:204` reads
+`n_head(il)` in its graph while sizing tensors from layer 0, so a
+heterogeneous Granite file fails in llama.cpp's own loader and is not in
+the table; and `hunyuan-moe`, `qwen3next` and the RWKV rows read
+`n_ff(i)` only as a fallback for a shared-expert width.
+
+The seam is `ModelConfig::layer_shape(il)`, the ONE accessor for a
+layer's `AttnShape::{Gqa, Linear, Absent}` and `ffn_dim`; the scalars
+`n_heads` / `n_kv_heads` are documented as the WIDEST layer's, for
+budgets, and no layer body reads them. `ModelConfig::new_kv_caches` /
+`new_paged_kv` size each layer's cache from its own shape, replacing
+some ninety hand-written `KvCache::new(config.n_kv_heads, ...)` sites,
+and `KvCache::push` asserts the row width so a cache built from the
+scalar panics on the first token of a narrower layer rather than storing
+a misaligned history. The fused Metal launches take ONE `n_heads` and
+one KV geometry, so `metal_can_serve_model` keeps a non-uniform model
+off all of them; the CUDA resident KV is gated on the same predicate;
+the slot-file writer refuses a set of layers whose geometries differ.
+`deci`'s three layer kinds -- `deci.cpp:107-109` passes the residual
+through with no norm when `n_head == 0`, `:115-118` runs `attn_norm`
+then `wo` alone when `n_head_kv == 0`, `:147-149` skips the FFN when
+`n_ff == 0` -- are the enum, and the one combination llama.cpp handles
+by discarding a computed branch (an FFN-free layer WITH attention: the
+`continue` at `:147-149` runs before the residual add at `:150-153`) is
+refused by name from a fixture that has it, with the drop MEASURED:
+scaling that layer's attention weights by 3 leaves libllama's logits
+byte-identical. Building the fixtures also found that libllama ABORTS
+when such a layer is the LAST one (`GGML_ASSERT(buffer)`,
+ggml-backend.cpp:194: the `inp_out_ids` `get_rows` result never rejoins
+the graph), so a real export whose final block is a no-op cannot be run
+by llama.cpp at all. Three libllama-golden fixtures
+(`tests/per_layer_shape_graphs.rs`): the Nemotron shape with one layer
+of each kind (KL 1.44e-13), the DeciLM-7B shape with only
+`head_count_kv` varying (7.29e-13), and openelm with three layers
+sharing no KV width and no FFN width, one fused `attn_qkv` per layer
+split by that layer's own counts (1.28e-13). `openelm`'s old refusal --
+a missing-hparam error for keys its file carries, because
+`GgufValue::as_u64` returned `None` for the arrays its converter writes
+-- is gone with it.
+
+`arcee` closed ALONE on the UNGATED ReLU-squared FFN, and the reason it
+was alone is the opposite of `olmo`'s. The cause is genuinely shared:
+five graphs pass `LLM_FFN_RELU_SQR` (`arcee`, `plm`, `nemotron`,
+`jais2`, `nemotron-h`, measured by grep). But the verdict constant the
+row shared with `plm` had been written from `arcee.cpp` alone, and
+`diff arcee.cpp plm.cpp` is 150 lines: `plm.cpp:16-19,32-36,84-166` is
+DeepSeek-2's MLA attention -- `attn_kv_a_mqa`, `attn_kv_a_norm`,
+`attn_kv_b`, Q split into nope/pe views, one shared roped key repeated
+across the heads -- which the generic decoder does not have at all.
+`plm` stays refused with a verdict that names the half that is done and
+the half that is not. The FFN itself is `down(relu(up(x))^2)`
+(`arcee.cpp:39-40,123-128`: `ffn_up` and `ffn_down`, no gate,
+`LLM_FFN_SEQ`). It is spelled without a fourth expert shape:
+`FfnActivation::ReluSqr` maps to `GluAct::Reglu` (`relu(gate) * up`) and
+the loader ALIASES the expert's gate to its up matrix, so every gated
+path computes `relu(up)^2` with no branch and the two dense hot paths
+skip the aliased matmul. The durable part is what it removed: six
+launch sites derived the fused Metal kernels' `gelu: bool` as
+`!is_swiglu()`, which reads "not SwiGLU, therefore GELU" and would have
+run this activation as GELU; `GluAct::fused_kernel_gelu_flag` returns
+`None` for it and every site refuses on `None`. KL 2.27e-14
+(`tests/ungated_ffn_graphs.rs`). A file WITH an `ffn_gate` is refused by
+name, as libllama refuses it (`wrong number of tensors; expected 21, got
+19`, measured).
+
 | Shape | Architectures |
 |---|---|
-| Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
+| Per-layer head counts or FFN width | CLOSED (`ferrox_models::layer_shapes`): `deci` and `openelm` run on it; `laguna`, `step35` and `mimo2` still refuse for the rows below and their verdicts say so |
 | A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `talkie`, `bitnet` (`olmo`, `olmo2`, `exaone4` and `dbrx` were here and are CLOSED) |
 | LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`) and weighted (`dbrx`) forms; the bias group below still refuses for more than the norm |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all six (`ferrox_models::rope_layers`): `exaone-moe`, `smollm3` and EXAONE-4 32B run on it; `smallthinker` and `afmoe` still refuse for the rows below and their verdicts say so |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
 | Hardcoded scales applied even when the GGUF carries no key | `mistral3` (`grok` was here and is CLOSED on the MiniCPM defaults hook) |
-| An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |
-| Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature) |
+| A gated attention tensor (`wqkv_gate`) | `laguna`, `step35`, `afmoe` |
+| Attention sinks outside gpt-oss | `mimo2` |
+| An ungated or non-SwiGLU FFN | CLOSED for the ungated ReLU-squared form (`FfnActivation::ReluSqr`): `arcee` runs on it; `plm` shares the FFN and refuses on MLA attention; `apertus` is xIELU |
+| Something structurally new | `nanbeige` (runs the same layers more than once), `grovemoe` (a second expert bank), `mellum` (two per-layer RoPE variants), `mistral3` (per-position attention temperature), `plm` (MLA attention on a dense model) |
 
 **Unknown (1).** `phi4` is the only row left here. It is not in
 llama.cpp's `LLM_ARCH_NAMES` -- `src/llama-arch.cpp` carries `phi3` and

@@ -905,6 +905,7 @@ mod tests {
             // Kimi's stack has no per-layer RoPE gate; llama.cpp writes
             // no `use_rope` for it (`crate::rope_layers`).
             rope_layers: crate::rope_layers::RopeLayers::All,
+            layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
             name: "synthetic-kimi-gguf-test",
             n_layers: 2,
             hidden_dim: d.hidden_dim,

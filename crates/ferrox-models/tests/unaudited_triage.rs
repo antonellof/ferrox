@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 18,
+        n, 15,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -95,7 +95,11 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          with it and neither moved this number, and 20 until `grok` and `dbrx` closed \
          together on seams landed the day before (`scalar_multipliers::MultiplierDefaults`, \
          `norm::NormOp::LayerNorm`, `clamp_kqv`, `norm_sites`; tests/grok_graphs.rs, \
-         tests/dbrx_graphs.rs), the clamp also closing `olmo`'s clip_qkv refusal by name \
+         tests/dbrx_graphs.rs), the clamp also closing `olmo`'s clip_qkv refusal by name, \
+         and 18 until `arcee` closed on the ungated ReLU-squared FFN \
+         (`FfnActivation::ReluSqr`, tests/ungated_ffn_graphs.rs) and `deci` and `openelm` \
+         closed together on the per-layer shape seam (`ferrox_models::layer_shapes`, \
+         tests/per_layer_shape_graphs.rs) \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -347,7 +351,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 18);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 15);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -432,9 +436,21 @@ fn batch_two_verdicts_are_pinned_to_what_was_read() {
         // it moved to `DedicatedOnly` rather than staying an unaudited
         // generic architecture. Its refusal is now asserted by
         // `minicpm3_is_refused_as_mla_not_as_unaudited` below.
-        ("openelm", TriageClass::NewCode, "per-LAYER head counts"),
-        ("arcee", TriageClass::NewCode, "UNGATED ReLU-squared"),
-        ("plm", TriageClass::NewCode, "UNGATED ReLU-squared"),
+        // `openelm` was HERE, NEW CODE on per-layer head counts, and is
+        // audited now with `deci` on one seam
+        // (`ferrox_models::layer_shapes`, tests/per_layer_shape_graphs.rs).
+        // `arcee` was HERE too, NEW CODE on the ungated ReLU-squared
+        // FFN, and is audited (tests/ungated_ffn_graphs.rs). It shared
+        // its verdict constant with `plm`, and that constant was WRONG
+        // about `plm` by an attention block: `plm.cpp:84-166` is
+        // DeepSeek-2's MLA attention, which the FFN-only reading had
+        // not seen. `plm` stays, with the verdict now naming the half
+        // that is done and the half that is not.
+        (
+            "plm",
+            TriageClass::NewCode,
+            "MLA attention on a dense model",
+        ),
     ];
     for (arch, class, evidence) in cases {
         let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
@@ -498,26 +514,32 @@ fn grok_and_dbrx_are_audited_and_carry_no_stale_verdict() {
 /// says so rather than letting the reader assume the triage line is what
 /// they got.
 ///
-/// `openelm` dies on a missing-hparam error for keys its file does
-/// carry, before the unaudited gate. A verdict that stayed silent about
-/// that would send someone looking for a message they will never see.
-///
-/// `granite` was the other case here: it died on
-/// `capability::unsupported_scaling_keys`, which refused the very
-/// multipliers its verdict named. Both halves are gone -- the
-/// multipliers are implemented and the row is audited -- so the case
-/// left this list rather than being kept as a stale example. One row is
-/// enough to pin the rule; nothing is left that has to be true about
-/// `granite` for it to hold.
+/// `openelm` was the row that pinned this rule: it died on a
+/// missing-hparam error for keys its file does carry, before the
+/// unaudited gate, because `GgufValue::as_u64` returned `None` for the
+/// per-layer ARRAYS its converter writes. That is gone with the row --
+/// `layer_shapes::read_u64_per_layer` reads both spellings and the
+/// architecture is audited -- and `granite` had left this list the
+/// same way before it. With no live example the rule is pinned on the
+/// property it exists for: a verdict for an architecture that is
+/// refused EARLIER, by name, must say so. `mimo2` is refused by
+/// `unsupported_feature_keys` on `nextn_predict_layers` before the
+/// unaudited gate when its file declares one, and its verdict names
+/// the NEXTN layers.
 #[test]
 fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
-    let (arch, marker) = ("openelm", "before the unaudited gate is reached");
+    let (arch, marker) = ("mimo2", "NEXTN");
     let t = unaudited_triage(arch).expect("verdict");
     assert!(
         t.blocker.contains(marker),
-        "`{arch}` must disclose that an earlier refusal fires first: {}",
+        "`{arch}` must name the feature an earlier gate refuses on: {}",
         t.blocker
     );
+    // The row that used to carry this rule is audited and carries no
+    // verdict; the misleading message it disclosed cannot be produced
+    // any more.
+    assert!(unaudited_triage("openelm").is_none());
+    assert!(ferrox_models::capability::is_audited_generic("openelm"));
 }
 
 /// Batch 3: the alias rows and the plain long-tail.
@@ -543,7 +565,14 @@ fn batch_three_verdicts_are_pinned_to_what_was_read() {
         // so they are refused as strings now, not triaged as
         // architectures. See
         // `the_alias_rows_are_refused_as_strings_no_converter_writes`.
-        ("deci", TriageClass::NewCode, "PER LAYER"),
+        // `deci` was HERE, NEW CODE on per-layer shapes with a three-way
+        // branch on them, and is audited now with `openelm` on one seam
+        // (`ferrox_models::layer_shapes`, tests/per_layer_shape_graphs.rs);
+        // the branch combination llama.cpp handles by discarding a
+        // computed attention output is refused by name from a fixture
+        // that has it, and `the_per_layer_shape_seam_...` below is where
+        // the claim about the reach of that seam lives.
+        //
         // `olmo` was HERE, NEW CODE on "NO norm weights at all". It is
         // audited now (`tests/olmo_graphs.rs`) and carries no verdict;
         // `the_post_norm_group_is_three_topologies...` above is where
@@ -558,6 +587,65 @@ fn batch_three_verdicts_are_pinned_to_what_was_read() {
             t.blocker
         );
     }
+    // The batch is EMPTY now -- every row it held either closed or
+    // turned out not to be an architecture -- so the loop above cannot
+    // fail, and what this test pins instead is that none of them came
+    // back: an audited row carrying a verdict would be a stale claim
+    // presented as a current one.
+    for arch in ["xverse", "baichuan", "chatglm", "deci", "olmo"] {
+        assert!(
+            is_audited_generic(arch) && unaudited_triage(arch).is_none(),
+            "`{arch}` closed out of batch three and must stay audited with no verdict"
+        );
+    }
+}
+
+/// The per-layer shape seam (`ferrox_models::layer_shapes`) closed
+/// `deci` and `openelm` and reaches three more rows, and each of those
+/// three says so: the verdict names the per-layer half as done and the
+/// remaining blocker as something else.
+///
+/// The reach was MEASURED before the seam was built -- all 140
+/// `src/models/*.cpp` scanned for `n_head(i)` / `n_head_kv(i)` /
+/// `n_ff(i)` in both the tensor loader and the graph -- and
+/// `PER_LAYER_SHAPE_ARCHS` is the record. A verdict that still called
+/// per-layer heads the blocker on a row the seam serves would be the
+/// confident wrong verdict this suite exists to catch.
+#[test]
+fn the_per_layer_shape_seam_closed_two_rows_and_its_reach_is_recorded_on_the_rest() {
+    use ferrox_models::layer_shapes::per_layer_shapes_read_by_llama_cpp;
+    for arch in ["deci", "openelm"] {
+        assert!(is_audited_generic(arch), "{arch}");
+        assert!(unaudited_triage(arch).is_none(), "{arch}");
+        assert!(per_layer_shapes_read_by_llama_cpp(arch), "{arch}");
+    }
+    for arch in ["laguna", "mimo2", "step35"] {
+        let t = unaudited_triage(arch).expect("still refuses");
+        assert_eq!(t.class, TriageClass::NewCode);
+        assert!(
+            t.blocker.contains("NO LONGER a blocker: the per-layer"),
+            "`{arch}` must say the per-layer half is done: {}",
+            t.blocker
+        );
+        assert!(
+            t.blocker.contains("crate::layer_shapes"),
+            "`{arch}` must point at the seam: {}",
+            t.blocker
+        );
+        assert!(
+            per_layer_shapes_read_by_llama_cpp(arch),
+            "{arch} is in the reach table"
+        );
+    }
+    // `nanbeige` reads the arrays too and is NOT served: it rewrites
+    // them to loop its physical layers, which is a different graph.
+    let t = unaudited_triage("nanbeige").expect("still refuses");
+    assert!(t.blocker.contains("crate::layer_shapes"), "{}", t.blocker);
+    assert!(t.blocker.contains("not the blocker"), "{}", t.blocker);
+    // And `granite` reads `n_head(il)` in its graph alone
+    // (`granite.cpp:204`) while sizing tensors from layer 0, so it is
+    // deliberately absent from the table.
+    assert!(!per_layer_shapes_read_by_llama_cpp("granite"));
 }
 
 /// The three alias rows are refused as STRINGS NOBODY WRITES, not
@@ -757,7 +845,11 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         // `the_qk_norm_ordering_arm_is_no_longer_anybody_s_leading_blocker`
         // below is what pins that.
         ("laguna", TriageClass::NewCode, "second rotary width"),
-        ("step35", TriageClass::NewCode, "per-LAYER rotary width"),
+        (
+            "step35",
+            TriageClass::NewCode,
+            "per-layer SwiGLU clamp arrays",
+        ),
     ];
     for (arch, class, evidence) in cases {
         let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
@@ -872,7 +964,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 17, 1),
+        (0, 0, 14, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -889,7 +981,13 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          defaults hook and the norm-site table for `grok`, the weighted LayerNorm, the \
          QKV clamp and the same table for `dbrx` -- and the clamp closed `olmo`'s \
          clip_qkv refusal by name with it, which again moved the audited number and not \
-         this one. \
+         this one, and 17 to 14 when `arcee` closed on the ungated ReLU-squared FFN and \
+         `deci` and `openelm` closed together on the per-layer shape seam \
+         (`ferrox_models::layer_shapes`) -- one cause behind five refusals, of which two \
+         were closable by it alone and three (`laguna`, `mimo2`, `step35`) say so and \
+         name what else they need. `arcee` closed ALONE for the opposite reason to \
+         `olmo`'s: its cause IS shared (five graphs pass LLM_FFN_RELU_SQR) but the constant \
+         that shared it with `plm` had missed `plm`'s MLA attention. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -898,5 +996,5 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 18);
+    assert_eq!(fixture + arm + new_code + unknown, 15);
 }

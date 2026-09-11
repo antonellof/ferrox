@@ -962,9 +962,7 @@ fn main() -> anyhow::Result<()> {
 
             let vocab = 32;
             let decoder = Decoder::new_random_small(cfg.clone(), 2, vocab);
-            let mut caches: Vec<KvCache> = (0..2)
-                .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-                .collect();
+            let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
 
             for pos in 0..steps {
                 let token = pos % vocab;
@@ -1025,14 +1023,7 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             let decoder = Decoder::from_gguf(&path, cfg)?;
-            let mut caches: Vec<ferrox_core::cache::KvCache> = (0..decoder.layers.len())
-                .map(|_| {
-                    ferrox_core::cache::KvCache::new(
-                        decoder.config.n_kv_heads,
-                        decoder.config.head_dim,
-                    )
-                })
-                .collect();
+            let mut caches: Vec<ferrox_core::cache::KvCache> = decoder.config.new_kv_caches();
             let logits = decoder.forward_token(token, pos, &mut caches);
             println!("logits ({} values):", logits.len());
             for (i, v) in logits.iter().enumerate() {
@@ -1408,14 +1399,7 @@ fn main() -> anyhow::Result<()> {
                 let vocab = 256;
 
                 let decoder = Decoder::new_random_small(cfg, n_layers, vocab);
-                let mut caches: Vec<ferrox_core::cache::KvCache> = (0..n_layers)
-                    .map(|_| {
-                        ferrox_core::cache::KvCache::new(
-                            decoder.config.n_kv_heads,
-                            decoder.config.head_dim,
-                        )
-                    })
-                    .collect();
+                let mut caches: Vec<ferrox_core::cache::KvCache> = decoder.config.new_kv_caches();
 
                 let n_tokens = 32;
                 let t0 = Instant::now();
@@ -1457,14 +1441,7 @@ fn main() -> anyhow::Result<()> {
             cfg.moe.expert_ffn_dim = 32;
 
             let decoder = Decoder::new_random_small(cfg, 3, 256);
-            let mut caches: Vec<ferrox_core::cache::KvCache> = (0..3)
-                .map(|_| {
-                    ferrox_core::cache::KvCache::new(
-                        decoder.config.n_kv_heads,
-                        decoder.config.head_dim,
-                    )
-                })
-                .collect();
+            let mut caches: Vec<ferrox_core::cache::KvCache> = decoder.config.new_kv_caches();
 
             let prompt_tokens: Vec<usize> = ferrox_models::ByteTokenizer::encode(&prompt)
                 .into_iter()

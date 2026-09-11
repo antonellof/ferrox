@@ -27,6 +27,9 @@ impl From<FfnActivation> for GluAct {
             // exists.
             FfnActivation::Swiglu | FfnActivation::SwigluFused => GluAct::Swiglu,
             FfnActivation::Gelu => GluAct::Geglu,
+            // Ungated on disk, gated in the enum: the loader aliases
+            // gate to up. See `FfnActivation::ReluSqr`.
+            FfnActivation::ReluSqr => GluAct::Reglu,
         }
     }
 }
@@ -43,5 +46,6 @@ mod tests {
         assert_eq!(GluAct::from(FfnActivation::Gelu), GluAct::Geglu);
         assert_eq!(GluAct::from(FfnActivation::Swiglu), GluAct::Swiglu);
         assert_eq!(GluAct::from(FfnActivation::SwigluFused), GluAct::Swiglu);
+        assert_eq!(GluAct::from(FfnActivation::ReluSqr), GluAct::Reglu);
     }
 }

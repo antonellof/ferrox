@@ -299,14 +299,7 @@ impl Model {
     pub(crate) fn embed_tokens(&self, tokens: &[usize]) -> Option<Vec<Vec<f32>>> {
         match self {
             Model::Gguf(m) => {
-                let mut caches: Vec<_> = (0..m.decoder.layers.len())
-                    .map(|_| {
-                        ferrox_core::cache::KvCache::new(
-                            m.decoder.config.n_kv_heads,
-                            m.decoder.config.head_dim,
-                        )
-                    })
-                    .collect();
+                let mut caches: Vec<_> = m.decoder.config.new_kv_caches();
                 Some(m.decoder.forward_hidden_batch(tokens, 0, &mut caches))
             }
             Model::Kimi(_) | Model::Mla(_) | Model::Gemma4(_) | Model::Glm52(_) => None,
@@ -4292,8 +4285,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 }
             };
             let bytes_per_block = block_size
-                * cfg.n_layers
-                * cfg.n_kv_heads
+                * cfg.kv_heads_all_layers()
                 * cfg.head_dim
                 * 2
                 * std::mem::size_of::<f32>();
@@ -4443,13 +4435,9 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 );
             }
             Some(generate::PagedKvConfig {
-                store: Arc::new(ferrox_core::cache::SharedPagedKv::new(
-                    cfg.n_layers,
-                    block_size,
-                    blocks_per_layer,
-                    cfg.n_kv_heads,
-                    cfg.head_dim,
-                )),
+                // Per layer, because a per-layer-shape model's layers do
+                // not all cache the same width (`layer_shapes`).
+                store: Arc::new(cfg.new_paged_kv(block_size, blocks_per_layer)),
                 queue_wait: Duration::from_millis(queue_wait_ms),
                 radix,
                 anchor_token,
@@ -6833,13 +6821,7 @@ mod tests {
         // Drive one real forward pass so the store sees decode
         // activity (the fixture's tiny vocab can't survive the HTTP
         // path's template text, so decode directly).
-        let mut caches: Vec<ferrox_core::cache::KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| {
-                ferrox_core::cache::KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim)
-            })
-            .collect();
+        let mut caches: Vec<ferrox_core::cache::KvCache> = decoder.config.new_kv_caches();
         decoder.forward_token(1, 0, &mut caches);
 
         let model = Model::Gguf(GgufModel {
@@ -8760,6 +8742,7 @@ mod tests {
 
         let model_cfg = ferrox_models::ModelConfig {
             rope_layers: ferrox_models::rope_layers::RopeLayers::All,
+            layer_shapes: ferrox_models::layer_shapes::LayerShapes::Uniform,
             name: "synthetic-kimi-server-test",
             n_layers: 1,
             hidden_dim,

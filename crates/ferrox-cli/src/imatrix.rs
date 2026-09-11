@@ -209,9 +209,7 @@ pub fn run(args: ImatrixArgs) -> Result<()> {
         if let Some(b) = bos {
             ids[0] = b;
         }
-        let mut caches: Vec<KvCache> = (0..decoder.layers.len())
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let t = Instant::now();
         let _logits = decoder.forward_batch(&ids, 0, &mut caches);
         if let Some(msg) = collector.non_finite() {

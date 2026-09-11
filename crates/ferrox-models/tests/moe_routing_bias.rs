@@ -108,11 +108,7 @@ fn load() -> Decoder {
 }
 
 fn prefill(decoder: &Decoder) -> Vec<f32> {
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     decoder.forward_batch_last(&PROMPT, 0, &mut caches)
 }
 
@@ -132,11 +128,7 @@ fn routing_bias_prefill_matches_llama_cpp() {
 #[test]
 fn routing_bias_decode_matches_llama_cpp() {
     let decoder = load();
-    let mut caches: Vec<KvCache> = decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let mut logits = Vec::new();
     for (pos, &tok) in PROMPT.iter().enumerate() {
         logits = decoder.forward_token(tok, pos, &mut caches);
@@ -148,11 +140,7 @@ fn routing_bias_decode_matches_llama_cpp() {
 #[test]
 fn routing_bias_multi_seq_matches_llama_cpp() {
     let decoder = load();
-    let mut caches: Vec<Vec<KvCache>> = vec![decoder
-        .layers
-        .iter()
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect()];
+    let mut caches: Vec<Vec<KvCache>> = vec![decoder.config.new_kv_caches()];
     let mut logits = Vec::new();
     for (pos, &tok) in PROMPT.iter().enumerate() {
         let out = decoder.forward_multi_seq(&[tok], &[pos], &mut caches);

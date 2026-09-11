@@ -54,10 +54,7 @@ impl Engine for Decoder {
     type State = Vec<KvCache>;
 
     fn new_state(&self) -> Vec<KvCache> {
-        self.layers
-            .iter()
-            .map(|_| KvCache::new(self.config.n_kv_heads, self.config.head_dim))
-            .collect()
+        self.config.new_kv_caches()
     }
 
     fn vocab_size(&self) -> usize {
@@ -393,11 +390,7 @@ mod tests {
         let decoder = Decoder::new_random_small(test_dense_fixture(), 2, 64);
         let tokens = [3usize, 7, 1, 9];
 
-        let mut direct_caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut direct_caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let mut direct_logits = Vec::new();
         for (pos, &tok) in tokens.iter().enumerate() {
             direct_logits = decoder.forward_token(tok, pos, &mut direct_caches);
@@ -421,11 +414,7 @@ mod tests {
         let decoder = Decoder::new_random_small(test_dense_fixture(), 2, 64);
         let tokens = vec![2usize, 5, 8];
 
-        let mut batch_caches: Vec<KvCache> = decoder
-            .layers
-            .iter()
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let mut batch_caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let batch_logits = decoder.forward_batch(&tokens, 0, &mut batch_caches);
         let ground_truth = batch_logits.last().unwrap().clone();
 

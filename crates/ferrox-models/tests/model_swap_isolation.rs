@@ -84,9 +84,7 @@ fn greedy_once(path: &Path) -> Vec<usize> {
     let prompt = prompt_tokens(&file, PROMPT, PROMPT_TOKENS);
     let decoder = Decoder::from_gguf(path, config).expect("decoder");
 
-    let mut caches: Vec<KvCache> = (0..decoder.layers.len())
-        .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-        .collect();
+    let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let mut logits = decoder.forward_batch_last(&prompt, 0, &mut caches);
     let mut out = Vec::with_capacity(MAX_NEW_TOKENS);
     for pos in (prompt.len()..).take(MAX_NEW_TOKENS) {

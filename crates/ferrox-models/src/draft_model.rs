@@ -158,9 +158,7 @@ impl DraftModelSpeculator {
                 target: target_vocab,
             });
         }
-        let kv_caches = (0..decoder.config.n_layers)
-            .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
-            .collect();
+        let kv_caches = decoder.config.new_kv_caches();
         Ok(DraftModelSpeculator {
             decoder,
             kv_caches,
@@ -478,9 +476,7 @@ mod tests {
         let max_new = 8;
 
         let target = Decoder::new_random_small(cfg.clone(), 4, vocab);
-        let mut caches: Vec<KvCache> = (0..target.config.n_layers)
-            .map(|_| KvCache::new(target.config.n_kv_heads, target.config.head_dim))
-            .collect();
+        let mut caches: Vec<KvCache> = target.config.new_kv_caches();
 
         // A different model, not a copy of the target: two layers
         // rather than four, so it disagrees constantly.
@@ -493,9 +489,7 @@ mod tests {
 
         // The same target, decoded the ordinary way.
         let plain = Decoder::new_random_small(cfg, 4, vocab);
-        let mut plain_caches: Vec<KvCache> = (0..plain.config.n_layers)
-            .map(|_| KvCache::new(plain.config.n_kv_heads, plain.config.head_dim))
-            .collect();
+        let mut plain_caches: Vec<KvCache> = plain.config.new_kv_caches();
         let mut pending = plain
             .forward_batch(&prompt, 0, &mut plain_caches)
             .pop()
