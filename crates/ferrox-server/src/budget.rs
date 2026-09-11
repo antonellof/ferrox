@@ -607,7 +607,7 @@ mod tests {
         cfg.n_kv_heads = 1;
         cfg.head_dim = 4;
         cfg.sliding_window = Some(8);
-        cfg.swa_pattern = None; // every layer slides: the old zero divisor
+        cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::All; // every layer slides: the old zero divisor
         let windowed = KvShape::from_config(&cfg, KvElem::F32);
         assert_eq!(windowed, shape(), "64 bytes/token, window or no window");
 

@@ -43,23 +43,46 @@ assertion:
     `{arch}.attention.sliding_window` as a REQUIRED key, so the file's
     own value always wins over the `n_swa = 128` seeded at :5.
 
-NOT carried: `nextn_predict_layers` (:23). Those MTP blocks are inside
-`block_count` and llama.cpp skips them (`n_layer = n_layer_all -
-n_layer_nextn`, :52-57 create them `TENSOR_SKIP`); ferrox refuses a
-file declaring a nonzero value rather than running the speculative head
-as two more decoder layers, and that refusal has its own test.
+Two things a REAL export carries on top, each behind a flag so the
+base fixture stays byte-identical to the one that audited the row:
+
+  * `--window-array agree|disagree` writes `attention.sliding_window_
+    pattern` as the per-layer BOOL ARRAY `conversion/exaone.py:84`
+    writes from `layer_types` (K-EXAONE's is "LLLG" repeated), at
+    `num_hidden_layers` length -- the TRUNK, not `block_count`.
+    `exaone-moe.cpp:7` reads the key through the SCALAR overload of
+    `get_key_or_arr`, which returns false on an array
+    (llama-model-loader.cpp:502-507), so llama.cpp never looks at it
+    and :8 keeps `set_swa_pattern(4)`. `agree` writes the array a real
+    converter would ([T, T, T, F]); `disagree` writes its inverse, so
+    that the golden logits being IDENTICAL for the two is the
+    measurement that upstream ignores the value, and ferrox matching
+    both is the evidence that it does too.
+  * `--mtp` appends ONE NextN/MTP block after the trunk, inside
+    `block_count` (5 blocks, `nextn_predict_layers = 1`), exactly as
+    `conversion/exaone.py:132,146` does for K-EXAONE-236B-A23B
+    (`num_hidden_layers = 48`, `num_nextn_predict_layers = 1`, 49
+    blocks). llama.cpp creates its tensors `TENSOR_SKIP` (:52-57) and
+    runs `n_layer() = 4` (llama-hparams.cpp:280-282); the block is
+    REQUIRED to be present (the missing-tensor throw at
+    llama-model-loader.cpp:1092-1095 precedes the skip at :1116, and
+    this loader has no trunk-only probe), and it is a DENSE block
+    (:73 `i >= n_layer` takes the dense branch) with the `nextn.*`
+    tensors of :96-104. Its weights are drawn LARGE so that running it
+    as a fifth layer is not a near miss.
 
 Weights are pseudo-random from a fixed seed so the file is byte-stable.
 
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
-        python3 scripts/make_exaone_moe_fixture.py OUT.gguf
+        python3 scripts/make_exaone_moe_fixture.py OUT.gguf \\
+            [--window-array agree|disagree] [--mtp]
 
 The golden values that go with it are produced by llama.cpp itself
 (see `scripts/gptoss_reference_logits.cpp`), not by this script.
 """
 
-import sys
+import argparse
 
 import numpy as np
 
@@ -89,8 +112,10 @@ RMS_EPS = 1e-5
 EXPERT_WEIGHTS_SCALE = 2.5
 
 
-def main(out_path: str) -> None:
+def main(out_path: str, window_array: str | None, mtp: bool) -> None:
     rng = np.random.default_rng(0xE4A0E)
+    n_mtp = 1 if mtp else 0
+    block_count = N_LAYER + n_mtp
 
     def rnd(*shape: int) -> np.ndarray:
         # Small magnitudes keep the synthetic logits in a range where a
@@ -100,7 +125,7 @@ def main(out_path: str) -> None:
 
     w = gguf.GGUFWriter(out_path, ARCH)
     w.add_name("ferrox-exaone-moe-fixture")
-    w.add_block_count(N_LAYER)
+    w.add_block_count(block_count)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
     w.add_feed_forward_length(N_FF)
@@ -112,6 +137,14 @@ def main(out_path: str) -> None:
     w.add_rope_freq_base(ROPE_BASE)
     w.add_rope_dimension_count(HEAD_DIM)
     w.add_sliding_window(SWA_WINDOW)
+    if window_array is not None:
+        # exaone.py:84: `[t == "sliding_attention" for t in layer_types]`,
+        # one entry per HIDDEN layer. `set_swa_pattern(4)` last-dense is
+        # [T, T, T, F] over four layers.
+        agree = [il % 4 != 3 for il in range(N_LAYER)]
+        w.add_sliding_window_pattern(agree if window_array == "agree" else [not b for b in agree])
+    if mtp:
+        w.add_nextn_predict_layers(n_mtp)
     w.add_expert_count(N_EXPERT)
     w.add_expert_used_count(N_EXPERT_USED)
     w.add_expert_shared_count(N_EXPERT_SHARED)
@@ -186,6 +219,29 @@ def main(out_path: str) -> None:
         w.add_tensor(p + "ffn_up_shexp.weight", rnd(N_FF_SHEXP, N_EMBD))
         w.add_tensor(p + "ffn_down_shexp.weight", rnd(N_EMBD, N_FF_SHEXP))
 
+    for il in range(N_LAYER, block_count):
+        # The NextN block, exaone-moe.cpp:52-104 with `i >= n_layer`:
+        # the attention set, a DENSE FFN, and the `nextn.*` head. Drawn
+        # 8x wider than the trunk so that a loader which runs it as a
+        # layer moves the logits by far more than any tolerance.
+        p = f"blk.{il}."
+        w.add_tensor(p + "attn_norm.weight", rnd(N_EMBD) * 8.0)
+        w.add_tensor(p + "attn_q.weight", rnd(n_embd_q, N_EMBD) * 8.0)
+        w.add_tensor(p + "attn_k.weight", rnd(n_embd_kv, N_EMBD) * 8.0)
+        w.add_tensor(p + "attn_v.weight", rnd(n_embd_kv, N_EMBD) * 8.0)
+        w.add_tensor(p + "attn_q_norm.weight", rnd(HEAD_DIM) + 1.5)
+        w.add_tensor(p + "attn_k_norm.weight", rnd(HEAD_DIM) + 1.5)
+        w.add_tensor(p + "attn_output.weight", rnd(N_EMBD, n_embd_q) * 8.0)
+        w.add_tensor(p + "ffn_norm.weight", rnd(N_EMBD) * 8.0)
+        w.add_tensor(p + "ffn_gate.weight", rnd(N_FF, N_EMBD) * 8.0)
+        w.add_tensor(p + "ffn_up.weight", rnd(N_FF, N_EMBD) * 8.0)
+        w.add_tensor(p + "ffn_down.weight", rnd(N_EMBD, N_FF) * 8.0)
+        # ne = [2 * n_embd, n_embd] -> numpy [n_embd, 2 * n_embd]
+        w.add_tensor(p + "nextn.eh_proj.weight", rnd(N_EMBD, 2 * N_EMBD))
+        w.add_tensor(p + "nextn.enorm.weight", rnd(N_EMBD))
+        w.add_tensor(p + "nextn.hnorm.weight", rnd(N_EMBD))
+        w.add_tensor(p + "nextn.shared_head_norm.weight", rnd(N_EMBD))
+
     w.add_tensor("output_norm.weight", rnd(N_EMBD))
     w.add_tensor("output.weight", rnd(N_VOCAB, N_EMBD))
 
@@ -197,4 +253,9 @@ def main(out_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "exaone-moe-fixture.gguf")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out", nargs="?", default="exaone-moe-fixture.gguf")
+    ap.add_argument("--window-array", choices=["agree", "disagree"], default=None)
+    ap.add_argument("--mtp", action="store_true")
+    args = ap.parse_args()
+    main(args.out, args.window_array, args.mtp)

@@ -5028,7 +5028,7 @@ mod tests {
             // Smaller than the decode length below, so the window really
             // drops positions rather than degenerating to full causal.
             cfg.sliding_window = Some(2);
-            cfg.swa_pattern = None;
+            cfg.swa_layers = crate::swa_layers::SwaLayers::All;
             cfg
         };
         let softcapped = || {
@@ -5051,7 +5051,7 @@ mod tests {
         let alternating = || {
             let mut cfg = tiny_test_config();
             cfg.sliding_window = Some(2);
-            cfg.swa_pattern = Some(2);
+            cfg.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
             cfg
         };
 
@@ -5342,7 +5342,7 @@ mod tests {
         let windowed = || {
             let mut cfg = tiny_test_config();
             cfg.sliding_window = Some(2);
-            cfg.swa_pattern = None;
+            cfg.swa_layers = crate::swa_layers::SwaLayers::All;
             cfg
         };
         let scaled_and_capped = || {
@@ -5355,7 +5355,7 @@ mod tests {
         let alternating = || {
             let mut cfg = tiny_test_config();
             cfg.sliding_window = Some(2);
-            cfg.swa_pattern = Some(2);
+            cfg.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
             cfg
         };
 
@@ -5775,7 +5775,7 @@ mod tests {
             {
                 let mut c = tiny_test_config();
                 c.sliding_window = Some(2);
-                c.swa_pattern = None;
+                c.swa_layers = crate::swa_layers::SwaLayers::All;
                 c
             },
             {
@@ -6891,7 +6891,7 @@ mod metal_rope_tests {
         cfg.rope_theta = 1_000_000.0;
         cfg.rope_theta_swa = Some(10_000.0);
         cfg.sliding_window = Some(4);
-        cfg.swa_pattern = Some(6);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(6, false);
         cfg.rope_freqs = Some(crate::config::RopeFreqs {
             full: vec![8.0; 4],
             swa: Some(vec![1.0; 4]),

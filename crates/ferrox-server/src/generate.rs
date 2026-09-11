@@ -3299,7 +3299,7 @@ mod tests {
     fn windowed_decoder(window: usize) -> Decoder {
         let mut cfg = test_dense_fixture();
         cfg.sliding_window = Some(window);
-        cfg.swa_pattern = None;
+        cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::All;
         Decoder::new_random_small(cfg, 2, 256)
     }
 
@@ -3407,7 +3407,7 @@ mod tests {
         // rather than a refusal.
         let mut alternating_cfg = test_dense_fixture();
         alternating_cfg.sliding_window = Some(window);
-        alternating_cfg.swa_pattern = Some(2);
+        alternating_cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::period(2, false);
         let alternating = Decoder::new_random_small(alternating_cfg, 2, 256);
         assert_eq!(alternating.config.kv_block_window(), Some(window));
         assert_eq!(alternating.config.uniform_sliding_window(), None);
@@ -4160,7 +4160,7 @@ mod tests {
         let full = small_decoder();
         let mut alternating_cfg = test_dense_fixture();
         alternating_cfg.sliding_window = Some(4);
-        alternating_cfg.swa_pattern = Some(2);
+        alternating_cfg.swa_layers = ferrox_models::swa_layers::SwaLayers::period(2, false);
         let alternating = Decoder::new_random_small(alternating_cfg, 2, 256);
         assert_eq!(
             alternating.config.uniform_sliding_window(),

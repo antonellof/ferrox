@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 13,
+        n, 12,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -103,7 +103,14 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          together on the gated attention (`ferrox_models::attn_gate`, \
          tests/gated_attention_graphs.rs) -- ONE cause behind THREE verdicts, read side by \
          side and found to be one op with two free parameters; `step35`, the third, still \
-         needs its per-layer clamp arrays and window array and says so \
+         needs its per-layer clamp arrays and window array and says so, and 13 until \
+         `mellum` closed on the per-layer sliding-window ARRAY seam \
+         (`ferrox_models::swa_layers`, tests/window_array_graphs.rs) -- the seam three \
+         verdicts named, of which `mellum` is the only generic-path graph that HONOURS the \
+         array; the same seam lifted an over-refusal on every real EXAONE-4 32B, \
+         EXAONE-MoE and Olmo-3 export, whose arrays llama.cpp IGNORES, and \
+         `ferrox_models::mtp_blocks` beside it skips the NextN blocks `mimo2` and `step35` \
+         named, so both say so and lead with what is left \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -355,7 +362,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 13);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 12);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -526,13 +533,15 @@ fn grok_and_dbrx_are_audited_and_carry_no_stale_verdict() {
 /// architecture is audited -- and `granite` had left this list the
 /// same way before it. With no live example the rule is pinned on the
 /// property it exists for: a verdict for an architecture that is
-/// refused EARLIER, by name, must say so. `mimo2` is refused by
-/// `unsupported_feature_keys` on `nextn_predict_layers` before the
-/// unaudited gate when its file declares one, and its verdict names
-/// the NEXTN layers.
+/// refused EARLIER, by name, must say so. `mimo2` is refused by the
+/// loader's `split K/V head dims` check before the unaudited gate --
+/// every real MiMo-V2 export has `head_dim: 192, v_head_dim: 128` --
+/// and its verdict leads with exactly that. (Its NEXTN blocks used to
+/// be the earlier refusal, through `unsupported_feature_keys`; they are
+/// skipped now, `ferrox_models::mtp_blocks`, and the verdict says so.)
 #[test]
 fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
-    let (arch, marker) = ("mimo2", "NEXTN");
+    let (arch, marker) = ("mimo2", "split K/V head dims");
     let t = unaudited_triage(arch).expect("verdict");
     assert!(
         t.blocker.contains(marker),
@@ -821,21 +830,25 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
             TriageClass::NewCode,
             "RUNS THE SAME PHYSICAL LAYERS MORE THAN ONCE",
         ),
-        (
-            "mellum",
-            TriageClass::NewCode,
-            "two per-layer RoPE variants",
-        ),
+        // `mellum` was HERE, NEW CODE on "two per-layer RoPE
+        // variants" and, second, the sliding-window ARRAY. The array is
+        // `ferrox_models::swa_layers` and the row is audited on a
+        // libllama-golden fixture whose array disagrees with the seeded
+        // period (`tests/window_array_graphs.rs`); the RoPE half is a
+        // refusal by name (`swa_geometry`) for a file with both a window
+        // and a scaling, which every real Mellum2 is.
         ("talkie", TriageClass::NewCode, "NO norm weights"),
-        // `mimo2`'s leading blocker WAS "attention sinks on a
-        // non-gpt-oss architecture". Sinks are loaded by tensor
-        // presence now (`AttnWeights::sinks`), and what is left is what
-        // every real MiMo-V2 export carries: three NEXTN blocks and a
-        // per-layer window array (`conversion/mimo.py:22,153,167`).
+        // `mimo2`'s leading blocker WAS "attention sinks", then "NEXTN
+        // blocks and a window array". Sinks load by tensor presence,
+        // the blocks are skipped (`ferrox_models::mtp_blocks`) and the
+        // array honoured (`ferrox_models::swa_layers`); what is left is
+        // what every real MiMo-V2 export has and no seam yet serves: a
+        // V head width that differs from K's (`head_dim: 192,
+        // v_head_dim: 128`).
         (
             "mimo2",
             TriageClass::NewCode,
-            "NEXTN/MTP layers that every export",
+            "a V head width that differs from the K head width",
         ),
         // Batch 5. `plamo3` was here, FIXTURE-AWAY. Building its
         // fixture found the verdict was wrong by one tensor name -- it
@@ -1047,7 +1060,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 12, 1),
+        (0, 0, 11, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1076,7 +1089,12 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          verdicts, read side by side first; `step35` keeps the other two things its \
          verdict names, and `mimo2`'s sinks moved off the gpt-oss name onto the tensor \
          without closing it, because every real export carries NEXTN blocks and a \
-         per-layer window array. \
+         per-layer window array, and 12 to 11 when `mellum` closed on the per-layer \
+         sliding-window ARRAY (`ferrox_models::swa_layers`) -- the cause those two \
+         verdicts named, and `mellum` is the one generic-path graph that honours the \
+         array; `ferrox_models::mtp_blocks` landed beside it and skips the NextN blocks \
+         both named, so `mimo2` now leads with its split K/V head width and `step35` \
+         with its clamp arrays and half-width rotary. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1085,5 +1103,5 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 13);
+    assert_eq!(fixture + arm + new_code + unknown, 12);
 }

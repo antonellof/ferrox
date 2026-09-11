@@ -104,6 +104,68 @@ pub const GRAPH_TOL: f32 = 1e-5;
 /// by more than 1e-2.
 pub const GELU_TABLE_TOL: f32 = 2e-4;
 
+/// llama.cpp's logits for `exaone_moe_tiny.gguf` over [`GRAPH_PROMPT`],
+/// produced by `scripts/gptoss_reference_logits.cpp` against libllama.
+///
+/// Shared by two suites rather than copied: `no_rope_layer_graphs`
+/// audits the row on it, and `window_array_graphs` re-measures it
+/// against two fixtures that differ from the base ONLY in carrying
+/// `attention.sliding_window_pattern` as a per-layer array (one
+/// agreeing with the seeded period, one inverted). libllama's logits
+/// for all three are byte-identical -- `exaone-moe.cpp:7` reads the
+/// key through the scalar overload of `get_key_or_arr`, which returns
+/// false on an array -- so one constant IS the claim.
+pub const EXAONE_MOE_GOLDEN: [f32; 48] = [
+    -0.14592841,
+    0.07052712,
+    -0.18324699,
+    -0.7073586,
+    -0.08151308,
+    0.6084596,
+    0.39939362,
+    -0.021832988,
+    0.020600826,
+    -0.13804454,
+    0.36290932,
+    -0.28110275,
+    0.50166076,
+    0.17682396,
+    0.21900047,
+    -0.03235077,
+    -0.401246,
+    0.6190969,
+    0.20589752,
+    -0.27477443,
+    0.30851653,
+    0.3272262,
+    0.21583161,
+    -0.46494246,
+    -0.25845033,
+    -0.14444366,
+    -0.2289539,
+    -0.38887924,
+    -0.031140663,
+    -0.26675346,
+    -0.108890794,
+    -0.13819581,
+    -0.32289377,
+    -0.12842968,
+    0.387041,
+    0.22891839,
+    0.17846167,
+    -0.24666634,
+    0.09334628,
+    -0.36998641,
+    0.050943088,
+    -0.42619628,
+    0.08477548,
+    0.22552544,
+    0.028861046,
+    -0.07179281,
+    -0.07399839,
+    -0.42189643,
+];
+
 pub fn graph_fixture_path(name: &str) -> String {
     format!(
         "{}/tests/fixtures/{name}_tiny.gguf",

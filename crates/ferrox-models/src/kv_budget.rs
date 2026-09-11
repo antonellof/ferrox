@@ -954,7 +954,7 @@ mod tests {
         cfg.n_kv_heads = 1;
         cfg.head_dim = 8;
         cfg.sliding_window = Some(4);
-        cfg.swa_pattern = Some(3);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(3, false);
         cfg
     }
 
@@ -1119,7 +1119,7 @@ mod tests {
         cfg.n_kv_heads = 4;
         cfg.head_dim = 256;
         cfg.sliding_window = Some(1024);
-        cfg.swa_pattern = Some(6);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(6, false);
         let shape = KvShape::from_config(&cfg, KvElem::F32);
         let tokens = 32_768;
 
@@ -1209,7 +1209,7 @@ mod tests {
         gpt_oss.n_kv_heads = 8;
         gpt_oss.head_dim = 64;
         gpt_oss.sliding_window = Some(128);
-        gpt_oss.swa_pattern = Some(2);
+        gpt_oss.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
         assert_eq!(
             KvShape::from_config(&gpt_oss, KvElem::F32).kv_bytes_for_tokens(131_072),
             12_884_901_888
@@ -1221,7 +1221,7 @@ mod tests {
         gemma3.n_kv_heads = 4;
         gemma3.head_dim = 256;
         gemma3.sliding_window = Some(1024);
-        gemma3.swa_pattern = Some(6);
+        gemma3.swa_layers = crate::swa_layers::SwaLayers::period(6, false);
         assert_eq!(
             KvShape::from_config(&gemma3, KvElem::F32).kv_bytes_for_tokens(32_768),
             9_126_805_504
@@ -1237,7 +1237,7 @@ mod tests {
         let windowed = alternating_swa_config();
         let mut full = windowed.clone();
         full.sliding_window = None;
-        full.swa_pattern = None;
+        full.swa_layers = crate::swa_layers::SwaLayers::All;
         for tokens in [1, 3, 4, 5, 64, 100_000] {
             assert_eq!(
                 KvShape::from_config(&windowed, KvElem::F32).kv_bytes_for_tokens(tokens),
@@ -1302,7 +1302,7 @@ mod tests {
         // could recycle for one still holds the whole prompt, and it is
         // a context length this prices.
         cfg.sliding_window = Some(256);
-        cfg.swa_pattern = None;
+        cfg.swa_layers = crate::swa_layers::SwaLayers::All;
         assert_eq!(KvShape::from_config(&cfg, KvElem::F32), shape);
     }
 
@@ -1530,7 +1530,7 @@ mod tests {
     #[test]
     fn a_windowed_model_is_bounded_by_memory_like_any_other() {
         let mut cfg = alternating_swa_config();
-        cfg.swa_pattern = Some(1); // every layer slides: the old zero divisor
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(1, false); // every layer slides: the old zero divisor
         let shape = KvShape::from_config(&cfg, KvElem::F32);
         // Room for 1024 tokens, against a model that would like 1e6.
         let b = budget(1_000, 1_000 + shape.per_token_kv_bytes() * 1024, shape);

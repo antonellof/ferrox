@@ -358,8 +358,7 @@ mod tests {
         cfg.rope_theta_swa = Some(10_000.0);
         cfg.sliding_window = Some(4);
         // Period 2, last-dense: layer 0 slides, layer 1 does not.
-        cfg.swa_pattern = Some(2);
-        cfg.swa_dense_first = false;
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
         cfg.rope_freqs = Some(RopeFreqs {
             full: vec![FACTOR; 4],
             swa: Some(vec![1.0; 4]),
@@ -423,7 +422,7 @@ mod tests {
         cfg.head_dim = 8;
         cfg.rope_layout = RopeLayout::Norm;
         cfg.sliding_window = Some(4);
-        cfg.swa_pattern = Some(2);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
         cfg.rope_freqs = Some(RopeFreqs {
             full: vec![8.0; 4],
             swa: None,

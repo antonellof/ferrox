@@ -447,11 +447,11 @@ mod tests {
         cfg.n_kv_heads = 4;
         cfg.head_dim = 64;
         cfg.sliding_window = None;
-        cfg.swa_pattern = None;
+        cfg.swa_layers = crate::swa_layers::SwaLayers::All;
         let full = KvShape::from_config(&cfg, KvElem::F32);
 
         cfg.sliding_window = Some(512);
-        cfg.swa_pattern = Some(6);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(6, false);
         let windowed = KvShape::from_config(&cfg, KvElem::F32);
 
         assert_eq!(

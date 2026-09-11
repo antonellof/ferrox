@@ -42,8 +42,9 @@
 //! What it does NOT close, and says so: `nanbeige` rewrites the arrays
 //! to walk its physical layers more than once (`nanbeige.cpp:13-31`);
 //! `mimo2` and `step35` read per-layer heads AND something else
-//! (NEXTN layers and a per-layer window array, per-layer clamp
-//! arrays); `laguna` closed the day after, when its other thing (the
+//! (a V head width differing from K's; per-layer clamp arrays and a
+//! half-width rotary -- their window arrays and NextN blocks are
+//! `crate::swa_layers` and `crate::mtp_blocks` now); `laguna` closed the day after, when its other thing (the
 //! gated attention, `crate::attn_gate`) landed; the hybrid recurrent rows (`jamba`, `lfm2`, `nemotron-h`,
 //! `plamo2`, `granite-hybrid`, `kimi-linear`) use `n_head_kv(i) == 0`
 //! to mean "this layer is recurrent", a different graph entirely.
@@ -94,15 +95,17 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
     ),
     (
         "mimo2",
-        "NOT closed by this seam: mimo2.cpp:47-49,111-112 read heads per layer AND :12 reads \
-         a per-layer is_swa array, :19 NEXTN layers, :16,181 apply value_scale (the sinks \
-         at :58 are `AttnWeights::sinks` now)",
+        "NOT closed by this seam: mimo2.cpp:47-49,111-112 read heads per layer AND :47-48 \
+         size V from a width that differs from K's on every real export, :16,181 apply \
+         value_scale (the sinks at :58 are `AttnWeights::sinks`, the is_swa array at :12 is \
+         `crate::swa_layers` and the NEXTN blocks at :19 are `crate::mtp_blocks` now)",
     ),
     (
         "step35",
         "NOT closed by this seam: step35.cpp:76-78,208-209 read heads per layer AND :28-29 \
-         read per-layer clamp arrays, :26 a per-layer is_swa array (the gate at :96 is \
-         `crate::attn_gate` now)",
+         read per-layer clamp arrays, :9 halves the full layers' rotary width (the gate at \
+         :96 is `crate::attn_gate`, the is_swa array at :26 is `crate::swa_layers` and the \
+         NEXTN blocks at :32 are `crate::mtp_blocks` now)",
     ),
     (
         "nanbeige",
@@ -324,6 +327,31 @@ impl LayerShapes {
 /// `GgufValue::as_u64` returns `None` for an array, which is how
 /// `openelm` used to die on a missing-hparam error for a key its file
 /// carries; this is the read that sees both spellings.
+/// [`read_u64_per_layer`] for a file that may carry NextN/MTP blocks:
+/// the array is length-checked against `block_count`, which is what
+/// llama.cpp passes (`llama-model.cpp:1148-1156` read the three shape
+/// arrays with `hparams.n_layer()` BEFORE `load_arch_hparams` at `:1233`
+/// has read `nextn_predict_layers`, so `n_layer()` is still
+/// `n_layer_all`, and `conversion/mimo.py:146-150` writes the arrays at
+/// that length with the MTP entries appended), and only the trunk's
+/// entries are returned.
+///
+/// The loader reads every per-layer shape through this and never
+/// through the raw function, so a call site cannot hand the trunk count
+/// to the length check by mistake.
+pub fn read_u64_trunk_layers(
+    file: &impl TensorSource,
+    key: &str,
+    trunk: &crate::mtp_blocks::TrunkLayers,
+) -> Result<Option<Vec<u64>>, LoadError> {
+    Ok(
+        read_u64_per_layer(file, key, trunk.block_count)?.map(|mut v| {
+            v.truncate(trunk.n_layers);
+            v
+        }),
+    )
+}
+
 pub fn read_u64_per_layer(
     file: &impl TensorSource,
     key: &str,

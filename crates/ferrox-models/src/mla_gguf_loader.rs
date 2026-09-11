@@ -66,7 +66,11 @@ pub fn read_deepseek2_hparams(file: &impl TensorSource) -> Result<Deepseek2Hpara
         return Err(LoadError::UnsupportedArchitecture(arch));
     }
     let p = |suffix: &str| format!("{arch}.{suffix}");
-    let n_layer = meta_u64(file, &p("block_count"))? as usize;
+    // The trunk: `block_count` minus the NextN/MTP blocks llama.cpp
+    // never runs, decided once for every loader in `crate::mtp_blocks`.
+    let n_layer =
+        crate::mtp_blocks::trunk_layers(file, &arch, meta_u64(file, &p("block_count"))? as usize)?
+            .n_layers;
     let hidden_dim = meta_u64(file, &p("embedding_length"))? as usize;
     let ffn_dim = meta_u64(file, &p("feed_forward_length"))? as usize;
     let n_heads = meta_u64(file, &p("attention.head_count"))? as usize;
@@ -474,8 +478,13 @@ mod tests {
         buf
     }
 
-    #[test]
-    fn load_synthetic_deepseek2_dense_and_forward() {
+    /// The two-layer dense fixture, with `n_mtp_blocks` NextN/MTP blocks
+    /// declared after it: `block_count` counts them and
+    /// `nextn_predict_layers` names them, and NO tensor is written for
+    /// them -- llama.cpp's "trunk-only" split (`deepseek2.cpp:64-66`),
+    /// which is also exactly the file that would fail to load if the
+    /// blocks were treated as layers.
+    fn synthetic_dense_deepseek2(n_mtp_blocks: u64) -> Vec<u8> {
         let h = 16usize;
         let n_heads = 2usize;
         let q_lora = 8usize;
@@ -555,7 +564,8 @@ mod tests {
         }
 
         let kv = [
-            ("deepseek2.block_count", 2u64),
+            ("deepseek2.block_count", 2u64 + n_mtp_blocks),
+            ("deepseek2.nextn_predict_layers", n_mtp_blocks),
             ("deepseek2.embedding_length", h as u64),
             ("deepseek2.feed_forward_length", ffn as u64),
             ("deepseek2.attention.head_count", n_heads as u64),
@@ -571,19 +581,40 @@ mod tests {
             ("deepseek2.attention.layer_norm_rms_epsilon", 1e-5f32),
             ("deepseek2.rope.freq_base", 10000.0f32),
         ];
-        let bytes = build_gguf(arch, &kv, &fkv, &tensors);
+        build_gguf(arch, &kv, &fkv, &tensors)
+    }
+
+    fn load_and_forward(bytes: &[u8], tag: &str) -> MlaEngine {
         let path =
-            std::env::temp_dir().join(format!("ferrox_mla_gguf_{}.gguf", std::process::id()));
-        std::fs::write(&path, &bytes).unwrap();
+            std::env::temp_dir().join(format!("ferrox_mla_gguf_{tag}_{}.gguf", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
         let file = GgufFile::open(&path).unwrap();
         let engine = load_mla_engine(&file).expect("load mla");
-        assert_eq!(engine.layers.len(), 2);
-        assert_eq!(engine.vocab_size(), vocab);
         let mut state = engine.new_state();
         let logits = engine.forward_token(0, 0, &mut state);
-        assert_eq!(logits.len(), vocab);
+        assert_eq!(logits.len(), engine.vocab_size());
         assert!(logits.iter().all(|x| x.is_finite()));
         let _ = std::fs::remove_file(&path);
+        engine
+    }
+
+    #[test]
+    fn load_synthetic_deepseek2_dense_and_forward() {
+        let engine = load_and_forward(&synthetic_dense_deepseek2(0), "dense");
+        assert_eq!(engine.layers.len(), 2);
+        assert_eq!(engine.vocab_size(), 8);
+    }
+
+    /// A real DeepSeek-V3 / GLM-4.7-Flash export counts its MTP block
+    /// in `block_count` (`conversion/deepseek.py:457,498`). This loader
+    /// took `block_count` verbatim, so on such a file it would have
+    /// either run the block as a 62nd layer or, on a trunk-only split,
+    /// failed on its missing tensors. The trunk is what loads now, and
+    /// the block's absent tensors are not asked for.
+    #[test]
+    fn a_deepseek2_file_with_an_mtp_block_loads_only_its_trunk() {
+        let engine = load_and_forward(&synthetic_dense_deepseek2(1), "mtp");
+        assert_eq!(engine.layers.len(), 2, "block_count 3 minus one MTP block");
     }
 
     #[allow(clippy::too_many_arguments)] // test fixture: mirrors the MLA tensor shape set

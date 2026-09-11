@@ -10,7 +10,7 @@ fn main() {
     eprintln!(
         "swa={:?} pattern={:?} emb_scale={:?} rope={} rope_swa={:?} ffn={:?} qk={:?}",
         config.sliding_window,
-        config.swa_pattern,
+        config.swa_layers,
         config.embedding_scale,
         config.rope_theta,
         config.rope_theta_swa,

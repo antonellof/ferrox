@@ -341,9 +341,18 @@ impl ModelConfig {
                 .into_boxed_str(),
         );
 
-        let n_layers =
+        let block_count =
             file.metadata_u64(&key("block_count"))
                 .ok_or_else(|| LoadError::MissingHparam(key("block_count")))? as usize;
+        // llama.cpp's `n_layer()` is `block_count` MINUS the NextN/MTP
+        // blocks the converter appended inside it, for the graphs that
+        // read `nextn_predict_layers` (`crate::mtp_blocks`). `n_layers`
+        // is the trunk from here on; `block_count` is handed ONLY to the
+        // two things llama.cpp decides before it has read the key --
+        // `exaone4.cpp:4`'s layer-count gate and the per-layer array
+        // lengths -- and nowhere else.
+        let trunk = crate::mtp_blocks::trunk_layers(file, &arch, block_count)?;
+        let n_layers = trunk.n_layers;
         // Baichuan is one architecture string covering two positional
         // schemes: 7B rotates, 13B uses ALiBi and no RoPE at all
         // (`src/models/baichuan.cpp:11-14`, `:57-58`, where `inp_pos` is
@@ -383,16 +392,16 @@ impl ModelConfig {
         // below are the WIDEST layer's; `ModelConfig::layer_shape` is
         // what a layer body reads. See `crate::layer_shapes`.
         let heads_per_layer =
-            crate::layer_shapes::read_u64_per_layer(file, &key("attention.head_count"), n_layers)?
+            crate::layer_shapes::read_u64_trunk_layers(file, &key("attention.head_count"), &trunk)?
                 .ok_or_else(|| LoadError::MissingHparam(key("attention.head_count")))?;
         let n_heads = heads_per_layer.iter().copied().max().unwrap_or(0) as usize;
 
         let mut best_effort_fields: Vec<&'static str> = Vec::new();
 
-        let kv_heads_per_layer = match crate::layer_shapes::read_u64_per_layer(
+        let kv_heads_per_layer = match crate::layer_shapes::read_u64_trunk_layers(
             file,
             &key("attention.head_count_kv"),
-            n_layers,
+            &trunk,
         )? {
             Some(v) => v,
             None => {
@@ -535,7 +544,7 @@ impl ModelConfig {
         // `n_ff_exp = n_ff_exp ? n_ff_exp : n_ff / n_expert_used` (1408 for
         // Qwen1.5-MoE); the shared expert keeps the full `n_ff` (5632).
         let ffn_per_layer =
-            crate::layer_shapes::read_u64_per_layer(file, &key("feed_forward_length"), n_layers)?
+            crate::layer_shapes::read_u64_trunk_layers(file, &key("feed_forward_length"), &trunk)?
                 // Qwen-1 declares gate and up as one number; see
                 // `FFN_LENGTH_COUNTS_GATE_AND_UP`.
                 .map(|v| {
@@ -652,7 +661,12 @@ impl ModelConfig {
             // has to drop the window rather than pick a period, because
             // upstream is declining to use the file's value, not
             // choosing a different one.
-            .filter(|_| !crate::capability::swa_disabled_by_arch(&arch, n_layers));
+            //
+            // `block_count`, NOT `n_layers`: `exaone4.cpp:4` tests
+            // `n_layer() == 64` at a point where `n_layer_nextn` has not
+            // been read yet (`:18`), so a 64-trunk EXAONE-4 with an MTP
+            // block appended sees 65 there and gets no window.
+            .filter(|_| !crate::capability::swa_disabled_by_arch(&arch, trunk.block_count));
 
         // Three graphs rope their SLIDING layers with the scaling
         // switched off -- freq_scale = 1, ext_factor = 0, attn_factor =
@@ -691,57 +705,44 @@ impl ModelConfig {
             }
         }
 
-        // Gemma alternating SWA period (`attention.sliding_window_pattern`).
-        // llama.cpp: gemma2 defaults period=2, gemma3 defaults period=6 when
-        // the pattern key is absent. A missing key must NOT mean "all SWA".
+        // WHICH LAYERS SLIDE (`attention.sliding_window_pattern`).
         //
-        // The metadata key overrides the PERIOD only. The phase is a
-        // property of the architecture in llama.cpp -- `dense_first` is
-        // an argument to `set_swa_pattern`, not a GGUF key -- so it
-        // comes from the registry either way.
-        let swa_layout = crate::capability::default_swa_layout(&arch);
-        let swa_dense_first = swa_layout.is_some_and(|p| p.dense_first);
-        // llama.cpp reads this with `ml.get_key_or_arr`, so the value is
-        // a scalar period OR an n_layer-long per-layer array. ferrox
-        // carries one scalar `swa_pattern`, and `metadata_u64_any`
-        // simply returns `None` for an array -- which silently
-        // substituted `default_swa_layout`'s period for the layout the
-        // file actually declared. Present-but-unreadable is the case to
-        // refuse; presence alone is not, because the pattern itself is
-        // implemented (`ModelConfig::layer_sliding_window`, both
-        // phases). `capability::unsupported_feature_keys` used to refuse
-        // presence alone, and its comment says why that was wrong.
-        let swa_pattern_key = key("attention.sliding_window_pattern");
-        if file.metadata(&swa_pattern_key).is_some()
-            && metadata_u64_any(file, std::slice::from_ref(&swa_pattern_key)).is_none()
-        {
-            return Err(LoadError::UnsupportedFeature(
-                arch.clone(),
-                format!(
-                    "{swa_pattern_key} is not a scalar period; llama.cpp accepts a \
-                     per-layer array here (ml.get_key_or_arr) and ferrox carries one \
-                     period for the whole model, so honouring it would mean substituting \
-                     a different layout for the file's"
-                ),
-            ));
-        }
-        let swa_pattern = metadata_u64_any(file, &[swa_pattern_key])
-            .map(|v| v as usize)
-            .or_else(|| {
-                sliding_window?;
-                // llama.cpp hardcodes the period per architecture and
-                // only lets the metadata key override it, so a missing
-                // key is *not* "every layer windowed" -- see
-                // `capability::default_swa_layout`.
-                swa_layout.map(|p| p.period).or(
-                    // Any Gemma variant not named in the table keeps the
-                    // gemma3+ period rather than going uniform.
-                    match arch_profile.family {
-                        crate::capability::DecoderFamily::GemmaFamily => Some(6),
-                        _ => None,
-                    },
-                )
-            });
+        // llama.cpp seeds a period per architecture (gemma2 2, gemma3
+        // 6, exaone4 4, ...) and only then reads the key, so a missing
+        // key must NOT mean "all SWA": the seed is
+        // `capability::default_swa_layout`, with the gemma3+ period for
+        // any Gemma variant the table does not name. The phase is a
+        // property of the architecture -- `dense_first` is an argument
+        // to `set_swa_pattern`, not a GGUF key -- so it comes from the
+        // seed either way.
+        //
+        // The key itself is a scalar period OR a per-layer bool array,
+        // and which of the two an architecture's graph honours -- and
+        // what it does with the other -- is `crate::swa_layers`'s
+        // table, transcribed from the `get_key_or_arr` overload each
+        // `load_arch_hparams` calls. The array used to be REFUSED here
+        // for every architecture, which stopped every real EXAONE-4
+        // 32B, EXAONE-MoE and Olmo-3 export at the door over a value
+        // llama.cpp never reads for them.
+        let swa_seed = crate::capability::default_swa_layout(&arch).or(match arch_profile.family {
+            crate::capability::DecoderFamily::GemmaFamily => Some(crate::capability::SwaPattern {
+                period: 6,
+                dense_first: false,
+            }),
+            _ => None,
+        });
+        let swa_layers = match sliding_window {
+            // No window: no graph consults `is_swa`, and reading the
+            // key would only refuse a file over a value nothing uses.
+            None => crate::swa_layers::SwaLayers::All,
+            Some(_) => crate::swa_layers::read_swa_layers(
+                file,
+                &arch,
+                &key("attention.sliding_window_pattern"),
+                &trunk,
+                swa_seed,
+            )?,
+        };
 
         // The metadata-declared scalar multipliers, resolved once for
         // whichever subset this architecture's reference graph applies.
@@ -1146,6 +1147,7 @@ impl ModelConfig {
         Ok(ModelConfig {
             name,
             n_layers,
+            n_mtp_blocks: trunk.n_mtp_blocks,
             hidden_dim,
             n_heads,
             n_kv_heads,
@@ -1158,8 +1160,7 @@ impl ModelConfig {
             // runs the standard Gqa path.
             attention: crate::config::AttentionKind::Gqa,
             sliding_window,
-            swa_pattern,
-            swa_dense_first,
+            swa_layers,
             // llama.cpp's per-layer `use_rope`. Fed the POST-gate window
             // answer (`sliding_window`, not the raw key), because
             // `exaone4` decides both off the same layer count and the
@@ -2681,6 +2682,28 @@ impl Decoder {
         // `rope_freqs.weight` it in fact uses on every RoPE call.
         for name in crate::config::MODEL_LEVEL_TENSORS_READ_BY_CONFIG {
             file.note_consumed(name);
+        }
+        // The NextN/MTP blocks llama.cpp creates `TENSOR_SKIP` and never
+        // runs (`crate::mtp_blocks`): deliberately unread, and said so,
+        // rather than left for the gate below to report as a term the
+        // graph is missing. The range is the config's, so the layer
+        // loop above and this mark cannot disagree about where the
+        // trunk ends.
+        let skipped = crate::mtp_blocks::note_mtp_blocks_skipped(
+            &file,
+            &crate::mtp_blocks::TrunkLayers {
+                block_count: decoder.config.n_layers + decoder.config.n_mtp_blocks,
+                n_layers: decoder.config.n_layers,
+                n_mtp_blocks: decoder.config.n_mtp_blocks,
+            },
+        );
+        if skipped > 0 {
+            eprintln!(
+                "ferrox: skipping {} NextN/MTP block(s) after layer {} ({skipped} tensors), as \
+                 llama.cpp does",
+                decoder.config.n_mtp_blocks,
+                decoder.config.n_layers - 1
+            );
         }
         assert_every_tensor_consumed(&file)?;
         Ok(decoder)
@@ -4533,37 +4556,31 @@ mod tests {
         }
     }
 
-    /// A per-layer sliding-window pattern is refused, and a scalar one
-    /// still loads.
+    /// A per-layer sliding-window ARRAY on an architecture whose graph
+    /// reads the key as a scalar is IGNORED and the seeded period
+    /// stands, exactly as llama.cpp does; a scalar still overrides the
+    /// period.
     ///
-    /// Both halves matter. `capability::unsupported_feature_keys` used
-    /// to refuse the key outright with the reason "not implemented in
-    /// the generic decoder", which was false -- the alternating pattern
-    /// is `ModelConfig::layer_sliding_window`, both phases, and
-    /// `gpt-oss` has run on it since it was audited. What that gate
-    /// really did was make the loader's own read of the key dead for
-    /// every non-Gemma architecture. The case ferrox genuinely cannot
-    /// express is the ARRAY, which `metadata_u64_any` reads as `None`
-    /// and which therefore used to fall through to
-    /// `default_swa_layout` -- substituting the architecture's
-    /// hardcoded layout for the file's, silently.
+    /// Three generations of this gate. `capability::
+    /// unsupported_feature_keys` refused the key outright with the
+    /// reason "not implemented in the generic decoder", which was
+    /// false. Then the loader refused the ARRAY form for every
+    /// architecture, on the reasoning that honouring it as a period was
+    /// impossible and ignoring it would substitute the seed for the
+    /// file's layout -- which is TRUE and is ALSO what llama.cpp does:
+    /// `get_key_or_arr(kid, swa_period, false)` returns false on an
+    /// array (`llama-model-loader.cpp:502-507`) and `plamo3.cpp:9-11`
+    /// keeps its 8. Every real EXAONE-4 32B, EXAONE-MoE and Olmo-3
+    /// export carries the array (`conversion/exaone.py:84`,
+    /// `olmo.py:59-66`) and was refused over a value upstream never
+    /// reads. `crate::swa_layers` carries which graphs read which form;
+    /// the array-HONOURED mode has its own fixture in
+    /// `tests/window_array_graphs.rs`.
     #[test]
-    fn an_array_valued_sliding_window_pattern_is_refused_rather_than_substituted() {
-        // llama.cpp reads this key with `ml.get_key_or_arr`, so a file
-        // may declare a per-layer array instead of a scalar period.
-        // ferrox carries ONE period for the whole model and
-        // `metadata_u64_any` returns `None` for an array, so before this
-        // gate the loader fell through to `default_swa_layout` and ran
-        // the architecture's hardcoded layout in place of the file's --
-        // silently, which is the failure this repo keeps finding.
-        //
-        // `capability::unsupported_feature_keys` used to refuse the key
-        // outright, which stopped this AND stopped every legitimate
-        // scalar. Now presence is fine and unreadability is not, so
-        // both halves have to be tested: the scalar case is the plamo3
-        // fixture in `tests/fixture_away_graphs.rs`, and this is the
-        // array case.
-        let pattern: [u32; 4] = [1, 0, 1, 0];
+    fn an_array_valued_sliding_window_pattern_is_ignored_where_llama_cpp_ignores_it() {
+        // Disagrees with plamo3's seeded last-dense 8 on layers 0..3,
+        // so honouring it would be visible.
+        let pattern: [u32; 4] = [0, 0, 0, 0];
         let kvs: Vec<(&str, Kv)> = vec![
             ("general.architecture", Kv::Str("plamo3")),
             ("plamo3.block_count", Kv::U32(4)),
@@ -4579,25 +4596,25 @@ mod tests {
             ),
         ];
         let file = open_metadata_gguf("swa_pattern_array", &kvs);
-        match ModelConfig::from_gguf(&file) {
-            Err(LoadError::UnsupportedFeature(arch, msg)) => {
-                assert_eq!(arch, "plamo3");
-                assert!(
-                    msg.contains("not a scalar period"),
-                    "the refusal must name what is wrong with the value: {msg}"
-                );
-            }
-            other => panic!("an array-valued SWA pattern must refuse, got {other:?}"),
-        }
+        let config = ModelConfig::from_gguf(&file).expect("the array is not a refusal");
+        assert_eq!(
+            config.swa_layers,
+            crate::swa_layers::SwaLayers::period(8, false),
+            "plamo3.cpp:9-11 seeds 8 and the scalar overload ignores an array"
+        );
+        assert_eq!(config.layer_sliding_window(0), Some(3));
+        assert_eq!(config.layer_sliding_window(3), Some(3));
 
-        // And the scalar spelling of the same key still loads, or the
-        // gate would be refusing the feature rather than the shape.
+        // And the scalar spelling of the same key overrides the seed.
         let mut scalar = kvs;
         scalar.pop();
         scalar.push(("plamo3.attention.sliding_window_pattern", Kv::U32(2)));
         let file = open_metadata_gguf("swa_pattern_scalar", &scalar);
         let config = ModelConfig::from_gguf(&file).expect("a scalar period must load");
-        assert_eq!(config.swa_pattern, Some(2));
+        assert_eq!(
+            config.swa_layers,
+            crate::swa_layers::SwaLayers::period(2, false)
+        );
         assert_eq!(config.layer_sliding_window(0), Some(3));
         assert_eq!(config.layer_sliding_window(1), None);
     }
@@ -4774,8 +4791,11 @@ mod tests {
         let file = open_metadata_gguf("exaone4_32b", &base(64));
         let cfg = ModelConfig::from_gguf(&file).expect("EXAONE-4 32B loads");
         assert_eq!(cfg.sliding_window, Some(4096));
-        assert_eq!(cfg.swa_pattern, Some(4), "exaone4.cpp:7-9");
-        assert!(!cfg.swa_dense_first, "set_swa_pattern's default phase");
+        assert_eq!(
+            cfg.swa_layers,
+            crate::swa_layers::SwaLayers::period(4, false),
+            "exaone4.cpp:7-9, and set_swa_pattern's default phase"
+        );
         for il in 0..64 {
             assert_eq!(
                 cfg.layer_rotates(il),
@@ -4796,35 +4816,76 @@ mod tests {
         }
     }
 
-    /// NextN/MTP layers are inside `block_count` and llama.cpp skips
-    /// them (`n_layer = n_layer_all - n_layer_nextn`); ferrox's
-    /// `n_layers` IS `block_count`, so it would run the speculative
-    /// head as two more decoder layers. Refused on the VALUE, because
-    /// `conversion/exaone.py:146` writes the key as `0` for every
-    /// EXAONE-MoE export that has no MTP head -- a presence gate would
-    /// refuse them all, and a gate nobody can pass is not a gate.
+    /// NextN/MTP blocks are inside `block_count` and llama.cpp skips
+    /// them (`n_layer = n_layer_all - n_layer_nextn`, llama-hparams.cpp
+    /// :280-282). For a graph that reads the key (`exaone-moe.cpp:23`)
+    /// the trunk is what loads; the key is written as `0` by
+    /// `conversion/exaone.py:146` for every EXAONE-MoE export without an
+    /// MTP head, so zero must be the whole file. A nonzero value on a
+    /// graph that does NOT read the key stays refused
+    /// (`mtp_blocks::tests`).
+    ///
+    /// The second half pins the ORDER of two reads in `exaone4.cpp`:
+    /// `:4` tests `n_layer() == 64` before `:18` reads the key, so it
+    /// sees `block_count`. A 64-trunk file with one MTP block appended
+    /// is 65 there and gets NO window in llama.cpp; ferrox feeds
+    /// `block_count` to the same gate and gets the same answer.
     #[test]
-    fn a_nonzero_nextn_predict_layers_is_refused_and_zero_is_not() {
+    fn nextn_predict_layers_subtracts_the_trunk_for_a_reader_and_zero_is_the_whole_file() {
         let base = |nextn: u32| -> Vec<(&str, Kv)> {
             vec![
                 ("general.architecture", Kv::Str("exaone-moe")),
-                ("exaone-moe.block_count", Kv::U32(4)),
+                ("exaone-moe.block_count", Kv::U32(5)),
                 ("exaone-moe.nextn_predict_layers", Kv::U32(nextn)),
+                ("exaone-moe.embedding_length", Kv::U32(32)),
+                ("exaone-moe.attention.head_count", Kv::U32(4)),
+                ("exaone-moe.attention.head_count_kv", Kv::U32(2)),
+                ("exaone-moe.attention.key_length", Kv::U32(8)),
+                ("exaone-moe.attention.value_length", Kv::U32(8)),
+                ("exaone-moe.rope.freq_base", Kv::F32(10_000.0)),
+                ("exaone-moe.attention.sliding_window", Kv::U32(128)),
+                ("exaone-moe.expert_count", Kv::U32(4)),
+                ("exaone-moe.expert_used_count", Kv::U32(2)),
+                ("exaone-moe.expert_gating_func", Kv::U32(2)),
             ]
         };
-        match ModelConfig::from_gguf(&open_metadata_gguf("exaone_moe_mtp", &base(1))) {
-            Err(LoadError::UnsupportedFeature(arch, msg)) => {
-                assert_eq!(arch, "exaone-moe");
-                assert!(msg.contains("NextN"), "{msg}");
-            }
-            other => panic!("a file with an MTP head must refuse, got {other:?}"),
-        }
-        // Zero passes the gate and fails on the next missing hparam,
-        // which is what a real converter-written file would do here.
-        match ModelConfig::from_gguf(&open_metadata_gguf("exaone_moe_no_mtp", &base(0))) {
-            Err(LoadError::MissingHparam(key)) => assert_eq!(key, "exaone-moe.embedding_length"),
-            other => panic!("nextn_predict_layers = 0 must pass, got {other:?}"),
-        }
+        let cfg = ModelConfig::from_gguf(&open_metadata_gguf("exaone_moe_mtp", &base(1)))
+            .expect("a reader with an MTP block loads its trunk");
+        assert_eq!((cfg.n_layers, cfg.n_mtp_blocks), (4, 1));
+        let cfg = ModelConfig::from_gguf(&open_metadata_gguf("exaone_moe_no_mtp", &base(0)))
+            .expect("zero is the whole file");
+        assert_eq!((cfg.n_layers, cfg.n_mtp_blocks), (5, 0));
+
+        // `exaone4.cpp:4` before `:18`: 64 trunk layers plus one MTP
+        // block is NOT the 32B to llama.cpp.
+        let exaone4 = |block_count: u32, nextn: u32| -> Vec<(&str, Kv)> {
+            vec![
+                ("general.architecture", Kv::Str("exaone4")),
+                ("exaone4.block_count", Kv::U32(block_count)),
+                ("exaone4.nextn_predict_layers", Kv::U32(nextn)),
+                ("exaone4.embedding_length", Kv::U32(32)),
+                ("exaone4.attention.head_count", Kv::U32(4)),
+                ("exaone4.attention.head_count_kv", Kv::U32(2)),
+                ("exaone4.attention.key_length", Kv::U32(8)),
+                ("exaone4.attention.value_length", Kv::U32(8)),
+                ("exaone4.rope.freq_base", Kv::F32(10_000.0)),
+                ("exaone4.attention.sliding_window", Kv::U32(4096)),
+            ]
+        };
+        let with_mtp =
+            ModelConfig::from_gguf(&open_metadata_gguf("exaone4_65", &exaone4(65, 1))).unwrap();
+        assert_eq!((with_mtp.n_layers, with_mtp.n_mtp_blocks), (64, 1));
+        assert_eq!(
+            with_mtp.sliding_window, None,
+            "exaone4.cpp:4 sees n_layer_all = 65 and never reaches set_swa_pattern"
+        );
+        let without =
+            ModelConfig::from_gguf(&open_metadata_gguf("exaone4_64", &exaone4(64, 0))).unwrap();
+        assert_eq!(
+            without.sliding_window,
+            Some(4096),
+            "the same trunk without the block is the 32B"
+        );
     }
 
     /// An `olmo2` file carrying BOTH a sliding window and a RoPE
@@ -4884,7 +4945,10 @@ mod tests {
         assert_eq!(config.sliding_window, Some(3));
         // olmo2.cpp:9-11: the period defaults to 4 and `set_swa_pattern`
         // leaves `dense_first` false.
-        assert_eq!(config.swa_pattern, Some(4));
+        assert_eq!(
+            config.swa_layers,
+            crate::swa_layers::SwaLayers::period(4, false)
+        );
 
         // Scaling with no window: one RoPE for the whole model, which is
         // what ferrox carries.

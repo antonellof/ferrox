@@ -12,22 +12,22 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-11. **44** architectures run with
+Honest position, re-audited 2026-09-11. **45** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 13 unaudited refusals are now TRIAGED, and the refusal says which of
+The 12 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 12 need new code, 1 is unknown with the question stated. Five
+away**, 11 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
-`openelm`, `afmoe` and `laguna` on 2026-09-11, each with a
+`openelm`, `afmoe`, `laguna` and `mellum` on 2026-09-11, each with a
 libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
-to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13; the step from 28 to 25
+to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12; the step from 28 to 25
 was moving the three alias rows off
 the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
@@ -40,8 +40,8 @@ refusing is one fixture or one arm away, so every row that is left
 needs a different graph.
 
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
-times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 four times
-more, 20 to 19, 19 to 17, 17 to 14 and 14 to 12. The first two took several rows
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 five times
+more, 20 to 19, 19 to 17, 17 to 14, 14 to 12 and 12 to 11. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -58,7 +58,77 @@ is the sixth's lesson applied to the sixth's leftovers: the shape seam
 had narrowed `afmoe`, `laguna` and `step35` to the same last word,
 `wqkv_gate`, and reading the three graphs SIDE BY SIDE before calling
 them one cause found one op with two free parameters rather than one
-graph -- two rows closed on it, the third says so.
+graph -- two rows closed on it, the third says so. The eighth is the
+lesson with its count hidden the other way round: the per-layer window
+ARRAY was named by THREE places (`mimo2`, `step35`, and #193's report
+on EXAONE) and moved the column by ONE, because the row it closed
+(`mellum`) was none of the three -- it is the only generic-path graph
+that HONOURS the array -- while the three it was aimed at were either
+over-refused on a value llama.cpp ignores (lifted, with a fixture that
+measures the ignoring) or still need something the seam does not touch.
+Reading `get_key_or_arr`'s two overloads before assuming "an array is
+per-layer truth" is what found that: for fifteen graphs it is dead
+metadata, and honouring it would have been wrong on every real EXAONE
+and Olmo-3 file.
+
+`mellum` closed on `ferrox-models/src/swa_layers.rs`, and the
+EXAONE-4 32B / EXAONE-MoE / Olmo-3 over-refusal lifted with it. llama.cpp
+reads `attention.sliding_window_pattern` with `get_key_or_arr`, which
+is THREE behaviours: the scalar overload with `required = false`
+returns false on an array and the seeded period stands
+(`llama-model-loader.cpp:502-507`; `exaone4.cpp:8`, `exaone-moe.cpp:7`,
+`olmo2.cpp:10`, fifteen graphs -- measured), the array overload takes
+the array at `n_layer()` length and BROADCASTS a scalar as a bool
+(`:474-478`; `mimo2.cpp:12`, `step35.cpp:26`, `gemma4.cpp:5`,
+`dflash.cpp:69`), and `mellum.cpp:12-17` / `cohere2moe.cpp:32-36` try
+the first then the second. `SwaLayers` is one enum (`All`, `Period`,
+`PerLayer`) replacing the two fields (`swa_pattern`, `swa_dense_first`)
+behind the ONE accessor every backend already asked,
+`ModelConfig::layer_sliding_window(il)`; the fused Metal stacks ask per
+layer, so this was the sixth thing looked for in them and the first not
+found. Two fixtures carry the EXAONE array (`conversion/exaone.py:84`
+writes it for every 32B and MoE export), one agreeing with the seeded
+period and one INVERTED, and libllama's logits are byte-identical for
+both and for the base -- that is the measurement that ignoring is
+upstream's answer -- KL 1.43e-14. `mellum`'s fixture array disagrees
+with the seed on two layers and libllama honours it (`is_swa =
+1, 1, 0, 1`), KL 1.02e-14; its window-with-YaRN half, which every real
+Mellum2 declares, stays refused by name in `swa_geometry`.
+
+`ferrox-models/src/mtp_blocks.rs` landed beside it, because `mimo2`,
+`step35` and the same EXAONE report named the NextN blocks too.
+`llama-model.cpp:1092` reads `block_count` into `n_layer_all`,
+`llama-hparams.cpp:280-282` defines `n_layer()` as `n_layer_all -
+n_layer_nextn`, `llama-graph.cpp:1433` builds every graph over
+`n_layer()`, and each tensor loader creates the trailing blocks
+`TENSOR_SKIP` (`exaone-moe.cpp:52-57`, `mimo2.cpp:51-52`). Only the
+SEVENTEEN graphs that read `nextn_predict_layers` subtract (`grep -l`
+over all 140, `NEXTN_READERS`); a nonzero key on any other stays
+refused, where upstream would run every block and then fail on the
+unread `nextn.*` tensors. `ModelConfig::n_layers` is the trunk and
+`n_mtp_blocks` the rest, the skipped tensors are marked deliberately
+unread so `assert_every_tensor_consumed` can tell "skipped as llama.cpp
+does" from "missing", and two orderings were copied rather than tidied:
+`exaone4.cpp:4` tests `n_layer() == 64` BEFORE `:18` reads the key, so
+a 64-trunk EXAONE-4 with a block appended gets NO window there and gets
+none here (pinned), and the per-layer shape arrays are read at
+`block_count` length because `llama-model.cpp:1148-1156` run before
+`load_arch_hparams`. The defect it found is in the dedicated engines,
+which the task said to check: the GLM (`glm4moe`, `glm-dsa`, `glm4`),
+MLA (`deepseek2`) and hybrid (`qwen3next`, `qwen35`, `qwen35moe`)
+loaders took `block_count` verbatim while every one of those graphs
+subtracts upstream and their converters append the block inside
+`block_count` (`glm.py:99`, `deepseek.py:457`), so a real GLM-4.5 or
+DeepSeek-V3 export would have run its MTP block as one more decoder
+layer with the `nextn.*` tensors silently unread. All four dedicated
+loaders take the trunk from `trunk_layers` now, and the MLA loader has
+a trunk-only fixture that fails without it. K-EXAONE's real shape --
+one block, the array at trunk length -- has a fixture, KL 1.09e-14.
+`mimo2` still refuses, and its verdict leads with what no seam touches:
+MiMo-V2-Flash is `head_dim: 192, v_head_dim: 128`, a V width that
+differs from K's, which every KV cache and attention kernel here takes
+as one number. `step35` leads with its clamp arrays and its half-width
+rotary on the full layers.
 
 `afmoe` and `laguna` are ONE seam, `ferrox-models/src/attn_gate.rs`.
 llama.cpp's `LLM_TENSOR_ATTN_GATE` is created by six of the 140 graphs
@@ -106,7 +176,8 @@ Laguna-XS.2 has both. `mimo2`'s sinks moved off the gpt-oss NAME onto
 the TENSOR (`AttnWeights::sinks`; four graphs pass it into the one
 `build_attn_mha`) without closing the row, because every real MiMo-V2
 export carries three MTP blocks inside `block_count` and a per-layer
-window ARRAY; its verdict leads with those now.
+window ARRAY; both are seams now (below) and its verdict leads with its
+split K/V head width.
 
 `deci` and `openelm` are ONE seam, `ferrox-models/src/layer_shapes.rs`.
 llama.cpp reads `head_count`, `head_count_kv` and `feed_forward_length`

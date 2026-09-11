@@ -164,7 +164,16 @@ impl RopeLayout {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub name: &'static str,
+    /// Decoder layers: llama.cpp's `n_layer()`, which is the file's
+    /// `block_count` MINUS [`Self::n_mtp_blocks`].
     pub n_layers: usize,
+    /// NextN / MTP blocks the file appends after the trunk, inside its
+    /// `block_count`, which llama.cpp creates `TENSOR_SKIP` and never
+    /// runs (`crate::mtp_blocks`). Their tensors are `blk.N.*` for
+    /// `n_layers <= N < n_layers + n_mtp_blocks`; the loader marks them
+    /// deliberately unread. Zero for every architecture whose graph
+    /// does not read `nextn_predict_layers`.
+    pub n_mtp_blocks: usize,
     pub hidden_dim: usize,
     /// Query heads of the WIDEST layer. Every layer's for a uniform
     /// model, which is every model but the per-layer-shape ones
@@ -269,23 +278,18 @@ pub struct ModelConfig {
     /// How Q/K RMSNorm weights are applied when present (see
     /// [`crate::capability::QkNormStyle`]).
     pub qk_norm_style: crate::capability::QkNormStyle,
-    /// Alternating SWA period, llama.cpp's `set_swa_pattern` argument.
+    /// WHICH LAYERS SLIDE -- llama.cpp's `is_swa_impl[il]`, as a
+    /// period with a phase, the file's own per-layer array, or every
+    /// layer. See [`crate::swa_layers`]. Meaningless without
+    /// [`Self::sliding_window`]; [`Self::layer_sliding_window`] is the
+    /// one accessor that combines the two.
     ///
-    /// `Some(0)` windows every layer and `Some(1)` windows none, which
-    /// are llama.cpp's two degenerate spellings and are NOT the same as
-    /// `None` (no period known, so every layer windows). Any larger `p`
-    /// alternates, with the phase in [`Self::swa_dense_first`].
-    pub swa_pattern: Option<usize>,
-    /// llama.cpp's `dense_first` argument to `set_swa_pattern`, which
-    /// decides WHICH layer of each period is the full-attention one.
-    ///
-    /// `false` puts it last (`il % p == p - 1`), `true` puts it first
-    /// (`il % p == 0`). Getting this wrong is not a near miss: on a
-    /// 32-layer period-4 model the two phases disagree about SIXTEEN
-    /// layers, each of which then attends over the wrong span at full
-    /// speed. `capability::default_swa_layout` carries the per-arch
-    /// value, transcribed from llama.cpp.
-    pub swa_dense_first: bool,
+    /// Getting the phase wrong is not a near miss: on a 32-layer
+    /// period-4 model the two phases disagree about SIXTEEN layers,
+    /// each of which then attends over the wrong span at full speed.
+    /// `capability::default_swa_layout` carries the per-arch value,
+    /// transcribed from llama.cpp.
+    pub swa_layers: crate::swa_layers::SwaLayers,
     /// WHICH LAYERS ROTATE -- llama.cpp's per-layer `use_rope`.
     ///
     /// [`crate::rope_layers::RopeLayers::All`] for every architecture
@@ -516,23 +520,11 @@ impl ModelConfig {
     /// Sliding-window size for layer `il`, honouring Gemma-style
     /// alternating SWA patterns. `None` means full causal attention.
     pub fn layer_sliding_window(&self, layer_idx: usize) -> Option<usize> {
+        // llama.cpp's `is_swa(il)`, which `set_swa_pattern`
+        // (`src/llama-hparams.cpp:8-22`) or the file's own array fills
+        // in; `crate::swa_layers` is the one implementation of both.
         let window = self.sliding_window?;
-        // llama.cpp `llama_hparams::set_swa_pattern`
-        // (`src/llama-hparams.cpp:8-22`), both phases:
-        //
-        //   dense_first: is_swa = n_pattern == 0 || (il % n_pattern != 0)
-        //   otherwise:   is_swa = n_pattern == 0 || (il % n_pattern < n_pattern - 1)
-        //
-        // `period == 1` therefore windows NOTHING under either phase,
-        // which is the opposite of `None`. It used to be filtered out
-        // before it reached here and fell back to "every layer", which
-        // is exactly inverted.
-        let sliding = match self.swa_pattern {
-            None | Some(0) => true,
-            Some(period) if self.swa_dense_first => !layer_idx.is_multiple_of(period),
-            Some(period) => layer_idx % period < period - 1,
-        };
-        sliding.then_some(window)
+        self.swa_layers.slides(layer_idx).then_some(window)
     }
 
     /// The narrowest sliding window any layer of this model uses, or
@@ -719,6 +711,7 @@ pub fn glm_5_2() -> ModelConfig {
         name: "glm-5.2",
         attention: AttentionKind::Gqa,
         n_layers: 92,
+        n_mtp_blocks: 0,
         hidden_dim: 6144,
         n_heads: 48,
         n_kv_heads: 8,
@@ -759,8 +752,7 @@ pub fn glm_5_2() -> ModelConfig {
         // via `glm_dsa`/`mla`, not this preset's Decoder path.
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
         rope_layers: crate::rope_layers::RopeLayers::All,
         layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
@@ -797,6 +789,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         name: "deepseek-v4-pro",
         attention: AttentionKind::Gqa,
         n_layers: 96,
+        n_mtp_blocks: 0,
         hidden_dim: 7168,
         n_heads: 56,
         n_kv_heads: 8,
@@ -843,8 +836,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         // llama.cpp maps LLM_ARCH_DEEPSEEK4 -> LLAMA_ROPE_TYPE_NORM.
         rope_layout: RopeLayout::Norm,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
         rope_layers: crate::rope_layers::RopeLayers::All,
         layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
@@ -879,6 +871,7 @@ pub fn kimi_k3() -> ModelConfig {
         sliding_window: None,
         name: "kimi-k3",
         n_layers: 93,
+        n_mtp_blocks: 0,
         hidden_dim: 7168,
         // n_heads/n_kv_heads/head_dim describe the Gqa fallback
         // Decoder actually runs today, not Kimi K3's real attention
@@ -959,8 +952,7 @@ pub fn kimi_k3() -> ModelConfig {
         // or KDA and never reaches Decoder::apply_rope_head.
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
         rope_layers: crate::rope_layers::RopeLayers::All,
         layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
@@ -992,6 +984,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         name: "ferrox-test-dense",
         attention: AttentionKind::Gqa,
         n_layers: 2,
+        n_mtp_blocks: 0,
         hidden_dim: 32,
         n_heads: 4,
         n_kv_heads: 2,
@@ -1021,8 +1014,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         // Matches the independent reference's split-half apply_rope.
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
         rope_layers: crate::rope_layers::RopeLayers::All,
         layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
@@ -1050,6 +1042,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         name: "ferrox-test-moe",
         attention: AttentionKind::Gqa,
         n_layers: 2,
+        n_mtp_blocks: 0,
         hidden_dim: 32,
         n_heads: 4,
         n_kv_heads: 2,
@@ -1078,8 +1071,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         rope_orig_ctx: None,
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
         rope_layers: crate::rope_layers::RopeLayers::All,
         layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
@@ -1110,6 +1102,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         name: "ferrox-test-mixed",
         attention: AttentionKind::Gqa,
         n_layers: 3,
+        n_mtp_blocks: 0,
         hidden_dim: 32,
         n_heads: 4,
         n_kv_heads: 2,
@@ -1138,8 +1131,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         rope_orig_ctx: None,
         rope_layout: RopeLayout::Neox,
         qk_norm_style: crate::capability::QkNormStyle::WholeVector,
-        swa_pattern: None,
-        swa_dense_first: false,
+        swa_layers: crate::swa_layers::SwaLayers::All,
         rope_layers: crate::rope_layers::RopeLayers::All,
         layer_shapes: crate::layer_shapes::LayerShapes::Uniform,
         attn_logit_softcap: None,
@@ -1202,7 +1194,7 @@ mod tests {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 24;
         cfg.sliding_window = Some(128);
-        cfg.swa_pattern = Some(2);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
 
         // Half the layers are full-attention, but the model is still
         // constrained: one mis-aligned sliding layer is enough.
@@ -1224,7 +1216,7 @@ mod tests {
         let mut cfg = test_dense_fixture();
         cfg.n_layers = 30;
         cfg.sliding_window = Some(512);
-        cfg.swa_pattern = Some(6);
+        cfg.swa_layers = crate::swa_layers::SwaLayers::period(6, false);
         assert!(
             cfg.layer_sliding_window(5).is_none(),
             "every 6th layer is full-attention"
@@ -1249,7 +1241,7 @@ mod tests {
         let mut alternating = test_dense_fixture();
         alternating.n_layers = 24;
         alternating.sliding_window = Some(128);
-        alternating.swa_pattern = Some(2);
+        alternating.swa_layers = crate::swa_layers::SwaLayers::period(2, false);
         assert_eq!(alternating.kv_block_window(), Some(128));
         assert_eq!(
             alternating.uniform_sliding_window(),
@@ -1260,7 +1252,7 @@ mod tests {
         let mut uniform = test_dense_fixture();
         uniform.n_layers = 24;
         uniform.sliding_window = Some(128);
-        uniform.swa_pattern = None;
+        uniform.swa_layers = crate::swa_layers::SwaLayers::All;
         assert_eq!(uniform.uniform_sliding_window(), Some(128));
 
         // `Some(0)` is llama.cpp's spelling of "every layer slides"
@@ -1269,11 +1261,11 @@ mod tests {
         // used to assert the two were the same, which is how the
         // inversion stayed invisible.
         let mut period_zero = uniform.clone();
-        period_zero.swa_pattern = Some(0);
+        period_zero.swa_layers = crate::swa_layers::SwaLayers::period(0, false);
         assert_eq!(period_zero.uniform_sliding_window(), Some(128));
 
         let mut period_one = uniform.clone();
-        period_one.swa_pattern = Some(1);
+        period_one.swa_layers = crate::swa_layers::SwaLayers::period(1, false);
         assert_eq!(
             period_one.uniform_sliding_window(),
             None,
@@ -1290,7 +1282,7 @@ mod tests {
     fn a_full_causal_model_keeps_the_block_size_it_was_given() {
         let mut cfg = test_dense_fixture();
         cfg.sliding_window = None;
-        cfg.swa_pattern = None;
+        cfg.swa_layers = crate::swa_layers::SwaLayers::All;
         assert_eq!(cfg.kv_block_window(), None);
         let layout = cfg.kv_block_layout(48);
         assert_eq!(layout.block_size(), 48);
