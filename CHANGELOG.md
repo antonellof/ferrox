@@ -13,9 +13,55 @@ Entries name what changed and, where it matters, what was wrong
 before. A fix that closed a silent-wrong-answer class says so — those
 are the ones worth reading twice.
 
-## [Unreleased]
+## [0.20.0] - 2026-09-11
 
 ### Fixed
+
+- **The tokenizer disagreed with llama.cpp on text that mentions special
+  tokens** (#198). Silent-wrong-answer class. Two bugs, not one. A
+  heuristic added for one checkpoint's `<|im_end|>` promoted ANY
+  angle-bracket-shaped vocabulary entry to special, sweeping in `<s>`,
+  `</s>`, `<unk>` and `<?>`; in Qwen2.5's file `<s>` is a plain token
+  and llama.cpp never treats it as special under any setting. Removed.
+  And llama.cpp's common tokenize path defaults to NOT parsing special
+  tokens in text, while ferrox behaved as if it always did. Every
+  `encode` now takes an explicit `SpecialTokens::{AsText, Parse}`, so a
+  caller cannot avoid choosing, and each caller sits where llama.cpp's
+  own source puts it, cited line by line. The oracle was strengthened
+  first: the golden dumper writes every case under both settings, two
+  new cases contain markers as prose, and they were confirmed RED on
+  main before the fix. After it, all 20 local checkpoints match a
+  current libllama across 21 cases and both settings.
+
+- **Metal decode was thread-affine, and the pool gate is now relaxed
+  for it** (#184, closing #166). A thread-local configuration flag was
+  read on whichever thread ran the step. It is carried across the pool
+  explicitly now: `Carry` destructures itself exhaustively with no `..`,
+  so a setting added later and not carried fails to compile. CUDA and
+  Vulkan still decline, stated as a verdict with the reason.
+
+- **Evicting behind a sliding window leaked pool blocks** (#189). The
+  shrink made `push` compare rows against a capacity that had moved, so
+  a pool-backed cache drew a fresh block every `slack + 1` tokens forever
+  and exhausted a pool where `push` is documented infallible. Reachable
+  with `FERROX_KV_POOL_BLOCKS` and `FERROX_KV_WINDOW` together; the
+  existing pool test never reached the shrink.
+
+- **Gemma 4 tool calls fell through to the Llama 3 parser** (#190).
+  Format inference tested the literal string `gemma4` while the
+  checkpoint calls itself `Gemma-4-E2B-It`, so the arm had NEVER fired.
+  Widened, with the earlier Gemmas asserted still not to match.
+
+- **The Gemma family was exempted from four scaling keys it does not
+  read** (#186), so a hand-written `gemma3.residual_scale` would have
+  loaded and been ignored. Found by deriving the refusal list from the
+  implementation table instead of restating it beside it.
+
+- **`nextn_predict_layers` was refused nowhere** (#193). MTP blocks sit
+  inside `block_count` and llama.cpp skips them, so a real EXAONE-MoE
+  export with an MTP head would have run its speculative head as two
+  more decoder layers. Gated on the value, since the converter writes
+  `0` for sizes with no head.
 
 - **Swapping the model through `POST /admin/models/load` could leave
   generation fluent and wrong** (#180). Silent-wrong-answer class, so
@@ -35,6 +81,86 @@ are the ones worth reading twice.
   model selector is that endpoint. The repack cache named as the likely
   cause in the issue was NOT it: the same swap sequence under
   `FERROX_METAL=0` answers identically on every pair.
+
+### Added
+
+- **Ten more architectures run with evidence**, 26 to 37, each with a
+  libllama-golden fixture, and the two cheap triage classes are now
+  EMPTY: nothing still refusing is one fixture or one match arm away.
+  - `olmo2` and `exaone4`, one post-norm residual topology (#183)
+  - `chatglm` and `qwen`, sharing the fused `attn_qkv.bias` arm; `qwen`
+    also needed its FFN width halved, which the verdict never named
+    (#185)
+  - `granite`, `granitemoe` and `granite-moe`, on one implementation of
+    the four scalar multipliers, with 18 hand-written residual adds in
+    `decoder.rs` collapsed onto one function (#186)
+  - `minicpm`, on the defaults hook that Granite made a field of the
+    same table (#191)
+  - `olmo`, on a non-parametric LayerNorm; its `clamp_kqv` stays a
+    refusal because llama.cpp's logits move when the key is present
+    (#191)
+  - `exaone-moe`, `smollm3` and EXAONE-4 32B, on one per-layer RoPE
+    gate that llama.cpp applies in six architectures from literals and
+    never from a key (#193)
+- **Three rows turned out not to be architectures**: `mistral`,
+  `mixtral` and `yi`. libllama refuses all three strings and every real
+  checkpoint declares `llama`. They now refuse by name and say to
+  re-convert (#185).
+- **Forced `tool_choice` on 10 of 11 wire formats**, up from 8. Two
+  recorded refusals were wrong: MiniMax-M3's ambiguity is real when
+  reading and absent when writing from a schema, and Gemma 4 needed a
+  new shape rather than a new branch. Muse-Glimmer still refuses for a
+  stated reason (#190, closing #29).
+- **`ferrox imatrix`**, a port of `llama-imatrix`, and `ferrox quantize
+  --imatrix`. Importance-weighted quantization is byte-identical to
+  `llama-quantize --imatrix` on 311 of 311 tensors across five targets.
+  The matrix file matches llama.cpp's in format, names and shapes, with
+  values agreeing to the forward pass's precision (#195).
+- **`ferrox batched-bench`**, a port of `llama-batched-bench`, on the
+  same guards as `ferrox bench` rather than beside them; the host
+  preflight and receipt envelope were extracted so both tools call one
+  function. Four llama.cpp flags refuse by name through an exhaustive
+  destructure (#197).
+- **Server slot save and restore**, with an identity check llama.cpp's
+  own slot file lacks: a digest over the checkpoint's sorted metadata,
+  tensor directory and a sample of every tensor, plus layer geometry.
+  Restore under a different quantisation refuses naming the checkpoint;
+  under a different model, naming the model (#192).
+- **`-b` and `-ub` batch flags** on the server, which exposed one number
+  spelled as two independent environment variables at two readers; both
+  names now live in one array both readers index. `-np` was already
+  wired and the audit was stale, so `/metrics` now reports the scheduler
+  configuration the worker was spawned with (#192).
+- **Windowed models are priced by their window** (#189, on #61). The
+  store already evicted behind `FERROX_KV_WINDOW`, including per-layer
+  for alternating models; what was missing was that nothing spent the
+  saving. `KvBudget` now carries a residency, so `--ctx-size auto`, the
+  pre-load check and `inspect-plan` see it. Gemma-2-2B at 32k context:
+  6.50 GiB to 4.06 GiB.
+- **`/v1/tokenize` honours `parse_special`**, which was a 501 by name
+  (#198).
+
+### Changed
+
+- **Ferrox Studio has a mark instead of two letters, and a palette with
+  no brand hue** (#187). The logo is alpha-iron's body-centred cubic
+  cell seen down its body diagonal, one outline, three spokes, one
+  node; it reads at 16 pixels. The neutral ramp is zero-chroma and the
+  only coloured tokens are the semantic states; a test fails if a
+  non-semantic token gains colour or the two theme blocks drift. The
+  send button is a circle, and the send glyph is one whose horizontal
+  centre is verifiable.
+
+### Documented
+
+- `docs/MODELS.md`'s list of audited architectures had been severed in
+  half by an inserted section and was three rows stale; it is rejoined
+  and now verified against `AUDITED_GENERIC_GQA` in both directions
+  (#188).
+- Studio screenshots in the README and `ui/README.md`, captured from a
+  real server, in the dark theme (#194, #196).
+- `ferrox quantize --help` claimed only Q8_0 and Q4_K write; a test now
+  walks every target against the long help (#195).
 
 ## [0.19.1] - 2026-09-10
 
@@ -618,6 +744,7 @@ benchmark ledger.
 First tag. GGUF mmap loader, quantized CPU kernels, Metal backend,
 `ferrox` CLI and `ferrox-server`.
 
+[0.20.0]: https://github.com/antonellof/ferrox/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/antonellof/ferrox/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/antonellof/ferrox/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/antonellof/ferrox/compare/v0.17.1...v0.18.0
