@@ -71,6 +71,31 @@ as `{id}_{backend}.json`. A run that fails leaves the previous receipt
 in place instead of overwriting it. `--render` rewrites the engine table
 in `RESULTS.md` between HTML markers and leaves the Open notes alone.
 
+## Batched throughput (`ferrox batched-bench`)
+
+`ferrox bench` is one sequence. `ferrox batched-bench` is
+`llama-batched-bench`: throughput against the number of parallel
+sequences, through the continuous batcher's engine seams
+(`forward_batch_last_host_kv` per prompt, `forward_multi_seq` per
+decode step) with no HTTP. Same ten columns as upstream, so a ferrox
+table and a llama.cpp table paste side by side.
+
+```bash
+./target/release/ferrox batched-bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+  -c 2048 -npp 128,512 -ntg 128 -npl 1,2,4,8
+llama-batched-bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+  -c 2048 -npp 128,512 -ntg 128 -npl 1,2,4,8
+```
+
+It runs under the same contract as `ferrox bench`: the quiet-host,
+thermal and free-memory bars below (the memory bar counts the largest
+row's KV on top of the weights), one discarded warmup per row that
+must agree with the timed pass on both input and output, and a receipt
+(`--receipt`) that is refused when its `--backend-label` is not the
+backend that ran. `-b`, `-kvu`, `-fa` and `-tb` are refused by name;
+`docs/CLI.md` has the flag table. No batched rows are published in
+`RESULTS.md` yet.
+
 ## When a run stops instead of printing a number
 
 Four checks run before the timer starts. Each one exists because the

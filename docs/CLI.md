@@ -1070,6 +1070,79 @@ limited, or short enough on free memory that the weights would page to
 disk. [`benchmarks/README.md`](../benchmarks/README.md) has each check,
 what it reads, and what `--max-load 0` waives.
 
+## Batched benchmark (`ferrox batched-bench`)
+
+Throughput as a function of batch size, like
+[`llama-batched-bench`](https://github.com/ggerganov/llama.cpp/tree/master/tools/batched-bench):
+for every combination of prompt length (`-npp`), generation length
+(`-ntg`) and parallel sequences (`-npl`), one row with the prompt
+speed, the decode speed and the total. Same ten columns, same widths
+(`tools/batched-bench/batched-bench.cpp:128-129,245`), so the two
+tables paste side by side; `--output-format jsonl` prints one object
+per row with upstream's per-row keys.
+
+```bash
+./target/release/ferrox batched-bench -m model.gguf -c 2048 -npp 128,256,512 -ntg 128,256 -npl 1,2,4,8,16,32
+./target/release/ferrox batched-bench -m model.gguf -c 2048 -npp 512 -ntg 128 -npl 1,4,16 -pps      # shared prompt
+./target/release/ferrox batched-bench -m model.gguf -ngl 99 -npp 128 -ntg 128 -npl 8 --output-format jsonl
+# the llama.cpp line to put beside it
+llama-batched-bench -m model.gguf -c 2048 -npp 128,256,512 -ntg 128,256 -npl 1,2,4,8,16,32
+```
+
+```
+|    PP |     TG |    B |   N_KV |   T_PP s | S_PP t/s |   T_TG s | S_TG t/s |      T s |    S t/s |
+|-------|--------|------|--------|----------|----------|----------|----------|----------|----------|
+|   128 |    128 |    1 |    256 |    0.108 |  1186.64 |    3.079 |    41.57 |    3.187 |    80.32 |
+```
+
+`PP`/`TG` are per sequence, `B` is the sequence count, `N_KV = B*(PP+TG)`
+is the KV the row needs, `S_PP` is `B*PP/T_PP` (or `PP/T_PP` with
+`-pps`), `S_TG` is `B*TG/T_TG`, `S` is all tokens over `T_PP + T_TG`.
+That is upstream's arithmetic (`batched-bench.cpp:229-235`), pinned by
+a test.
+
+What it drives is the continuous batcher's own engine seams, without
+the server around them: each prompt goes through
+`Decoder::forward_batch_last_host_kv` in `-ub` chunks, and every decode
+step is one `Decoder::forward_multi_seq` call across the `B` sequences,
+the same call `ferrox-server` makes per tick under
+`FERROX_CONTINUOUS_BATCHING=1`. Two honest differences from upstream:
+ferrox has no cross-sequence prefill, so `B` prompts are `B` calls
+rather than one batch (the number reported is still the time to
+prefill all of them); and the batched decode attends on the host on
+every backend, so `-ngl` offloads the projections and not the
+attention. `ferrox serve-bench` measures the same batcher over HTTP.
+
+| Flag | Meaning |
+|---|---|
+| `-m/--model` | GGUF to benchmark (generic decoder architectures only; the dedicated engines have no multi-sequence step and are refused by name) |
+| `-npp`, `-ntg`, `-npl` | Comma-separated sweeps; all three required, every value > 0 (upstream prints a `NaN` row for `0`, this refuses it) |
+| `-pps` | One prompt shared by every sequence: prefilled once, its KV copied to the others between the two timers (`batched-bench.cpp:168-185`) |
+| `-tgs` | Decode each sequence to completion in turn instead of one step across all of them per call (`:189-223`) |
+| `-c` | `n_kv_max`; a combination needing more is skipped, and the skip is printed rather than silent. `0` = the GGUF's `{arch}.context_length` |
+| `-ub` | Prompt tokens per forward call (default 512, upstream's `n_ubatch`) |
+| `-t`, `-ngl` | As `ferrox bench` |
+| `--output-format` | `md` (default) or `jsonl` |
+| `--receipt`, `--backend-label` | Write a JSON receipt; the label must name the backend that ran or the receipt is refused, before the sweep and again at write time |
+| `--max-load` | The same quiet-host bar as `ferrox bench`, waiving the thermal and free-memory checks with it at `0`. The free-memory check counts the largest row's KV on top of the weights |
+
+Flags `llama-batched-bench` takes that this tool **refuses by name**
+rather than accepting and ignoring: `-b` (`n_batch`; ferrox has no
+logical batch distinct from `-ub`), `-kvu` (every sequence has its own
+cache here, so `N_KV` is `B*(PP+TG)` with or without `-pps`), `-fa`
+(no flash-attention switch to honour) and `-tb` (one thread pool).
+For the same reason the JSONL rows omit `n_batch`, `flash_attn` and
+`n_threads_batch` instead of printing a made-up value for them.
+
+Every row runs twice: one discarded warmup pass and one timed pass,
+and the two must have fed the same tokens and produced the same greedy
+picks, per sequence, for prompt and decode. That is `ferrox bench`'s
+determinism check, and it is the reason each row costs two passes
+where upstream pays one global 16-token warmup. The other `bench_guard`
+checks run too: cold caches per pass, prompt and decode lengths
+re-read from every sequence's KV afterwards (the copied caches under
+`-pps` included), and a rate that is not finite refuses the row.
+
 ### One model at a time
 
 Every command that loads weights (`run`, `bench`, `verify`, `smoke`,

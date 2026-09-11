@@ -1,8 +1,10 @@
 //! ferrox CLI, llama.cpp-style GGUF completion (`-m`/`-p`/`-n`/…) plus
 //! inspect / presets / smoke / Kimi helpers. See `docs/CLI.md`.
 
+mod batched_bench;
 mod bench_bw;
 mod bench_client;
+mod bench_contract;
 mod bench_guard;
 mod bench_model;
 mod bench_render;
@@ -92,6 +94,13 @@ enum Commands {
     /// HTTP-free and measures kernels against `llama-bench`. This one
     /// answers what the SERVER does under load. Start the server first.
     ServeBench(serve_bench::ServeBenchArgs),
+    /// Throughput as a function of batch size, like
+    /// `llama-batched-bench`: for every `-npp` x `-ntg` x `-npl`
+    /// combination, prompt speed, decode speed and the total, in
+    /// llama.cpp's ten columns. Drives the continuous batcher's engine
+    /// seams directly, no HTTP.
+    #[command(name = "batched-bench")]
+    BatchedBench(batched_bench::BatchedBenchArgs),
     /// Download a GGUF from Hugging Face Hub (`hf download`).
     Pull(pull::PullArgs),
 
@@ -552,6 +561,7 @@ const SUBCOMMANDS: &[&str] = &[
     "smoke",
     "run-real",
     "bench",
+    "batched-bench",
     "verify",
     "layer-divergence",
     "quant-sensitivity",
@@ -602,6 +612,16 @@ fn rewrite_llama_style_argv(args: Vec<String>) -> Vec<String> {
             // looked like the flag did not exist.
             "-hf" => "--hf-repo".into(),
             "-hff" => "--hf-file".into(),
+            // `llama-batched-bench`'s own spellings, for `batched-bench`.
+            "-npp" => "--n-pp".into(),
+            "-ntg" => "--n-tg".into(),
+            "-npl" => "--n-pl".into(),
+            "-pps" => "--pp-shared".into(),
+            "-tgs" => "--tg-separate".into(),
+            "-ub" => "--ubatch-size".into(),
+            "-kvu" => "--kv-unified".into(),
+            "-fa" => "--flash-attn".into(),
+            "-tb" => "--threads-batch".into(),
             _ => arg,
         })
         .collect();
@@ -692,6 +712,7 @@ fn instance_target(command: &Commands) -> Option<(&'static str, Option<String>)>
             }
             Some(("bench", model.clone()))
         }
+        Commands::BatchedBench(args) => Some(("batched-bench", Some(args.model.clone()))),
         Commands::Smoke { preset, .. } => Some(("smoke", Some(preset.clone()))),
         Commands::RunKimi { checkpoint_dir, .. } => {
             Some(("run-kimi", Some(checkpoint_dir.clone())))
@@ -739,21 +760,27 @@ fn main() -> anyhow::Result<()> {
     // and every one of those receipts recorded `backend_active:
     // "Metal"` next to `backend: "cpu"` without anything comparing the
     // two (#126).
-    if let Commands::Bench {
-        threads,
-        n_gpu_layers,
-        suite,
-        render,
-        ..
-    } = &cli.command
-    {
-        // `--suite` and `--render` do not benchmark in THIS process:
-        // the suite spawns a child per entry and render only reads
-        // receipts, so applying a backend here would pin the parent to
-        // one backend for children that each want their own.
-        if !suite && !render {
-            bench_model::apply_env(*threads, *n_gpu_layers)?;
+    match &cli.command {
+        Commands::Bench {
+            threads,
+            n_gpu_layers,
+            suite,
+            render,
+            ..
+        } => {
+            // `--suite` and `--render` do not benchmark in THIS process:
+            // the suite spawns a child per entry and render only reads
+            // receipts, so applying a backend here would pin the parent
+            // to one backend for children that each want their own.
+            if !suite && !render {
+                bench_model::apply_env(*threads, *n_gpu_layers)?;
+            }
         }
+        // Same ordering constraint, same function: the batched bench
+        // writes the same kind of receipt and is refused the same way
+        // when the label and the backend disagree.
+        Commands::BatchedBench(args) => bench_model::apply_env(args.threads, args.n_gpu_layers)?,
+        _ => {}
     }
 
     // Held for the whole run: dropping it deregisters this process.
@@ -768,6 +795,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Run(args) => run::run_infer(args)?,
         Commands::Chat(args) => chat::run_chat(args)?,
         Commands::ServeBench(args) => serve_bench::run_serve_bench(args)?,
+        Commands::BatchedBench(args) => batched_bench::run(args)?,
         Commands::BenchBw(args) => bench_bw::run_bench_bw(args)?,
         // Blocking, and it builds its own Tokio runtime: nothing above
         // this point has started one. It also claims the instance
