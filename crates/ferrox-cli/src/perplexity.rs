@@ -261,9 +261,16 @@ pub fn run(args: PerplexityArgs) -> anyhow::Result<()> {
     // over is the one `parity` proves against llama.cpp. A second
     // spelling of "encode, then add BOS if the checkpoint says to" is
     // exactly the drift that makes two numbers incomparable.
-    let (decoder, tokens, _eos) =
-        crate::verify_engine::load_and_tokenize(Path::new(&path), &text, None)
-            .context("loading the model and tokenizing the corpus")?;
+    let (decoder, tokens, _eos) = crate::verify_engine::load_and_tokenize(
+        Path::new(&path),
+        &text,
+        // llama-perplexity tokenizes its corpus with
+        // `common_tokenize(ctx, params.prompt, true)`, whose
+        // `parse_special` defaults to false.
+        ferrox_models::tokenizer::SpecialTokens::AsText,
+        None,
+    )
+    .context("loading the model and tokenizing the corpus")?;
 
     // The per-window BOS reset needs the id itself, and needs to know
     // whether this checkpoint uses one at all. Same predicate as the

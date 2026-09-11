@@ -16,6 +16,7 @@ use crate::attribution::Attribution;
 use crate::generate::{FinishReason, GenerationParams};
 use crate::sampling_knobs::SamplingKnobs;
 use crate::{unsupported_feature, ApiError, AppState};
+use ferrox_models::tokenizer::SpecialTokens;
 
 /// What one of the small endpoints knows before it does any work.
 ///
@@ -110,11 +111,10 @@ pub(crate) struct TokenizeRequest {
     #[serde(default)]
     add_special: Option<bool>,
     /// llama.cpp: tokenize special-token text as special tokens rather
-    /// than as plaintext. Upstream defaults to `true`, and ferrox's
-    /// tokenizers always split on special tokens
-    /// (`ferrox_models::tokenizer::split_on_special_tokens`), so `true`
-    /// is honoured and `false` is REFUSED BY NAME rather than silently
-    /// ignored.
+    /// than as plaintext. Upstream defaults to `true`
+    /// (`server-context.cpp`: `json_value(body, "parse_special", true)`)
+    /// and so does this server; `false` tokenizes `<|im_start|>` as the
+    /// characters it is written with.
     #[serde(default)]
     parse_special: Option<bool>,
     /// llama.cpp: return `{"id", "piece"}` objects instead of bare ids.
@@ -153,13 +153,6 @@ impl TokenizeRequest {
     /// Every knob this server does not implement, refused by name
     /// before any work happens.
     fn reject_unsupported(&self) -> Result<(), ApiError> {
-        if self.parse_special == Some(false) {
-            return Err(unsupported_feature(
-                "`parse_special: false` is not implemented: ferrox's tokenizers always split \
-                 on special-token text, so this server cannot tokenize `<|im_start|>` as \
-                 plain characters. Omit the field or send `true` (llama.cpp's default)",
-            ));
-        }
         if self.with_pieces == Some(true) {
             return Err(unsupported_feature(
                 "`with_pieces: true` is not implemented: ferrox's tokenizers expose decoded \
@@ -169,6 +162,15 @@ impl TokenizeRequest {
             ));
         }
         Ok(())
+    }
+
+    /// The `parse_special` setting the request asked for, with
+    /// llama.cpp's default when it did not say.
+    fn specials(&self) -> SpecialTokens {
+        match self.parse_special {
+            Some(false) => SpecialTokens::AsText,
+            Some(true) | None => SpecialTokens::Parse,
+        }
     }
 }
 
@@ -422,7 +424,7 @@ fn tokenize_inner(
     // generative model" on an encoder-only server, which is the right
     // refusal for a decode and the wrong one for this (issue #28).
     let active = state.require_active()?;
-    let mut tokens = active.encode_any(text);
+    let mut tokens = active.encode_any(text, req.specials());
     if req.add_special == Some(true) {
         // The same helper the generation path uses, so `add_special`
         // reports the prompt the model would actually be given --
@@ -559,30 +561,21 @@ mod tests {
         serde_json::from_value(value).expect("request")
     }
 
-    /// The two llama.cpp knobs this server does not implement. Both
-    /// deserialize, so serde would happily have dropped them; the
-    /// point of declaring them is that they are refused BY NAME.
+    /// The llama.cpp knob this server does not implement. It
+    /// deserializes, so serde would happily have dropped it; the point
+    /// of declaring it is that it is refused BY NAME.
     #[test]
-    fn the_tokenize_knobs_ferrox_lacks_are_refused_by_name() {
-        for (field, body) in [
-            (
-                "parse_special",
-                serde_json::json!({"content": "hi", "parse_special": false}),
-            ),
-            (
-                "with_pieces",
-                serde_json::json!({"content": "hi", "with_pieces": true}),
-            ),
-        ] {
-            let (status, body) = tokenize_request(body)
+    fn the_tokenize_knob_ferrox_lacks_is_refused_by_name() {
+        let field = "with_pieces";
+        let (status, body) =
+            tokenize_request(serde_json::json!({"content": "hi", "with_pieces": true}))
                 .reject_unsupported()
                 .expect_err("this is not implemented");
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{field}");
-            assert!(
-                body.0["error"]["message"].as_str().unwrap().contains(field),
-                "the refusal must name {field}: {body:?}"
-            );
-        }
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{field}");
+        assert!(
+            body.0["error"]["message"].as_str().unwrap().contains(field),
+            "the refusal must name {field}: {body:?}"
+        );
     }
 
     /// The values ferrox *does* honour must not be refused: upstream's
@@ -595,6 +588,25 @@ mod tests {
         )
         .reject_unsupported()
         .expect("these are the values this server implements");
+    }
+
+    /// `parse_special` maps onto the tokenizer's setting, and an absent
+    /// field is llama.cpp's default of `true`. `false` used to be
+    /// refused by name because ferrox parsed specials unconditionally.
+    #[test]
+    fn parse_special_selects_the_tokenizer_setting_and_defaults_to_true() {
+        assert_eq!(
+            tokenize_request(serde_json::json!({"content": "hi"})).specials(),
+            SpecialTokens::Parse
+        );
+        assert_eq!(
+            tokenize_request(serde_json::json!({"content": "hi", "parse_special": true}))
+                .specials(),
+            SpecialTokens::Parse
+        );
+        let off = tokenize_request(serde_json::json!({"content": "hi", "parse_special": false}));
+        off.reject_unsupported().expect("false is implemented now");
+        assert_eq!(off.specials(), SpecialTokens::AsText);
     }
 
     /// One field under two spellings. Absent means absent -- llama.cpp

@@ -29,11 +29,16 @@
 //! * **Vocab size**, because two different id spaces make every
 //!   comparison below it meaningless rather than merely failing.
 //!
-//! `parse_special = true` on the llama side because ferrox's tokenizers
-//! always carve special tokens out of raw text first; `false` would ask
-//! the two sides different questions. No corpus case contains a
-//! special-token literal, so today the setting is not load-bearing — it
-//! is set correctly so that adding such a case later stays honest.
+//! * **Both `parse_special` settings**, every case. They are different
+//!   questions -- is `<|im_end|>` in the input the end-of-turn token or
+//!   six characters of prose -- and llama.cpp answers both, so ferrox
+//!   has to. The sweep used to dump only `parse_special = true`, on the
+//!   grounds that ferrox always parsed specials and no corpus case
+//!   contained one. Both halves of that were the hole: ferrox's
+//!   unconditional parsing WAS the divergence from llama.cpp's default,
+//!   and a corpus with no marker in it could not see it. The
+//!   `special-markers-as-prose` case and the second run per case exist
+//!   so that this class turns the sweep red.
 
 mod corpus;
 
@@ -42,7 +47,7 @@ use corpus::{Case, CORPUS};
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::tokenizer::{
     should_add_bos_token, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer,
-    GgufWordPieceTokenizer,
+    GgufWordPieceTokenizer, SpecialTokens,
 };
 use std::path::Path;
 use std::process::Command;
@@ -58,7 +63,22 @@ struct Reference {
     add_bos: bool,
     add_eos: bool,
     n_vocab: usize,
-    cases: Vec<Vec<u32>>,
+    /// One entry per corpus case, in corpus order; each holds the ids
+    /// for every [`SpecialTokens`] setting, in [`SETTINGS`] order.
+    cases: Vec<[Vec<u32>; SETTINGS.len()]>,
+}
+
+/// The `parse_special` settings every case is compared under. The
+/// dumper writes them in THIS order (`tools/llama_logits.c`, FXTK v2:
+/// `false` first), and the reader below indexes by it.
+const SETTINGS: [SpecialTokens; 2] = [SpecialTokens::AsText, SpecialTokens::Parse];
+
+/// How a setting is named in the report, as llama.cpp spells it.
+fn setting_name(mode: SpecialTokens) -> &'static str {
+    match mode {
+        SpecialTokens::AsText => "parse_special=false",
+        SpecialTokens::Parse => "parse_special=true",
+    }
 }
 
 /// Where two id sequences first stop agreeing, with enough around it to
@@ -79,10 +99,12 @@ pub(super) struct Divergence {
     pub ferrox_len: usize,
 }
 
+/// One corpus case under one `parse_special` setting.
 pub(super) struct CaseOutcome {
     pub name: &'static str,
     pub why: &'static str,
     pub text: &'static str,
+    pub mode: SpecialTokens,
     pub n_tokens: usize,
     pub divergence: Option<Divergence>,
 }
@@ -149,12 +171,12 @@ impl Encoder {
         })
     }
 
-    fn encode(&self, text: &str) -> Vec<u32> {
+    fn encode(&self, text: &str, mode: SpecialTokens) -> Vec<u32> {
         match self {
-            Encoder::Bpe(t) => t.encode(text),
-            Encoder::Spm(t) => t.encode(text),
-            Encoder::Unigram(t) => t.encode(text),
-            Encoder::WordPiece(t) => t.encode(text),
+            Encoder::Bpe(t) => t.encode(text, mode),
+            Encoder::Spm(t) => t.encode(text, mode),
+            Encoder::Unigram(t) => t.encode(text, mode),
+            Encoder::WordPiece(t) => t.encode(text, mode),
         }
     }
 
@@ -208,18 +230,27 @@ pub(super) fn run(dumper: &Path, model: &Path) -> anyhow::Result<Option<Report>>
         );
     }
 
+    let encoder = &encoder;
     let cases = CORPUS
         .iter()
         .zip(&reference.cases)
-        .map(|(case, llama_ids)| {
-            let ferrox_ids = encoder.encode(case.text);
-            CaseOutcome {
-                name: case.name,
-                why: case.why,
-                text: case.text,
-                n_tokens: llama_ids.len(),
-                divergence: first_divergence(llama_ids, &ferrox_ids, &|id| encoder.piece(id)),
-            }
+        .flat_map(|(case, llama_runs)| {
+            SETTINGS
+                .iter()
+                .zip(llama_runs)
+                .map(move |(&mode, llama_ids)| {
+                    let ferrox_ids = encoder.encode(case.text, mode);
+                    CaseOutcome {
+                        name: case.name,
+                        why: case.why,
+                        text: case.text,
+                        mode,
+                        n_tokens: llama_ids.len(),
+                        divergence: first_divergence(llama_ids, &ferrox_ids, &|id| {
+                            encoder.piece(id)
+                        }),
+                    }
+                })
         })
         .collect();
 
@@ -283,8 +314,10 @@ pub(super) fn print_report(r: &Report) {
         .unwrap_or_else(|| r.model.clone());
     let verdict = if r.diverged() { "DIVERGES" } else { "MATCH" };
     println!(
-        "tokenizer {name}: {verdict} ({} cases / {} tokens, pre={}, ferrox vs llama.cpp)",
-        r.cases.len(),
+        "tokenizer {name}: {verdict} ({} cases x {} parse_special settings / {} tokens, pre={}, \
+         ferrox vs llama.cpp)",
+        r.cases.len() / SETTINGS.len(),
+        SETTINGS.len(),
         r.n_tokens(),
         r.pre
     );
@@ -308,19 +341,21 @@ pub(super) fn print_report(r: &Report) {
 
     if r.n_bad() == 0 {
         println!(
-            "  all {} cases tokenize identically (digit runs, multi-space, indents, blank \
-             lines, CJK, emoji, contractions).",
-            r.cases.len()
+            "  all {} cases tokenize identically under both parse_special settings (digit \
+             runs, multi-space, indents, blank lines, CJK, emoji, contractions, special-token \
+             markers as prose).",
+            r.cases.len() / SETTINGS.len()
         );
         return;
     }
 
-    println!("  {}/{} cases diverge:", r.n_bad(), r.cases.len());
+    println!("  {}/{} case runs diverge:", r.n_bad(), r.cases.len());
     for c in r.cases.iter().filter(|c| c.divergence.is_some()) {
         let d = c.divergence.as_ref().expect("filtered on is_some");
         println!(
-            "\n  [{}] token {} of {} (llama) / {} (ferrox), byte ~{} of {}",
+            "\n  [{} @ {}] token {} of {} (llama) / {} (ferrox), byte ~{} of {}",
             c.name,
+            setting_name(c.mode),
             d.index,
             d.llama_len,
             d.ferrox_len,
@@ -412,8 +447,11 @@ fn parse_result(bytes: &[u8]) -> anyhow::Result<Reference> {
     }
     let mut at = 4usize;
     let version = u32_at(&mut at)?;
-    if version != 1 {
-        anyhow::bail!("reference tokenization is FXTK v{version}, this build reads v1");
+    if version != 2 {
+        anyhow::bail!(
+            "reference tokenization is FXTK v{version}, this build reads v2 (one run per \
+             parse_special setting). Rebuild the dumper with ./tools/build_llama_logits.sh"
+        );
     }
     let flags = u32_at(&mut at)?;
     let n_vocab = u32_at(&mut at)? as usize;
@@ -421,16 +459,31 @@ fn parse_result(bytes: &[u8]) -> anyhow::Result<Reference> {
 
     let mut cases = Vec::with_capacity(n_cases);
     for i in 0..n_cases {
-        let n = u32_at(&mut at)? as usize;
-        let mut ids = Vec::with_capacity(n);
-        for _ in 0..n {
-            let raw = u32_at(&mut at)? as i32;
-            if raw < 0 {
-                anyhow::bail!("reference tokenization case {i} holds a negative token id {raw}");
+        let mut runs: [Vec<u32>; SETTINGS.len()] = Default::default();
+        for run in runs.iter_mut() {
+            let n = u32_at(&mut at)? as usize;
+            // Every id is four bytes on the wire, so a declared count
+            // cannot exceed the bytes left; a torn file says so here
+            // rather than in a giant allocation.
+            let remaining = bytes.len().saturating_sub(at) / 4;
+            if n > remaining {
+                anyhow::bail!(
+                    "reference tokenization case {i} declares {n} ids with {remaining} left"
+                );
             }
-            ids.push(raw as u32);
+            let mut ids = Vec::with_capacity(n);
+            for _ in 0..n {
+                let raw = u32_at(&mut at)? as i32;
+                if raw < 0 {
+                    anyhow::bail!(
+                        "reference tokenization case {i} holds a negative token id {raw}"
+                    );
+                }
+                ids.push(raw as u32);
+            }
+            *run = ids;
         }
-        cases.push(ids);
+        cases.push(runs);
     }
     if at != bytes.len() {
         anyhow::bail!(
@@ -597,31 +650,51 @@ mod tests {
         assert_eq!(blob.len(), 20);
     }
 
-    fn result_blob(flags: u32, n_vocab: u32, cases: &[&[i32]]) -> Vec<u8> {
+    /// A v2 result: every case is two runs, `parse_special` false then
+    /// true.
+    fn result_blob(flags: u32, n_vocab: u32, cases: &[[&[i32]; 2]]) -> Vec<u8> {
         let mut b = Vec::from(*b"FXTK");
-        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&2u32.to_le_bytes());
         b.extend_from_slice(&flags.to_le_bytes());
         b.extend_from_slice(&n_vocab.to_le_bytes());
         b.extend_from_slice(&(cases.len() as u32).to_le_bytes());
-        for c in cases {
-            b.extend_from_slice(&(c.len() as u32).to_le_bytes());
-            for id in *c {
-                b.extend_from_slice(&id.to_le_bytes());
+        for runs in cases {
+            for c in runs {
+                b.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                for id in *c {
+                    b.extend_from_slice(&id.to_le_bytes());
+                }
             }
         }
         b
     }
 
     #[test]
-    fn a_result_file_round_trips_flags_vocab_and_cases() {
-        let blob = result_blob(0b11, 128_256, &[&[1, 2, 3], &[]]);
+    fn a_result_file_round_trips_flags_vocab_and_both_runs_of_every_case() {
+        // The prose case's shape: `<s>` is three ids as text and one
+        // when parsed, so the two runs of one case differ in length.
+        let blob = result_blob(0b11, 128_256, &[[&[1, 2, 3], &[9]], [&[], &[]]]);
         let r = parse_result(&blob).expect("well-formed result must parse");
         assert!(r.add_bos && r.add_eos);
         assert_eq!(r.n_vocab, 128_256);
-        assert_eq!(r.cases, vec![vec![1u32, 2, 3], vec![]]);
+        assert_eq!(r.cases, vec![[vec![1u32, 2, 3], vec![9]], [vec![], vec![]]]);
 
-        let none = parse_result(&result_blob(0, 32, &[&[7]])).unwrap();
+        let none = parse_result(&result_blob(0, 32, &[[&[7], &[7]]])).unwrap();
         assert!(!none.add_bos && !none.add_eos);
+    }
+
+    /// A dumper built from the v1 source writes one run per case. Read
+    /// as v2 that would pair case N's ids with case N+1's and report
+    /// nonsense divergences, so the version is refused by name.
+    #[test]
+    fn a_version_one_result_is_refused_and_names_the_rebuild() {
+        let mut blob = result_blob(0, 32, &[[&[1], &[1]]]);
+        blob[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let err = parse_result(&blob).unwrap_err().to_string();
+        assert!(
+            err.contains("FXTK v1") && err.contains("build_llama_logits.sh"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -633,17 +706,25 @@ mod tests {
 
         // Truncated mid-case: a short read must not become a short
         // sequence that then reports a divergence at the wrong place.
-        let mut blob = result_blob(0, 32, &[&[1, 2, 3]]);
+        let mut blob = result_blob(0, 32, &[[&[1, 2, 3], &[1, 2, 3]]]);
         blob.truncate(blob.len() - 5);
         assert!(parse_result(&blob).is_err());
 
         // Trailing bytes mean the two sides disagree about the layout.
-        let mut blob = result_blob(0, 32, &[&[1]]);
+        let mut blob = result_blob(0, 32, &[[&[1], &[1]]]);
         blob.push(0);
         assert!(parse_result(&blob).is_err());
 
         // A negative id would silently become a huge u32 index.
-        assert!(parse_result(&result_blob(0, 32, &[&[-3]])).is_err());
+        assert!(parse_result(&result_blob(0, 32, &[[&[-3], &[3]]])).is_err());
+
+        // A count larger than the bytes left is a torn file, refused
+        // before any allocation sized by it.
+        let mut blob = result_blob(0, 32, &[[&[1], &[1]]]);
+        let at = blob.len() - 8;
+        blob[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = parse_result(&blob).unwrap_err().to_string();
+        assert!(err.contains("declares"), "got {err}");
     }
 
     #[test]

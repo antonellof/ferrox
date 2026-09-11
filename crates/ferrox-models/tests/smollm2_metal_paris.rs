@@ -17,7 +17,7 @@ use ferrox_core::cache::KvCache;
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::config::ModelConfig;
 use ferrox_models::decoder::Decoder;
-use ferrox_models::tokenizer::GgufBpeTokenizer;
+use ferrox_models::tokenizer::{GgufBpeTokenizer, SpecialTokens};
 
 const PROMPT: &str = "The capital of France is";
 const MAX_NEW_TOKENS: usize = 16;
@@ -66,7 +66,11 @@ fn smollm2_metal_greedy_paris_regression() {
     let tok = GgufBpeTokenizer::from_gguf(&file).expect("tokenizer");
     let decoder = Decoder::from_gguf(&path, config.clone()).expect("load decoder");
 
-    let mut tokens: Vec<usize> = tok.encode(PROMPT).into_iter().map(|t| t as usize).collect();
+    let mut tokens: Vec<usize> = tok
+        .encode(PROMPT, SpecialTokens::Parse)
+        .into_iter()
+        .map(|t| t as usize)
+        .collect();
 
     let mut caches: Vec<KvCache> = (0..config.n_layers)
         .map(|_| KvCache::new(config.n_kv_heads, config.head_dim))

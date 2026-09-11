@@ -213,8 +213,9 @@ picking a side:
 - Most upstream templates open with `{{ bos_token }}`: gemma-2/3/4
   (`<bos>`), Mistral-Instruct and Phi-3 (`<s>`), Llama-3
   (`<|begin_of_text|>`), DeepSeek-R1-Distill. Rendering one puts BOS in the
-  *text*, and encoding splits on special-token text, so it comes back as
-  the BOS *id* in position 0.
+  *text*, and a rendered prompt is encoded with special-token markers
+  parsed (llama.cpp's `parse_special = true`, as its server does), so it
+  comes back as the BOS *id* in position 0.
 - Unsloth deliberately **strips** `{{ bos_token }}` from the templates it
   bakes into its GGUF exports, so that a runtime adding BOS itself does not
   double it. TinyLlama's checked-in template is the local example.
@@ -719,9 +720,7 @@ Deviations, all stated: one chunk per forward pass where `llama-imatrix`
 folds `n_batch / n_ctx` chunks into one batch as separate sequences
 (same rows in the same order, so the same sums); no perplexity printed,
 because `ferrox perplexity` already computes that number by llama.cpp's
-method; special-token strings in the text are always parsed, which is
-`llama-imatrix --parse-special`, because ferrox's tokenizers have no
-mode that does not; no `--in-file` combining of earlier matrices; and
+method; no `--in-file` combining of earlier matrices; and
 expert streaming (`Stored` experts) is refused because a streamed
 expert's weight view has no stable identity.
 
@@ -755,16 +754,20 @@ the weights enter the fit as relative importances -- but that is a
 statement about the effect, not a claim the files match.
 
 Two things to check before trusting a comparison. The text must
-tokenize identically: on the repo's own markdown docs ferrox's
-Qwen2-style BPE produced 17208 tokens where `llama-tokenize
---no-escape` produced 17209 (one token fewer somewhere in the 100
-bytes ``es open with `{{ bos_token }}`: gemma-2/3/4\n  (`<bos>`),
-Mistral-Instruct and Phi-3 (`<s>`), Llama-3``), and `llama-imatrix`'s
-own default, which does not parse special-token markers, produced
-17218 because the docs contain six `<|...|>` strings. Either
-difference shifts every chunk boundary and turns a 1e-3 comparison
-into a 1e-1 one. And it must be the same text through the same
-number of chunks, since a chunk count is a token count.
+tokenize identically, and it once did not: on the repo's own markdown
+docs ferrox's Qwen2-style BPE produced 17208 tokens where
+`llama-tokenize --no-escape` produced 17209, one fewer at each
+mention of `<s>` -- Qwen2.5's vocabulary carries `<s>` as an ordinary
+entry that llama.cpp never treats as special, and ferrox promoted it
+on its shape. That is fixed, and `ferrox imatrix` now tokenizes its
+text with special-token markers left as text, which is
+`llama-imatrix`'s own default (`parse_special = false`); a doc that
+mentions `<|im_end|>` is six characters on both engines. `ferrox
+parity`'s tokenizer sweep carries a case of markers-as-prose under
+both `parse_special` settings so the class stays closed. Either kind
+of difference shifts every chunk boundary and turns a 1e-3 comparison
+into a 1e-1 one. And it must be the same text through the same number
+of chunks, since a chunk count is a token count.
 
 ## Split and merge GGUF (`ferrox gguf-split`)
 

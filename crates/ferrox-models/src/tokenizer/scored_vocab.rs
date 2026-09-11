@@ -104,7 +104,7 @@ impl ScoredVocab {
     }
 
     /// The token texts in id order, for the callers that walk the
-    /// vocabulary itself (`load_special_tokens` zips it against
+    /// vocabulary itself (`SpecialTokenTable::from_gguf` zips it against
     /// `tokenizer.ggml.token_type`; Unigram measures its longest
     /// piece).
     pub(crate) fn tokens(&self) -> &[String] {

@@ -11,7 +11,9 @@ use ferrox_models::config::ModelConfig;
 use ferrox_models::decoder::Decoder;
 use ferrox_models::engine::Engine;
 use ferrox_models::engine_factory::{load_gemma4_engine_from_path, ServedEngine};
-use ferrox_models::tokenizer::{GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer};
+use ferrox_models::tokenizer::{
+    GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, SpecialTokens,
+};
 use ferrox_models::GEMMA4_ARCHES;
 use std::path::Path;
 
@@ -22,11 +24,23 @@ enum Tok {
 }
 
 impl Tok {
-    fn encode(&self, text: &str) -> Vec<usize> {
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
         match self {
-            Tok::Bpe(t) => t.encode(text).into_iter().map(|i| i as usize).collect(),
-            Tok::Spm(t) => t.encode(text).into_iter().map(|i| i as usize).collect(),
-            Tok::Unigram(t) => t.encode(text).into_iter().map(|i| i as usize).collect(),
+            Tok::Bpe(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|i| i as usize)
+                .collect(),
+            Tok::Spm(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|i| i as usize)
+                .collect(),
+            Tok::Unigram(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|i| i as usize)
+                .collect(),
         }
     }
 }
@@ -47,10 +61,11 @@ impl Tok {
 pub fn greedy_token_ids(
     path: &Path,
     prompt: &str,
+    specials: SpecialTokens,
     n: usize,
     prompt_tokens: Option<usize>,
 ) -> anyhow::Result<(Vec<u32>, usize)> {
-    let (decoder, tokens, eos) = load_and_tokenize(path, prompt, prompt_tokens)?;
+    let (decoder, tokens, eos) = load_and_tokenize(path, prompt, specials, prompt_tokens)?;
 
     let mut caches: Vec<KvCache> = (0..decoder.layers.len())
         .map(|_| KvCache::new(decoder.config.n_kv_heads, decoder.config.head_dim))
@@ -83,9 +98,11 @@ pub fn greedy_token_ids(
 pub fn prefill_logits(
     path: &Path,
     prompt: &str,
+    specials: SpecialTokens,
     prompt_tokens: Option<usize>,
 ) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
-    let (file, tokens, _eos, runtime_ctx) = tokenize_checkpoint(path, prompt, prompt_tokens)?;
+    let (file, tokens, _eos, runtime_ctx) =
+        tokenize_checkpoint(path, prompt, specials, prompt_tokens)?;
     let arch = file
         .metadata_str("general.architecture")
         .unwrap_or_default();
@@ -116,9 +133,18 @@ fn prefill_logits_gemma4(path: &Path, tokens: &[usize]) -> anyhow::Result<(Vec<u
 }
 
 /// Tokenize a prompt the same way verify/parity do, without loading weights.
+///
+/// `specials` is llama.cpp's `parse_special`, and the caller says which
+/// because the tools above this differ: a prompt handed to `verify`,
+/// `parity`, `layer-divergence` or `quant-sensitivity` is parsed like
+/// `llama-completion`'s (`Parse`); the corpus `perplexity` and `imatrix`
+/// read is text, and `llama-perplexity` (`common_tokenize(ctx,
+/// params.prompt, true)`, default `false`) and `llama-imatrix`
+/// (`common.h`: `parse_special = false`) both keep it that way.
 fn tokenize_checkpoint(
     path: &Path,
     prompt: &str,
+    specials: SpecialTokens,
     prompt_tokens: Option<usize>,
 ) -> anyhow::Result<(ShardedGguf, Vec<usize>, Option<usize>, usize)> {
     let file = ShardedGguf::open(path)?;
@@ -135,7 +161,7 @@ fn tokenize_checkpoint(
         .metadata_u64("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize);
 
-    let mut tokens = tokenizer.encode(prompt);
+    let mut tokens = tokenizer.encode(prompt, specials);
     if ferrox_models::tokenizer::should_add_bos_token(&file) {
         if let Some(b) = bos {
             if tokens.first() != Some(&b) {
@@ -159,9 +185,11 @@ fn tokenize_checkpoint(
 pub(crate) fn load_and_tokenize(
     path: &Path,
     prompt: &str,
+    specials: SpecialTokens,
     prompt_tokens: Option<usize>,
 ) -> anyhow::Result<(Decoder, Vec<usize>, Option<usize>)> {
-    let (file, tokens, eos, runtime_ctx) = tokenize_checkpoint(path, prompt, prompt_tokens)?;
+    let (file, tokens, eos, runtime_ctx) =
+        tokenize_checkpoint(path, prompt, specials, prompt_tokens)?;
     let arch = file
         .metadata_str("general.architecture")
         .unwrap_or_default();

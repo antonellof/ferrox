@@ -1258,8 +1258,8 @@ The request body accepts both dialects on both paths:
 | both at once | **400.** They are one field, and guessing which was meant would tokenize text the caller did not ask about |
 | neither | **400** naming both. llama.cpp answers an empty array here; ferrox does not, because an empty array cannot be told apart from tokenizing `""` |
 | `add_special` | Supported. Prepends the same BOS id the generation path prepends, including its no-op on a checkpoint whose metadata says not to add one, so the count matches the prompt the model would really see |
-| `parse_special: true` (upstream's default) | Supported. ferrox's tokenizers always split on special-token text |
-| `parse_special: false` | **501 by name.** ferrox cannot tokenize `<|im_start|>` as plain characters |
+| `parse_special: true` (upstream's default) | Supported. Special-token markers in the text are the tokens they name |
+| `parse_special: false` | Supported. `<|im_start|>` is tokenized as the characters it is written with, as llama.cpp does |
 | `with_pieces` | **501 by name.** ferrox's tokenizers expose decoded text, not the raw per-token piece bytes, so a byte-fallback token could not be given llama.cpp's `piece` byte array |
 | `model` | Accepted and ignored; this server serves one model at a time |
 

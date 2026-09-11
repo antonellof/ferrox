@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use clap::{Args, ValueEnum};
 use ferrox_core::cache::KvCache;
 use ferrox_gguf::ShardedGguf;
+use ferrox_models::tokenizer::SpecialTokens;
 use ferrox_models::{
     ensure_generic_decoder, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, Decoder, Engine, GgufBpeTokenizer,
@@ -932,11 +933,27 @@ enum CliTokenizer {
 }
 
 impl CliTokenizer {
-    fn encode(&self, text: &str) -> Vec<usize> {
+    /// `specials` is llama.cpp's `parse_special`. The prompt sites pass
+    /// `Parse`, as `llama-completion` does for its prompt
+    /// (`tools/completion/completion.cpp`: `common_tokenize(ctx, prompt,
+    /// true, true)`); the DRY breakers below pass `AsText`.
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
         match self {
-            CliTokenizer::Bpe(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            CliTokenizer::Spm(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            CliTokenizer::Unigram(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
+            CliTokenizer::Bpe(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            CliTokenizer::Spm(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            CliTokenizer::Unigram(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
         }
     }
 
@@ -983,7 +1000,7 @@ impl ferrox_models::dry::DryVocab for CliTokenizer {
     }
 
     fn tokenize(&self, text: &str) -> Vec<usize> {
-        self.encode(text)
+        self.encode(text, SpecialTokens::AsText)
     }
 }
 
@@ -1380,7 +1397,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     let decoder = load_decoder_streaming_if_needed(path, config)?;
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-    let mut tokens = tokenizer.encode(&prompt);
+    let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);
     // Match llama.cpp vocab add_bos (qwen2/BPE default false). Blindly
     // prepending bos_token_id poisons Qwen2-MoE (`<|endoftext|>`).
     ferrox_models::tokenizer::prepend_bos(
@@ -1560,7 +1577,7 @@ fn run_mla_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::Re
     };
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-    let mut tokens = tokenizer.encode(&prompt);
+    let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);
     ferrox_models::tokenizer::prepend_bos(
         &mut tokens,
         bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),
@@ -1691,7 +1708,7 @@ fn run_gemma4_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow:
     let engine = *engine;
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-    let mut tokens = tokenizer.encode(&prompt);
+    let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);
     ferrox_models::tokenizer::prepend_bos(
         &mut tokens,
         bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),
@@ -1821,7 +1838,7 @@ fn run_glm52_infer(args: InferArgs, path: &Path, file: &ShardedGguf) -> anyhow::
     };
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
-    let mut tokens = tokenizer.encode(&prompt);
+    let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);
     ferrox_models::tokenizer::prepend_bos(
         &mut tokens,
         bos_id.filter(|_| ferrox_models::tokenizer::should_add_bos_token(file)),

@@ -211,8 +211,13 @@ fn child_tokens(
 /// Child side: greedy-decode `N_TOKENS` and print the ids.
 fn emit_tokens(model: &str, prompt: &str, prompt_tokens: Option<usize>) -> anyhow::Result<()> {
     let path = crate::pull::resolve_model_path(model)?;
-    let (ids, prompt_len) =
-        crate::verify_engine::greedy_token_ids(Path::new(&path), prompt, N_TOKENS, prompt_tokens)?;
+    let (ids, prompt_len) = crate::verify_engine::greedy_token_ids(
+        Path::new(&path),
+        prompt,
+        ferrox_models::tokenizer::SpecialTokens::Parse,
+        N_TOKENS,
+        prompt_tokens,
+    )?;
     let joined: Vec<String> = ids.iter().map(|t| t.to_string()).collect();
     println!("{LEN_TAG}{prompt_len}");
     println!("{TAG}{}", joined.join(" "));

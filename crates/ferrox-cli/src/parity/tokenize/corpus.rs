@@ -1,7 +1,7 @@
 //! The corpus `ferrox parity` tokenizes on both engines.
 //!
 //! Its own module because the corpus IS the coverage claim: what these
-//! nineteen strings contain decides which pre-tokenizer bugs the oracle
+//! twenty-one strings contain decides which tokenizer bugs the oracle
 //! next door can see, and that is a separate thing to review from the
 //! comparison machinery. The test at the bottom asserts the claim, so
 //! trimming the corpus to "the cases that pass" goes red instead of
@@ -134,6 +134,29 @@ pub(super) const CORPUS: &[Case] = &[
               whitespace clause.",
         text: " ",
     },
+    Case {
+        name: "special-markers-as-prose",
+        why: "special-token markers MENTIONED in text. Under parse_special=false llama.cpp \
+              tokenizes a CONTROL marker as the characters it is written with; ferrox used \
+              to parse it unconditionally, and promoted any NORMAL entry shaped like `<...>` \
+              (Qwen2.5's `<s>`) to special under BOTH settings. Off by one token per mention \
+              on any document that discusses tokenizers.",
+        text: "Mistral wraps a turn in `<s>[INST] ... [/INST]` and ends it with `</s>`; \
+               Llama-3 opens with `<|begin_of_text|>` and ends a turn with `<|eot_id|>`; \
+               ChatML puts `<|im_start|>user` before and `<|im_end|>` after; gemma uses \
+               `<bos>`, `<start_of_turn>`, `<end_of_turn>` and `<eos>`; Qwen's pad is \
+               `<|endoftext|>`, Phi's is `<|end|>`, and BERT brackets with `[CLS]` and \
+               `[SEP]`. An `<unk>` or `<pad>` may also appear.",
+    },
+    Case {
+        name: "special-markers-glued",
+        why: "markers at the very start of the input, glued to text, and followed by a \
+              newline: the shape a rendered chat template has. Exercises the SPM dummy-prefix \
+              rule after a special (`add_space_prefix && is_prev_special`) as well as which \
+              entries are special at all.",
+        text: "<s>hello</s><|im_start|>user\nhi<|im_end|>\n<start_of_turn>model\n\
+               <|begin_of_text|>[CLS] a [SEP]<|endoftext|>",
+    },
 ];
 
 #[cfg(test)]
@@ -230,6 +253,39 @@ mod tests {
         assert!(
             longest_digit_run(case("alnum-mixtures")) >= 3,
             "digits welded to letters and dots"
+        );
+        // One marker per tokenizer family the sweep covers, so that on
+        // every local checkpoint at least one of them is a real special
+        // entry and the parse_special=false run has something to keep
+        // as prose.
+        for marker in [
+            "<s>",
+            "</s>",
+            "<|begin_of_text|>",
+            "<|eot_id|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<bos>",
+            "<eos>",
+            "<end_of_turn>",
+            "<|endoftext|>",
+            "<|end|>",
+            "[CLS]",
+            "[SEP]",
+            "<unk>",
+        ] {
+            assert!(
+                case("special-markers-as-prose").contains(marker),
+                "the prose case must mention {marker}"
+            );
+        }
+        assert!(
+            case("special-markers-glued").starts_with("<s>"),
+            "a marker at the very start of the input"
+        );
+        assert!(
+            case("special-markers-glued").contains("<|im_end|>\n"),
+            "a marker followed by a newline, as a chat template renders it"
         );
 
         // Names are printed in the report and looked up above, so they

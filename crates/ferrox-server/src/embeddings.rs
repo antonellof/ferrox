@@ -47,6 +47,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use ferrox_models::pooling::{l2_normalize, pool, PoolingType};
+use ferrox_models::tokenizer::SpecialTokens;
 use ferrox_models::EmbeddingModel;
 
 use crate::openai_extra::Call;
@@ -257,7 +258,8 @@ async fn decoder_embeddings(
         let mut out = Vec::with_capacity(inputs.len());
         let mut prompt_tokens = 0usize;
         for (i, text) in inputs.iter().enumerate() {
-            let tokens = model.encode(text);
+            // `Parse`, as llama.cpp's `handle_embeddings_impl` does.
+            let tokens = model.encode(text, SpecialTokens::Parse);
             prompt_tokens += tokens.len();
             if let Some(vocab) = model.vocab_size() {
                 if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab) {

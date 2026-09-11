@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrox_gguf::ShardedGguf;
-use ferrox_models::tokenizer::StopTokens;
+use ferrox_models::tokenizer::{SpecialTokens, StopTokens};
 use ferrox_models::{
     deepseek_v4_pro, glm_5_2, kimi_k3, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, ByteTokenizer, Decoder, Gemma4Engine,
@@ -157,13 +157,28 @@ pub enum ServerTokenizer {
 }
 
 impl ServerTokenizer {
-    pub fn encode(&self, text: &str) -> Vec<usize> {
+    /// `specials` is llama.cpp's `parse_special`. Every route picks the
+    /// setting its llama.cpp counterpart uses; see the callers of
+    /// `Model::encode`.
+    pub fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
         match self {
-            ServerTokenizer::Bpe(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            ServerTokenizer::Spm(t) => t.encode(text).into_iter().map(|id| id as usize).collect(),
-            ServerTokenizer::Unigram(t) => {
-                t.encode(text).into_iter().map(|id| id as usize).collect()
-            }
+            ServerTokenizer::Bpe(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            ServerTokenizer::Spm(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            ServerTokenizer::Unigram(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
+            // A byte vocabulary has no special entries, so the setting
+            // has nothing to select.
             ServerTokenizer::Byte => ByteTokenizer::encode(text)
                 .into_iter()
                 .map(|id| id as usize)
@@ -204,8 +219,8 @@ impl ServerTokenizer {
 }
 
 impl TextTokenizer for ServerTokenizer {
-    fn encode(&self, text: &str) -> Vec<usize> {
-        ServerTokenizer::encode(self, text)
+    fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
+        ServerTokenizer::encode(self, text, specials)
     }
 
     fn decode(&self, ids: &[usize]) -> String {

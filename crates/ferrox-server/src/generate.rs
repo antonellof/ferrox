@@ -17,7 +17,7 @@ use ferrox_core::cache::{
     PagedStoreExhausted, SharedPagedKv,
 };
 use ferrox_models::sampling::SamplingParams;
-use ferrox_models::tokenizer::{prepend_bos, StopTokens};
+use ferrox_models::tokenizer::{prepend_bos, SpecialTokens, StopTokens};
 use ferrox_models::{Ceiling, Decoder, Engine, KvElem, KvShape, PrefixCache, TextTokenizer};
 
 use crate::budget::ContextCeiling;
@@ -1313,7 +1313,10 @@ pub fn generate(
         }
     };
 
-    let mut tokens = tokenizer.encode(prompt);
+    // `Parse`: the prompt is what a chat template rendered, or a raw
+    // completion, and llama.cpp's server tokenizes both with
+    // `parse_special = true`. See `Model::encode`.
+    let mut tokens = tokenizer.encode(prompt, SpecialTokens::Parse);
     prepend_bos(&mut tokens, bos_id);
     let prompt_tokens = tokens.len();
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {
@@ -1842,7 +1845,8 @@ pub fn generate_engine<E: Engine, T: TextTokenizer>(
     mut emit: impl FnMut(&str),
 ) -> Result<(FinishReason, Usage), DecodeError> {
     let vocab_size = engine.vocab_size();
-    let mut tokens = tokenizer.encode(prompt);
+    // `Parse`, as the GGUF path above. See `Model::encode`.
+    let mut tokens = tokenizer.encode(prompt, SpecialTokens::Parse);
     prepend_bos(&mut tokens, bos_id);
     let prompt_tokens = tokens.len();
     if let Some(&bad) = tokens.iter().find(|&&t| t >= vocab_size) {

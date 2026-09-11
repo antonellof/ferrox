@@ -18,6 +18,7 @@ use common::collect_gguf;
 use ferrox_models::chat_template::{ChatTemplate, RenderOptions};
 use ferrox_models::tokenizer::{
     prepend_bos, should_add_bos_token, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer,
+    SpecialTokens,
 };
 use serde_json::json;
 
@@ -41,9 +42,9 @@ impl Tok {
 
     fn encode(&self, text: &str) -> Vec<u32> {
         match self {
-            Tok::Bpe(t) => t.encode(text),
-            Tok::Spm(t) => t.encode(text),
-            Tok::Unigram(t) => t.encode(text),
+            Tok::Bpe(t) => t.encode(text, SpecialTokens::Parse),
+            Tok::Spm(t) => t.encode(text, SpecialTokens::Parse),
+            Tok::Unigram(t) => t.encode(text, SpecialTokens::Parse),
         }
     }
 }

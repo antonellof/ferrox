@@ -15,6 +15,7 @@ use crate::kimi_decoder::{
 use crate::kimi_tokenizer::KimiTokenizer;
 use crate::penalty_window::PenaltyWindow;
 use crate::sampling::{Sampler, SamplingParams};
+use crate::tokenizer::SpecialTokens;
 
 /// Encodes `prompt`, runs it through the decoder to prime `KimiDecodeState`,
 /// then samples up to `max_new_tokens` further tokens (greedy if
@@ -80,7 +81,10 @@ fn generate_on_workers(
     eos_id: Option<u32>,
     seed: u64,
 ) -> (String, Vec<u32>) {
-    let prompt_ids = tokenizer.encode(prompt);
+    // `AsText`: the prompt is user text, and `tokenization_kimi.py`
+    // encodes that with `disallowed_special=()`. There is no template
+    // in front of it here whose markers would need parsing.
+    let prompt_ids = tokenizer.encode(prompt, SpecialTokens::AsText);
     let mut state = KimiDecodeState::new(weights, kda_cfg);
     let mut sampler = Sampler::new(seed);
     // The two halves of the penalty window, kept apart because that is

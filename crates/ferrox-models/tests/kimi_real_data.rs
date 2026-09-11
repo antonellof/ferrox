@@ -598,7 +598,7 @@ fn kimi_tokenizer_matches_the_real_tiktoken_library_on_real_vocab() {
     ];
 
     for (text, expected) in cases {
-        let ids = tok.encode(text);
+        let ids = tok.encode(text, ferrox_models::tokenizer::SpecialTokens::AsText);
         assert_eq!(ids, *expected, "encode({text:?}) mismatch");
         let back = tok.decode(&ids);
         assert_eq!(&back, text, "decode roundtrip mismatch for {text:?}");

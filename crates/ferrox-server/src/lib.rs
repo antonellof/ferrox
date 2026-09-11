@@ -101,7 +101,7 @@ pub use cli::{ServerArgs, BUILT_WITH_CUDA, BUILT_WITH_METAL};
 use ferrox_core::cache::KvBlockPool;
 use ferrox_models::kimi_tokenizer::KimiTokenizer;
 use ferrox_models::sampling::SamplingParams;
-use ferrox_models::tokenizer::StopTokens;
+use ferrox_models::tokenizer::{SpecialTokens, StopTokens};
 use ferrox_models::{Decoder, Gemma4Engine, KimiEngine, MlaEngine, PrefixCache};
 use generate::{FinishReason, GenerationParams};
 pub(crate) use loaded::{ActiveModel, Loaded};
@@ -222,18 +222,44 @@ impl Model {
         }
     }
 
-    pub(crate) fn encode(&self, text: &str) -> Vec<usize> {
+    /// `specials` is llama.cpp's `parse_special`, and each caller is
+    /// matched to the llama.cpp server site it mirrors
+    /// (`tools/server/server-context.cpp` unless said otherwise):
+    ///
+    /// * a prompt, rendered from a chat template or given raw --
+    ///   `/v1/chat/completions`, `/v1/completions`, `/v1/messages`,
+    ///   `count_tokens`, slot save: `Parse`, as
+    ///   `tokenize_input_prompts(..., true, true)` does for both
+    ///   completion routes. llama.cpp's server does NOT tokenize a
+    ///   message's content separately from the template around it, so
+    ///   neither does this one; a document that mentions `<|im_end|>`
+    ///   inside a chat message is parsed on both engines. Doing better
+    ///   would need the template renderer to hand back which spans are
+    ///   content, and is deliberately not done here so the two engines
+    ///   agree about the prompt.
+    /// * pooled decoder embeddings: `Parse` (`handle_embeddings_impl`).
+    /// * `/v1/tokenize`: the request's own `parse_special`, default
+    ///   `true` (`json_value(body, "parse_special", true)`).
+    /// * DRY sequence breakers: `AsText`
+    ///   (`llama-sampler.cpp`: `vocab.tokenize(str, false, false)`).
+    /// * a stop string that is one token: `Parse`. This is ferrox's own
+    ///   mechanism (llama.cpp matches stop strings on decoded text and
+    ///   tokenizes them only to trim `n_probs`), and a caller who names
+    ///   `<|eot_id|>` as a stop means the token.
+    /// * a tool-call opener that anchors the paged KV window: `Parse`,
+    ///   because the opener is a special token where the family has one.
+    pub(crate) fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<usize> {
         match self {
-            Model::Gguf(m) => m.tokenizer.encode(text),
+            Model::Gguf(m) => m.tokenizer.encode(text, specials),
             Model::Kimi(m) => m
                 .tokenizer
-                .encode(text)
+                .encode(text, specials)
                 .into_iter()
                 .map(|id| id as usize)
                 .collect(),
-            Model::Mla(m) => m.tokenizer.encode(text),
-            Model::Gemma4(m) => m.tokenizer.encode(text),
-            Model::Glm52(m) => m.tokenizer.encode(text),
+            Model::Mla(m) => m.tokenizer.encode(text, specials),
+            Model::Gemma4(m) => m.tokenizer.encode(text, specials),
+            Model::Glm52(m) => m.tokenizer.encode(text, specials),
         }
     }
 
@@ -341,7 +367,7 @@ impl ferrox_models::dry::DryVocab for Model {
     }
 
     fn tokenize(&self, text: &str) -> Vec<usize> {
-        self.encode(text)
+        self.encode(text, SpecialTokens::AsText)
     }
 }
 
@@ -2248,8 +2274,9 @@ fn run_generation_emit(
     // one answer rather than two that can drift.
     let params = &{
         let mut resolved = params.clone();
-        resolved.stop_token_ids =
-            crate::stop::resolve_stop_tokens(&resolved.stop, |text| model.encode(text));
+        resolved.stop_token_ids = crate::stop::resolve_stop_tokens(&resolved.stop, |text| {
+            model.encode(text, SpecialTokens::Parse)
+        });
         resolved
     };
     let used_batcher = matches!((model, continuous_batcher), (Model::Gguf(_), Some(_)));
@@ -2258,7 +2285,7 @@ fn run_generation_emit(
     let (finish, usage) = match model {
         Model::Gguf(m) => {
             if let Some(batcher) = continuous_batcher {
-                let mut tokens = m.tokenizer.encode(prompt);
+                let mut tokens = m.tokenizer.encode(prompt, SpecialTokens::Parse);
                 ferrox_models::tokenizer::prepend_bos(&mut tokens, m.bos_id);
                 let (finish, _generated_ids, text, usage) = if synthetic {
                     batcher.generate(tokens, params.clone(), m.stop_tokens.clone())?
@@ -4384,7 +4411,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
                 .opener(),
                 |text| {
                     gguf.tokenizer
-                        .encode(text)
+                        .encode(text, SpecialTokens::Parse)
                         .into_iter()
                         .map(|t| t as u32)
                         .collect()

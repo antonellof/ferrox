@@ -30,6 +30,7 @@
 //! publicly documented tiktoken algorithm description, not copied from
 //! any source file.
 
+use crate::tokenizer::{SpecialKind, SpecialTokenTable, SpecialTokens, TextOrSpecial};
 use base64::Engine;
 use fancy_regex::Regex;
 use std::collections::HashMap;
@@ -181,6 +182,9 @@ pub struct KimiTokenizer {
     encoder: HashMap<Vec<u8>, u32>,
     decoder: HashMap<u32, Vec<u8>>,
     special_tokens: HashMap<String, u32>,
+    /// The same specials as a carve-out table, for
+    /// [`SpecialTokens::Parse`] -- tiktoken's `allowed_special="all"`.
+    special_table: SpecialTokenTable,
     split_re: Regex,
 }
 
@@ -191,10 +195,16 @@ impl KimiTokenizer {
     ) -> Result<Self, KimiTokenizerError> {
         let decoder = encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
         let split_re = Regex::new(PAT_STR)?;
+        let special_table = SpecialTokenTable::from_entries(
+            special_tokens
+                .iter()
+                .map(|(name, &id)| (name.as_str(), id, SpecialKind::Control)),
+        );
         Ok(KimiTokenizer {
             encoder,
             decoder,
             special_tokens,
+            special_table,
             split_re,
         })
     }
@@ -207,13 +217,24 @@ impl KimiTokenizer {
         self.special_tokens.get(name).copied()
     }
 
-    /// Encodes ordinary text (no inline special-token recognition --
-    /// matches the real `disallowed_special=()` path used for
-    /// untrusted/user text in `tokenization_kimi.py`, so a literal
-    /// `<|...|>` substring in the input is BPE-encoded like any other
-    /// text, never misread as a control token).
-    pub fn encode(&self, text: &str) -> Vec<u32> {
+    /// Encodes text. [`SpecialTokens::AsText`] is the real
+    /// `disallowed_special=()` path `tokenization_kimi.py` uses for
+    /// untrusted/user text: a literal `<|...|>` substring is BPE-encoded
+    /// like any other text, never misread as a control token.
+    /// [`SpecialTokens::Parse`] is `allowed_special="all"`: every name
+    /// in `tokenizer_config.json` is carved out as its id.
+    pub fn encode(&self, text: &str, specials: SpecialTokens) -> Vec<u32> {
         let mut out = Vec::new();
+        for seg in self.special_table.split(text, specials) {
+            match seg {
+                TextOrSpecial::Special(id) => out.push(id),
+                TextOrSpecial::Text(run) => self.encode_text_run(run, &mut out),
+            }
+        }
+        out
+    }
+
+    fn encode_text_run(&self, text: &str, out: &mut Vec<u32>) {
         for piece in self.split_re.find_iter(text) {
             let piece = piece.expect("split regex match should not error mid-scan");
             let bytes = piece.as_str().as_bytes();
@@ -223,7 +244,6 @@ impl KimiTokenizer {
             }
             out.extend(byte_pair_merge(bytes, &self.encoder));
         }
-        out
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
@@ -292,9 +312,26 @@ mod tests {
     fn encode_decode_roundtrips_on_a_tiny_synthetic_vocab() {
         let ranks = tiny_ranks();
         let tok = KimiTokenizer::new(ranks, HashMap::new()).expect("regex must compile");
-        let ids = tok.encode("hello");
+        let ids = tok.encode("hello", SpecialTokens::AsText);
         let back = tok.decode(&ids);
         assert_eq!(back, "hello");
+    }
+
+    /// tiktoken's two modes: `disallowed_special=()` leaves a written
+    /// marker as bytes, `allowed_special="all"` returns its id.
+    #[test]
+    fn a_written_marker_is_bytes_as_text_and_one_id_when_parsed() {
+        let ranks = tiny_ranks();
+        let specials = HashMap::from([("[EOS]".to_string(), 9_000u32)]);
+        let tok = KimiTokenizer::new(ranks, specials).expect("regex must compile");
+        let as_text = tok.encode("hello[EOS]", SpecialTokens::AsText);
+        assert!(!as_text.contains(&9_000), "got {as_text:?}");
+        let parsed = tok.encode("hello[EOS]", SpecialTokens::Parse);
+        assert_eq!(parsed.last(), Some(&9_000), "got {parsed:?}");
+        assert_eq!(
+            &parsed[..parsed.len() - 1],
+            &tok.encode("hello", SpecialTokens::AsText)[..]
+        );
     }
 
     #[test]

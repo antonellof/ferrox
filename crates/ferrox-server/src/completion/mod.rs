@@ -61,6 +61,7 @@ use crate::decode_task::{self, DecodeHandles};
 use crate::generate::GenerationParams;
 use crate::sampling_knobs::SamplingKnobs;
 use crate::{sse, stats, unsupported_feature, ApiError, AppState};
+use ferrox_models::tokenizer::SpecialTokens;
 
 mod wire;
 
@@ -569,7 +570,7 @@ pub(crate) async fn completion(
                          server does not quietly substitute a smaller one",
                     )
                 })?;
-            let prompt_tokens = handles.model().encode(&prompt).len();
+            let prompt_tokens = handles.model().encode(&prompt, SpecialTokens::Parse).len();
             limit.saturating_sub(prompt_tokens)
         }
     };
