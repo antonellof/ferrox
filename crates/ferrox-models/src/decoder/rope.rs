@@ -73,8 +73,16 @@ impl Decoder {
         }
     }
 
+    /// A layer llama.cpp does not rotate is a NO-OP here, not a
+    /// rotation at some default base: `ModelConfig::layer_rope` answers
+    /// `None` for it (`crate::rope_layers`), and the `let ... else`
+    /// below is the CPU half of that rule. Rotating anyway is the
+    /// silent failure the rule exists to stop -- fluent output from
+    /// positions the checkpoint never encodes that way.
     pub(crate) fn apply_rope_head_layer(&self, slice: &mut [f32], pos: usize, layer_idx: usize) {
-        let (theta, freq_factors) = self.config.layer_rope(layer_idx);
+        let Some((theta, freq_factors)) = self.config.layer_rope(layer_idx) else {
+            return;
+        };
         self.apply_rope_head_theta(slice, pos, theta, freq_factors)
     }
 
@@ -88,10 +96,21 @@ impl Decoder {
     /// Both q and k are scaled, so attention logits carry `m²`, which is
     /// the whole observable effect (V is untouched, and k enters the
     /// cache scaled exactly as llama.cpp's does).
+    ///
+    /// `layer_idx` is here because `attn_factor` is an ARGUMENT to
+    /// `ggml_rope_ext`, not a separate op: a layer llama.cpp does not
+    /// rotate never reaches `rope_yarn` and never takes the scale
+    /// either. Applying it to an unrotated layer would leave q and k
+    /// scaled by `m` with no rotation to justify it, and attention
+    /// logits carrying `m²` -- which is the whole observable effect of
+    /// this function, so the error would be exactly as large as the
+    /// feature. Taking the layer rather than a caller-computed bool is
+    /// what stops this from being a second answer to the question
+    /// `ModelConfig::layer_rope` already answers.
     #[inline]
-    pub(crate) fn apply_rope_attn_factor(&self, q: &mut [f32], k: &mut [f32]) {
+    pub(crate) fn apply_rope_attn_factor(&self, q: &mut [f32], k: &mut [f32], layer_idx: usize) {
         let m = self.config.rope_attn_factor;
-        if m == 1.0 {
+        if m == 1.0 || !self.config.layer_rotates(layer_idx) {
             return;
         }
         // ggml folds `attn_factor` into cos_theta/sin_theta inside
@@ -194,7 +213,7 @@ mod tests {
         let mut q: Vec<f32> = (0..16).map(|i| 1.0 + i as f32).collect();
         let mut k: Vec<f32> = (0..16).map(|i| 1.0 + i as f32).collect();
         let before = q.clone();
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        decoder.apply_rope_attn_factor(&mut q, &mut k, 0);
 
         for h in 0..2 {
             let base = h * 8;
@@ -231,7 +250,7 @@ mod tests {
         let mut q: Vec<f32> = (0..8).map(|i| 1.0 + i as f32).collect();
         let mut k = q.clone();
         let before = q.clone();
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        decoder.apply_rope_attn_factor(&mut q, &mut k, 0);
         for i in 0..8 {
             assert_eq!(q[i], before[i] * 3.0);
         }
@@ -254,6 +273,42 @@ mod tests {
         assert!(head[4..] != before[4..]);
     }
 
+    /// `attn_factor` is an argument to `ggml_rope_ext`, so a layer
+    /// llama.cpp does not rotate never takes it. Before `layer_idx` was
+    /// a parameter here, an unrotated layer of a model with a YaRN
+    /// `mscale` would have had q and k scaled by `m` with no rotation
+    /// behind it -- attention logits off by `m²` on exactly the layers
+    /// the per-layer rule exists for.
+    #[test]
+    fn an_unrotated_layer_takes_no_attn_factor_either() {
+        use crate::rope_layers::RopeLayers;
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.rope_attn_factor = 2.0;
+        // `SlidingOnly` with no window at all: no layer slides, so no
+        // layer rotates -- llama.cpp's degenerate `set_swa_pattern(1)`.
+        cfg.sliding_window = None;
+        cfg.rope_layers = RopeLayers::SlidingOnly;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+        assert!(!decoder.config.layer_rotates(0), "the premise");
+
+        let mut q = vec![1.0f32, -2.0, 3.0];
+        let mut k = vec![0.5f32, 4.0];
+        decoder.apply_rope_attn_factor(&mut q, &mut k, 0);
+        assert_eq!(q, vec![1.0, -2.0, 3.0], "no rotation, no mscale");
+        assert_eq!(k, vec![0.5, 4.0]);
+
+        // And the same head DOES take it on a rotating layer, so the
+        // test is about the gate and not about the scale being dead.
+        let mut cfg = crate::config::test_dense_fixture();
+        cfg.rope_attn_factor = 2.0;
+        cfg.rope_layers = RopeLayers::All;
+        let decoder = Decoder::new_random_small(cfg, 1, 32);
+        let mut q = vec![1.0f32, -2.0, 3.0];
+        let mut k = vec![0.5f32, 4.0];
+        decoder.apply_rope_attn_factor(&mut q, &mut k, 0);
+        assert_eq!(q, vec![2.0, -4.0, 6.0]);
+    }
+
     /// `mscale` scales q and k and nothing else; `1.0` must be a literal
     /// no-op so every other model pays nothing.
     #[test]
@@ -263,7 +318,7 @@ mod tests {
         let decoder = Decoder::new_random_small(cfg, 1, 32);
         let mut q = vec![1.0f32, -2.0, 3.0];
         let mut k = vec![0.5f32, 4.0];
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        decoder.apply_rope_attn_factor(&mut q, &mut k, 0);
         assert_eq!(q, vec![2.0, -4.0, 6.0]);
         assert_eq!(k, vec![1.0, 8.0]);
 
@@ -272,7 +327,7 @@ mod tests {
         let decoder = Decoder::new_random_small(cfg, 1, 32);
         let mut q = vec![1.0f32, -2.0];
         let mut k = vec![3.0f32];
-        decoder.apply_rope_attn_factor(&mut q, &mut k);
+        decoder.apply_rope_attn_factor(&mut q, &mut k, 0);
         assert_eq!(q, vec![1.0, -2.0]);
         assert_eq!(k, vec![3.0]);
     }

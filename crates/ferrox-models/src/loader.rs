@@ -388,31 +388,17 @@ impl ModelConfig {
                     .to_string(),
             ));
         }
-        // The same shape, on a different architecture: EXAONE-4 32B is
-        // a different graph from EXAONE-4 1.2B and llama.cpp decides
-        // which off the layer count with no GGUF key involved.
-        // `src/models/exaone4.cpp:4-14` switches the whole SWA
-        // machinery on inside `if (hparams.n_layer() == 64)`, and :116
-        // then makes RoPE conditional --
-        // `use_rope = is_swa(il) || swa_type == NONE` -- so in a
-        // 64-layer EXAONE-4 the FULL-ATTENTION layers get NO rotation
-        // at all. That is the NoPE class (`smollm3`, `exaone-moe`), the
-        // generic decoder rotates every layer, and there is no key for
-        // `capability::unsupported_feature_keys` to test and no unread
-        // tensor to notice: the file loads clean and answers fluently
-        // from positions it never encodes that way.
-        if arch == "exaone4" && n_layers == 64 {
-            return Err(LoadError::UnsupportedFeature(
-                arch.clone(),
-                "EXAONE-4 32B (block_count=64) gives its FULL-ATTENTION layers no RoPE at \
-                 all -- llama.cpp turns SWA on off the layer count (exaone4.cpp:4-9) and \
-                 then ropes only the sliding layers (:116, `use_rope = is_swa(il) || \
-                 swa_type == NONE`) -- and the generic decoder rotates every layer. There \
-                 is no GGUF key for it. EXAONE-4 1.2B (block_count=30) is unaffected and \
-                 runs"
-                    .to_string(),
-            ));
-        }
+        // EXAONE-4 32B used to be refused HERE, on the same shape:
+        // `exaone4.cpp:4-14` switches the whole SWA machinery on inside
+        // `if (hparams.n_layer() == 64)` and :116 then ropes only the
+        // sliding layers, so its full-attention layers get no rotation
+        // at all and no GGUF key says so. That is now IMPLEMENTED rather
+        // than refused -- `capability::swa_disabled_by_arch` carries the
+        // layer-count gate and `crate::rope_layers` the per-layer
+        // rotation rule it feeds -- so the two EXAONE-4 sizes are one
+        // code path with two answers instead of one running and one
+        // stopping. `tests/no_rope_layer_graphs.rs` has a 64-layer
+        // fixture against libllama's own logits.
         let hidden_dim = file
             .metadata_u64(&key("embedding_length"))
             .ok_or_else(|| LoadError::MissingHparam(key("embedding_length")))?
@@ -646,7 +632,7 @@ impl ModelConfig {
             // has to drop the window rather than pick a period, because
             // upstream is declining to use the file's value, not
             // choosing a different one.
-            .filter(|_| !crate::capability::swa_disabled_by_arch(&arch));
+            .filter(|_| !crate::capability::swa_disabled_by_arch(&arch, n_layers));
 
         // `olmo2` with a window AND a RoPE scaling is Olmo-3, and it
         // ropes its two kinds of layer DIFFERENTLY. `olmo2.cpp:120-134`
@@ -1107,6 +1093,11 @@ impl ModelConfig {
             sliding_window,
             swa_pattern,
             swa_dense_first,
+            // llama.cpp's per-layer `use_rope`. Fed the POST-gate window
+            // answer (`sliding_window`, not the raw key), because
+            // `exaone4` decides both off the same layer count and the
+            // two must not be able to disagree.
+            rope_layers: crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some()),
             moe: MoeLayerConfig {
                 n_experts: n_experts.max(1),
                 n_experts_active,
@@ -4520,56 +4511,100 @@ mod tests {
         assert!(!crate::capability::NON_PARAMETRIC_LAYER_NORM.is_empty());
     }
 
-    /// EXAONE-4 32B is the `baichuan` shape on a different
-    /// architecture: llama.cpp picks a different GRAPH off the layer
-    /// count, with no GGUF key to declare it.
+    /// EXAONE-4 is ONE architecture string over TWO graphs, and
+    /// llama.cpp picks between them off the LAYER COUNT with no GGUF key
+    /// involved. It used to be refused for it; both sizes run now, and
+    /// this is the test that says they run DIFFERENTLY.
     ///
-    /// `exaone4.cpp:4-9` turns SWA on inside `if (n_layer() == 64)` and
-    /// :116 then ropes only the sliding layers, so a 64-layer EXAONE-4
-    /// gives its full-attention layers no rotation at all. The generic
-    /// decoder rotates every layer, and nothing downstream could see it:
-    /// the tensor set is identical to the 1.2B's.
+    /// `exaone4.cpp:4-9` wraps the entire SWA setup in
+    /// `if (hparams.n_layer() == 64)`, and :116 then gates rotation on
+    /// it -- `use_rope = is_swa(il) || swa_type == NONE`. So:
     ///
-    /// This gate has to be REACHABLE, which is the half that has been
-    /// wrong here before -- this repo shipped a refusal keyed on a GGUF
-    /// spelling nothing writes. So the 30-layer half of this test is not
-    /// decoration: it proves the gate discriminates rather than refusing
-    /// the architecture outright.
+    /// * 64 layers: a window, `set_swa_pattern(4)` last-dense, and the
+    ///   FULL-ATTENTION layer of every period gets no rotation at all.
+    /// * 30 layers: no window whatever the file declares, and every
+    ///   layer rotates.
+    ///
+    /// Both halves are here because the gate is a layer-count EQUALITY.
+    /// A one-sided version would pass while windowing the 1.2B off a key
+    /// llama.cpp never reaches, which is the divergence
+    /// `capability::swa_disabled_by_arch` was extended to stop -- and it
+    /// would then rope three layers in four of the 1.2B not at all.
     #[test]
-    fn exaone4_32b_is_refused_because_its_full_attention_layers_get_no_rope() {
-        let thirty_two_b = open_metadata_gguf(
-            "exaone4_32b",
-            &[
+    fn the_two_exaone4_sizes_get_different_windows_and_different_rotation() {
+        // `Kv` is not `Clone`, so the shared header is a builder rather
+        // than a value; both sizes must read from one list or the test
+        // compares two transcriptions.
+        let base = |n_layers: u32| -> Vec<(&str, Kv)> {
+            vec![
                 ("general.architecture", Kv::Str("exaone4")),
-                ("exaone4.block_count", Kv::U32(64)),
-            ],
-        );
-        match ModelConfig::from_gguf(&thirty_two_b) {
-            Err(LoadError::UnsupportedFeature(arch, msg)) => {
-                assert_eq!(arch, "exaone4");
-                assert!(msg.contains("no RoPE"), "{msg}");
-                assert!(
-                    msg.contains("64"),
-                    "the refusal must name the layer count: {msg}"
-                );
-            }
-            other => panic!("EXAONE-4 32B must be refused, got {other:?}"),
+                ("exaone4.block_count", Kv::U32(n_layers)),
+                ("exaone4.embedding_length", Kv::U32(32)),
+                ("exaone4.attention.head_count", Kv::U32(4)),
+                ("exaone4.attention.head_count_kv", Kv::U32(2)),
+                ("exaone4.attention.key_length", Kv::U32(8)),
+                ("exaone4.attention.value_length", Kv::U32(8)),
+                ("exaone4.rope.freq_base", Kv::F32(10_000.0)),
+                // The SAME declared window for both sizes: that is the
+                // whole point. Only the layer count may change the
+                // answer.
+                ("exaone4.attention.sliding_window", Kv::U32(4096)),
+            ]
+        };
+
+        let file = open_metadata_gguf("exaone4_32b", &base(64));
+        let cfg = ModelConfig::from_gguf(&file).expect("EXAONE-4 32B loads");
+        assert_eq!(cfg.sliding_window, Some(4096));
+        assert_eq!(cfg.swa_pattern, Some(4), "exaone4.cpp:7-9");
+        assert!(!cfg.swa_dense_first, "set_swa_pattern's default phase");
+        for il in 0..64 {
+            assert_eq!(
+                cfg.layer_rotates(il),
+                il % 4 != 3,
+                "layer {il} of EXAONE-4 32B: only the sliding layers rotate"
+            );
         }
 
-        // The 1.2B has 30 layers, takes neither branch of `if (n_layer()
-        // == 64)`, and rotates every layer exactly as the generic
-        // decoder does. It must pass this gate and fail on the next
-        // missing hparam instead.
-        let one_two_b = open_metadata_gguf(
-            "exaone4_1_2b",
-            &[
-                ("general.architecture", Kv::Str("exaone4")),
-                ("exaone4.block_count", Kv::U32(30)),
-            ],
+        let file = open_metadata_gguf("exaone4_1_2b", &base(30));
+        let cfg = ModelConfig::from_gguf(&file).expect("EXAONE-4 1.2B loads");
+        assert_eq!(
+            cfg.sliding_window, None,
+            "exaone4.cpp:4 never reaches set_swa_pattern below 64 layers, \
+             so the declared window is dead metadata"
         );
-        match ModelConfig::from_gguf(&one_two_b) {
-            Err(LoadError::MissingHparam(key)) => assert_eq!(key, "exaone4.embedding_length"),
-            other => panic!("EXAONE-4 1.2B must pass the NoPE gate, got {other:?}"),
+        for il in 0..30 {
+            assert!(cfg.layer_rotates(il), "layer {il} of EXAONE-4 1.2B");
+        }
+    }
+
+    /// NextN/MTP layers are inside `block_count` and llama.cpp skips
+    /// them (`n_layer = n_layer_all - n_layer_nextn`); ferrox's
+    /// `n_layers` IS `block_count`, so it would run the speculative
+    /// head as two more decoder layers. Refused on the VALUE, because
+    /// `conversion/exaone.py:146` writes the key as `0` for every
+    /// EXAONE-MoE export that has no MTP head -- a presence gate would
+    /// refuse them all, and a gate nobody can pass is not a gate.
+    #[test]
+    fn a_nonzero_nextn_predict_layers_is_refused_and_zero_is_not() {
+        let base = |nextn: u32| -> Vec<(&str, Kv)> {
+            vec![
+                ("general.architecture", Kv::Str("exaone-moe")),
+                ("exaone-moe.block_count", Kv::U32(4)),
+                ("exaone-moe.nextn_predict_layers", Kv::U32(nextn)),
+            ]
+        };
+        match ModelConfig::from_gguf(&open_metadata_gguf("exaone_moe_mtp", &base(1))) {
+            Err(LoadError::UnsupportedFeature(arch, msg)) => {
+                assert_eq!(arch, "exaone-moe");
+                assert!(msg.contains("NextN"), "{msg}");
+            }
+            other => panic!("a file with an MTP head must refuse, got {other:?}"),
+        }
+        // Zero passes the gate and fails on the next missing hparam,
+        // which is what a real converter-written file would do here.
+        match ModelConfig::from_gguf(&open_metadata_gguf("exaone_moe_no_mtp", &base(0))) {
+            Err(LoadError::MissingHparam(key)) => assert_eq!(key, "exaone-moe.embedding_length"),
+            other => panic!("nextn_predict_layers = 0 must pass, got {other:?}"),
         }
     }
 
@@ -4763,10 +4798,14 @@ mod tests {
         // matters: getting it wrong swaps which five-sixths are wrong.
         assert!(cfg.layer_sliding_window(0).is_some());
         assert!(cfg.layer_sliding_window(5).is_none());
-        assert_eq!(cfg.layer_rope_freqs(0), Some(&[1.0f32; 128][..]));
-        assert_eq!(cfg.layer_rope_freqs(5), Some(&[8.0f32; 128][..]));
-        assert_eq!(cfg.layer_rope_theta(0), 10_000.0);
-        assert_eq!(cfg.layer_rope_theta(5), 1_000_000.0);
+        assert_eq!(
+            cfg.layer_rope(0),
+            Some((10_000.0, Some(&[1.0f32; 128][..])))
+        );
+        assert_eq!(
+            cfg.layer_rope(5),
+            Some((1_000_000.0, Some(&[8.0f32; 128][..])))
+        );
         assert!(
             cfg.rope_freqs_vary_by_layer(),
             "the fused Metal stacks take one divisor slice for a whole run \
@@ -4818,7 +4857,7 @@ mod tests {
         // both get the same divisors.
         assert!(cfg.layer_sliding_window(0).is_some());
         assert!(cfg.layer_sliding_window(1).is_none());
-        assert_eq!(cfg.layer_rope_freqs(0), cfg.layer_rope_freqs(1));
+        assert_eq!(cfg.layer_rope(0), cfg.layer_rope(1));
 
         // The two tables really are different: this is the pair that
         // must not be collapsed into one.

@@ -892,7 +892,13 @@ impl Decoder {
             || layer.attn.post_ffn_norm.is_some()
             || self.config.layer_sliding_window(layer_idx).is_some()
             || !GluAct::from(self.config.ffn_activation).is_swiglu()
-            || self.config.layer_rope_theta(layer_idx) != self.config.rope_theta
+            // `Some(base)` when this layer rotates at the model's own
+            // base, so this ONE comparison covers both stack-only RoPE
+            // facts: a per-layer base (Gemma-3's sliding layers) and a
+            // layer that does not rotate at all (`crate::rope_layers`,
+            // EXAONE-4 32B's full-attention layers). A second predicate
+            // beside it is exactly the drift this file keeps paying for.
+            || self.config.layer_rope_theta(layer_idx) != Some(self.config.rope_theta)
     }
 
     /// BOTH halves of layer `il`'s RoPE, in the shape the Metal
@@ -907,12 +913,12 @@ impl Decoder {
     /// Gemma-3 4B/12B/27B off the fused path entirely rather than rope
     /// five layers in six at the wrong scale.
     #[cfg(feature = "metal")]
-    fn metal_layer_rope(&self, layer_idx: usize) -> ferrox_metal::attn::LayerRope<'_> {
-        let (theta, freq_factors) = self.config.layer_rope(layer_idx);
-        ferrox_metal::attn::LayerRope {
+    fn metal_layer_rope(&self, layer_idx: usize) -> Option<ferrox_metal::attn::LayerRope<'_>> {
+        let (theta, freq_factors) = self.config.layer_rope(layer_idx)?;
+        Some(ferrox_metal::attn::LayerRope {
             theta,
             freq_factors,
-        }
+        })
     }
 
     /// Optional QKV bias / QK-norm ops for the Metal attn paths.
@@ -2009,6 +2015,13 @@ impl Decoder {
                             let hidden_ref: &[f32] =
                                 if embd_gather.is_some() { &[] } else { &hidden };
                             match seed.and_then(|_| {
+                                // A stack whose layer 0 does not rotate
+                                // cannot ride this launch; refuse rather
+                                // than rotate, and the CPU body serves
+                                // the token.
+                                let stack_rope = self
+                                    .metal_layer_rope(0)
+                                    .ok_or(ferrox_metal::gpu::MetalError::CommandFailed)?;
                                 ferrox_metal::attn::launch_moe_decode_stack(
                                     hidden_ref,
                                     &moe_layers,
@@ -2017,15 +2030,16 @@ impl Decoder {
                                     self.config.moe.norm_topk_prob,
                                     n_heads,
                                     self.metal_rope(),
-                                    self.config.rope_theta,
-                                    // The stack-wide theta above is
-                                    // sound because no layer here
-                                    // `layer_needs_metal_stack`, which
-                                    // means none slides; the divisors
-                                    // are taken through the same
-                                    // accessor so the two stay one
-                                    // answer.
-                                    self.config.layer_rope_freqs(0),
+                                    // ONE `LayerRope` for the whole
+                                    // stack, sound because no layer here
+                                    // `layer_needs_metal_stack`: none
+                                    // slides, none has a base of its
+                                    // own, and none is unrotated -- that
+                                    // predicate now covers all three
+                                    // through the same accessor, so the
+                                    // stack-wide answer and the
+                                    // per-layer one cannot disagree.
+                                    stack_rope,
                                     pos,
                                     self.config.rms_norm_eps,
                                     final_norm_w,
@@ -2331,6 +2345,15 @@ impl Decoder {
                                 // `NormOp::rms_weights` returning `None` sends
                                 // the whole layer to the host body, which reads
                                 // the raw residual the way llama.cpp does.
+                                // `metal_layer_rope` joins the six because
+                                // these four launches all rope
+                                // unconditionally, and a layer llama.cpp
+                                // does not rotate must reach the host
+                                // body instead. It is the same `None`
+                                // `layer_needs_metal_stack` reads two
+                                // lines up, from the same accessor, so
+                                // the two cannot disagree about which
+                                // layers those are.
                                 if let (
                                     Some(q_l),
                                     Some(k_l),
@@ -2338,6 +2361,7 @@ impl Decoder {
                                     Some(o_l),
                                     Some(attn_norm_w),
                                     Some(ffn_norm_w),
+                                    Some(layer_rope),
                                 ) = (
                                     Self::metal_matvec_launch(&layer.attn.q_proj),
                                     Self::metal_matvec_launch(&layer.attn.k_proj),
@@ -2345,6 +2369,7 @@ impl Decoder {
                                     Self::metal_matvec_launch(&layer.attn.o_proj),
                                     layer.attn.norm_weight.rms_weights(),
                                     layer.moe.norm_weight.rms_weights(),
+                                    self.metal_layer_rope(l),
                                 ) {
                                     // Full dense layer on one CB when FFN is Metal-capable.
                                     if Self::layer_supports_metal_dense_ffn(layer) {
@@ -2370,8 +2395,7 @@ impl Decoder {
                                             &d_l,
                                             n_heads,
                                             self.metal_rope(),
-                                            self.config.rope_theta,
-                                            self.config.layer_rope_freqs(l),
+                                            layer_rope,
                                             pos,
                                             self.config.rms_norm_eps,
                                             &self.metal_attn_extras(layer),
@@ -2460,8 +2484,7 @@ impl Decoder {
                                                                 self.config.moe.norm_topk_prob,
                                                                 n_heads,
                                                                 self.metal_rope(),
-                                                                self.config.rope_theta,
-                                                                self.config.layer_rope_freqs(l),
+                                                                layer_rope,
                                                                 pos,
                                                                 self.config.rms_norm_eps,
                                                                 &self.metal_attn_extras(layer),
@@ -2498,8 +2521,7 @@ impl Decoder {
                                                         &router_l,
                                                         n_heads,
                                                         self.metal_rope(),
-                                                        self.config.rope_theta,
-                                                        self.config.layer_rope_freqs(l),
+                                                        layer_rope,
                                                         pos,
                                                         self.config.rms_norm_eps,
                                                         &self.metal_attn_extras(layer),
@@ -2588,8 +2610,7 @@ impl Decoder {
                                             &mut metal_kvs[l],
                                             n_heads,
                                             self.metal_rope(),
-                                            self.config.rope_theta,
-                                            self.config.layer_rope_freqs(l),
+                                            layer_rope,
                                             pos,
                                             &self.metal_attn_extras(layer),
                                             self.config.rms_norm_eps,
@@ -3886,7 +3907,7 @@ impl Decoder {
             // The Metal branch below therefore hands its kernels
             // `attn_factor_applied_by_caller()` — folding it into cos/sin
             // there as well would square it.
-            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
+            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
 
             #[cfg(feature = "metal")]
             {
@@ -3902,10 +3923,18 @@ impl Decoder {
                 if let Some(guard) = metal_kv_guard.as_mut() {
                     if let Some(metal_kvs) = guard.as_mut() {
                         // POSITIONS: compared against `start_pos`.
-                        if metal_kvs[l].seq_len == cache.positions()
-                            && start_pos == cache.positions()
-                            && swa_fits
-                        {
+                        // `layer_rope` is `None` where llama.cpp does
+                        // not rotate this layer at all
+                        // (`crate::rope_layers`); the Metal prefill
+                        // block always ropes, so such a layer takes the
+                        // CPU body below rather than a rotation the
+                        // checkpoint never trained.
+                        if let (true, Some(layer_rope)) = (
+                            metal_kvs[l].seq_len == cache.positions()
+                                && start_pos == cache.positions()
+                                && swa_fits,
+                            self.metal_layer_rope(l),
+                        ) {
                             let prefill_res = {
                                 ferrox_metal::attn::launch_prefill_attn_block(
                                     &q_batch,
@@ -3915,8 +3944,7 @@ impl Decoder {
                                     n_heads,
                                     batch_size,
                                     self.metal_rope().attn_factor_applied_by_caller(),
-                                    self.config.layer_rope_theta(l),
-                                    self.config.layer_rope_freqs(l),
+                                    layer_rope,
                                     start_pos,
                                     self.config.attn_logit_softcap,
                                     false,
@@ -4452,7 +4480,7 @@ impl Decoder {
             }
 
             self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
-            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch);
+            self.apply_rope_attn_factor(&mut q_batch, &mut k_batch, l);
 
             for b in 0..batch_size {
                 let pos = positions[b];
@@ -6691,8 +6719,13 @@ mod metal_rope_tests {
         let decoder = Decoder::new_random_small(cfg, 6, 32);
 
         for il in 0..decoder.layers.len() {
-            let (theta, ff) = decoder.config.layer_rope(il);
-            let sent = decoder.metal_layer_rope(il);
+            let (theta, ff) = decoder
+                .config
+                .layer_rope(il)
+                .expect("every layer rotates here");
+            let sent = decoder
+                .metal_layer_rope(il)
+                .expect("so every layer is handed a rope");
             assert_eq!(sent.theta, theta, "layer {il} base");
             assert_eq!(sent.freq_factors, ff, "layer {il} divisors");
         }
@@ -6700,13 +6733,44 @@ mod metal_rope_tests {
         // Not vacuous: with `swa_pattern = 6` last-dense, layers 0..=4
         // slide and layer 5 does not, so the run really does hold two
         // different answers.
-        let sliding = decoder.metal_layer_rope(0);
-        let full = decoder.metal_layer_rope(5);
+        let sliding = decoder.metal_layer_rope(0).unwrap();
+        let full = decoder.metal_layer_rope(5).unwrap();
         assert_eq!(sliding.freq_factors, Some(&[1.0f32; 4][..]));
         assert_eq!(full.freq_factors, Some(&[8.0f32; 4][..]));
         assert_ne!(
             sliding, full,
             "a run of layers that all rope alike proves nothing here"
+        );
+    }
+
+    /// The THIRD half of the answer: a layer llama.cpp does not rotate
+    /// reaches the Metal stacks as `None`, from the same accessor the
+    /// CPU bodies read, and `layer_needs_metal_stack` sees it through
+    /// the same `Option` -- so the per-layer launches, which always
+    /// rope, can never be handed such a layer.
+    #[test]
+    fn an_unrotated_layer_is_handed_no_rope_and_routed_to_the_stack() {
+        let mut cfg = gemma3_4b_shaped_config();
+        // Gemma-3's own graph rotates everything; borrow its shape and
+        // give it EXAONE-4 32B's rule so the full-attention layer 5 is
+        // the one that does not rotate.
+        cfg.rope_layers = crate::rope_layers::RopeLayers::SlidingOnly;
+        let decoder = Decoder::new_random_small(cfg, 6, 32);
+
+        for il in 0..5 {
+            assert!(
+                decoder.metal_layer_rope(il).is_some(),
+                "sliding layer {il} rotates"
+            );
+        }
+        assert_eq!(
+            decoder.metal_layer_rope(5),
+            None,
+            "the full-attention layer does not"
+        );
+        assert!(
+            decoder.layer_needs_metal_stack(&decoder.layers[5], 5),
+            "an unrotated layer must go to the fused stack, which implements `None`"
         );
     }
 }

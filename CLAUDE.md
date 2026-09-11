@@ -12,32 +12,37 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-10. **35** architectures run with
+Honest position, re-audited 2026-09-11. **37** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 21 unaudited refusals are now TRIAGED, and the refusal says which of
+The 20 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 20 need new code, 1 is unknown with the question stated. Five
+away**, 19 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
-`olmo` on 2026-09-10, each with a libllama-golden fixture, which is what
-moved 46 to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21; the step from
-28 to 25 was moving the three alias rows off the generic path rather
-than a closure. `minicpm` moved too and is not in that count: it was
-refused BY NAME, never as unaudited, so it raises the audited number
-without lowering the refusing one.
+`olmo` on 2026-09-10, and `exaone-moe` on 2026-09-11, each with a
+libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
+to 28 to 25 to 22 to 21 to 20; the step from 28 to 25 was moving the
+three alias rows off the generic path rather than a closure. `minicpm`
+moved too and is not in that count: it was refused BY NAME, never as
+unaudited, so it raises the audited number without lowering the
+refusing one. `smollm3` and EXAONE-4 32B closed with `exaone-moe` and
+are the same case, one a DedicatedOnly refusal and the other a refusal
+by name.
 BOTH cheap classes being EMPTY is the honest headline: nothing still
 refusing is one fixture or one arm away, so every row that is left
 needs a different graph.
 
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
-times: 26 to 24, 24 to 21, then 21 to 20. The first two took several
-rows at once for the same reason, and it is the lesson: each found ONE
-cause behind several refusals.
+times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 a fourth
+time, 20 to 19. The first two took several rows at once for the same
+reason, and it is the lesson: each found ONE cause behind several
+refusals. The fourth did too and the column hides it: the per-layer
+RoPE gate closed THREE refusals and only `exaone-moe` was in the column.
 
 `olmo` is the exception that says what the rule is really made of. It
 closed ALONE, and before writing a line of code the question "what else
@@ -62,9 +67,10 @@ reading the raw residual, each branch's output normed before its
 residual add. Reading `olmo2.cpp:45-52,92,160-182` beside
 `exaone4.cpp:60-67,118,152-169` gives the same graph line for line, so
 they got one implementation (`ferrox-models/src/norm.rs`) and a
-fixture each. Two sub-cases stay refused by name rather than swept in --
-an `olmo2` with both a window and a RoPE scaling, and EXAONE-4 32B,
-whose full-attention layers get no RoPE at all. `olmo` (OLMo-1) is a
+fixture each. One sub-case stays refused by name rather than swept in --
+an `olmo2` with both a window and a RoPE scaling; EXAONE-4 32B, whose
+full-attention layers get no RoPE at all, was the other and closed on
+2026-09-11 (below). `olmo` (OLMo-1) is a
 THIRD shape, pre-norm with a non-parametric LayerNorm, and closed on
 2026-09-10 as a third variant of the same enum; the type is
 `ferrox-models/src/norm.rs`'s `NormOp` now rather than `PreNorm`,
@@ -109,6 +115,37 @@ merged the wrong way round would agree with llama.cpp on exactly the
 files that prove it exists. Command-R is still not close, because its
 blocker is a parallel residual over LayerNorm rather than the
 multiplier.
+
+`exaone-moe`, `smollm3` and EXAONE-4 32B closed together on 2026-09-11
+on the PER-LAYER RoPE gate, and the claim that they are one cause was
+read before it was assumed: `exaone4.cpp:116` is
+`use_rope = is_swa(il) || swa_type == NONE`, `exaone-moe.cpp:136,155-161`
+is `is_swa(il)` around the same two `ggml_rope_ext` calls, and
+`exaone-moe.cpp:4` pins `swa_type` to STANDARD, which makes the second
+disjunct false -- identical, not similar. `smollm3.cpp:5,69` is another
+variant of the same enum, `(il + 1) % 4 != 0`. llama.cpp gates rotation
+this way in SIX architectures, always from a literal and never from a
+GGUF key, and `ferrox-models/src/rope_layers.rs` is one table for all
+six; `smallthinker`, `afmoe` and `llama4` are in it and still refuse
+for other things, and their verdicts now say so. The durable part is
+the type, not the arms: `ModelConfig::layer_rope` returns
+`Option<(base, divisors)>`, so no rotation site can take the pair
+without answering whether to rotate -- the CPU head loop, the YaRN
+`attn_factor` (an argument to `ggml_rope_ext`, so it goes with it), the
+four per-layer Metal launches (which lost a loose base/divisor
+parameter pair for one `LayerRope`) and both fused Metal stacks, whose
+RoPE dispatch had been written in unconditionally the way OLMo-1's
+final norm had. A 64-layer fixture evidences the 32B because
+`exaone4.cpp:4` tests equality, and building the three found two more
+things: EXAONE-4 1.2B must IGNORE a window its file declares
+(`exaone4.cpp:4-14` reaches `set_swa_pattern` only at 64 layers, so a
+window key below that is dead metadata -- `capability::
+swa_disabled_by_arch` carries it beside `phi3`), and
+`nextn_predict_layers` was refused NOWHERE: MTP blocks are inside
+`block_count` and llama.cpp skips them, so a real EXAONE-MoE export
+with an MTP head would have run its speculative head as two more
+decoder layers. It is gated on the value now, because the converter
+writes the key as `0` for the sizes that have no head.
 
 Building those fixtures keeps finding defects worth more than the
 admissions. The last three UNKNOWN rows -- `mistral`, `mixtral`, `yi` --
@@ -232,7 +269,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 35
+Those files are why llama.cpp has 140 architectures and ferrox has 37
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

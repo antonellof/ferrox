@@ -193,15 +193,15 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **35** do
+   logit comparison against real `libllama`, or a fixture; **37** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
    `ernie4_5-moe`, `internlm2`, `xverse`, `baichuan`, `exaone`,
-   `exaone4`, `plamo3`, `granite`, `granitemoe`, `granite-moe`,
-   `minicpm`, `olmo`,
+   `exaone4`, `exaone-moe`, `smollm3`, `plamo3`, `granite`, `granitemoe`,
+   `granite-moe`, `minicpm`, `olmo`,
    `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`, `dots1`). The other
-   **21** stop with `UnauditedArchitecture`.
+   **20** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
@@ -328,13 +328,15 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (20).** A different attention or residual structure. The
-recurring shapes, rather than 20 separate stories:
+**New code (19).** A different attention or residual structure. The
+recurring shapes, rather than 19 separate stories:
 
 The column moved for the first time on 2026-09-10, three times: 26 to
-24, 24 to 21, then 21 to 20. The first two took several rows at once,
-and for the same reason -- each found ONE cause behind several
-refusals.
+24, 24 to 21, then 21 to 20, and on 2026-09-11 a fourth, 20 to 19. The
+first two took several rows at once, and for the same reason -- each
+found ONE cause behind several refusals. The fourth did too, and the
+count hides it: the per-layer RoPE gate closed THREE refusals and only
+one of them (`exaone-moe`) was ever in this column.
 
 `olmo2` and `exaone4` were the POST-NORM-ONLY pair -- no `attn_norm` and
 no `ffn_norm` at all, both sublayers reading the raw residual, each
@@ -342,11 +344,42 @@ branch's output normed before its residual add -- and they closed
 together because reading `olmo2.cpp:45-52,92,160-182` against
 `exaone4.cpp:60-67,118,152-169` showed one graph, not two. One
 implementation (`ferrox_models::norm`), one fixture each
-(`tests/post_norm_only_graphs.rs`). Two sub-cases stay refused by name:
+(`tests/post_norm_only_graphs.rs`). One sub-case stays refused by name:
 an `olmo2` with BOTH a sliding window and a RoPE scaling (Olmo-3) ropes
-its sliding and full layers differently, and EXAONE-4 32B
-(`block_count == 64`) gives its full-attention layers no RoPE at all --
-both decided by llama.cpp with no GGUF key, the `baichuan` shape.
+its sliding and full layers differently, decided by llama.cpp with no
+GGUF key, the `baichuan` shape. EXAONE-4 32B was the other, and it is
+CLOSED -- see the next paragraph.
+
+`exaone-moe`, `smollm3` and EXAONE-4 32B were the PER-LAYER-RoPE trio,
+and the claim that they are one cause was checked before it was
+assumed. `exaone4.cpp:116` is `use_rope = is_swa(il) || swa_type ==
+NONE`; `exaone-moe.cpp:136,155-161` is `is_swa(il)` around the same two
+`ggml_rope_ext` calls, and `exaone-moe.cpp:4` pins `swa_type` to
+`STANDARD`, which nails the second disjunct false -- identical, not
+similar. `smollm3.cpp:5,69` is a different variant of the same enum,
+`(il + 1) % 4 != 0`, with no window involved. All six architectures
+llama.cpp gates this way (`smallthinker`, `afmoe` and `llama4` are the
+other three, each still refused for something else) sit in ONE table,
+`ferrox_models::rope_layers`, and `ModelConfig::layer_rope` answers
+`None` for an unrotated layer -- an `Option` around the base and the
+divisors rather than a `bool` beside them, so no rotation site can take
+the pair without answering the third question. Every site was checked:
+the CPU head loop, the YaRN `attn_factor` (an argument to
+`ggml_rope_ext`, so it goes with it), the four per-layer Metal launches
+(now one `LayerRope` argument instead of a loose base/divisor pair),
+and both fused Metal stacks, whose RoPE dispatch had been written in
+unconditionally the way OLMo-1's final norm had. One libllama-golden
+fixture per row (`tests/no_rope_layer_graphs.rs`): KL 2.05e-12 on the
+64-layer EXAONE-4 32B file, 1.43e-14 on `exaone-moe`, 5.29e-15 on
+`smollm3`. Building them found that EXAONE-4 1.2B must IGNORE a window
+its file declares (`exaone4.cpp:4-14` reaches `set_swa_pattern` only at
+64 layers), which `capability::swa_disabled_by_arch` now carries beside
+the `phi3` case; that `nextn_predict_layers` was unrefused everywhere
+(MTP blocks are inside `block_count` and llama.cpp skips them), which
+`unsupported_feature_keys` now gates on the value the converters
+actually write; and that `default_swa_layout`'s comment calling
+`smallthinker` LIVE was wrong -- it has refused on its router since it
+was triaged.
 
 `granite`, `granitemoe` and the `granite-moe` alias were the SCALAR
 MULTIPLIER trio, and the same story again: `granite-moe.cpp` has no
@@ -386,7 +419,7 @@ ignored.
 | Per-layer head counts, FFN width or rotary width | `openelm`, `deci`, `laguna`, `step35`, `mimo2` |
 | A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `talkie`, `bitnet`, `dbrx` (`olmo`, `olmo2` and `exaone4` were here and are CLOSED) |
 | LayerNorm rather than RMSNorm | `dbrx` (with a learned weight; `olmo`'s non-parametric one is CLOSED) |
-| Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | `smallthinker`, `afmoe`, `exaone-moe` |
+| Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all six (`ferrox_models::rope_layers`): `exaone-moe`, `smollm3` and EXAONE-4 32B run on it; `smallthinker` and `afmoe` still refuse for the rows below and their verdicts say so |
 | A branch fed from the raw layer input rather than the post-attention residual | `smallthinker` (its MoE router), `arctic` (its MoE branch) |
 | Hardcoded scales applied even when the GGUF carries no key | `grok`, `mistral3` |
 | An ungated or non-SwiGLU FFN | `arcee`, `plm`, `apertus` |

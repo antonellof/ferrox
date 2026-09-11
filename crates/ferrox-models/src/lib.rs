@@ -66,6 +66,7 @@ pub mod rank_head;
 pub mod recurrent_engine;
 pub mod residency_report;
 pub mod rope_finetuned;
+pub mod rope_layers;
 pub mod rope_ntk_alpha;
 pub(crate) mod sampler_chain;
 pub mod sampler_order;

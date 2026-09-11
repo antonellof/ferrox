@@ -432,12 +432,39 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // `exaone4` (exaone4.cpp:60-67,118,152-169): the same graph with
     // PER-HEAD QK-norm instead -- :61-62 sizes them `{n_embd_head_k}`
     // and :127-128 applies them to what `build_qkv` already reshaped.
-    // EXAONE-4 32B is `block_count == 64`, where llama.cpp turns SWA on
-    // off the layer count and then gives the full-attention layers no
-    // RoPE at all (:4-9, :116); that is refused by name in loader.rs,
-    // the `baichuan` precedent. NOT the audited `exaone` row, which is
-    // EXAONE 3.x and a plain pre-norm llama.
+    // NOT the audited `exaone` row, which is EXAONE 3.x and a plain
+    // pre-norm llama.
+    //
+    // BOTH SIZES run. EXAONE-4 32B (`block_count == 64`) used to be
+    // refused by name: llama.cpp turns SWA on off the layer count
+    // (:4-9) and then ropes only the sliding layers (:116), so its
+    // full-attention layers get no rotation. `crate::rope_layers`
+    // implements that rule and `capability::swa_disabled_by_arch`
+    // carries the layer-count gate it depends on, with a 64-layer
+    // libllama-golden fixture in `tests/no_rope_layer_graphs.rs`.
     "exaone4",
+    // tests/no_rope_layer_graphs.rs: the PER-LAYER-RoPE group, three
+    // rows on one rule (`crate::rope_layers`). llama.cpp gates rotation
+    // per layer in six architectures and ferrox had no way to say so,
+    // which cost `smollm3` and `exaone-moe` an outright refusal and
+    // EXAONE-4 32B a refusal by name.
+    //
+    // `exaone-moe` (exaone-moe.cpp:136,155-161): `is_swa(il)` around
+    // both `ggml_rope_ext` calls, with `swa_type` pinned to STANDARD at
+    // :4 -- which is `exaone4.cpp:116` with the second disjunct nailed
+    // false, i.e. the same rule and not a similar one. Its MoE half
+    // (:72-93) is machinery ferrox already had and the fixture carries
+    // all of it: leading dense, `exp_probs_b`, a shared expert sized by
+    // `expert_shared_feed_forward_length`, sigmoid gating from
+    // metadata, `expert_weights_scale`/`_norm`.
+    "exaone-moe",
+    // `smollm3` (smollm3.cpp:5,69): `(il + 1) % 4 != 0`, nine layers of
+    // a 36-layer SmolLM3-3B unrotated, from a literal with no GGUF key.
+    // The graph is otherwise the plain pre-norm llama one, so this is
+    // the row where the rule is the ONLY thing -- which is why it was
+    // in the "No RoPE at all" refusal group beside the ALiBi
+    // architectures until the rule existed.
+    "smollm3",
     // tests/one_match_arm_graphs.rs: the FUSED-`attn_qkv.bias` pair.
     // `create_tensor_qkv` (llama-model.cpp:2886-2900) creates the bias
     // beside a fused `wqkv`, and `build_qkv` (llama-graph.cpp:1605-1609)
@@ -908,17 +935,20 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     (
         "afmoe",
         TriageClass::NewCode,
-        "gated attention plus NoPE layers. src/models/afmoe.cpp:73 creates `wqkv_gate` \
+        "gated attention. src/models/afmoe.cpp:73 creates `wqkv_gate` \
          (LLM_TENSOR_ATTN_GATE), a learned gate applied to the attention output that the \
-         generic decoder has no slot for, and :137-138 skips RoPE where \
-         `(il + 1) % n_no_rope_layer_step == 0`, the smollm3 class with no GGUF key. It also \
+         generic decoder has no slot for. It also \
          scales the embeddings by sqrt(n_embd) at :120, which ferrox does only for the Gemma \
          family. THIRD, and the quiet one: :8 reads expert_gating_func as OPTIONAL and \
          :29-30 defaults it to SIGMOID when absent, while ferrox's fallback \
          (loader.rs:375, SIGMOID_GATING_ARCHITECTURES) defaults to softmax for any \
          architecture not on its list -- so a checkpoint omitting the key would be routed \
          through the wrong scoring function. That last one is the `deepseek` shape and would \
-         need fixing even if the rest were free",
+         need fixing even if the rest were free. NO LONGER a blocker: the NoPE layers. \
+         :137-138 skips RoPE where `(il + 1) % n_no_rope_layer_step == 0` with the field at \
+         its llama-hparams.h:203 default of 4, and `crate::rope_layers` carries afmoe as \
+         exactly that (latent until the rest closes; `smollm3` is the same variant and is \
+         audited on it)",
     ),
     (
         "apertus",
@@ -931,19 +961,6 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          two-matrix shape as `arcee` and `plm` on top of the activation. It further requires \
          optional attn_q_norm/attn_k_norm BIASES (:50,:52), and ferrox's norms take a weight \
          only",
-    ),
-    (
-        "exaone-moe",
-        TriageClass::NewCode,
-        "the GLOBAL layers get no RoPE. src/models/exaone-moe.cpp:155-161 wraps both \
-         ggml_rope_ext calls in `if (is_local_layer)`, where is_local_layer is \
-         `hparams.is_swa(il)` (:136) -- so on the full-attention layers of every period Q \
-         and K are never rotated. ferrox rotates every layer, and there is no GGUF key that \
-         says otherwise: the SWA pattern implies it. Checked and CLEAN on the other axis: \
-         :5 seeds n_swa = 128 but :13 reads {arch}.attention.sliding_window as REQUIRED, so \
-         the window is always the file's own value and ferrox reads the same number, and \
-         `default_swa_layout` already carries exaone-moe as period 4. The MoE half (:72-93) \
-         -- leading dense, exp_probs_b, shared expert, gating from metadata -- ferrox has",
     ),
     (
         "grovemoe",
@@ -1044,13 +1061,15 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          the router logits from the raw layer input `inpL`, before the attention block, and \
          passes them into build_moe_ffn as a precomputed `probs` with a NULL ffn_gate_inp \
          (:151-161); every other MoE architecture routes on the normed FFN input, which is \
-         what ferrox computes. Two more, either of which alone would disqualify it: (1) NoPE \
-         layers with no GGUF key -- llama-hparams.h:203 defaults n_no_rope_layer_step to 4 \
-         and the SWA branch (:6-15) never overwrites it, so :108-109's \
-         `use_rope = n_no_rope_layer_step == n_layer || il % n_no_rope_layer_step != 0` \
-         leaves layers 0, 4, 8 ... unrotated, the `smollm3` class exactly, which ferrox \
-         refuses outright; (2) `LLM_FFN_RELU` experts (:158), and FfnActivation has no ReLU \
-         variant. :8 also pins n_swa to 4096 over whatever the file declares. \
+         what ferrox computes. One more that alone would disqualify it: `LLM_FFN_RELU` \
+         experts (:158), and FfnActivation has no ReLU variant. :8 also pins n_swa to 4096 \
+         over whatever the file declares. NO LONGER a blocker: the NoPE layers. \
+         llama-hparams.h:203 defaults n_no_rope_layer_step to 4 and the SWA branch (:6-15) \
+         never overwrites it, so :108-109's `use_rope = n_no_rope_layer_step == n_layer || \
+         il % n_no_rope_layer_step != 0` leaves layers 0, 4, 8 ... unrotated -- the FIRST \
+         layer of each period, which is the OTHER phase from smollm3's -- and \
+         `crate::rope_layers` carries smallthinker as exactly that, with the no-window \
+         branch (:18, step = n_layer, i.e. rotate everything) as well. \
          `default_swa_layout` and `swa_rope_base_follows_model` already carry smallthinker \
          correctly; they are not the blocker",
     ),
@@ -1147,6 +1166,17 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // way `LlamaModel` does. A file declaring a positive
         // `olmo.attention.clamp_kqv` is refused by name in `loader.rs`.
         v.push(gqa_norm("olmo"));
+        // `smollm3` was refused OUTRIGHT, in the "No RoPE at all" group
+        // below, and it was the only row there whose graph is the plain
+        // pre-norm llama one. What it needed was a way to say WHICH
+        // LAYERS ROTATE: `smollm3.cpp:5,69` skip `(il + 1) % 4 == 0`,
+        // nine layers of a 36-layer SmolLM3-3B, with no GGUF key.
+        // `crate::rope_layers` says it now, once, for the six
+        // architectures llama.cpp gates per layer, and
+        // `tests/no_rope_layer_graphs.rs` is the libllama-golden
+        // evidence. NORM RoPE: llama-model.cpp puts LLM_ARCH_SMOLLM3 in
+        // the consecutive-pairs group (:2600).
+        v.push(gqa_norm("smollm3"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1203,6 +1233,21 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // these two rows.
             "olmo2",
             "exaone4",
+            // Was NEW CODE in `NEOX_ROPE_TRIAGED` on ONE blocker: its
+            // GLOBAL layers get no RoPE (`exaone-moe.cpp:136,155-161`).
+            // That is the SAME RULE as `exaone4`'s -- :4 pins
+            // `swa_type` to STANDARD, which makes `exaone4.cpp:116`'s
+            // second disjunct false and the two predicates identical --
+            // so both rows take one implementation,
+            // `crate::rope_layers`, with a libllama-golden fixture each
+            // in `tests/no_rope_layer_graphs.rs`. Everything else it
+            // needed (leading dense, `exp_probs_b`, shared expert,
+            // sigmoid gating from metadata, a per-head QK-norm) ferrox
+            // already had, and its fixture carries all of it rather
+            // than asserting so. A file declaring a nonzero
+            // `nextn_predict_layers` is refused by
+            // `unsupported_feature_keys`.
+            "exaone-moe",
             // Was a `DedicatedOnly` bias refusal, not an unaudited row:
             // its only dropped bias was the FUSED `attn_qkv.bias`, which
             // `crate::qkv_fused` applies now. Qwen-1 only; qwen2 and
@@ -1232,17 +1277,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `LLAMA_NO_ROPE` pins the group so a later edit cannot quietly
         // put one back on a rotating path.
         for (n, reason) in [
-            (
-                "smollm3",
-                "a NoPE layer pattern: llama.cpp hardcodes \
-                 `hparams.n_no_rope_layer_step = 4` (src/models/smollm3.cpp:5) and \
-                 skips RoPE where `(il + 1) % 4 == 0` (:69), so 9 of a 36-layer \
-                 SmolLM3-3B's layers get NO rotation at all. There is NO GGUF key \
-                 for it, so no metadata gate could see it: the tensor set matches \
-                 the generic llama set exactly and the file loads clean. The \
-                 generic decoder rotates every layer, which is a different model. \
-                 Same shape as the ALiBi group below, and found the same way",
-            ),
             (
                 "gpt2",
                 "learned absolute position embeddings (`position_embd.weight`, \
@@ -2041,8 +2075,33 @@ pub struct SwaPattern {
 /// This is deliberately a REFUSAL TO HONOUR the key rather than a
 /// transcribed period: llama.cpp is not choosing a different window
 /// here, it is declining to use the one in the file.
-pub fn swa_disabled_by_arch(arch: &str) -> bool {
-    matches!(arch, "phi3")
+///
+/// # The second cause, and why it shares this predicate
+///
+/// `src/models/exaone4.cpp:4-14` wraps the ENTIRE SWA setup --
+/// `swa_type`, `n_swa`, `set_swa_pattern`, both SWA RoPE fields -- in
+/// `if (hparams.n_layer() == 64)`, and only then reads
+/// `LLM_KV_ATTENTION_SLIDING_WINDOW` at :16 into an `hparams.n_swa` no
+/// layer consults. So EXAONE-4 1.2B (30 layers) attends over the whole
+/// context on every layer no matter what its file declares, and
+/// EXAONE-4 32B (64) does not.
+///
+/// It is the same QUESTION as `phi3`'s -- "does this file get a window
+/// at all" -- so it is the same predicate rather than a second one
+/// beside it. `crate::rope_layers::rope_layers` takes this function's
+/// answer, not the raw presence of the key, and getting that wrong
+/// would rope the 1.2B as if it were the 32B: `exaone4.cpp:116` gates
+/// rotation on `is_swa(il)`, so a spurious window would silently stop
+/// three layers in four from rotating.
+pub fn swa_disabled_by_arch(arch: &str, n_layers: usize) -> bool {
+    match arch {
+        "phi3" => true,
+        // exaone4.cpp:4. NOT `>= 64` and not a range: llama.cpp tests
+        // equality, so a hypothetical 63- or 65-layer EXAONE-4 gets no
+        // window there either.
+        "exaone4" => n_layers != 64,
+        _ => false,
+    }
 }
 
 /// Architectures whose FFN gate uses GELU rather than SiLU, i.e. GeGLU
@@ -2132,8 +2191,10 @@ pub fn default_swa_layout(arch: &str) -> Option<SwaPattern> {
         // `swa_dense_first`; it used to implement only the first, which
         // is why `smallthinker` and `laguna` windowed every layer.
         //
-        // src/models/smallthinker.cpp:9-11. LIVE: `smallthinker` is on
-        // the generic GQA path.
+        // src/models/smallthinker.cpp:9-11. Latent: `smallthinker` is
+        // triaged NEW CODE on its raw-input router and ReLU experts, so
+        // it refuses before this row is consulted. This used to say
+        // LIVE, and was wrong: the triage row predates the comment.
         "smallthinker" => dense_first(4),
         // src/models/laguna.cpp:39-41 (its own comment: "XS.2: FULL at
         // il%4==0"). LIVE: `laguna` is on the generic GQA path.
@@ -2309,6 +2370,27 @@ pub fn unsupported_feature_keys(arch: &str) -> Vec<(String, &'static str)> {
         (
             key("final_logit_softcapping"),
             "final logit soft-capping (Gemma 2+); not implemented in the generic decoder",
+        ),
+        // NextN / MTP layers are INSIDE `block_count`, and llama.cpp
+        // does not run them: `hparams.n_layer()` is
+        // `n_layer_all - n_layer_nextn` and every architecture that
+        // reads this key creates its last `n_layer_nextn` blocks with
+        // `TENSOR_SKIP` (`exaone-moe.cpp:52-57`, `exaone4.cpp:44-49`,
+        // `glm4-moe.cpp`). ferrox's `n_layers` IS `block_count`, so it
+        // would run the speculative-decoding head as if it were two more
+        // decoder layers, on top of a residual the checkpoint never
+        // sends through them.
+        //
+        // Reachable, and checked: `conversion/exaone.py:146` and
+        // `:229-231` write the key, so a real EXAONE-4.5 or EXAONE-MoE
+        // export carries it -- as `0` for the sizes that have no MTP
+        // head, which is why the gate must read the VALUE and the
+        // `> 0` test above is load-bearing rather than defensive.
+        (
+            key("nextn_predict_layers"),
+            "NextN/MTP prediction layers are counted in block_count and llama.cpp skips \
+             them (n_layer = n_layer_all - n_layer_nextn); the generic decoder would run \
+             them as ordinary decoder layers",
         ),
         // `{arch}.attention.sliding_window_pattern` WAS refused here,
         // with the reason "not implemented in the generic decoder".
@@ -2581,7 +2663,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 21,
+            seen == 20,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -2605,10 +2687,16 @@ mod audit_tests {
              weight and all three hits are `olmo.cpp`, so this variant was never going to \
              take a second row with it -- see `NON_PARAMETRIC_LAYER_NORM`. `gemma` was the \
              last fixture-away row and `chatglm` the last one-match-arm row, so BOTH \
-             classes are empty: what is left is 21 NEW CODE and one UNKNOWN (`phi4`). \
-             The NEW CODE rows that have closed are `olmo2`, `exaone4` and the three \
-             Granite rows, and each closure took more than one row at a time because \
-             each found ONE cause behind several refusals"
+             classes are empty, and 21 until `exaone-moe` closed on the per-layer RoPE \
+             gate (`crate::rope_layers`, tests/no_rope_layer_graphs.rs) -- which is ONE \
+             cause behind three refusals, and the count moved by one only because the \
+             other two were not in it: EXAONE-4 32B was refused BY NAME in loader.rs \
+             and `smollm3` sat in the \"No RoPE at all\" DedicatedOnly group, so both \
+             raise the audited number without lowering this one. What is left is 19 NEW \
+             CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have closed are \
+             `olmo2`, `exaone4`, the three Granite rows and `exaone-moe`, and each \
+             closure but `olmo`'s took more than one row at a time because each found \
+             ONE cause behind several refusals"
         );
     }
 

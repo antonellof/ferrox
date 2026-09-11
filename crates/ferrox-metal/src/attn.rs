@@ -157,6 +157,13 @@ impl MetalRope {
 /// `rope_scaling {linear, factor 8}` on the full layers, unscaled on
 /// the sliding ones) could not ride them at all. Answering the base
 /// question without answering the divisor question no longer compiles.
+///
+/// **An `Option<LayerRope>` of `None` means this layer does not rotate
+/// at all** -- llama.cpp's per-layer `use_rope`, which six
+/// architectures upstream gate (`ferrox_models::rope_layers`). It is
+/// spelled as the absence of the whole struct rather than as a `bool`
+/// beside it, so a fused stack cannot take a base and divisors for a
+/// layer it must not rotate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerRope<'a> {
     /// This layer's RoPE frequency base (`rope_theta`, or
@@ -167,6 +174,15 @@ pub struct LayerRope<'a> {
     /// nothing.
     pub freq_factors: Option<&'a [f32]>,
 }
+
+/// [`LayerRope`] as the private encoders take it, once the divisors are
+/// already a resident device buffer: the frequency base and that buffer,
+/// or `None` for a layer that does not rotate.
+///
+/// One `Option` around the pair rather than an `Option<f32>` beside an
+/// `Option<&Buffer>`, because "no base" and "no divisors" are different
+/// questions and only the outer one decides whether a dispatch happens.
+type EncodedRope<'a> = Option<(f32, Option<&'a ProtocolObject<dyn MTLBuffer>>)>;
 
 /// Whether the fused Metal attention block should run (in addition to
 /// dense Metal matvecs). Default off until measured; `1|true|on` enables.
@@ -4251,12 +4267,20 @@ pub fn launch_decode_attn_block(
     kv: &mut MetalKvBuffers,
     n_heads: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    freq_factors: Option<&[f32]>,
+    // This layer's rotation, BOTH halves in one value. Two loose
+    // parameters here is how a per-layer base ended up beside a
+    // stack-wide divisor set at four call sites; see `LayerRope`.
+    rope: LayerRope<'_>,
     pos: usize,
     extras: &AttnExtras<'_>,
     rms_eps: f32,
 ) -> Result<Vec<f32>, MetalError> {
+    // Exhaustive destructure, no `..`: adding a third half to a
+    // layer's rotation must break every launch that ropes.
+    let LayerRope {
+        theta: rope_theta,
+        freq_factors,
+    } = rope;
     let head_dim = kv.head_dim;
     let n_kv_heads = kv.n_kv_heads;
     assert_eq!(q_launch.rows, n_heads * head_dim);
@@ -4551,12 +4575,20 @@ pub fn launch_moe_decode_pre(
     router_launch: &MatvecLaunch<'_>,
     n_heads: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    freq_factors: Option<&[f32]>,
+    // This layer's rotation, BOTH halves in one value. Two loose
+    // parameters here is how a per-layer base ended up beside a
+    // stack-wide divisor set at four call sites; see `LayerRope`.
+    rope: LayerRope<'_>,
     pos: usize,
     rms_eps: f32,
     extras: &AttnExtras<'_>,
 ) -> Result<Vec<f32>, MetalError> {
+    // Exhaustive destructure, no `..`: adding a third half to a
+    // layer's rotation must break every launch that ropes.
+    let LayerRope {
+        theta: rope_theta,
+        freq_factors,
+    } = rope;
     let head_dim = kv.head_dim;
     let n_kv_heads = kv.n_kv_heads;
     let hidden_dim = attn_norm_w.len();
@@ -5142,12 +5174,16 @@ pub fn launch_moe_decode_layer_fused(
     norm_topk_prob: bool,
     n_heads: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    freq_factors: Option<&[f32]>,
+    // This layer's rotation, BOTH halves in one value. Two loose
+    // parameters here is how a per-layer base ended up beside a
+    // stack-wide divisor set at four call sites; see `LayerRope`.
+    rope: LayerRope<'_>,
     pos: usize,
     rms_eps: f32,
     extras: &AttnExtras<'_>,
 ) -> Result<Vec<usize>, MetalError> {
+    // No destructure here: this launch forwards the whole `LayerRope`
+    // to the stack below, which is the point of it being one value.
     let layer = MoeLayerMetal {
         attn_norm_w,
         ffn_norm_w,
@@ -5234,8 +5270,7 @@ pub fn launch_moe_decode_layer_fused(
         norm_topk_prob,
         n_heads,
         rope_layout,
-        rope_theta,
-        freq_factors,
+        rope,
         pos,
         rms_eps,
         None,
@@ -5264,8 +5299,10 @@ pub fn launch_moe_decode_stack(
     norm_topk_prob: bool,
     n_heads: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    freq_factors: Option<&[f32]>,
+    // This layer's rotation, BOTH halves in one value. Two loose
+    // parameters here is how a per-layer base ended up beside a
+    // stack-wide divisor set at four call sites; see `LayerRope`.
+    rope: LayerRope<'_>,
     pos: usize,
     rms_eps: f32,
     final_norm_w: Option<&[f32]>,
@@ -5274,6 +5311,12 @@ pub fn launch_moe_decode_stack(
     reuse_scratch_h: bool,
     embd: Option<&EmbdGatherMetal<'_>>,
 ) -> Result<(Vec<f32>, Vec<Vec<usize>>), MetalError> {
+    // Exhaustive destructure, no `..`: adding a third half to a
+    // layer's rotation must break every launch that ropes.
+    let LayerRope {
+        theta: rope_theta,
+        freq_factors,
+    } = rope;
     assert!(!layers.is_empty());
     assert_eq!(layers.len(), kvs.len());
     assert!(top_k > 0 && top_k <= 8);
@@ -5495,12 +5538,20 @@ pub fn launch_decode_dense_layer(
     down_launch: &MatvecLaunch<'_>,
     n_heads: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    freq_factors: Option<&[f32]>,
+    // This layer's rotation, BOTH halves in one value. Two loose
+    // parameters here is how a per-layer base ended up beside a
+    // stack-wide divisor set at four call sites; see `LayerRope`.
+    rope: LayerRope<'_>,
     pos: usize,
     rms_eps: f32,
     extras: &AttnExtras<'_>,
 ) -> Result<Vec<f32>, MetalError> {
+    // Exhaustive destructure, no `..`: adding a third half to a
+    // layer's rotation must break every launch that ropes.
+    let LayerRope {
+        theta: rope_theta,
+        freq_factors,
+    } = rope;
     let head_dim = kv.head_dim;
     let n_kv_heads = kv.n_kv_heads;
     let hidden_dim = hidden.len();
@@ -5674,8 +5725,9 @@ pub struct PrefillDenseLayerMetal<'a> {
     /// QKV bias / QK-norm (Qwen2.5, Qwen3, Gemma-3). Applied after GEMM,
     /// before RoPE — same order as the CPU / decode paths.
     pub extras: AttnExtras<'a>,
-    /// This layer's RoPE base AND divisors; see [`LayerRope`].
-    pub rope: LayerRope<'a>,
+    /// This layer's RoPE base AND divisors, or `None` where this layer
+    /// does not rotate at all; see [`LayerRope`].
+    pub rope: Option<LayerRope<'a>>,
     /// Layer index for [`PrefillCbCache`] keying only.
     pub layer_idx: u32,
 }
@@ -5811,8 +5863,7 @@ fn encode_prefill_dense_layer(
     batch: usize,
     hidden_dim: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    ff_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    rope: EncodedRope<'_>,
     start_pos: usize,
     rms_eps: f32,
     gelu_ffn: bool,
@@ -5902,32 +5953,40 @@ fn encode_prefill_dense_layer(
     mrs.end_op(&[q_buf, k_buf, v_buf], &[q_buf, k_buf, v_buf]);
 
     // RoPE q ∥ RoPE k, in place (disjoint buffers, so they overlap).
-    mrs.begin_op(encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
-    encode_rope_batch(
-        encoder,
-        device,
-        rope_layout,
-        q_buf,
-        n_heads as u32,
-        head_dim as u32,
-        rope_theta,
-        start_pos as u32,
-        batch as u32,
-        ff_buf,
-    )?;
-    encode_rope_batch(
-        encoder,
-        device,
-        rope_layout,
-        k_buf,
-        n_kv_heads as u32,
-        head_dim as u32,
-        rope_theta,
-        start_pos as u32,
-        batch as u32,
-        ff_buf,
-    )?;
-    mrs.end_op(&[q_buf, k_buf], &[q_buf, k_buf]);
+    //
+    // `None` = this layer does not rotate (llama.cpp's per-layer
+    // `use_rope`), and then there is simply no dispatch: q and k reach
+    // the KV store and the attention exactly as the projections left
+    // them, which is what `ggml` does when the graph never builds the
+    // `ggml_rope_ext` node.
+    if let Some((rope_theta, ff_buf)) = rope {
+        mrs.begin_op(encoder, &[q_buf, k_buf], &[q_buf, k_buf]);
+        encode_rope_batch(
+            encoder,
+            device,
+            rope_layout,
+            q_buf,
+            n_heads as u32,
+            head_dim as u32,
+            rope_theta,
+            start_pos as u32,
+            batch as u32,
+            ff_buf,
+        )?;
+        encode_rope_batch(
+            encoder,
+            device,
+            rope_layout,
+            k_buf,
+            n_kv_heads as u32,
+            head_dim as u32,
+            rope_theta,
+            start_pos as u32,
+            batch as u32,
+            ff_buf,
+        )?;
+        mrs.end_op(&[q_buf, k_buf], &[q_buf, k_buf]);
+    }
 
     let kv_width = n_kv_heads * head_dim;
     let token_elems = (batch * kv_width) as u32;
@@ -6184,7 +6243,11 @@ pub fn launch_prefill_dense_stack(
         }
         assert_eq!(kv.head_dim, head_dim);
         assert_eq!(kv.n_kv_heads, n_kv_heads);
-        assert_freq_factors_len(layer.rope.freq_factors, rope_layout, head_dim);
+        assert_freq_factors_len(
+            layer.rope.and_then(|r| r.freq_factors),
+            rope_layout,
+            head_dim,
+        );
     }
 
     let max_q = layers.iter().map(|l| l.q.rows).max().unwrap();
@@ -6230,7 +6293,7 @@ pub fn launch_prefill_dense_stack(
     // `launch_decode_dense_stack`.
     let ff_resident = layers
         .iter()
-        .map(|l| match l.rope.freq_factors {
+        .map(|l| match l.rope.and_then(|r| r.freq_factors) {
             Some(ff) => resident_f32_buffer(device, ff).map(Some),
             None => Ok(None),
         })
@@ -6288,8 +6351,12 @@ pub fn launch_prefill_dense_stack(
             batch,
             hidden_dim,
             rope_layout,
-            layer.rope.theta,
-            ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref()),
+            layer.rope.map(|r| {
+                (
+                    r.theta,
+                    ff_resident[layer_idx].as_ref().map(|b| b.buffer.as_ref()),
+                )
+            }),
             start_pos,
             rms_eps,
             gelu_ffn,
@@ -6496,12 +6563,20 @@ pub fn launch_prefill_attn_block(
     n_heads: usize,
     n_q: usize,
     rope_layout: MetalRope,
-    rope_theta: f32,
-    freq_factors: Option<&[f32]>,
+    // This layer's rotation, BOTH halves in one value. Two loose
+    // parameters here is how a per-layer base ended up beside a
+    // stack-wide divisor set at four call sites; see `LayerRope`.
+    rope: LayerRope<'_>,
     start_pos: usize,
     attn_softcap: Option<f32>,
     return_kv: bool,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), MetalError> {
+    // Exhaustive destructure, no `..`: adding a third half to a
+    // layer's rotation must break every launch that ropes.
+    let LayerRope {
+        theta: rope_theta,
+        freq_factors,
+    } = rope;
     let head_dim = kv.head_dim;
     let n_kv_heads = kv.n_kv_heads;
     let q_width = n_heads * head_dim;
@@ -8141,8 +8216,10 @@ mod tests {
             n_heads,
             n_q,
             MetalRope::new(MetalRopeLayout::Norm),
-            10000.0,
-            None,
+            LayerRope {
+                theta: 10000.0,
+                freq_factors: None,
+            },
             start_pos,
             None,
             true,
@@ -8225,8 +8302,10 @@ mod tests {
             n_heads,
             n_q,
             MetalRope::new(MetalRopeLayout::Norm),
-            10000.0,
-            None,
+            LayerRope {
+                theta: 10000.0,
+                freq_factors: None,
+            },
             0,
             None,
             false,
@@ -8240,8 +8319,10 @@ mod tests {
             n_heads,
             n_q,
             MetalRope::new(MetalRopeLayout::Norm),
-            10000.0,
-            None,
+            LayerRope {
+                theta: 10000.0,
+                freq_factors: None,
+            },
             0,
             None,
             false,
@@ -8317,7 +8398,7 @@ mod tests {
 
     fn dense_layer_metal<'a>(
         w: &'a DenseLayerBytes,
-        rope: LayerRope<'a>,
+        rope: Option<LayerRope<'a>>,
         hidden: usize,
         n_q: usize,
         n_kv: usize,
@@ -8407,7 +8488,7 @@ mod tests {
 
         for pos in 0..steps {
             let layers: Vec<DenseLayerMetal<'_>> = (0..2)
-                .map(|i| dense_layer_metal(&w[i], ropes[i], hidden, n_q, n_kv, ffn))
+                .map(|i| dense_layer_metal(&w[i], Some(ropes[i]), hidden, n_q, n_kv, ffn))
                 .collect();
             h_stack = launch_decode_dense_stack(
                 &h_stack,
@@ -8441,8 +8522,7 @@ mod tests {
                     &f32_matvec(&w[i].down, hidden, ffn),
                     n_heads,
                     rope,
-                    ropes[i].theta,
-                    ropes[i].freq_factors,
+                    ropes[i],
                     pos,
                     eps,
                     &AttnExtras::default(),
@@ -8452,7 +8532,7 @@ mod tests {
 
             // The bug, run deliberately: layer 0's rope for both layers.
             let one_set: Vec<DenseLayerMetal<'_>> = (0..2)
-                .map(|i| dense_layer_metal(&w[i], ropes[0], hidden, n_q, n_kv, ffn))
+                .map(|i| dense_layer_metal(&w[i], Some(ropes[0]), hidden, n_q, n_kv, ffn))
                 .collect();
             h_one = launch_decode_dense_stack(
                 &h_one,
@@ -8493,6 +8573,153 @@ mod tests {
         assert!(
             drift > 1e-3,
             "one shared rope for both layers answered the same as two: \
+             this test proves nothing (max drift {drift})"
+        );
+    }
+
+    /// A layer whose `rope` is `None` must not be rotated by the fused
+    /// decode stack -- llama.cpp's per-layer `use_rope`, which EXAONE-4
+    /// 32B, `exaone-moe` and `smollm3` all gate (`ferrox_models::
+    /// rope_layers`). The stacks used to have the RoPE dispatch written
+    /// in unconditionally, the same way they had the final norm written
+    /// in for OLMo-1.
+    ///
+    /// The oracle is the per-layer launch, which always rotates, fed
+    /// divisors so large that every angle rounds to zero: `angle /=
+    /// freq_factors[i]` (the kernel source above) with `1e30` is the
+    /// identity rotation to float precision, so "rotated by nothing"
+    /// and "not rotated" must agree. The last assertion is what keeps
+    /// it honest: the same stack with a REAL rope on that layer must
+    /// answer differently, or the test could not tell `None` from
+    /// `Some`.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn a_decode_stack_leaves_a_layer_with_no_rope_unrotated() {
+        let (hidden, n_heads, n_kv_heads, head_dim, ffn) =
+            (32usize, 2usize, 1usize, 16usize, 32usize);
+        let n_q = n_heads * head_dim;
+        let n_kv = n_kv_heads * head_dim;
+        let rope = MetalRope::new(MetalRopeLayout::Norm);
+        let eps = 1e-5f32;
+        let real = LayerRope {
+            theta: 10_000.0,
+            freq_factors: None,
+        };
+        let identity_ff = vec![1e30f32; head_dim / 2];
+        // Rotation by an angle of zero on every band: the oracle's
+        // spelling of "no rotation" through a kernel that always ropes.
+        let identity = LayerRope {
+            theta: 10_000.0,
+            freq_factors: Some(&identity_ff),
+        };
+
+        let w: Vec<DenseLayerBytes> = (0..2)
+            .map(|i| DenseLayerBytes::new(hidden, n_q, n_kv, ffn, i as f32 * 11.0))
+            .collect();
+        // Layer 0 rotates, layer 1 does not: EXAONE-4 32B's shape in
+        // the smallest stack that can show it.
+        let stack_ropes = [Some(real), None];
+        let oracle_ropes = [real, identity];
+        let all_rotate = [Some(real), Some(real)];
+
+        let steps = 6usize;
+        let hidden0: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.13).sin()).collect();
+        let mut kv_stack: Vec<MetalKvBuffers> = (0..2)
+            .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+            .collect();
+        let mut kv_ref: Vec<MetalKvBuffers> = (0..2)
+            .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+            .collect();
+        let mut kv_all: Vec<MetalKvBuffers> = (0..2)
+            .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+            .collect();
+        let mut h_stack = hidden0.clone();
+        let mut h_ref = hidden0.clone();
+        let mut h_all = hidden0.clone();
+
+        for pos in 0..steps {
+            let layers: Vec<DenseLayerMetal<'_>> = (0..2)
+                .map(|i| dense_layer_metal(&w[i], stack_ropes[i], hidden, n_q, n_kv, ffn))
+                .collect();
+            h_stack = launch_decode_dense_stack(
+                &h_stack,
+                &layers,
+                &mut kv_stack,
+                n_heads,
+                rope,
+                pos,
+                eps,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect("decode stack");
+
+            for i in 0..2 {
+                h_ref = launch_decode_dense_layer(
+                    &h_ref,
+                    &w[i].attn_norm,
+                    &f32_matvec(&w[i].q, n_q, hidden),
+                    &f32_matvec(&w[i].k, n_kv, hidden),
+                    &f32_matvec(&w[i].v, n_kv, hidden),
+                    &f32_matvec(&w[i].o, hidden, n_q),
+                    &mut kv_ref[i],
+                    &w[i].ffn_norm,
+                    &f32_matvec(&w[i].gate, ffn, hidden),
+                    &f32_matvec(&w[i].up, ffn, hidden),
+                    &f32_matvec(&w[i].down, hidden, ffn),
+                    n_heads,
+                    rope,
+                    oracle_ropes[i],
+                    pos,
+                    eps,
+                    &AttnExtras::default(),
+                )
+                .expect("decode layer");
+            }
+
+            // The bug, run deliberately: rotate layer 1 too.
+            let rotated: Vec<DenseLayerMetal<'_>> = (0..2)
+                .map(|i| dense_layer_metal(&w[i], all_rotate[i], hidden, n_q, n_kv, ffn))
+                .collect();
+            h_all = launch_decode_dense_stack(
+                &h_all,
+                &rotated,
+                &mut kv_all,
+                n_heads,
+                rope,
+                pos,
+                eps,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect("decode stack, everything rotated");
+        }
+
+        assert_eq!(h_stack.len(), h_ref.len());
+        for (i, (a, b)) in h_ref.iter().zip(h_stack.iter()).enumerate() {
+            // `1e30` divisors leave angles of ~1e-30 radians: cos is
+            // exactly 1 and sin is ~1e-30 in f32, so the oracle's
+            // rotation is the identity to well under this tolerance.
+            let tol = 1e-5 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "elem {i}: identity-roped={a} unroped={b} tol={tol}"
+            );
+        }
+        let drift = h_stack
+            .iter()
+            .zip(h_all.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            drift > 1e-3,
+            "rotating the no-rope layer answered the same as leaving it: \
              this test proves nothing (max drift {drift})"
         );
     }
@@ -8558,7 +8785,7 @@ mod tests {
 
     fn prefill_layer_metal<'a>(
         w: &'a PrefillLayerBytes,
-        rope: LayerRope<'a>,
+        rope: Option<LayerRope<'a>>,
         layer_idx: u32,
         hidden: usize,
         n_q: usize,
@@ -8627,7 +8854,7 @@ mod tests {
             .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
             .collect();
         let layers: Vec<PrefillDenseLayerMetal<'_>> = (0..2)
-            .map(|i| prefill_layer_metal(&w[i], ropes[i], i as u32, hidden, n_q, n_kv, ffn))
+            .map(|i| prefill_layer_metal(&w[i], Some(ropes[i]), i as u32, hidden, n_q, n_kv, ffn))
             .collect();
         let h_stack = launch_prefill_dense_stack(
             &hidden0,
@@ -8646,7 +8873,8 @@ mod tests {
         let mut h_ref = hidden0.clone();
         for i in 0..2 {
             let mut kv = MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv");
-            let layer = prefill_layer_metal(&w[i], ropes[i], i as u32, hidden, n_q, n_kv, ffn);
+            let layer =
+                prefill_layer_metal(&w[i], Some(ropes[i]), i as u32, hidden, n_q, n_kv, ffn);
             let input = std::mem::take(&mut h_ref);
             h_ref = launch_prefill_dense_layer(
                 &input, &layer, &mut kv, n_heads, batch, rope, 0, eps, false, None,
@@ -8659,7 +8887,7 @@ mod tests {
             .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
             .collect();
         let one_set: Vec<PrefillDenseLayerMetal<'_>> = (0..2)
-            .map(|i| prefill_layer_metal(&w[i], ropes[0], i as u32, hidden, n_q, n_kv, ffn))
+            .map(|i| prefill_layer_metal(&w[i], Some(ropes[0]), i as u32, hidden, n_q, n_kv, ffn))
             .collect();
         let h_one = launch_prefill_dense_stack(
             &hidden0,
@@ -8691,6 +8919,82 @@ mod tests {
         assert!(
             drift > 1e-3,
             "one shared rope for both layers answered the same as two: \
+             this test proves nothing (max drift {drift})"
+        );
+    }
+
+    /// The prefill twin of
+    /// `a_decode_stack_leaves_a_layer_with_no_rope_unrotated`. The two
+    /// stacks are two encoders (`encode_prefill_dense_layer` here,
+    /// `launch_decode_dense_stack` in `decode_dense.rs`), each with its
+    /// own `if let Some(..) = rope` around the dispatch, so each needs
+    /// its own proof that `None` means "unrotated" rather than "rotated
+    /// by whatever the buffer held".
+    ///
+    /// Same oracle: divisors of `1e30` turn every angle to zero, so a
+    /// layer roped by the identity must agree with one not roped at
+    /// all, and a layer roped for real must not.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn a_prefill_stack_leaves_a_layer_with_no_rope_unrotated() {
+        let (hidden, n_heads, n_kv_heads, head_dim, ffn) =
+            (32usize, 2usize, 2usize, 16usize, 64usize);
+        let n_q = n_heads * head_dim;
+        let n_kv = n_kv_heads * head_dim;
+        let batch = 8usize;
+        let rope = MetalRope::new(MetalRopeLayout::Norm);
+        let eps = 1e-5f32;
+        let real = LayerRope {
+            theta: 10_000.0,
+            freq_factors: None,
+        };
+        let identity_ff = vec![1e30f32; head_dim / 2];
+        let identity = LayerRope {
+            theta: 10_000.0,
+            freq_factors: Some(&identity_ff),
+        };
+        let w: Vec<PrefillLayerBytes> = (0..2)
+            .map(|i| PrefillLayerBytes::new(hidden, n_q, n_kv, ffn, i as f32 * 11.0))
+            .collect();
+        let hidden0: Vec<f32> = (0..batch * hidden)
+            .map(|i| (i as f32 * 0.031).sin())
+            .collect();
+
+        let run = |ropes: [Option<LayerRope<'_>>; 2]| -> Vec<f32> {
+            let mut kvs: Vec<MetalKvBuffers> = (0..2)
+                .map(|_| MetalKvBuffers::with_capacity(n_kv_heads, head_dim, 32).expect("kv"))
+                .collect();
+            let layers: Vec<PrefillDenseLayerMetal<'_>> = (0..2)
+                .map(|i| prefill_layer_metal(&w[i], ropes[i], i as u32, hidden, n_q, n_kv, ffn))
+                .collect();
+            launch_prefill_dense_stack(
+                &hidden0, &layers, &mut kvs, n_heads, batch, rope, 0, eps, false, None,
+            )
+            .expect("prefill stack")
+        };
+
+        // Layer 0 rotates, layer 1 does not.
+        let h_stack = run([Some(real), None]);
+        let h_ref = run([Some(real), Some(identity)]);
+        // The bug, run deliberately.
+        let h_all = run([Some(real), Some(real)]);
+
+        assert_eq!(h_stack.len(), h_ref.len());
+        for (i, (a, b)) in h_ref.iter().zip(h_stack.iter()).enumerate() {
+            let tol = 1e-5 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "elem {i}: identity-roped={a} unroped={b} tol={tol}"
+            );
+        }
+        let drift = h_stack
+            .iter()
+            .zip(h_all.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            drift > 1e-3,
+            "rotating the no-rope layer answered the same as leaving it: \
              this test proves nothing (max drift {drift})"
         );
     }

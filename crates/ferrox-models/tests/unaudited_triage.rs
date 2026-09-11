@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 21,
+        n, 20,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -87,8 +87,12 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          the non-parametric LayerNorm (`ferrox_models::norm`, `tests/olmo_graphs.rs`) -- \
          the FIRST NEW CODE row to close alone, and it closed alone because its cause \
          really is unshared: every `build_norm` call in llama.cpp's 140 graphs was \
-         scanned for a null weight and all three hits are `olmo.cpp` -- rows closing is \
-         the count going DOWN \
+         scanned for a null weight and all three hits are `olmo.cpp`, and 21 until \
+         `exaone-moe` closed on the per-layer RoPE gate (`ferrox_models::rope_layers`, \
+         `tests/no_rope_layer_graphs.rs`) -- ONE cause behind THREE refusals, of which \
+         only this row was in this count: EXAONE-4 32B was refused BY NAME in loader.rs \
+         and `smollm3` sat in the \"No RoPE at all\" DedicatedOnly group, so both closed \
+         with it and neither moved this number -- rows closing is the count going DOWN \
          for the best reason. Either an architecture was audited or reclassified (good -- \
          update the count and the docs) or one was added (check it was triaged)"
     );
@@ -339,7 +343,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 21);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 20);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -729,11 +733,14 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         // (`tests/fixture_away_graphs.rs`).
         ("afmoe", TriageClass::NewCode, "gated attention"),
         ("apertus", TriageClass::NewCode, "xIELU"),
-        (
-            "exaone-moe",
-            TriageClass::NewCode,
-            "GLOBAL layers get no RoPE",
-        ),
+        // `exaone-moe` was HERE, NEW CODE on "GLOBAL layers get no
+        // RoPE". That is `exaone4.cpp:116` with `swa_type` pinned to
+        // STANDARD -- one rule, not two -- and `ferrox_models::
+        // rope_layers` implements it for both, so the row is audited
+        // and carries no verdict (`tests/no_rope_layer_graphs.rs`).
+        // `the_per_layer_rope_gate_is_no_longer_anybody_s_leading_blocker`
+        // below pins that, and pins that the two rows which still
+        // mention NoPE now say it is NOT their blocker.
         ("grovemoe", TriageClass::NewCode, "SECOND bank of experts"),
         // `hunyuan-dense` was HERE, ONE MATCH ARM on the NTK-alpha RoPE
         // base rescale. The arm landed (`rope_ntk_alpha`) and is
@@ -785,24 +792,51 @@ fn the_qk_norm_ordering_arm_is_no_longer_anybody_s_leading_blocker() {
     }
 }
 
-/// `exaone-moe`'s hardcoded `n_swa = 128` was checked and is NOT a
-/// divergence, and the verdict records that.
+/// The per-layer RoPE gate was the LEADING blocker of one row
+/// (`exaone-moe`) and a listed blocker of two more (`afmoe`,
+/// `smallthinker`), and `ferrox_models::rope_layers` implements it for
+/// all six architectures llama.cpp gates. So: `exaone-moe` is audited
+/// and carries no verdict, and the two rows that still refuse for
+/// other reasons must now say the gate is NOT what stops them -- a
+/// verdict that keeps naming an implemented feature as a blocker is
+/// the shape this suite exists to catch.
 ///
-/// A cross-cutting sweep of every `hparams.n_swa =` in llama.cpp turned
-/// this up as a candidate for the `deepseek` shape: a per-architecture
-/// default with no key to correct it. It is not one, because
-/// `exaone-moe.cpp:13` reads the window as a REQUIRED key. A clean
-/// result is still a result, and recording it stops the next person
-/// re-running the same sweep and re-raising the same false alarm.
+/// (`exaone-moe`'s old verdict also recorded that its hardcoded
+/// `n_swa = 128` was checked and CLEAN -- `exaone-moe.cpp:13` reads the
+/// window as a REQUIRED key -- and that finding now lives in the fixture
+/// itself, which declares a window narrower than the prompt and matches
+/// llama.cpp on it.)
 #[test]
-fn exaone_moe_records_the_swa_sweep_as_clean() {
-    let t = unaudited_triage("exaone-moe").expect("verdict");
+fn the_per_layer_rope_gate_is_no_longer_anybody_s_leading_blocker() {
     assert!(
-        t.blocker.contains("CLEAN"),
-        "exaone-moe's verdict must record the checked-and-clean axis: {}",
-        t.blocker
+        is_audited_generic("exaone-moe"),
+        "exaone-moe closed on the per-layer RoPE gate"
     );
-    assert!(t.blocker.contains("REQUIRED"), "{}", t.blocker);
+    assert!(unaudited_triage("exaone-moe").is_none());
+    for arch in ["afmoe", "smallthinker"] {
+        let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
+        assert!(
+            t.blocker.contains("NO LONGER a blocker: the NoPE layers"),
+            "`{arch}` must say the per-layer RoPE gate is implemented: {}",
+            t.blocker
+        );
+        assert!(
+            !t.blocker.starts_with("gated attention plus NoPE")
+                && !t.blocker.contains("which ferrox refuses outright"),
+            "`{arch}` still leads with, or refuses on, a feature ferrox implements: {}",
+            t.blocker
+        );
+    }
+    // And the census in `rope_layers` names both, so the verdict text
+    // and the table cannot drift apart about which rows carry the gate.
+    for arch in ["afmoe", "smallthinker", "exaone-moe"] {
+        assert!(
+            ferrox_models::rope_layers::PER_LAYER_ROPE_GATES
+                .iter()
+                .any(|(name, _)| *name == arch),
+            "`{arch}` is not in PER_LAYER_ROPE_GATES"
+        );
+    }
 }
 
 /// Every one of the 47 now carries a verdict, and the four classes are
@@ -830,7 +864,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 20, 1),
+        (0, 0, 19, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -838,7 +872,11 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          CODE. That column went 26 to 24 when `olmo2` and `exaone4` closed together -- \
          one topology, one implementation -- 24 to 21 when `granite`, `granitemoe` \
          and the `granite-moe` alias closed on ONE implementation of their four scalar \
-         multipliers, and 21 to 20 when `olmo` closed on the non-parametric LayerNorm. \
+         multipliers, 21 to 20 when `olmo` closed on the non-parametric LayerNorm, and \
+         20 to 19 when `exaone-moe` closed on the per-layer RoPE gate \
+         (`ferrox_models::rope_layers`) -- one cause behind three refusals, but only \
+         one of the three was in this column (EXAONE-4 32B was refused by name and \
+         `smollm3` was DedicatedOnly), which is why it reads like `olmo` and is not. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -847,5 +885,5 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 21);
+    assert_eq!(fixture + arm + new_code + unknown, 20);
 }
