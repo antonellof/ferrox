@@ -147,9 +147,12 @@ const LOAD_POLL_MS = 1000;
 function ModelSwitcher({
   active,
   onSwitched,
+  onLoadingChange,
 }: {
   active: string | null;
   onSwitched: () => void;
+  /** The id a load is in flight for, or `null` once it has a verdict. */
+  onLoadingChange: (id: string | null) => void;
 }) {
   const [inventory, setInventory] = useState<Inventory | null>(null);
   const [unsupported, setUnsupported] = useState(false);
@@ -160,6 +163,9 @@ function ModelSwitcher({
   // trigger carries the spinner from there on, and an error re-opens
   // nothing -- it is shown the next time the menu is opened.
   const [open, setOpen] = useState(false);
+  // The parent disables the composer for the same window; one state,
+  // reported outward, so the two cannot disagree about when it ends.
+  useEffect(() => onLoadingChange(loading), [loading, onLoadingChange]);
 
   const refresh = useCallback(() => {
     return getJson<Inventory>(routes.adminModels)
@@ -232,7 +238,7 @@ function ModelSwitcher({
             <Loader2 className="size-3.5 shrink-0 animate-spin" />
           ) : null}
           <span className="truncate font-mono text-2xs">
-            {loading ? `loading ${loading}…` : (active ?? "no model loaded")}
+            {loading ?? active ?? "no model loaded"}
           </span>
           <ChevronDown className="text-faint" />
         </Button>
@@ -538,6 +544,12 @@ function ChatInner({
     : serving.error
       ? `Could not read ${routes.models}: ${serving.error}`
       : "No model is loaded — pick one from the model menu above before sending.";
+  // A load in flight pauses the composer: a message sent now would be
+  // answered by whichever checkpoint happened to be in when it landed.
+  const [loadingModel, setLoadingModel] = useState<string | null>(null);
+  const composerDisabled = loadingModel
+    ? `Loading ${loadingModel}… sending resumes when it is in.`
+    : disabledReason;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -553,7 +565,11 @@ function ChatInner({
         {transcript.mode === "server" ? (
           <ConversationPicker transcript={transcript} />
         ) : null}
-        <ModelSwitcher active={serving.modelId} onSwitched={refreshServing} />
+        <ModelSwitcher
+          active={serving.modelId}
+          onSwitched={refreshServing}
+          onLoadingChange={setLoadingModel}
+        />
         <SamplingPanel value={sampling} onChange={setSampling} />
         <Button variant="ghost" size="sm" onClick={transcript.newChat}>
           <SquarePen />
@@ -624,7 +640,7 @@ function ChatInner({
 
       <div className="min-h-0 flex-1">
         <Thread
-          disabledReason={disabledReason}
+          disabledReason={composerDisabled}
           footer={
             <p className="text-center text-2xs text-faint">
               {transcript.mode === "server"
