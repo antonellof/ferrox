@@ -1,19 +1,20 @@
-// Models: the library. What is on disk, how to get more, and how to give
-// the memory back.
+// Models: the library. What is on disk, how to get more, which one
+// answers, and how to give the memory back.
 //
-// **Choosing which model answers is not done here.** It is done in the
-// picker in the Chat header, which is the only model selector in this
-// app. This screen used to carry a second one — a `Load` button on every
-// row, posting the same `/admin/models/load` to the same server for the
-// same effect — plus an `Unload` in the header AND an `Unload` in the
-// loaded row, and an `active:` badge restating what the row's own state
-// column already said. Four controls and two badges for two verbs.
+// **Loading is done here AND in the chat header's picker**, and both post
+// the same `/admin/models/load` to the same server. The picker is for
+// the person mid-conversation; this screen is for the person managing a
+// box, who should not have to leave for the chat to switch what is
+// running. One `Load` per row and one `Unload` on the loaded one, so
+// each row carries exactly the verb that applies to it, and the header
+// carries neither.
 //
-// The split it now follows is the one every UI of this shape converged
-// on: a management screen installs, removes and reports; a picker beside
-// the conversation selects. `Unload` stays because it is the one verb
-// the picker cannot express — give the memory back without putting
-// something else in it — and it exists exactly once.
+// **Downloads take what is on the clipboard.** One box accepts an
+// `owner/repo` identifier, `owner/repo:file-or-glob`, a repo URL or a
+// file URL (`lib/hf-source.ts` resolves them); the pattern box beside
+// it is the default when none of those names a file. Progress shows
+// under the box while a task runs and only then: a task list that
+// mostly says "done" is a log, and the Activity screen is the log.
 //
 // Two more rules this screen exists to respect.
 //
@@ -29,7 +30,7 @@
 // explanation rather than as a broken table.
 
 import { useCallback, useEffect, useState } from "react";
-import { Boxes, CloudDownload, RefreshCw, Search } from "lucide-react";
+import { Boxes, CloudDownload, Loader2, RefreshCw, Search } from "lucide-react";
 import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -62,6 +63,7 @@ import {
   fmtRate,
   isNum,
 } from "@/lib/format";
+import { parseHfSource } from "@/lib/hf-source";
 
 /** Poll fast while something is moving, slowly when nothing is. */
 const BUSY_POLL_MS = 1000;
@@ -161,9 +163,10 @@ export function ModelsScreen() {
   const [unsupported, setUnsupported] = useState(false);
   const [banner, setBanner] = useState<Banner>(null);
   const [filter, setFilter] = useState("");
-  const [repo, setRepo] = useState("");
+  const [source, setSource] = useState("");
   const [file, setFile] = useState("*Q4_K_M.gguf");
   const [queueing, setQueueing] = useState(false);
+  const [loadingId, setLoadingId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -221,21 +224,36 @@ export function ModelsScreen() {
 
   const unloadModel = () =>
     act("Unload", () => postJson(routes.adminModelsUnload));
+  // `202 Accepted` means queued, not loaded; the row's state column,
+  // polled fast while anything moves, is what says when it landed.
+  const loadModel = async (id: string) => {
+    setLoadingId(id);
+    try {
+      await act("Load", () => postJson(routes.adminModelsLoad, { id }));
+    } finally {
+      setLoadingId(null);
+    }
+  };
   const cancelTask = (taskId: string) =>
     act("Cancel", () => postJson(routes.adminTaskCancel(taskId)));
 
   const startDownload = async (event: React.FormEvent) => {
     event.preventDefault();
+    const parsed = parseHfSource(source, file);
+    if ("error" in parsed) {
+      setBanner({ text: parsed.error, tone: "err" });
+      return;
+    }
     setQueueing(true);
     try {
       // The server resolves a `*` glob against the repo's file list and
       // refuses anything that is not a plain `.gguf` child of the model
       // directory, so no validation is duplicated here.
-      await postJson(routes.adminDownload, {
-        repo: repo.trim(),
-        file: file.trim(),
+      await postJson(routes.adminDownload, parsed);
+      setBanner({
+        text: `Download queued: ${parsed.file} from ${parsed.repo}.`,
+        tone: "info",
       });
-      setBanner({ text: `Download queued for ${repo.trim()}.`, tone: "info" });
       await refresh();
     } catch (error) {
       setBanner({
@@ -270,6 +288,12 @@ export function ModelsScreen() {
   }
 
   const active = inventory?.active ?? null;
+  // Only what is moving, plus the most recent failure so a refused or
+  // broken download is not silently a task that vanished.
+  const liveTasks = tasks.filter(
+    (t) => t.status === "queued" || t.status === "running",
+  );
+  const lastFailed = tasks.find((t) => t.status === "error") ?? null;
   const needle = filter.trim().toLowerCase();
   const visible = (inventory?.models ?? []).filter(
     (m) =>
@@ -289,17 +313,10 @@ export function ModelsScreen() {
             : "What is on disk, Hugging Face downloads, and giving the memory back."
         }
         actions={
-          <>
-            {active ? (
-              <Button variant="default" size="sm" onClick={unloadModel}>
-                Unload {active}
-              </Button>
-            ) : null}
-            <Button variant="ghost" size="sm" onClick={() => void refresh()}>
-              <RefreshCw />
-              Refresh
-            </Button>
-          </>
+          <Button variant="ghost" size="sm" onClick={() => void refresh()}>
+            <RefreshCw />
+            Refresh
+          </Button>
         }
       />
 
@@ -308,11 +325,8 @@ export function ModelsScreen() {
       <Card>
         <CardHeader>
           <CardTitle>Inventory</CardTitle>
-          {/* The active checkpoint is stated once on this screen. When
-              there is one it is on the `Unload …` button, which names it
-              and does something about it; only the empty case needs a
-              badge of its own. The `state` column says the same thing
-              per row and is where the eye goes anyway. */}
+          {/* The `state` column and the row's own button say which
+              checkpoint is loaded; only the empty case needs a badge. */}
           {active ? null : <Badge tone="neutral">nothing loaded</Badge>}
           <span className="flex-1" />
           <div className="relative">
@@ -320,9 +334,9 @@ export function ModelsScreen() {
             <Input
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter by id, quant or arch"
-              aria-label="Filter models"
-              className="h-8 w-56 pl-8 text-xs"
+              placeholder="Search by id, quant or arch"
+              aria-label="Search models"
+              className="h-8 w-64 pl-8 text-xs"
             />
           </div>
         </CardHeader>
@@ -367,6 +381,9 @@ export function ModelsScreen() {
                   <Th numeric>on disk</Th>
                   <Th numeric>resident</Th>
                   <Th>state</Th>
+                  <Th>
+                    <span className="sr-only">actions</span>
+                  </Th>
                 </Tr>
               </thead>
               <tbody>
@@ -399,6 +416,31 @@ export function ModelsScreen() {
                       <Td>
                         <StateBadge entry={entry} activeId={active} />
                       </Td>
+                      <Td className="text-right">
+                        {entry.id === active ? (
+                          <Button
+                            variant="default"
+                            size="sm"
+                            onClick={unloadModel}
+                            title="Give the memory back without loading another"
+                          >
+                            Unload
+                          </Button>
+                        ) : (
+                          <Button
+                            variant="default"
+                            size="sm"
+                            disabled={busy || loadingId !== null}
+                            onClick={() => void loadModel(entry.id)}
+                            title="Load this checkpoint for every client of this server"
+                          >
+                            {loadingId === entry.id || entry.state === "loading" ? (
+                              <Loader2 className="animate-spin" />
+                            ) : null}
+                            Load
+                          </Button>
+                        )}
+                      </Td>
                     </Tr>
                   );
                 })}
@@ -408,12 +450,13 @@ export function ModelsScreen() {
         )}
 
         <CardFooter>
-          Pick which of these answers in the model menu at the top of{" "}
+          Load swaps the checkpoint for every client of this server; an
+          in-flight request finishes on the weights it started on. The
+          same switch is in the model menu at the top of{" "}
           <Link to="/ui/chat" className="link">
             Chat
           </Link>
-          . A swap loads the checkpoint for every client of this server; an
-          in-flight request finishes on the weights it started on.
+          .
         </CardFooter>
       </Card>
 
@@ -427,22 +470,25 @@ export function ModelsScreen() {
             className="flex flex-wrap items-end gap-3"
           >
             <Field
-              label="Hugging Face repo"
-              className="min-w-64 flex-1"
-              htmlFor="repo"
+              label="Hugging Face repo, repo:file, or URL"
+              className="min-w-72 flex-1"
+              htmlFor="source"
             >
               <Input
-                id="repo"
+                id="source"
                 required
-                value={repo}
-                onChange={(e) => setRepo(e.target.value)}
-                placeholder="unsloth/Llama-3.2-3B-Instruct-GGUF"
+                value={source}
+                onChange={(e) => setSource(e.target.value)}
+                placeholder="unsloth/Llama-3.2-3B-Instruct-GGUF  or  https://huggingface.co/…/resolve/main/x.gguf"
               />
             </Field>
-            <Field label="file (name or glob)" className="w-48" htmlFor="file">
+            <Field
+              label="file (name or glob) when the source names none"
+              className="w-56"
+              htmlFor="file"
+            >
               <Input
                 id="file"
-                required
                 value={file}
                 onChange={(e) => setFile(e.target.value)}
                 placeholder="*Q4_K_M.gguf"
@@ -454,21 +500,10 @@ export function ModelsScreen() {
             </Button>
           </form>
         </CardBody>
-        <CardFooter>
-          <code className="font-mono">POST /admin/download</code> starts a task;
-          progress appears below.
-        </CardFooter>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Tasks</CardTitle>
-          {tasks.length ? <Badge>{tasks.length}</Badge> : null}
-        </CardHeader>
-        {tasks.length ? (
-          <CardBody>
+        {liveTasks.length ? (
+          <CardBody className="border-t border-line">
             <ul className="space-y-2">
-              {tasks.map((task) => (
+              {liveTasks.map((task) => (
                 <TaskCard
                   key={task.task_id}
                   task={task}
@@ -477,15 +512,23 @@ export function ModelsScreen() {
               ))}
             </ul>
           </CardBody>
-        ) : (
-          <EmptyState
-            icon={CloudDownload}
-            title="No downloads or loads have run yet"
-          >
-            A rate appears only once the server's estimator calls it stable —
-            until then the progress line says so instead of guessing.
-          </EmptyState>
-        )}
+        ) : null}
+        {lastFailed ? (
+          <CardBody className="border-t border-line">
+            <Notice tone="err">
+              {lastFailed.label} failed: {lastFailed.error ?? "no reason given"}
+            </Notice>
+          </CardBody>
+        ) : null}
+        <CardFooter>
+          A rate appears only once the server's estimator calls it stable;
+          until then the progress line says so instead of guessing. Finished
+          tasks are in{" "}
+          <Link to="/ui/activity" className="link">
+            Activity
+          </Link>
+          .
+        </CardFooter>
       </Card>
     </Page>
   );
