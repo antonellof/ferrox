@@ -17,6 +17,21 @@ are the ones worth reading twice.
 
 ### Added
 
+- **YaRN on the MLA engine, as every real DeepSeek-V2 / V3 export
+  declares it.** `ferrox_models::mla_yarn` resolves the three pieces
+  llama.cpp computes across `deepseek2.cpp:34-37` (the key divided by
+  0.1), `llama-context.cpp:194-231` (the `attn_factor`, with
+  `LLM_ARCH_DEEPSEEK2`'s `mscale == mscale_all_dim` rule, which
+  `mistral4` does not take -- a column in `mla_arch`) and
+  `deepseek2.cpp:438-448` (`mscale^2` folded into `kq_scale`): per-band
+  divisors on the `pe` slice, one magnitude, one softmax scale, handed
+  to `mla_forward_token` as an argument. Three fixtures against
+  libllama -- V2's `0.707`, V3's `1.0`, V2 on the legacy form -- KL
+  2.98e-15 / 4.42e-15 / 2.94e-15 (`tests/deepseek2_graphs.rs`); YaRN
+  moves the plain golden by 3.6e-3, the generations differ by 1.5e-3.
+  The refusal that had stopped every real DeepSeek on this engine is
+  gone; `yarn` without `original_context_length` and any other scaling
+  type stay refused by name.
 - **The MLA engine serves the split `attn_k_b` / `attn_v_b` every real
   DeepSeek export carries, and `deepseek2` has libllama goldens in both
   tensor forms.** `ferrox_models::mla::MlaKvB::{Combined, Split}`: the
@@ -34,8 +49,7 @@ are the ones worth reading twice.
   had blamed llama.cpp for the resulting `ggml.c:3942` abort. Fixed,
   with a `--legacy-kv-b` variant derived from the same draw the way the
   converter splits it (libllama's two branches agree on the pair to
-  1.79e-7). YaRN is still refused by name on this engine, so no real
-  DeepSeek runs yet.
+  1.79e-7).
 - **`arctic` runs, and Grok-2's refusal by name lifts with it.**
   `src/models/arctic.cpp:118-154` runs a dense SiLU FFN sized
   `{n_embd, n_embd}` on the post-attention residual and its router AND

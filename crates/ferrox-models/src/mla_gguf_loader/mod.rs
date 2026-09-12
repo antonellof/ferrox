@@ -12,10 +12,9 @@
 //! architectures differ are one table, `crate::mla_arch`.
 //!
 //! `use_output_gate` is off (classic DeepSeek-2). RoPE uses interleaved
-//! Norm layout via [`crate::config::MlaRopeConfig`]; a file declaring a
-//! `rope.scaling.type` is REFUSED, because `deepseek2.cpp:312-319`
-//! folds YaRN's magnitude into `kq_scale` and this engine has neither
-//! that nor the frequency rewrite.
+//! Norm layout via [`crate::config::MlaRopeConfig`]; YaRN is
+//! `crate::mla_yarn`, resolved from the keys at load and handed to the
+//! forward pass.
 
 use ferrox_gguf::TensorSource;
 use ferrox_moe::GatingFunction;
@@ -48,6 +47,9 @@ pub struct Deepseek2Hparams {
     pub v_head_dim: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// YaRN, resolved from the keys (`crate::mla_yarn`); `None` for a
+    /// file declaring no scaling.
+    pub yarn: Option<crate::mla_yarn::MlaYarn>,
     /// Layers `[0, leading_dense)` use dense SwiGLU; rest require MoE.
     pub leading_dense_block_count: usize,
     pub n_expert: usize,
@@ -171,31 +173,17 @@ pub fn read_deepseek2_hparams(file: &impl TensorSource) -> Result<Deepseek2Hpara
         .unwrap_or(ffn_dim as u64) as usize;
     let rms_norm_eps = meta_f32(file, &p("attention.layer_norm_rms_epsilon"), 1e-6);
     let rope_theta = meta_f32(file, &p("rope.freq_base"), 10000.0);
-    // A RoPE scaling is two things this engine does not have: the
-    // frequency rewrite (`ggml_rope_ext`'s `freq_scale` / `ext_factor`
-    // on `q_pe` and `k_pe`, `deepseek2.cpp:320-328`) and YaRN's
-    // magnitude folded into the softmax scale (`:312-319`: `kq_scale =
-    // mscale^2 / sqrt(n_embd_head_k_mla)`). Every real DeepSeek-V2 /
-    // V3 export declares `yarn` (`conversion/deepseek.py:352-361`), so
-    // this used to run them at factor 1 with the wrong scale; the
-    // generic path implements both (`crate::loader`, `crate::
-    // yarn_magnitude`) and has the goldens to show it. A file that
-    // declares `none` is what `plm` and `conversion/deepseek.py:140`'s
-    // dense exports write, and is not a scaling.
-    if let Some(kind) = file
-        .metadata_str(&p("rope.scaling.type"))
-        .filter(|k| *k != "none")
-    {
-        return Err(LoadError::UnsupportedFeature(
-            arch.clone(),
-            format!(
-                "`{arch}.rope.scaling.type = \"{kind}\"`: llama.cpp's deepseek2 graph rewrites the \
-                 `pe` frequencies through `ggml_rope_ext` and folds YaRN's mscale into `kq_scale` \
-                 (src/models/deepseek2.cpp:312-328); the MLA engine has plain RoPE and \
-                 `1/sqrt(n_embd_head_k)` only, so it stops rather than run this file at factor 1"
-            ),
-        ));
-    }
+    // YaRN (`crate::mla_yarn`): the frequency rewrite, the `pe`
+    // magnitude and `kq_scale`, as `deepseek2.cpp:312-328,438-448`
+    // compute them; any other scaling type is refused there.
+    let yarn = crate::mla_yarn::resolve_mla_yarn(
+        file,
+        &arch,
+        row.yarn_log_mul,
+        qk_rope_head_dim,
+        qk_nope_head_dim + qk_rope_head_dim,
+        rope_theta,
+    )?;
     // llama.cpp deepseek2: default Softmax unless expert_gating_func set
     // (1=softmax, 2=sigmoid); special-case GLM 4.7 Lite sigmoid when absent.
     let gating = match file.metadata_u64(&p("expert_gating_func")) {
@@ -269,6 +257,7 @@ pub fn read_deepseek2_hparams(file: &impl TensorSource) -> Result<Deepseek2Hpara
         v_head_dim,
         rms_norm_eps,
         rope_theta,
+        yarn,
         leading_dense_block_count: leading_dense.min(n_layer),
         n_expert,
         n_expert_used: n_expert_used.min(n_expert.max(1)),
@@ -606,6 +595,7 @@ pub fn load_mla_engine(file: &impl TensorSource) -> Result<MlaEngine, LoadError>
         rms_norm_eps: hp.rms_norm_eps,
         hidden_dim: hp.hidden_dim,
         moe,
+        yarn: hp.yarn,
     })
 }
 

@@ -324,23 +324,37 @@ fn a_lite_deepseek2_projects_q_directly_whatever_its_key_says() {
     assert!(err.to_string().contains("never both"), "{err}");
 }
 
-/// `deepseek2.cpp:312-328`: a scaled file stops with the lines,
-/// where it used to run at factor 1; `none` is not a scaling.
+/// `crate::mla_yarn`: a `yarn` file without `original_context_length`
+/// stops with the lines, a `linear` file stops because no MLA graph
+/// has a caller for it, and `none` is not a scaling. A served YaRN
+/// file is `tests/deepseek2_graphs.rs`'s, against libllama.
 #[test]
-fn a_rope_scaling_is_refused_by_name_and_none_is_not_one() {
-    let refused = synthetic_dense_deepseek2_with(2, 0, QForm::LowRank, Some("yarn"));
-    let path = write_temp(&refused, "yarn");
+fn rope_scaling_is_yarn_with_an_original_context_or_nothing() {
+    let no_ctx = synthetic_dense_deepseek2_with(2, 0, QForm::LowRank, Some("yarn"));
+    let path = write_temp(&no_ctx, "yarn_noctx");
     let err = load_mla_engine(&GgufFile::open(&path).unwrap())
         .err()
         .expect("refused");
     let _ = std::fs::remove_file(&path);
     assert!(
-        err.to_string().contains("rope.scaling.type = \"yarn\"")
-            && err.to_string().contains("deepseek2.cpp:312-328"),
+        err.to_string()
+            .contains("without `rope.scaling.original_context_length`")
+            && err.to_string().contains("llama-model.cpp:1164-1165"),
+        "{err}"
+    );
+    let linear = synthetic_dense_deepseek2_with(2, 0, QForm::LowRank, Some("linear"));
+    let path = write_temp(&linear, "linear");
+    let err = load_mla_engine(&GgufFile::open(&path).unwrap())
+        .err()
+        .expect("refused");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        err.to_string().contains("rope.scaling.type = \"linear\""),
         "{err}"
     );
     let served = synthetic_dense_deepseek2_with(2, 0, QForm::LowRank, Some("none"));
-    load_and_forward(&served, "scaling_none");
+    let engine = load_and_forward(&served, "scaling_none");
+    assert!(engine.yarn.is_none());
 }
 
 #[test]

@@ -65,6 +65,7 @@ pub mod mla;
 pub mod mla_arch;
 pub mod mla_gguf_loader;
 pub mod mla_q_proj;
+pub mod mla_yarn;
 pub mod mmproj;
 pub mod moe_interleave;
 pub mod mtp_blocks;

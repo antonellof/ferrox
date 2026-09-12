@@ -10,6 +10,7 @@
 //! | Q projection | `attn_q_a` / `attn_q_b` when `q_lora_rank > 0`, direct `attn_q` for the LITE layer counts (`deepseek2.cpp:8,11-13,104-115`) | direct `attn_q`, no key (`plm.cpp:32`) |
 //! | dense FFN | gated SwiGLU (`deepseek2.cpp:129-131`, `build_ffn(..., LLM_FFN_SILU, LLM_FFN_PAR)`) | ungated `LLM_FFN_RELU_SQR` over `ffn_up` / `ffn_down` (`plm.cpp:39-40,181-187`) |
 //! | lm_head | `output`, else `tok_embd` (`deepseek2.cpp:92-96`) | `tok_embd` DUPLICATED, no `output` read (`plm.cpp:23-24`) |
+//! | `yarn_log_multiplier` | read and divided by 0.1 (`deepseek2.cpp:34-37`); `deepseek2` alone takes `llama-context.cpp:210-213`'s `mscale == mscale_all_dim` rule | not read |
 //!
 //! `mistral4` has no loader of its own (`mistral4.cpp` is one
 //! `build_arch_graph` line; its hparams and tensors are `deepseek2`'s),
@@ -38,6 +39,8 @@
 //! exactly the file a test would use to tell the two apart.
 
 use ferrox_moe::GluAct;
+
+use crate::mla_yarn::YarnLogMul;
 
 /// How the row projects Q; the type it produces is
 /// `crate::mla_q_proj::MlaQProj`.
@@ -75,7 +78,10 @@ pub struct MlaArch {
     /// second matmul (`GluAct::ungated`).
     pub dense_act: GluAct,
     pub output_head: MlaOutputHead,
-    /// Where the row's three decisions are read from.
+    /// Whether the loader reads `yarn_log_multiplier`, and whether
+    /// the DeepSeek-V2 `mscale` rule applies (`crate::mla_yarn`).
+    pub yarn_log_mul: YarnLogMul,
+    /// Where the row's decisions are read from.
     pub lines: &'static str,
 }
 
@@ -86,13 +92,21 @@ pub const MLA_ENGINE_ARCHS: &[MlaArch] = &[
         q_proj: QProjRule::LoraUnlessLite,
         dense_act: GluAct::Swiglu,
         output_head: MlaOutputHead::OutputOrTied,
-        lines: "src/models/deepseek2.cpp:8,11-13,92-96,104-115,129-131",
+        yarn_log_mul: YarnLogMul::Read {
+            deepseek2_mscale_rule: true,
+        },
+        lines: "src/models/deepseek2.cpp:8,11-13,34-37,92-96,104-115,129-131",
     },
     MlaArch {
         name: "mistral4",
         q_proj: QProjRule::LoraUnlessLite,
         dense_act: GluAct::Swiglu,
         output_head: MlaOutputHead::OutputOrTied,
+        // The key is read through deepseek2's loader, but
+        // `llama-context.cpp:210` tests `LLM_ARCH_DEEPSEEK2`.
+        yarn_log_mul: YarnLogMul::Read {
+            deepseek2_mscale_rule: false,
+        },
         lines: "src/models/mistral4.cpp (deepseek2's loader and graph)",
     },
     MlaArch {
@@ -100,6 +114,7 @@ pub const MLA_ENGINE_ARCHS: &[MlaArch] = &[
         q_proj: QProjRule::Direct,
         dense_act: GluAct::ReluSqr,
         output_head: MlaOutputHead::TiedOnly,
+        yarn_log_mul: YarnLogMul::NotRead,
         lines: "src/models/plm.cpp:23-24,32,39-40,181-187",
     },
 ];
@@ -169,6 +184,20 @@ mod tests {
         let m4 = mla_arch("mistral4").unwrap();
         assert_eq!(ds.q_proj, m4.q_proj);
         assert_eq!(ds.output_head, m4.output_head);
+        // The one column that differs, and why: the loader is shared,
+        // the arch test in llama-context.cpp is not.
+        assert!(matches!(
+            ds.yarn_log_mul,
+            YarnLogMul::Read {
+                deepseek2_mscale_rule: true
+            }
+        ));
+        assert!(matches!(
+            m4.yarn_log_mul,
+            YarnLogMul::Read {
+                deepseek2_mscale_rule: false
+            }
+        ));
         assert!(matches!(
             (ds.dense_act, m4.dense_act),
             (GluAct::Swiglu, GluAct::Swiglu)

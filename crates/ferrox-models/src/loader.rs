@@ -1500,7 +1500,7 @@ fn linear_scaling_from_gguf(file: &impl TensorSource, arch: &str) -> Option<f32>
 ///   inventing one (say, from `context_length`, which on a YaRN file is
 ///   the *extended* length) would put the ramp in the wrong place and
 ///   quietly rope the checkpoint at frequencies nobody trained.
-fn yarn_scaling_from_gguf(
+pub(crate) fn yarn_scaling_from_gguf(
     file: &impl TensorSource,
     arch: &str,
     orig_ctx: Option<usize>,

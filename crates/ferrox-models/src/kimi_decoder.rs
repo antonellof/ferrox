@@ -192,7 +192,15 @@ pub fn kimi_forward_token(
                 kda::kda_forward_token(w, kda_cfg, &normed, cfg.rms_norm_eps, s)
             }
             (KimiLayerAttention::Mla(w), KimiLayerState::Mla { k_cache, v_cache }) => {
-                mla::mla_forward_token(w, mla_cfg, &normed, cfg.rms_norm_eps, k_cache, v_cache)
+                mla::mla_forward_token(
+                    w,
+                    mla_cfg,
+                    None,
+                    &normed,
+                    cfg.rms_norm_eps,
+                    k_cache,
+                    v_cache,
+                )
             }
             _ => unreachable!("layer attention kind and decode state kind must always match"),
         };

@@ -177,8 +177,35 @@ where `conversion/deepseek.py:307-308` writes 1 for every MLA export
 `ggml.c:3942` abort. Its `--legacy-kv-b` file derives the combined
 matrix and the split pair from ONE draw exactly as the converter
 splits them, and libllama's two branches agree on the pair to 1.79e-7,
-which is the number that says the derivation is the converter's. What
-a real DeepSeek still needs of this engine is YaRN (refused by name).
+which is the number that says the derivation is the converter's.
+
+YaRN on that engine is `ferrox-models/src/mla_yarn.rs`, and it is
+three places in llama.cpp read in order, because a reading of any one
+of them is wrong in a way only libllama's logits show:
+`deepseek2.cpp:34-37` DIVIDE `rope.scaling.yarn_log_multiplier` by 0.1
+(the converter writes `0.1 * mscale_all_dim`, "for legacy reasons");
+`llama-context.cpp:194-231` compute the `attn_factor` handed to
+`ggml_rope_ext`, with `LLM_ARCH_DEEPSEEK2` alone taking `mscale ==
+mscale_all_dim` when the latter is not 1 (DeepSeek-V2's config has
+both at 0.707) -- `mistral4` shares the loader and not the arch test,
+which is why `mla_arch` has a column for it -- then cancel the
+`(1 + 0.1 ln F)` ggml multiplies back in; and `deepseek2.cpp:438-448`
+undo the cancel, take `mscale = attn_factor_org * (1 + 0.1 L ln F)`,
+and fold `mscale^2` into `kq_scale`. `MlaYarn` is the three observable
+pieces (per-band divisors on the `pe` slice, ONE magnitude on `q_pe` /
+`k_pe`, ONE softmax scale), an ARGUMENT to `mla_forward_token` so no
+rotation site or attention body is reached without it. For both real
+shapes the magnitude comes out at exactly 1 -- libllama's own log line
+says `setting new yarn_attn_factor = 1.0000` -- and the whole effect
+is the rewrite plus `kq_scale`, which every real DeepSeek was missing
+here. Three fixtures (V2's `0.707`, V3's `1.0`, V2 on the legacy
+combined form), KL 2.98e-15, 4.42e-15, 2.94e-15; YaRN moves the plain
+golden by 3.6e-3 and the two generations differ by 1.5e-3, and
+sabotaging the `/ 0.1` turns both red. A `yarn` without
+`original_context_length` and any other scaling type stay refused by
+name. With the split tensors and YaRN both served, a real DeepSeek-V2
+/ V3 export has nothing left that this engine refuses on its
+attention; what it has not had is a real file run through it.
 
 `plm` closed on `ferrox-models/src/mla_arch.rs` and `mla_q_proj.rs`, on
 the MLA engine. `plm.cpp:84-166` is `deepseek2.cpp`'s naive MLA branch
