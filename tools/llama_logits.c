@@ -356,6 +356,18 @@ static int cmd_logits(const char * model_path, const char * out_path, int n_toke
     cparams.n_ctx    = (uint32_t) n_tokens + 8;
     cparams.n_batch  = (uint32_t) n_tokens;
     cparams.n_ubatch = (uint32_t) n_tokens;
+    // LLAMA_LOGITS_FLASH_ATTN=0 keeps llama.cpp off its flash-attention
+    // path. The default stays AUTO, which is what every published parity
+    // number was measured under; the switch exists because llama.cpp
+    // itself aborts under AUTO on a real PLM-1.8B file
+    // (`ggml_set_rows: GGML_ASSERT(a->ne[0] == b->ne[0])` from
+    // `build_attn` when the K head is 192 wide and the V head 128 --
+    // measured 2026-09-12 against 1269cb1), and runs the same file with
+    // it disabled, as `scripts/gptoss_reference_logits.cpp` always does.
+    const char * fa = getenv("LLAMA_LOGITS_FLASH_ATTN");
+    if (fa && strcmp(fa, "0") == 0) {
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
 
     struct llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {

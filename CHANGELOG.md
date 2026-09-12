@@ -17,6 +17,18 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`ferrox parity` reaches the MLA engine, and the first real MLA
+  checkpoint went through it.** `prefill_logits` dispatches `deepseek2`
+  / `mistral4` / `plm` to `MlaEngine` where it used to refuse them as
+  `DedicatedOnly`. PLM-1.8B-Instruct Q8_0: tokenizer MATCH; the Q8_0
+  logits read `WRONG` at KL 3.54e-2, and the arbiter -- the same file
+  dequantized to f32 (`scripts/dequantize_gguf.py`, new) through both
+  engines -- shows the graph at 4.5e-5, ferrox's Q8_0 at 4.5e-5 from
+  llama.cpp's f32 (2.8e-9 from its own) and llama.cpp's Q8_0 at 3.7e-2
+  from its own f32: the verdict is the reference's 8-bit activation
+  quantization on the MLA latent, not ferrox (gap inventory §10.1). The
+  reference dumper gained `LLAMA_LOGITS_FLASH_ATTN=0`, because llama.cpp
+  aborts on this file with flash attention on.
 - **YaRN on the MLA engine, as every real DeepSeek-V2 / V3 export
   declares it.** `ferrox_models::mla_yarn` resolves the three pieces
   llama.cpp computes across `deepseek2.cpp:34-37` (the key divided by

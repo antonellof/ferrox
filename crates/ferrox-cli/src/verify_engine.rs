@@ -10,7 +10,10 @@ use ferrox_gguf::ShardedGguf;
 use ferrox_models::config::ModelConfig;
 use ferrox_models::decoder::Decoder;
 use ferrox_models::engine::Engine;
-use ferrox_models::engine_factory::{load_gemma4_engine_from_path, ServedEngine};
+use ferrox_models::engine_factory::{
+    load_gemma4_engine_from_path, load_mla_engine_from_path, select_engine_kind,
+    SelectedEngineKind, ServedEngine,
+};
 use ferrox_models::tokenizer::{
     GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, SpecialTokens,
 };
@@ -107,12 +110,33 @@ pub fn prefill_logits(
     if GEMMA4_ARCHES.contains(&arch) {
         return prefill_logits_gemma4(path, &tokens);
     }
+    if matches!(select_engine_kind(arch), Ok(SelectedEngineKind::Mla)) {
+        return prefill_logits_mla(path, &tokens);
+    }
     let mut config = ModelConfig::from_gguf(&file).context("reading model config")?;
     config.apply_runtime_context(runtime_ctx);
     let decoder = Decoder::from_gguf(path, config)?;
     let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
     let logits = decoder.forward_batch_last(&tokens, 0, &mut caches);
     Ok((tokens.into_iter().map(|t| t as u32).collect(), logits))
+}
+
+/// The MLA engine (`deepseek2` / `mistral4` / `plm`) has one body,
+/// token by token, so the prefill is a decode loop; the distribution
+/// at the last prompt position is the same question. This is what puts
+/// a real DeepSeek or PLM file in front of `ferrox parity`, where the
+/// generic-only dispatch used to refuse it as `DedicatedOnly`.
+fn prefill_logits_mla(path: &Path, tokens: &[usize]) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {
+    let served = load_mla_engine_from_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ServedEngine::Mla(engine) = served else {
+        anyhow::bail!("expected MlaEngine for an MLA checkpoint");
+    };
+    let mut state = Engine::new_state(&engine);
+    let mut logits = Vec::new();
+    for (pos, &tok) in tokens.iter().enumerate() {
+        logits = Engine::forward_token(&engine, tok, pos, &mut state);
+    }
+    Ok((tokens.iter().map(|&t| t as u32).collect(), logits))
 }
 
 fn prefill_logits_gemma4(path: &Path, tokens: &[usize]) -> anyhow::Result<(Vec<u32>, Vec<f32>)> {

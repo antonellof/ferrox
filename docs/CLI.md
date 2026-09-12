@@ -417,6 +417,26 @@ Comparing greedy *text* would not work here. A chain of argmaxes turns
 one last-bit difference into a different sentence, so a text diff cannot
 tell `TIE-FLIP` from `WRONG`.
 
+A `WRONG` on a quantized file is a distance between two points and does
+not say which one moved. llama.cpp quantizes activations to 8 bits for
+its quantized matmuls and ferrox keeps them in f32, and on a graph that
+amplifies that loss the two disagree while ferrox is the closer of the
+two to the f32 answer -- PLM-1.8B Q8_0 reads `WRONG` at 3.5e-2 for
+exactly that reason (`docs/plans/llama-cpp-gap-inventory.md` §10.1).
+The arbiter is the dequantized file:
+
+```bash
+PYTHONPATH=$LLAMA/gguf-py python3 scripts/dequantize_gguf.py model-Q8_0.gguf /tmp/model-f32.gguf
+./target/release/ferrox parity -m /tmp/model-f32.gguf   --dumper target/llama_logits --dump-logits /tmp/f32
+./target/release/ferrox parity -m model-Q8_0.gguf       --dumper target/llama_logits --dump-logits /tmp/q8
+# KL(f32.llama || q8.llama) is the reference's own quantization loss;
+# KL(f32.llama || q8.ferrox) is ferrox's; KL(f32.llama || f32.ferrox) is the graph.
+```
+
+`LLAMA_LOGITS_FLASH_ATTN=0` keeps the reference off its flash-attention
+path (llama.cpp itself aborts under the default on a real PLM file; the
+published numbers were measured with the default).
+
 ### The reference dumper
 
 Both halves need it, built once. It is C, not Rust, and it lives outside
