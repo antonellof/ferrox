@@ -17,6 +17,26 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`orion` and `nemotron` run: the LayerNorm with a bias.**
+  `NormOp::LayerNormBias` is `build_norm(x, w, b, LLM_NORM, il)` --
+  multiply, then add -- the variant `capability::WEIGHTED_LAYER_NORM`
+  had named as having no caller. Read row by row, two of the eight
+  "LayerNorm-with-bias group" rows need nothing else: Orion-14B
+  (`orion.cpp:63-66,104-107,127-130`; a Llama with NEOX RoPE at the
+  defaults) and Nemotron-4 / Minitron (`nemotron.cpp:71-74,111-114,
+  136-139`; the ungated ReLU-squared FFN, partial NEOX RoPE).
+  `NormFunction::resolve` asks the file for each PART the function has
+  (`NormParam::{Weight, Bias}`), so the biased form cannot be built with
+  the bias forgotten and a function with no bias never asks for one.
+  `tests/biased_layer_norm_graphs.rs`: KL 2.33e-11 (orion; its 1.6e-5
+  max delta is f32 noise on a SwiGLU fed a non-zero-mean norm, measured
+  at unit weight scale too) and 5.13e-13 (nemotron); zeroing a bias,
+  dropping it (dbrx's form) and RMS-norming the final norm each diverge;
+  Nemotron's optional projection biases are refused as unread from a
+  fixture whose libllama logits differ by 8.07. `tests/attn_bias.rs`
+  now asks `BIASED_LAYER_NORM` which rows apply the three norm biases,
+  and the six remaining rows keep their refusals with the bias named.
+  58 audited.
 - **`glm4` runs: GLM-4-0414 (9B, 32B), GLM-Z1 and GLM-OCR on the
   generic path, audited against libllama.** The row had been sent to
   the GLM-5.2 MLA loader for `q_lora_rank` and three more keys

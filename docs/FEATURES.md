@@ -91,6 +91,14 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
+  Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
+  `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row
+  "LayerNorm-with-bias group" shares; these two rows need nothing else
+  (Orion is a Llama, Nemotron the ReLU-squared FFN `arcee` serves),
+  audited against libllama at KL 2.3e-11 and 5.1e-13. Nemotron's
+  optional `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` are
+  refused as unread; the other six rows say what else they need.
 - **GLM-4-0414 / GLM-Z1 / GLM-OCR (`glm4`) on the generic path**,
   audited against libllama at KL 9.7e-15 with no code change: the row
   had been sent to the GLM-5.2 MLA loader for keys its graph never

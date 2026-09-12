@@ -151,9 +151,20 @@ pub enum NormOp {
     /// LayerNorm with a learned weight and no bias:
     /// `(x - mean) / sqrt(var + eps) * w`.
     ///
-    /// `dbrx` (`dbrx.cpp:69-71`, `:110-112`, `:140-142`). See the
-    /// module docs for why there is no `(w, b)` variant beside it.
+    /// `dbrx` (`dbrx.cpp:69-71`, `:110-112`, `:140-142`).
     LayerNorm(Vec<f32>),
+    /// LayerNorm with a learned weight AND bias:
+    /// `(x - mean) / sqrt(var + eps) * w + b` -- `build_norm(x, w, b,
+    /// LLM_NORM, il)`, which multiplies `if (mw)` and then adds `if (mb)`
+    /// (`llama-graph.cpp`).
+    ///
+    /// `orion` (`orion.cpp:63-66,104-107,127-130`) and `nemotron`
+    /// (`nemotron.cpp:71-74,111-114,136-139`), both with all six per-layer
+    /// tensors and both output-norm tensors REQUIRED
+    /// (`capability::BIASED_LAYER_NORM`). The variant every row in the
+    /// old "LayerNorm-with-bias group" shares; it arrived when two rows
+    /// needed nothing else, and the six that need more say what.
+    LayerNormBias { weight: Vec<f32>, bias: Vec<f32> },
     /// No norm at all: the branch reads the raw residual.
     ///
     /// `olmo2` and `exaone4`. NOT "an RMSNorm whose weights are all
@@ -191,6 +202,17 @@ impl NormOp {
                 }
                 out
             }
+            Self::LayerNormBias { weight, bias } => {
+                // The same, then `ggml_add(cur, mb)`: the bias lands
+                // AFTER the multiply, so it is not scaled by `w`.
+                let mut out = layer_norm_no_params(x, eps);
+                debug_assert_eq!(out.len(), weight.len());
+                debug_assert_eq!(out.len(), bias.len());
+                for ((o, w), b) in out.iter_mut().zip(weight.iter()).zip(bias.iter()) {
+                    *o = *o * w + b;
+                }
+                out
+            }
             Self::None => x.to_vec(),
         }
     }
@@ -204,7 +226,29 @@ impl NormOp {
     pub fn rms_weights(&self) -> Option<&[f32]> {
         match self {
             Self::Rms(w) => Some(w),
-            Self::RmsNoParams | Self::LayerNormNoParams | Self::LayerNorm(_) | Self::None => None,
+            Self::RmsNoParams
+            | Self::LayerNormNoParams
+            | Self::LayerNorm(_)
+            | Self::LayerNormBias { .. }
+            | Self::None => None,
+        }
+    }
+}
+
+/// One learned tensor of a norm site: the `.weight` or the `.bias`
+/// suffix of its GGUF name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormParam {
+    Weight,
+    Bias,
+}
+
+impl NormParam {
+    /// The GGUF suffix.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            NormParam::Weight => "weight",
+            NormParam::Bias => "bias",
         }
     }
 }
@@ -225,6 +269,9 @@ pub enum NormFunction {
     /// `LLM_NORM` with a weight and no bias: `dbrx`
     /// (`capability::WEIGHTED_LAYER_NORM`).
     LayerNorm,
+    /// `LLM_NORM` with a weight AND a bias: `orion`, `nemotron`
+    /// (`capability::BIASED_LAYER_NORM`), [`NormOp::LayerNormBias`].
+    LayerNormBias,
     /// `LLM_NORM` with neither: `olmo`
     /// (`capability::NON_PARAMETRIC_LAYER_NORM`).
     LayerNormNoParams,
@@ -241,10 +288,22 @@ impl NormFunction {
     /// `LayerNormNoParams` never calls it, so a file that carries no
     /// norm tensor (OLMo-1 ships none) is never asked for one, and a
     /// site cannot be handed a weight its function would drop.
-    pub fn resolve<E>(self, load: impl FnOnce() -> Result<Vec<f32>, E>) -> Result<NormOp, E> {
+    ///
+    /// `load` is asked for each PART the function has -- `Weight`, and
+    /// for the biased form `Bias` too -- so a function that has no bias
+    /// never asks the file for one and the biased form cannot be built
+    /// with the bias forgotten.
+    pub fn resolve<E>(
+        self,
+        mut load: impl FnMut(NormParam) -> Result<Vec<f32>, E>,
+    ) -> Result<NormOp, E> {
         Ok(match self {
-            Self::Rms => NormOp::Rms(load()?),
-            Self::LayerNorm => NormOp::LayerNorm(load()?),
+            Self::Rms => NormOp::Rms(load(NormParam::Weight)?),
+            Self::LayerNorm => NormOp::LayerNorm(load(NormParam::Weight)?),
+            Self::LayerNormBias => NormOp::LayerNormBias {
+                weight: load(NormParam::Weight)?,
+                bias: load(NormParam::Bias)?,
+            },
             Self::LayerNormNoParams => NormOp::LayerNormNoParams,
             Self::RmsNoParams => NormOp::RmsNoParams,
         })
@@ -266,6 +325,8 @@ pub fn norm_function(arch: &str) -> NormFunction {
         NormFunction::RmsNoParams
     } else if crate::capability::uses_weighted_layer_norm(arch) {
         NormFunction::LayerNorm
+    } else if crate::capability::uses_biased_layer_norm(arch) {
+        NormFunction::LayerNormBias
     } else {
         NormFunction::Rms
     }
@@ -472,7 +533,14 @@ mod tests {
         for arch in ["llama", "qwen3", "olmo2", "gemma3", "grok"] {
             assert_eq!(norm_function(arch), NormFunction::Rms, "{arch}");
         }
-        let w = || -> Result<Vec<f32>, ()> { Ok(vec![1.0, 2.0]) };
+        assert_eq!(norm_function("orion"), NormFunction::LayerNormBias);
+        assert_eq!(norm_function("nemotron"), NormFunction::LayerNormBias);
+        let w = |p: NormParam| -> Result<Vec<f32>, ()> {
+            Ok(match p {
+                NormParam::Weight => vec![1.0, 2.0],
+                NormParam::Bias => vec![0.5, -0.5],
+            })
+        };
         assert_eq!(
             NormFunction::LayerNorm.resolve(w),
             Ok(NormOp::LayerNorm(vec![1.0, 2.0]))
@@ -480,6 +548,13 @@ mod tests {
         assert_eq!(
             NormFunction::Rms.resolve(w),
             Ok(NormOp::Rms(vec![1.0, 2.0]))
+        );
+        assert_eq!(
+            NormFunction::LayerNormBias.resolve(w),
+            Ok(NormOp::LayerNormBias {
+                weight: vec![1.0, 2.0],
+                bias: vec![0.5, -0.5],
+            })
         );
     }
 
@@ -492,7 +567,7 @@ mod tests {
     #[test]
     fn the_parameterless_function_never_reads_a_weight() {
         let mut asked = false;
-        let got = NormFunction::LayerNormNoParams.resolve(|| -> Result<Vec<f32>, ()> {
+        let got = NormFunction::LayerNormNoParams.resolve(|_| -> Result<Vec<f32>, ()> {
             asked = true;
             Err(())
         });

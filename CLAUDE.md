@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **56** architectures run with
+Honest position, re-audited 2026-09-12. **58** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -686,9 +686,21 @@ group. At the time none of them was one variant away, because each
 refused for more than the norm, so that variant was deliberately NOT
 written. The next day `dbrx` became the caller: its other two blockers
 were one implementation each, so `NormOp::LayerNorm` (weight, no bias)
-landed WITH a row that uses it, and the bias form still has no caller
-and still does not exist -- `capability::WEIGHTED_LAYER_NORM` records
-which rows it does not close and why.
+landed WITH a row that uses it. The bias form waited until 2026-09-12,
+when the group was read row by row instead of as a group: `orion` and
+`nemotron` need NOTHING else -- Orion-14B is a Llama with the biased
+norm, Nemotron-4 the same norm on the ReLU-squared FFN `arcee` had
+already served -- so `NormOp::LayerNormBias` landed with two callers
+(`capability::BIASED_LAYER_NORM`, `tests/biased_layer_norm_graphs.rs`,
+KL 2.3e-11 and 5.1e-13), `NormFunction::resolve` asks the file for each
+PART the function has so the biased form cannot be built with the bias
+forgotten, and the six the group still holds each say what else they
+need (`attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` for
+`starcoder2`, `codeshell`, `jais2`; those plus learned positions for
+`starcoder`; a parallel residual for `stablelm`; an `output.bias` and
+LongRoPE for `phimoe`). Nemotron's OPTIONAL projection biases are
+refused as unread from a fixture whose libllama logits differ by 8.07
+from the plain file's.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are ONE residual
 topology: no `attn_norm` and no `ffn_norm` tensor, both sublayers

@@ -896,6 +896,19 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // the converter permuted to NEOX, and its logits differ from the
     // plain file's by 0.72 (measured).
     "glm4",
+    // tests/biased_layer_norm_graphs.rs: the two rows of the old
+    // "LayerNorm-with-bias group" that needed only the norm
+    // (`BIASED_LAYER_NORM`, `NormOp::LayerNormBias`). `orion`
+    // (Orion-14B): a Llama whose every norm is `build_norm(x, w, b,
+    // LLM_NORM)` (`orion.cpp:63-66,104-107,127-130`), NEOX RoPE with no
+    // `rope.dimension_count` and no `rope.freq_base` in the file. `nemotron`
+    // (Nemotron-4, Minitron): the same norm (`nemotron.cpp:71-74,111-114,
+    // 136-139`), the ungated ReLU-squared FFN (`:118-123`), partial NEOX
+    // RoPE, `rope.scaling.type` `none` or `linear`; its OPTIONAL
+    // `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` (`:31,40-41`)
+    // are refused as unread when a file carries them.
+    "orion",
+    "nemotron",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1008,16 +1021,53 @@ pub fn uses_non_parametric_rms_norm(arch: &str) -> bool {
 /// strength of "it is LayerNorm too": the `nemotron` / `orion` /
 /// `stablelm` / `codeshell` / `jais2` / `starcoder` / `starcoder2` /
 /// `phimoe` group all create `*_norm.bias` as REQUIRED and `build_norm`
-/// adds it after the multiply. That is a `LayerNorm(w, b)` variant this
-/// enum does not have, and each of those rows refuses for something
-/// else on top -- ALiBi, learned positions, a parallel residual --
-/// which is why the bias form still has no caller.
+/// adds it after the multiply. That is the `LayerNorm(w, b)` variant,
+/// [`BIASED_LAYER_NORM`], which arrived on 2026-09-12 when `orion` and
+/// `nemotron` turned out to need nothing else; the other six still
+/// refuse for something on top.
 pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx"];
 
 /// Does this architecture normalise with a weighted LayerNorm?
 /// See [`WEIGHTED_LAYER_NORM`].
 pub fn uses_weighted_layer_norm(arch: &str) -> bool {
     WEIGHTED_LAYER_NORM.contains(&arch)
+}
+
+/// Architectures that normalise with a **LayerNorm with a learned
+/// weight AND bias** -- `build_norm(x, w, b, LLM_NORM, il)` -- at every
+/// norm site, the weights and the biases all REQUIRED.
+///
+/// The `(w, b)` variant [`WEIGHTED_LAYER_NORM`] had named as having no
+/// caller. It has two now, and they are the two rows of the old
+/// "LayerNorm-with-bias group" that need NOTHING ELSE of the generic
+/// decoder (`NormOp::LayerNormBias`, `tests/biased_layer_norm_graphs.rs`):
+///
+/// - `orion` (Orion-14B): `orion.cpp:17-18,24-25,30-31` create the six
+///   tensors and `:63-66,104-107,127-130` pass each pair to `LLM_NORM`;
+///   the rest is a Llama with NEOX RoPE (llama-model.cpp's NEOX group),
+///   no `rope.dimension_count` and no `rope.freq_base` in the file
+///   (`conversion/orion.py:13-37` writes neither).
+/// - `nemotron` (Nemotron-4, Minitron): `nemotron.cpp:18-19,25-26,33-34`
+///   the same six, plus the ungated ReLU-squared FFN `arcee` already
+///   serves (`uses_relu_sqr`), partial NEOX RoPE, and OPTIONAL
+///   `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` (`:31,40-41`,
+///   `TENSOR_NOT_REQUIRED`) that a file carrying them leaves UNREAD
+///   here, which `assert_every_tensor_consumed` refuses.
+///
+/// The six the group still holds, each for something ELSE on top of
+/// this norm (the norm is done for all of them): `starcoder2` and
+/// `codeshell` and `jais2` REQUIRE `attn_output.bias`, `ffn_up.bias`
+/// and `ffn_down.bias`, which have no slot on the generic dense path;
+/// `starcoder` those plus a learned `position_embd` with no RoPE;
+/// `stablelm` a parallel residual (`stablelm.cpp`) and its own QK norm
+/// order; `phimoe` an `attn_output.bias`, an `output.bias` on the LM
+/// head and LongRoPE. `tests/attn_bias.rs` pins all six as refused
+/// with the bias named.
+pub const BIASED_LAYER_NORM: &[&str] = &["orion", "nemotron"];
+
+/// See [`BIASED_LAYER_NORM`].
+pub fn uses_biased_layer_norm(arch: &str) -> bool {
+    BIASED_LAYER_NORM.contains(&arch)
 }
 
 /// How the generic `Decoder` / `ModelConfig::from_gguf` path treats a
@@ -1553,6 +1603,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // NORM RoPE: llama-model.cpp:2699 (M-RoPE files refused,
         // `crate::mrope`).
         v.push(gqa_norm("glm4"));
+        // `orion` and `nemotron` were DedicatedOnly on their REQUIRED
+        // LayerNorm biases; audited now on `NormOp::LayerNormBias`
+        // (tests/biased_layer_norm_graphs.rs). NEOX RoPE:
+        // llama-model.cpp:2653-2654.
+        v.push(gqa_neox("orion"));
+        v.push(gqa_neox("nemotron"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1847,22 +1903,9 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                  `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:21,29,36). \
                  `phi3` stays generic: it requires none of them",
             ),
-            (
-                "nemotron",
-                Neox,
-                "required LayerNorm biases `output_norm.bias`, `attn_norm.bias`, \
-                 `ffn_norm.bias` (src/models/nemotron.cpp:19,26,35). llama.cpp \
-                 normalises with `build_norm(..., LLM_NORM, ...)` and a bias; the \
-                 generic decoder applies RMSNorm with weight only, which is a \
-                 different function of the same tensors at every layer",
-            ),
-            (
-                "orion",
-                Neox,
-                "required LayerNorm biases `output_norm.bias`, `attn_norm.bias`, \
-                 `ffn_norm.bias` (src/models/orion.cpp:18,25,31); the generic \
-                 decoder is RMSNorm-only and drops all three",
-            ),
+            // `nemotron` and `orion` were HERE for their REQUIRED LayerNorm
+            // biases alone, and closed together on `NormOp::LayerNormBias`
+            // (`BIASED_LAYER_NORM`, tests/biased_layer_norm_graphs.rs).
             (
                 "stablelm",
                 Neox,
@@ -3745,13 +3788,14 @@ mod tests {
         // The sequential-residual siblings stay on the generic path --
         // this is a named list, not a family-wide ban.
         //
-        // `phimoe`, `starcoder2` and `nemotron` used to be checked here
-        // too. They left the generic path for an unrelated reason (the
-        // required bias tensors pinned by `tests/attn_bias.rs`), so
-        // asserting them generic would now assert the wrong thing; what
-        // still has to hold is that neither they nor the archs below are
-        // refused for a *residual* reason they do not have.
-        for arch in ["phi3", "plamo3", "qwen2", "llama"] {
+        // `phimoe` and `starcoder2` used to be checked here too. They
+        // left the generic path for an unrelated reason (the required
+        // bias tensors pinned by `tests/attn_bias.rs`), so asserting them
+        // generic would now assert the wrong thing; what still has to
+        // hold is that neither they nor the archs below are refused for
+        // a *residual* reason they do not have. `nemotron` was with them
+        // and is generic again (`BIASED_LAYER_NORM`).
+        for arch in ["phi3", "plamo3", "qwen2", "llama", "nemotron", "orion"] {
             assert!(
                 matches!(
                     resolve_architecture(arch),
@@ -3760,7 +3804,7 @@ mod tests {
                 "{arch} must stay generic"
             );
         }
-        for arch in ["phimoe", "starcoder2", "nemotron"] {
+        for arch in ["phimoe", "starcoder2"] {
             match resolve_architecture(arch) {
                 Some(ArchPath::DedicatedOnly { reason }) => assert!(
                     reason.contains("bias"),
