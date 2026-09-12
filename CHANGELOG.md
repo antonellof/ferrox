@@ -17,6 +17,25 @@ are the ones worth reading twice.
 
 ### Added
 
+- **The MLA engine serves the split `attn_k_b` / `attn_v_b` every real
+  DeepSeek export carries, and `deepseek2` has libllama goldens in both
+  tensor forms.** `ferrox_models::mla::MlaKvB::{Combined, Split}`: the
+  combined `attn_kv_b` expands per head and attends with per-head caches
+  (`deepseek2.cpp:600-635`); the split pair, refused until now, absorbs
+  the query through `wk_b`, attends as MQA over the latent `concat(c,
+  k_pe)` and pulls through `wv_b` (`:563-598`; `ferrox_core::
+  mla_absorbed`, unit-pinned equal to the naive form), with a cache
+  `kv_lora_rank + qk_rope` wide instead of `n_heads * (qk_nope + qk_rope
+  + v)`. `kq_scale` stays `1/sqrt(qk_nope + qk_rope)` for both. KL
+  2.35e-15 (split) and 3.57e-15 (legacy), `tests/deepseek2_graphs.rs`.
+  The fixture had never produced a golden: `scripts/
+  make_deepseek2_fixture.py` wrote `head_count_kv = n_head` where
+  `conversion/deepseek.py:307-308` writes 1 for every MLA export, and
+  had blamed llama.cpp for the resulting `ggml.c:3942` abort. Fixed,
+  with a `--legacy-kv-b` variant derived from the same draw the way the
+  converter splits it (libllama's two branches agree on the pair to
+  1.79e-7). YaRN is still refused by name on this engine, so no real
+  DeepSeek runs yet.
 - **`arctic` runs, and Grok-2's refusal by name lifts with it.**
   `src/models/arctic.cpp:118-154` runs a dense SiLU FFN sized
   `{n_embd, n_embd}` on the post-attention residual and its router AND

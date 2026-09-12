@@ -46,7 +46,7 @@ use crate::kimi_decoder::{
 use crate::latent_moe::{KimiExpertBacking, KimiExpertWeights, KimiLatentMoeWeights};
 use crate::loader::LoadError;
 use crate::loader::{load_f32_vec, load_weight_matrix, split_expert_tensor};
-use crate::mla::{MlaAttnWeights, MlaQProj};
+use crate::mla::{MlaAttnWeights, MlaKvB, MlaQProj};
 
 /// Real per-layer hyperparameters needed to load any layer from a real
 /// Kimi K3 GGUF file -- the GGUF counterpart of
@@ -178,18 +178,15 @@ fn load_mla_attn(
     let q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
     // Real on-disk k_b/v_b shapes are {qk_nope_head_dim, kv_lora_rank,
-    // n_head} / {kv_lora_rank, n_embd_head_v, n_head} (3D, per-head) --
-    // ferrox's `MlaAttnWeights::kv_b_proj` instead holds ferrox's own
-    // pre-split combined-per-head-2D convention (the same shape
+    // n_head} / {kv_lora_rank, n_embd_head_v, n_head} (3D, per-head).
+    // This loader reads the combined `attn_kv_b` (the shape
     // `kimi_loader::load_mla_attn` builds from the safetensors
-    // checkpoint's single combined `kv_b_proj`). Reassembling the real
-    // GGUF's already-split k_b/v_b into that single 2D matrix would
-    // require a real transpose/concat this loader does not yet
-    // implement -- reading them as two separate matrices instead is a
-    // real, disclosed gap, not silently wrong output: `find_info` will
-    // simply fail loudly if `attn_kv_b` doesn't exist (which it won't,
-    // for this checkpoint), rather than silently loading transposed or
-    // mismatched data.
+    // checkpoint's single combined `kv_b_proj`) into `MlaKvB::Combined`;
+    // `MlaKvB::Split` exists now (the DeepSeek loader fills it from the
+    // 3D pair and `mla_forward_token` runs the absorbed form on it), and
+    // taking it here is a change to make against a Kimi golden, not by
+    // analogy. `find_info` fails loudly if `attn_kv_b` is absent rather
+    // than loading transposed or mismatched data.
     let q_a_proj = load_weight_matrix(file, &format!("blk.{l}.attn_q_a.weight"))?;
     assert_eq!(
         q_a_proj.rows(),
@@ -241,7 +238,10 @@ fn load_mla_attn(
         },
         kv_a_proj_with_mqa,
         kv_a_layernorm: load_f32_vec(file, &format!("blk.{l}.attn_kv_a_norm.weight"))?,
-        kv_b_proj: load_weight_matrix(file, &format!("blk.{l}.attn_kv_b.weight"))?,
+        kv_b: MlaKvB::Combined(load_weight_matrix(
+            file,
+            &format!("blk.{l}.attn_kv_b.weight"),
+        )?),
         o_proj,
         g_proj: Some(load_weight_matrix(
             file,

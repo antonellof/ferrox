@@ -46,6 +46,7 @@ pub mod kv_disk;
 pub mod kv_signature;
 pub mod kv_swa;
 pub mod matmul;
+pub mod mla_absorbed;
 pub mod par;
 pub mod placement;
 pub mod qstar;

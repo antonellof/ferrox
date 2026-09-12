@@ -156,6 +156,30 @@ scalar up to eps, so the `sqrt(2)/2` moves libllama's own logits by
 at the row site and at the batch site each turns the golden red
 (confirmed).
 
+The MLA engine's second and third goldens are `deepseek2` itself, in
+both tensor forms (`tests/deepseek2_graphs.rs`, KL 2.35e-15 and
+3.57e-15). `ferrox-models/src/mla.rs`'s `MlaKvB` is the two forms as
+one enum: `Combined` (`attn_kv_b`, the legacy converter's and `plm`'s)
+expands the latent per head and attends with per-head caches
+(`deepseek2.cpp:600-635`); `Split` (`attn_k_b` / `attn_v_b`, EVERY
+DeepSeek export since the `_mla` keys existed, which the loader had
+refused as "not wired") absorbs the query through `wk_b`, attends as
+MQA over the latent `concat(c, k_pe)` and pulls the result through
+`wv_b` (`:563-598`; `ferrox-core/src/mla_absorbed.rs`, whose unit test
+pins the two forms equal), with the cache `kv_lora_rank + qk_rope`
+wide instead of `n_heads * (qk_nope + qk_rope + v)`. `kq_scale` stays
+`1/sqrt(qk_nope + qk_rope)` for both -- the latent width is the
+plausible wrong number, and the sabotage that uses it moves the logits
+by 2.2e-3. The fixture had never produced a golden because
+`scripts/make_deepseek2_fixture.py` wrote `head_count_kv = n_head`
+where `conversion/deepseek.py:307-308` writes 1 for every MLA export
+("converts into MQA"); the script had blamed llama.cpp for the
+`ggml.c:3942` abort. Its `--legacy-kv-b` file derives the combined
+matrix and the split pair from ONE draw exactly as the converter
+splits them, and libllama's two branches agree on the pair to 1.79e-7,
+which is the number that says the derivation is the converter's. What
+a real DeepSeek still needs of this engine is YaRN (refused by name).
+
 `plm` closed on `ferrox-models/src/mla_arch.rs` and `mla_q_proj.rs`, on
 the MLA engine. `plm.cpp:84-166` is `deepseek2.cpp`'s naive MLA branch
 line for line (`grep -l ATTN_KV_A_MQA` over all 140 graphs is six
@@ -361,8 +385,9 @@ of exactly that shape measures it (libllama byte-identical to the file
 with the key). KL 9.16e-15 with a floor of 2 that steps TWICE inside
 the six-token prompt, 5.14e-15 plain. The MLA engine (`deepseek2` /
 `mistral4`, i.e. Mistral-Large-3) REFUSES a nonzero scale by name now
-where it dropped both keys, because it has no golden to check an
-implementation against. Two corrections: the verdict's "leading-dense
+where it dropped both keys, because it had no golden to check an
+implementation against (it has `plm`'s and `deepseek2`'s since
+2026-09-12). Two corrections: the verdict's "leading-dense
 + MoE + shared expert" was wrong twice over (`mistral3.cpp:64-84` is
 dense OR MoE on every layer, and the `_shexp` tensors are created under
 an `n_ff_shexp` its hparams never set and read by no graph line; a
