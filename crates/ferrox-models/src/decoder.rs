@@ -23,6 +23,7 @@ mod rope;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::skip_stream::SkipStream;
 pub(crate) use attn_block::KvStep;
 use ferrox_core::attention::{
     causal_gqa_attention_prefill_shared_kv_split, causal_gqa_attention_row,
@@ -133,6 +134,12 @@ pub struct AttnWeights {
     /// through `metal_can_serve_model` and the layer through the
     /// exhaustive destructure in `Decoder::metal_attn_view`.
     pub attn_sub_norm: Option<Vec<f32>>,
+    /// `blk.N.attn_output.scale`, the `{1}` companion `build_lora_mm`
+    /// multiplies the attention branch by right after `wo`
+    /// (`llama-graph.cpp:1492-1494`; `talkie` writes it on every export,
+    /// `crate::weight_scales`). The fused Metal launches refuse a layer
+    /// that has one through the destructure in `metal_attn_view`.
+    pub o_scale: Option<f32>,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -213,6 +220,10 @@ pub struct MoeWeights {
     /// two dense FFN bodies; the fused kernels never see it because
     /// `metal_can_serve_model` refuses the model.
     pub ffn_sub_norm: Option<Vec<f32>>,
+    /// `blk.N.ffn_down.scale`, the `{1}` companion multiplied onto the
+    /// dense FFN's output right after `down` (`crate::weight_scales`);
+    /// refused on a routed layer, whose experts carry their own.
+    pub down_scale: Option<f32>,
     /// How many times each routed expert (index into `experts`) has been
     /// selected by `route_top_k` across every `forward_token`/
     /// `forward_batch` call so far. Real observed hotness, not a
@@ -386,6 +397,11 @@ impl MoeWeights {
 pub struct LayerWeights {
     pub attn: AttnWeights,
     pub moe: MoeWeights,
+    /// Talkie's `blk.N.layer_output_scale.weight`, the scalar its
+    /// embedding skip stream is multiplied by before joining this
+    /// layer's output (`talkie.cpp:123-126`, `crate::skip_stream`).
+    /// `Some` only on a `ModelConfig::skip_stream` model.
+    pub out_scale: Option<f32>,
 }
 
 /// The per-layer weights the gpt-oss graph carries and the generic GQA
@@ -683,6 +699,7 @@ impl Decoder {
                 output_gate: None,
                 sinks: None,
                 attn_sub_norm: None,
+                o_scale: None,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -724,6 +741,7 @@ impl Decoder {
             let moe = MoeWeights {
                 exp_probs_bias: None,
                 ffn_sub_norm: None,
+                down_scale: None,
                 router: wm(rng.vec(n_experts * hidden), vec![n_experts, hidden]),
                 experts: ExpertBacking::Resident(experts),
                 shared_experts,
@@ -734,7 +752,11 @@ impl Decoder {
                 packed_q4: None,
             };
 
-            layers.push(LayerWeights { attn, moe });
+            layers.push(LayerWeights {
+                attn,
+                moe,
+                out_scale: None,
+            });
         }
 
         let final_norm = NormOp::Rms(vec![1.0; hidden]);
@@ -896,6 +918,12 @@ impl Decoder {
             // with ONE `l`; a looped model's logical layers outnumber
             // its weights (`crate::layer_loops`).
             && config.layer_loops.is_none()
+            // Talkie: an embedding norm no gather kernel applies, a
+            // second residual no stack carries, a per-head SCALAR Q gain
+            // and a weightless K norm no `AttnExtras` spells
+            // (`crate::skip_stream`, `QkNormStyle::PerHeadScalar`).
+            && !config.skip_stream
+            && config.qk_norm_style != crate::capability::QkNormStyle::PerHeadScalar
             // `model_ffn_act` is `None` for an activation that varies
             // by layer (xIELU's parameters), which no fused kernel
             // takes; `fused_kernel_gelu_flag` is `None` for one no
@@ -1101,10 +1129,13 @@ impl Decoder {
             output_gate,
             sinks,
             attn_sub_norm,
+            o_scale,
         } = &layer.attn;
-        // No Metal attention kernel gates, sinks, or norms between the
-        // V sum and `wo`; a layer with any of the three runs on the host.
-        if output_gate.is_some() || sinks.is_some() || attn_sub_norm.is_some() {
+        // No Metal attention kernel gates, sinks, norms between the V
+        // sum and `wo`, or scales after it; a layer with any of the four
+        // runs on the host.
+        if output_gate.is_some() || sinks.is_some() || attn_sub_norm.is_some() || o_scale.is_some()
+        {
             return None;
         }
         Some(ferrox_metal::attn::AttnExtras {
@@ -1175,6 +1206,8 @@ impl Decoder {
     #[cfg(feature = "metal")]
     fn layer_supports_metal_dense_ffn(layer: &LayerWeights) -> bool {
         Self::is_dense_layer(layer)
+            // No fused FFN kernel scales after `down` (`crate::weight_scales`).
+            && layer.moe.down_scale.is_none()
             && layer.moe.with_expert(0, |ex| {
                 Self::metal_matvec_launch(&ex.gate).is_some()
                     && Self::metal_matvec_launch(&ex.up).is_some()
@@ -1191,7 +1224,9 @@ impl Decoder {
         config: &ModelConfig,
         lora_attached: bool,
     ) -> bool {
-        Self::is_dense_layer(layer) && Self::metal_can_serve_model(config, lora_attached)
+        Self::is_dense_layer(layer)
+            && layer.moe.down_scale.is_none()
+            && Self::metal_can_serve_model(config, lora_attached)
     }
 
     #[cfg(feature = "metal")]
@@ -2533,6 +2568,12 @@ impl Decoder {
             hidden = self.embed_token(token_id);
         }
 
+        // The skip source: the (normed) embedding, before any layer
+        // touches `hidden` (`crate::skip_stream`). Captured here and
+        // not at `embed_token`, because the Metal arms above leave
+        // `hidden` empty on purpose -- and a skip-stream model never
+        // reaches them (`metal_can_serve_model`).
+        let skip_rows = self.config.skip_stream.then(|| hidden.clone());
         if run_cpu_layers {
             for (l, cache) in kv_caches.iter_mut().enumerate() {
                 let layer = self.layer_for(l);
@@ -2912,6 +2953,7 @@ impl Decoder {
                                     .as_ref()
                                     .map(|p| p.layer_plan(self.physical_index(l))),
                                 operand,
+                                skip_rows.as_deref().map(|rows| SkipStream { rows }),
                             );
                         }
                         continue;
@@ -2936,6 +2978,7 @@ impl Decoder {
                         .as_ref()
                         .map(|p| p.layer_plan(self.physical_index(l))),
                     operand,
+                    skip_rows.as_deref().map(|rows| SkipStream { rows }),
                 );
             }
         } // run_cpu_layers
@@ -3007,6 +3050,7 @@ impl Decoder {
         }
 
         let mut hidden = self.embed_token(token_id);
+        let skip_rows = self.config.skip_stream.then(|| hidden.clone());
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
         for (l, cache) in kv_caches.iter_mut().enumerate() {
@@ -3049,6 +3093,7 @@ impl Decoder {
                     .as_ref()
                     .map(|p| p.layer_plan(self.physical_index(l))),
                 operand,
+                skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
         }
 
@@ -3747,12 +3792,21 @@ impl Decoder {
     /// every other -- which is why it survived as a drift for as long as
     /// it did. The lookup and the scale live in one function so a caller
     /// cannot obtain the row without it.
+    /// The embedding row, scaled by `embedding_scale` where the
+    /// architecture has one, and -- for a skip-stream model
+    /// (`crate::skip_stream`) -- RMS-normed without a weight, as
+    /// `talkie.cpp:50` norms `inpL` before layer 0. The ONE embedding
+    /// site; what it returns is both layer 0's input and the skip
+    /// source.
     fn embed_token(&self, token_id: usize) -> Vec<f32> {
         let mut row = self.embedding.dequant_row(token_id);
         if let Some(scale) = self.config.embedding_scale {
             for v in row.iter_mut() {
                 *v *= scale;
             }
+        }
+        if self.config.skip_stream {
+            row = crate::norm::rms_norm_no_params(&row, self.config.rms_norm_eps);
         }
         row
     }
@@ -3928,6 +3982,7 @@ impl Decoder {
 
         // [batch, hidden], flattened row-major.
         let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
+        let skip_rows = self.config.skip_stream.then(|| hidden_batch.clone());
 
         #[cfg(feature = "metal")]
         let use_metal_attn = ferrox_core::metal_dense_enabled()
@@ -4313,6 +4368,7 @@ impl Decoder {
                                 .map(|p| p.layer_plan(self.physical_index(l))),
                             operand,
                             ffn_block::BatchedFfnKernels::Prefill,
+                            skip_rows.as_deref().map(|rows| SkipStream { rows }),
                         );
                         l += 1;
                         continue 'layers;
@@ -4474,6 +4530,7 @@ impl Decoder {
                     .map(|p| p.layer_plan(self.physical_index(l))),
                 operand,
                 ffn_block::BatchedFfnKernels::Prefill,
+                skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
             l += 1;
         }
@@ -4544,6 +4601,7 @@ impl Decoder {
 
         // [batch, hidden], flattened row-major.
         let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
+        let skip_rows = self.config.skip_stream.then(|| hidden_batch.clone());
 
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
@@ -4688,6 +4746,7 @@ impl Decoder {
                     .map(|p| p.layer_plan(self.physical_index(l))),
                 operand,
                 ffn_block::BatchedFfnKernels::PerRow,
+                skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
         }
 
@@ -6925,6 +6984,46 @@ mod metal_rope_tests {
             &looped,
             false
         ));
+    }
+
+    /// Talkie's facts keep the model off every fused Metal path: the
+    /// skip stream and the per-head scalar QK gain through the model
+    /// predicate, and a projection gain on a layer through the
+    /// exhaustive destructure and the dense-FFN predicate
+    /// (`crate::skip_stream`, `crate::weight_scales`). Only reachable in
+    /// a `--features metal` build.
+    #[test]
+    fn talkie_s_facts_keep_the_model_off_every_fused_metal_path() {
+        let plain = plain_config_with_metal_view();
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.layer_supports_metal_attn(&d.layers[0]), "the premise");
+
+        let mut skip = plain.clone();
+        skip.skip_stream = true;
+        assert!(!Decoder::metal_can_serve_model(&skip, false));
+
+        let mut scalar = plain.clone();
+        scalar.qk_norm_style = crate::capability::QkNormStyle::PerHeadScalar;
+        assert!(!Decoder::metal_can_serve_model(&scalar, false));
+
+        let mut d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.metal_attn_view(&d.layers[0]).is_some());
+        d.layers[0].attn.o_scale = Some(1.5);
+        assert!(d.metal_attn_view(&d.layers[0]).is_none());
+
+        let mut d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &plain,
+            false
+        ));
+        d.layers[0].moe.down_scale = Some(0.5);
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &plain,
+            false
+        ));
+        assert!(!Decoder::layer_supports_metal_dense_ffn(&d.layers[0]));
     }
 
     fn plain_config_with_metal_view() -> ModelConfig {

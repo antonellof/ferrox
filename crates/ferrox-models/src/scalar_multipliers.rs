@@ -425,6 +425,18 @@ impl MultiplierSupport {
         attention: AttentionScaleKey::OutputScale,
         defaults: MultiplierDefaults::Grok,
     };
+
+    /// `talkie`. `{arch}.logit_scale` REQUIRED (`talkie.cpp:5`) and
+    /// MULTIPLIED onto the logits (`:141`, `ggml_scale(cur,
+    /// f_logit_scale)`), the `grok` use; none of the other three keys
+    /// is read, and nothing is seeded before the file.
+    pub const TALKIE: Self = Self {
+        embedding: false,
+        residual: false,
+        logit: LogitScaleUse::AsIs,
+        attention: AttentionScaleKey::NotRead,
+        defaults: MultiplierDefaults::FromFileOnly,
+    };
 }
 
 /// The GGUF architectures whose graph applies one or more of the four
@@ -442,6 +454,7 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     ("granite-moe", MultiplierSupport::GRANITE),
     ("minicpm", MultiplierSupport::MINICPM),
     ("grok", MultiplierSupport::GROK),
+    ("talkie", MultiplierSupport::TALKIE),
 ];
 
 /// Which multipliers ferrox applies for `arch`.

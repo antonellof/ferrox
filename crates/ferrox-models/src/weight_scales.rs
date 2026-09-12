@@ -31,8 +31,9 @@
 //! `2.0` scales gives DIFFERENT logits under libllama. And `talkie`
 //! (`conversion/talkie.py:26-31`), which writes `attn_output.scale` and
 //! `ffn_down.scale` from its `attn_gain` / `mlp_gain` on every export
-//! and is refused as unaudited before reaching here; its verdict says
-//! closing it means applying exactly those two.
+//! and closed on exactly those two: [`SERVED_SCALE_TENSORS`] are the
+//! companions the decoder applies (`AttnWeights::o_scale`,
+//! `MoeWeights::down_scale`), for any architecture, as upstream.
 //!
 //! # Why a refusal by name
 //!
@@ -51,6 +52,47 @@ use crate::LoadError;
 /// projection name.
 const SCALE_SUFFIXES: [&str; 2] = [".scale", ".input_scale"];
 
+/// The two companions ferrox APPLIES: `blk.N.attn_output.scale` (`wo_s`,
+/// multiplied onto the attention branch after `wo`) and
+/// `blk.N.ffn_down.scale` (`ffn_down_s`, onto the dense FFN after
+/// `down`). They are the two `talkie`'s converter writes on every
+/// export (`conversion/talkie.py:26-31`), and `build_lora_mm`'s
+/// `res = mul(mul_mat(w, x), s)` is the same multiply for both; every
+/// other companion is still refused below, because nothing ferrox can
+/// otherwise run writes it.
+pub const SERVED_SCALE_TENSORS: [&str; 2] = ["attn_output.scale", "ffn_down.scale"];
+
+/// Whether `name` is one of the two companions the decoder applies.
+fn is_served(name: &str) -> bool {
+    SERVED_SCALE_TENSORS.iter().any(|s| {
+        name.strip_prefix("blk.")
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(_, tail)| tail == *s)
+    })
+}
+
+/// Layer `l`'s `blk.N.<proj>.scale`, a `{1}` tensor, when the file has
+/// one. Optional everywhere, as `TENSOR_NOT_REQUIRED` upstream.
+pub fn load_projection_gain(
+    file: &impl ferrox_gguf::TensorSource,
+    arch: &str,
+    l: usize,
+    proj: &str,
+) -> Result<Option<f32>, LoadError> {
+    let name = format!("blk.{l}.{proj}.scale");
+    if file.find_tensor(&name).is_none() {
+        return Ok(None);
+    }
+    let v = crate::loader::load_f32_vec(file, &name)?;
+    if v.len() != 1 {
+        return Err(LoadError::UnsupportedFeature(
+            arch.to_string(),
+            format!("{name} has {} entries; a per-tensor scale is one", v.len()),
+        ));
+    }
+    Ok(Some(v[0]))
+}
+
 /// Refuses a file carrying any per-tensor weight scale, naming the
 /// first few.
 ///
@@ -62,7 +104,7 @@ pub fn refuse_weight_scale_tensors<'a>(
     names: impl Iterator<Item = &'a str>,
 ) -> Result<(), LoadError> {
     let mut scaled: Vec<&str> = names
-        .filter(|n| SCALE_SUFFIXES.iter().any(|s| n.ends_with(s)))
+        .filter(|n| SCALE_SUFFIXES.iter().any(|s| n.ends_with(s)) && !is_served(n))
         .collect();
     if scaled.is_empty() {
         return Ok(());
@@ -97,6 +139,27 @@ pub fn refuse_weight_scale_tensors<'a>(
 mod tests {
     use super::*;
 
+    /// The two `talkie` writes pass; the others beside them still do not.
+    #[test]
+    fn the_two_served_companions_pass_and_the_rest_are_still_refused() {
+        let ok = [
+            "blk.0.attn_output.scale",
+            "blk.3.ffn_down.scale",
+            "blk.0.attn_q.weight",
+        ];
+        assert!(refuse_weight_scale_tensors("talkie", ok.into_iter()).is_ok());
+        let err = refuse_weight_scale_tensors(
+            "talkie",
+            ["blk.0.attn_output.scale", "blk.0.attn_q.scale"].into_iter(),
+        )
+        .expect_err("attn_q.scale is not applied");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blk.0.attn_q.scale") && !msg.contains("attn_output.scale"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn a_file_without_scale_companions_passes() {
         let names = [
@@ -112,7 +175,7 @@ mod tests {
     #[test]
     fn either_suffix_anywhere_is_refused_by_name() {
         for name in [
-            "blk.3.ffn_down.scale",
+            "blk.3.ffn_gate.scale",
             "blk.0.attn_q.input_scale",
             "output.scale",
         ] {

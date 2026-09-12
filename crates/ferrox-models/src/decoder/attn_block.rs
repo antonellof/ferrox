@@ -194,6 +194,13 @@ impl Decoder {
                 }
             }
         }
+        // `build_lora_mm(wo, cur, wo_s)`: the `{1}` companion multiplied
+        // onto the projection's output (`crate::weight_scales`).
+        if let Some(scale) = layer.attn.o_scale {
+            for x in projected.iter_mut() {
+                *x *= scale;
+            }
+        }
         // mimo2.cpp:180-183: the branch scaled AFTER `wo`, before the
         // residual (`crate::attn_value_scale`).
         if let Some(scale) = self.config.attn_value_scale {

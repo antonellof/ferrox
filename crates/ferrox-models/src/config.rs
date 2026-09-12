@@ -440,6 +440,13 @@ pub struct ModelConfig {
     /// See [`crate::layer_loops`]; the fused Metal launches refuse a
     /// looped model.
     pub layer_loops: Option<crate::layer_loops::LayerLoops>,
+    /// Talkie's embedding skip stream (`talkie.cpp:50-52,123-126`): the
+    /// embeddings are RMS-normed without a weight before layer 0 and
+    /// every layer adds that vector, times its own
+    /// `layer_output_scale`, after its FFN residual. See
+    /// [`crate::skip_stream`]; the fused Metal launches refuse a model
+    /// that has one.
+    pub skip_stream: bool,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -946,6 +953,7 @@ pub fn glm_5_2() -> ModelConfig {
         block_sub_norms: false,
         attn_value_scale: None,
         layer_loops: None,
+        skip_stream: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1037,6 +1045,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         block_sub_norms: false,
         attn_value_scale: None,
         layer_loops: None,
+        skip_stream: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1160,6 +1169,7 @@ pub fn kimi_k3() -> ModelConfig {
         block_sub_norms: false,
         attn_value_scale: None,
         layer_loops: None,
+        skip_stream: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1229,6 +1239,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         block_sub_norms: false,
         attn_value_scale: None,
         layer_loops: None,
+        skip_stream: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1293,6 +1304,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         block_sub_norms: false,
         attn_value_scale: None,
         layer_loops: None,
+        skip_stream: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1360,6 +1372,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         block_sub_norms: false,
         attn_value_scale: None,
         layer_loops: None,
+        skip_stream: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,

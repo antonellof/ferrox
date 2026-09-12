@@ -314,7 +314,8 @@ const LEADING_DENSE_KEY_IS_INERT: &[&str] = &["bailingmoe"];
 /// The audited majority is the other way round -- `qwen3moe.cpp:99,108`
 /// and `bailingmoe2.cpp:123-135` both norm first -- which is why the
 /// decoder's default is "before" and this list is the exception.
-const QK_NORM_AFTER_ROPE_ARCHITECTURES: &[&str] = &["hunyuan-dense", "hunyuan-moe", "maincoder"];
+const QK_NORM_AFTER_ROPE_ARCHITECTURES: &[&str] =
+    &["hunyuan-dense", "hunyuan-moe", "maincoder", "talkie"];
 
 fn metadata_u64_any(file: &impl TensorSource, keys: &[String]) -> Option<u64> {
     keys.iter().find_map(|k| file.metadata_u64(k))
@@ -1357,6 +1358,7 @@ impl ModelConfig {
             n_layers,
             n_mtp_blocks: trunk.n_mtp_blocks,
             layer_loops,
+            skip_stream: crate::skip_stream::has_skip_stream(&arch),
             hidden_dim,
             n_heads,
             n_kv_heads,
@@ -2526,8 +2528,25 @@ impl Decoder {
                     let k_norm =
                         load_f32_vec_optional(&file, &format!("blk.{l}.attn_k_norm.weight"))?;
                     // Refine WholeVector vs PerHead from the first observed norm length.
+                    // The per-head SCALAR gain is decided by architecture first
+                    // (`capability::PER_HEAD_SCALAR_QK_GAIN`): its length is
+                    // `n_heads`, which a length test alone could confuse with
+                    // `head_dim`.
                     if let Some(ref w) = q_norm {
-                        if w.len() == config.head_dim {
+                        if crate::capability::uses_per_head_scalar_qk_gain(&arch) {
+                            if w.len() != n_heads {
+                                return Err(LoadError::UnsupportedFeature(
+                                    config.name.to_string(),
+                                    format!(
+                                        "blk.{l}.attn_q_norm.weight length {} is not one gain per \
+                                         head (n_heads={n_heads}; talkie.cpp:26 creates it {{1, \
+                                         n_head}})",
+                                        w.len()
+                                    ),
+                                ));
+                            }
+                            refined_qk_norm = crate::capability::QkNormStyle::PerHeadScalar;
+                        } else if w.len() == config.head_dim {
                             refined_qk_norm = crate::capability::QkNormStyle::PerHead;
                         } else if w.len() == n_heads * config.head_dim {
                             refined_qk_norm = crate::capability::QkNormStyle::WholeVector;
@@ -2591,6 +2610,12 @@ impl Decoder {
                         // checked where its side table loads.
                         sinks: load_attn_sinks(&file, l, n_heads)?,
                         attn_sub_norm: sub_norms.as_ref().map(|n| n.attn.clone()),
+                        o_scale: crate::weight_scales::load_projection_gain(
+                            &file,
+                            &arch,
+                            l,
+                            "attn_output",
+                        )?,
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,
@@ -2823,6 +2848,21 @@ impl Decoder {
                 shared_expert_gate,
                 exp_probs_bias,
                 ffn_sub_norm: sub_norms.map(|n| n.ffn),
+                down_scale: {
+                    let gain =
+                        crate::weight_scales::load_projection_gain(&file, &arch, l, "ffn_down")?;
+                    if gain.is_some() && !is_dense_layer {
+                        return Err(LoadError::UnsupportedFeature(
+                            arch.clone(),
+                            format!(
+                                "blk.{l}.ffn_down.scale on a MoE layer: the routed experts' \
+                                 scales are `ffn_down_exps.scale`, one per expert, which is \
+                                 not applied here"
+                            ),
+                        ));
+                    }
+                    gain
+                },
                 // The same table as the attention slot, so the two
                 // pre-norms cannot disagree about the function, and the
                 // pre-FFN tensor's NAME comes from the same row that
@@ -2842,7 +2882,15 @@ impl Decoder {
                 gpt_oss_layers.push(load_gpt_oss_layer(&file, l, &config, attn.sinks.is_some())?);
             }
 
-            layers.push(LayerWeights { attn, moe });
+            // Talkie's per-layer skip scalar (`crate::skip_stream`);
+            // REQUIRED there, untouched everywhere else.
+            let out_scale =
+                crate::skip_stream::load_out_scale(&file, &arch, config.skip_stream, l)?;
+            layers.push(LayerWeights {
+                attn,
+                moe,
+                out_scale,
+            });
         }
 
         // `olmo.cpp:15-36` creates no `output_norm` at all and
@@ -3728,23 +3776,24 @@ mod tests {
     /// `AUDITED_GENERIC_GQA` would have gone unnoticed.
     #[test]
     fn an_unaudited_generic_architecture_refuses_rather_than_guessing() {
-        // `talkie` is on the generic path and is not in the audited
-        // list. It is the fourth name to hold this slot: `starcoder` was
+        // `arctic` is on the generic path and is not in the audited
+        // list. It is the fifth name to hold this slot: `starcoder` was
         // first, until an audit found it REQUIRES a fused
         // `attn_qkv.bias` and a learned `position_embd` the generic
         // decoder has no slot for, so it refuses for a stronger reason;
         // then `xverse`, until it was admitted with a libllama-golden
         // fixture (`tests/fixture_away_graphs.rs`); then `nanbeige`,
-        // until the layer loop became `crate::layer_loops`. `talkie` has
-        // no norm weights, a per-head scalar Q gain and a learned skip
-        // stream (`src/models/talkie.cpp`), and its blockers are
+        // until the layer loop became `crate::layer_loops`; then
+        // `talkie`, until `crate::skip_stream`. `arctic` runs a dense FFN
+        // and an MoE bank in parallel from the layer input
+        // (`src/models/arctic.cpp:124-154`), and its blocker is
         // invisible in metadata, so nothing but this gate stops it.
         assert!(
-            !crate::capability::is_audited_generic("talkie"),
+            !crate::capability::is_audited_generic("arctic"),
             "this test needs an arch that is generic AND unaudited"
         );
-        match config_for_arch("talkie") {
-            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "talkie"),
+        match config_for_arch("arctic") {
+            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "arctic"),
             other => panic!("expected an unaudited refusal, got {other:?}"),
         }
     }

@@ -77,6 +77,25 @@ pub enum QkNormStyle {
     WholeVector,
     /// Qwen3 / Gemma3: RMSNorm per head with weight length `head_dim`.
     PerHead,
+    /// Talkie (`talkie.cpp:26,82-91`): RMSNorm per head, then ONE
+    /// learned scalar per head for Q (`attn_q_norm` is `{1, n_head}`),
+    /// and the same per-head RMSNorm with NO weight for K (`:90`,
+    /// `build_norm(Kcur, nullptr, ...)`); there is no `attn_k_norm`
+    /// tensor. Decided by architecture (`PER_HEAD_SCALAR_QK_GAIN`), not
+    /// by the weight's length: a file whose `n_head == head_dim` would
+    /// make the length ambiguous. Applied after RoPE, as the graph does.
+    PerHeadScalar,
+}
+
+/// Architectures whose Q norm weight is one scalar per head and whose K
+/// norm has no weight ([`QkNormStyle::PerHeadScalar`]). Measured:
+/// `attn_q_norm` created `{1, n_head}` in one of 140 graphs,
+/// `talkie.cpp:26`.
+pub const PER_HEAD_SCALAR_QK_GAIN: &[&str] = &["talkie"];
+
+/// See [`PER_HEAD_SCALAR_QK_GAIN`].
+pub fn uses_per_head_scalar_qk_gain(arch: &str) -> bool {
+    PER_HEAD_SCALAR_QK_GAIN.contains(&arch)
 }
 
 /// How much work admitting one UNAUDITED architecture to the generic
@@ -807,6 +826,31 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // with `skip_loop_final_norm`, and `num_loops = 1`, which is the
     // plain path every real export without looping takes.
     "nanbeige",
+    // tests/skip_stream_graphs.rs: `talkie`, NEW CODE on FOUR things,
+    // each one graph of 140 (measured). No norm weights: every
+    // `build_norm` is `(x, nullptr, nullptr, LLM_NORM_RMS)` (`talkie.cpp:
+    // 50,68,90,110,137`) -- `NormOp::RmsNoParams`, the RMS twin of
+    // OLMo-1's `LayerNormNoParams`, through the same `NormFunction`
+    // table, so no site loads a tensor the file does not have. A
+    // per-head SCALAR Q gain (`attn_q_norm` is `{1, n_head}`, `:26`)
+    // applied AFTER RoPE with a weightless per-head K norm beside it
+    // (`:82-91`) -- `QkNormStyle::PerHeadScalar`, decided by
+    // architecture because the weight's length is ambiguous with
+    // `head_dim`. The embedding skip stream: the embeddings normed
+    // before layer 0 (`:50`) and added into every layer's output times
+    // `layer_output_scale` (`:123-126`) -- `crate::skip_stream`, one
+    // `bool` for both halves, the norm at the ONE embedding site and the
+    // add at the end of BOTH FFN bodies. And the two `{1}` companions
+    // its converter writes (`conversion/talkie.py:26-31`),
+    // `attn_output.scale` / `ffn_down.scale`, multiplied onto `wo` and
+    // `down` as `build_lora_mm` multiplies them -- `AttnWeights::o_scale`
+    // / `MoeWeights::down_scale`, the two `crate::weight_scales` serves
+    // for any architecture, the rest still refused. `logit_scale`
+    // REQUIRED and multiplied (`:5,141`; `MultiplierSupport::TALKIE`, the
+    // `grok` use). Every fused Metal launch refuses the model. Two
+    // fixtures: the converter's shape with the gains, and the same file
+    // without them, whose golden differs.
+    "talkie",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -878,6 +922,24 @@ pub const NON_PARAMETRIC_LAYER_NORM: &[&str] = &["olmo"];
 /// See [`NON_PARAMETRIC_LAYER_NORM`].
 pub fn uses_non_parametric_layer_norm(arch: &str) -> bool {
     NON_PARAMETRIC_LAYER_NORM.contains(&arch)
+}
+
+/// Architectures that normalise with a **non-parametric RMSNorm** --
+/// `build_norm(x, nullptr, nullptr, LLM_NORM_RMS, il)` -- at every norm
+/// site: no `attn_norm`, `ffn_norm` or `output_norm` tensor in the file.
+///
+/// The RMS twin of [`NON_PARAMETRIC_LAYER_NORM`], and measured the same
+/// way: every `build_norm` call with a null weight across all 140
+/// graphs is `olmo.cpp` (three, `LLM_NORM`) and `talkie.cpp` (five,
+/// `LLM_NORM_RMS`: the embeddings at `:50`, `attn_norm` at `:68`, the K
+/// norm at `:90`, `ffn_norm` at `:110`, the final norm at `:137`).
+/// `NormOp::RmsNoParams` is the function; `crate::skip_stream` is the
+/// rest of `talkie`.
+pub const NON_PARAMETRIC_RMS_NORM: &[&str] = &["talkie"];
+
+/// See [`NON_PARAMETRIC_RMS_NORM`].
+pub fn uses_non_parametric_rms_norm(arch: &str) -> bool {
+    NON_PARAMETRIC_RMS_NORM.contains(&arch)
 }
 
 /// Architectures that normalise with a **LayerNorm with a learned
@@ -1212,24 +1274,13 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // branch against libllama (`tests/window_array_graphs.rs`). A
     // Mellum without a scaling runs; a Mellum2 stops on the first
     // thing, by name.
-    (
-        "talkie",
-        TriageClass::NewCode,
-        "talkie has NO norm weights and a learned per-layer skip connection. In \
-         src/models/talkie.cpp every \
-         normalisation is `build_norm(x, nullptr, nullptr, LLM_NORM_RMS, ...)` -- \
-         non-parametric RMSNorm, no weight tensor -- at :50 (on the embeddings, before layer \
-         0), :68, :90, :110 and :137; the only norm weight in the file is `attn_q_norm`, and \
-         it is shaped {1, n_head} (:26), one SCALAR PER HEAD rather than a head_dim vector, \
-         which is neither of ferrox's two QkNormStyle variants. Each layer then adds \
-         `inp_skip * out_scale` (:123-126) with a per-layer learned scalar `out_scale` \
-         (:32), a second residual stream the generic decoder has no slot for, and :5 reads \
-         {arch}.logit_scale as REQUIRED. Its converter (`conversion/talkie.py:26-31`) also \
-         writes `blk.N.attn_output.scale` and `blk.N.ffn_down.scale`, the per-tensor \
-         companions `build_lora_mm` multiplies by (`wo_s`, `ffn_down_s`), which \
-         `crate::weight_scales` refuses by name today: talkie is the one real writer of \
-         two of them, and closing it means applying those two",
-    ),
+    // `talkie` was HERE, NEW CODE on four things, and is audited now:
+    // the weightless norms are `NormOp::RmsNoParams`, the per-head
+    // scalar Q gain and weightless K norm are `QkNormStyle::
+    // PerHeadScalar`, the embedding skip stream is `crate::skip_stream`,
+    // and the two projection gains its converter writes are the two
+    // `crate::weight_scales` serves. `tests/skip_stream_graphs.rs`
+    // carries two fixtures. See `AUDITED_GENERIC_GQA`.
     // `mimo2` was HERE, NEW CODE on the split K/V head width, and is
     // audited now: `crate::kv_head_dims` is the seam,
     // `crate::attn_value_scale` its small second half, and
@@ -1597,6 +1648,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // NEOX RoPE: `LLM_ARCH_MIMO2` is in the NEOX group,
             // `tests/rope_layout.rs` pins it.
             "mimo2",
+            // Was NEW CODE in `NEOX_ROPE_TRIAGED` on its weightless norms,
+            // per-head scalar Q gain, skip stream and projection gains,
+            // audited now (`crate::skip_stream`,
+            // `tests/skip_stream_graphs.rs`). NEOX RoPE:
+            // llama-model.cpp:2681.
+            "talkie",
         ] {
             v.push(gqa_neox(n));
         }
@@ -3136,7 +3193,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 5,
+            seen == 4,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -3218,19 +3275,23 @@ mod audit_tests {
              `key_length`, two on the MLA engine, one here, and 6 until `nanbeige` closed \
              on the layer loop (`crate::layer_loops`, tests/layer_loop_graphs.rs) -- one \
              graph of 140 reads `num_loops`, and the seam is a mapping from logical to \
-             physical layer rather than a copy of the weights. \
-             What is left is 4 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             physical layer rather than a copy of the weights, and 5 until `talkie` closed \
+             on four things at once (`crate::skip_stream`, `NormOp::RmsNoParams`, \
+             `QkNormStyle::PerHeadScalar`, the two served `.scale` companions; \
+             tests/skip_stream_graphs.rs), each one graph of 140. \
+             What is left is 3 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
              closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
              `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
-             `step35`, `mistral3`, `smallthinker`, `bitnet`, `mimo2` and `nanbeige`, and each \
-             closure but `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, `smallthinker`'s, \
-             `bitnet`'s, `mimo2`'s and `nanbeige`'s took more than one row at a time because each found ONE cause \
+             `step35`, `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `nanbeige` and `talkie`, \
+             and each closure but `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, \
+             `smallthinker`'s, `bitnet`'s, `mimo2`'s, `nanbeige`'s and `talkie`'s took more \
+             than one row at a time because each found ONE cause \
              behind several refusals; `mellum`'s cause IS shared and moved three verdicts, \
              but only one of them was closable by it, `mistral3`'s is shared with two rows \
              on other engines, `smallthinker`'s mechanism (a precomputed `probs`) is shared \
              with three rows whose CAUSE it is not, `bitnet`'s is shared with nothing, and \
              `mimo2`'s is shared with the MLA engine, which has carried the two widths \
-             since it existed, and `nanbeige`'s with nothing"
+             since it existed, and `nanbeige`'s and `talkie`'s with nothing"
         );
     }
 
@@ -3247,16 +3308,16 @@ mod audit_tests {
         // `headline()` below, because a class with no rows still has to
         // render distinctly the day something lands in it again.
         //
-        // `talkie`, which used to be `bitnet`, which used to be
-        // `smallthinker`, which used to be `dbrx`, which used to be
-        // `olmo`: the sample keeps moving because the rows keep closing.
-        // `olmo`'s non-parametric LayerNorm, then `dbrx`'s weighted one
-        // plus its clamp and its `attn_output_norm` slot, then
-        // `smallthinker`'s router operand and gated ReLU experts, then
-        // `bitnet`'s two inner norms, are all implemented now. `talkie`
-        // has NO norm weights, a per-head scalar Q norm and a learned
-        // skip connection, and nothing landed so far reaches any of them.
-        let new_code = unaudited_refusal_detail("talkie");
+        // `arctic`, which used to be `talkie`, `bitnet`, `smallthinker`,
+        // `dbrx`, `olmo`: the sample keeps moving because the rows keep
+        // closing. `olmo`'s non-parametric LayerNorm, `dbrx`'s weighted
+        // one plus its clamp and its `attn_output_norm` slot,
+        // `smallthinker`'s router operand and gated ReLU experts,
+        // `bitnet`'s two inner norms, and `talkie`'s weightless norms,
+        // per-head scalar gain, skip stream and projection gains are all
+        // implemented now. `arctic` runs a dense FFN and an MoE bank in
+        // PARALLEL from the layer input, and nothing landed reaches that.
+        let new_code = unaudited_refusal_detail("arctic");
         // `phi4` is the only UNKNOWN row left: `mistral`, `mixtral` and
         // `yi` used to be the other three and are refused as strings
         // now (see `NO_UPSTREAM_ARCH`).
@@ -3283,7 +3344,7 @@ mod audit_tests {
         // The blocker itself, not only the class label, has to be in the
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
-        assert!(new_code.contains("talkie.cpp"), "{new_code}");
+        assert!(new_code.contains("arctic.cpp"), "{new_code}");
         assert!(unknown.contains("LLM_ARCH_NAMES"), "{unknown}");
         // The two empty classes still have to be distinguishable.
         let labels = [
@@ -3304,8 +3365,8 @@ mod audit_tests {
     /// whole point of the inversion.
     #[test]
     fn an_unchecked_architecture_is_not_audited() {
-        assert!(!is_audited_generic("talkie"));
         assert!(!is_audited_generic("arctic"));
+        assert!(!is_audited_generic("plm"));
         assert!(!is_audited_generic("an-arch-that-does-not-exist"));
     }
 }

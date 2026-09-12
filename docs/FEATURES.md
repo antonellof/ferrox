@@ -91,6 +91,17 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **Weightless RMS norms, a per-head scalar Q gain, an embedding skip
+  stream and two projection gains**, and with them Talkie (`talkie`).
+  `NormOp::RmsNoParams` for a file with no norm tensor at all;
+  `QkNormStyle::PerHeadScalar` for an `attn_q_norm` of one scalar per
+  head with a weightless K norm; `ferrox_models::skip_stream` for the
+  normed embedding added into every layer's output times
+  `layer_output_scale`; and `attn_output.scale` / `ffn_down.scale`, the
+  two per-tensor companions its converter writes, applied as
+  `build_lora_mm` applies them (`ferrox_models::weight_scales` serves
+  those two and still refuses the rest). The fused Metal launches
+  refuse the model.
 - **The same physical layers run more than once**, and with it Nanbeige
   (`nanbeige`). `num_loops` makes the logical layer count `n_phys *
   n_loops`, each logical layer with its own KV cache over shared
