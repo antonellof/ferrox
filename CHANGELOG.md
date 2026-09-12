@@ -17,6 +17,28 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`stablelm` runs: StableLM-2-1.6B and StableLM-3B-4E1T on the
+  biased LayerNorm, with the graph's two other shapes refused by name.**
+  `stablelm.cpp` decides three shapes by TENSOR PRESENCE and none by a
+  key. A layer with `ffn_norm` is sequential and matches libllama, KL
+  3.39e-13 (`tests/stablelm_graphs.rs`; the pre-FFN norm pair is
+  `TENSOR_NOT_REQUIRED` upstream and `NormFunction::resolve` requires
+  it as a pair). A layer without it is the PARALLEL residual
+  (`x + attn(norm(x)) + ffn(norm(x))`, `:135-137`):
+  `ferrox_models::parallel_residual` refuses it from a fixture whose
+  libllama logits move by 8.85, and its table records the eight graphs
+  that build the shape in two spellings (one shared norm; two norms
+  under `gptneox`'s key or `falcon`'s `attn_norm_2`). A layer with
+  `attn_q_norm` (`{n_embd_head_k, n_head}`, `LLM_NORM` per head, a
+  distinct weight per head) is refused by `ferrox_models::qk_layer_norm`
+  from a fixture whose logits move by 8.73, because the loader's length
+  rule and the fused Metal attention would both have read that weight
+  as one RMS over the whole projection; `command-r` and `chameleon`
+  build the same op. `use_parallel_residual`, written by every export
+  and read by nothing in the graph, is pinned ignored (libllama
+  byte-identical). `ferrox_models::test_source::StubSource` is the one
+  names-and-keys `TensorSource` for unit tests, replacing the first of
+  five copies. 62 audited.
 - **Projection biases on the dense path; `starcoder2`, `codeshell`
   and `jais2` run, and a `llama` file with biases loads.**
   `ferrox_models::proj_bias` reads `attn_output.bias` into

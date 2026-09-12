@@ -154,52 +154,7 @@ pub fn parallel_dense_for_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrox_gguf::{GgufError, GgufValue, TensorInfo};
-
-    /// The smallest `TensorSource` that can say whether one tensor
-    /// exists.
-    struct Names(Vec<TensorInfo>);
-
-    impl Names {
-        fn of(names: &[&str]) -> Self {
-            Self(
-                names
-                    .iter()
-                    .map(|n| TensorInfo {
-                        name: (*n).to_string(),
-                        shape: Vec::new(),
-                        dtype: ferrox_gguf::GgmlType::F32,
-                        offset: 0,
-                    })
-                    .collect(),
-            )
-        }
-    }
-
-    impl TensorSource for Names {
-        fn metadata(&self, _key: &str) -> Option<&GgufValue> {
-            None
-        }
-        fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
-            self.0.iter().find(|t| t.name == name)
-        }
-        fn tensor_bytes(&self, name: &str) -> Result<&[u8], GgufError> {
-            // Never reached: the gate asks only whether a tensor exists.
-            Err(GgufError::TensorNotFound(name.to_string()))
-        }
-        fn tensor_mapped_range(
-            &self,
-            name: &str,
-        ) -> Result<
-            (
-                std::sync::Arc<ferrox_gguf::MmapHandle>,
-                std::ops::Range<usize>,
-            ),
-            GgufError,
-        > {
-            Err(GgufError::TensorNotFound(name.to_string()))
-        }
-    }
+    use crate::test_source::StubSource;
 
     const TRIPLE: [&str; 3] = [
         "blk.0.ffn_gate.weight",
@@ -211,24 +166,27 @@ mod tests {
     /// the `else` branch; Arctic's absence is a missing REQUIRED tensor.
     #[test]
     fn presence_follows_each_rows_rule() {
-        let grok2 = parallel_dense_for_layer("grok", &Names::of(&TRIPLE), 0)
+        let grok2 = parallel_dense_for_layer("grok", &StubSource::with_tensors(&TRIPLE), 0)
             .unwrap()
             .expect("Grok-2 has the branch");
         assert_eq!(grok2.sum_scale, Some(FRAC_1_SQRT_2));
-        assert!(parallel_dense_for_layer("grok", &Names::of(&[]), 0)
-            .unwrap()
-            .is_none());
+        assert!(
+            parallel_dense_for_layer("grok", &StubSource::with_tensors(&[]), 0)
+                .unwrap()
+                .is_none()
+        );
 
-        let arctic = parallel_dense_for_layer("arctic", &Names::of(&TRIPLE), 0)
+        let arctic = parallel_dense_for_layer("arctic", &StubSource::with_tensors(&TRIPLE), 0)
             .unwrap()
             .expect("Arctic always has the branch");
         assert_eq!(arctic.sum_scale, None);
-        let err = parallel_dense_for_layer("arctic", &Names::of(&[]), 0).expect_err("REQUIRED");
+        let err = parallel_dense_for_layer("arctic", &StubSource::with_tensors(&[]), 0)
+            .expect_err("REQUIRED");
         assert!(err.to_string().contains("arctic.cpp:38-42"), "{err}");
 
         // An incomplete triple is refused on both rows.
         for arch in ["grok", "arctic"] {
-            let err = parallel_dense_for_layer(arch, &Names::of(&TRIPLE[..2]), 0)
+            let err = parallel_dense_for_layer(arch, &StubSource::with_tensors(&TRIPLE[..2]), 0)
                 .err()
                 .unwrap_or_else(|| panic!("{arch}: 2 of 3 refused"));
             assert!(err.to_string().contains("2 of the dense"), "{err}");
@@ -241,7 +199,7 @@ mod tests {
     fn a_dense_ffn_on_any_other_architecture_is_not_this_tables_business() {
         for arch in ["llama", "deepseek", "dbrx", "qwen3moe", "smallthinker"] {
             assert!(
-                parallel_dense_for_layer(arch, &Names::of(&TRIPLE), 0)
+                parallel_dense_for_layer(arch, &StubSource::with_tensors(&TRIPLE), 0)
                     .unwrap()
                     .is_none(),
                 "{arch}"

@@ -373,12 +373,15 @@ fn the_gpt_oss_exemption_is_backed_by_real_fields() {
 /// was computing a different normalisation at every layer of every one
 /// of them.
 ///
-/// SIX of the nine are still refused. `qwen` left, because its only
+/// TWO of the nine are still refused. `qwen` left, because its only
 /// dropped bias was the fused `attn_qkv.bias` and `qkv_fused` applies
 /// that now (`tests/one_match_arm_graphs.rs`); `orion` and `nemotron`
 /// left on 2026-09-12, because their only dropped biases were the three
 /// LayerNorm biases and `NormOp::LayerNormBias` applies them
-/// (`tests/biased_layer_norm_graphs.rs`). That is what this test is for
+/// (`tests/biased_layer_norm_graphs.rs`); `starcoder2`, `codeshell` and
+/// `jais2` left the same day on `proj_bias`, and `stablelm` on the same
+/// norm once its other two shapes were refused by name
+/// (`tests/stablelm_graphs.rs`). That is what this test is for
 /// -- a row leaves it by the blocker being implemented, not by the row
 /// being edited.
 #[test]
@@ -417,9 +420,9 @@ fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path()
 /// moment that other reason is fixed.
 #[test]
 fn the_bias_refusals_name_the_bias() {
-    // `nemotron`, `orion`, `codeshell`, `jais2` and `starcoder2` were
-    // here; their biases are applied now.
-    for arch in ["stablelm", "starcoder", "phimoe"] {
+    // `nemotron`, `orion`, `codeshell`, `jais2`, `starcoder2` and
+    // `stablelm` were here; their biases are applied now.
+    for arch in ["starcoder", "phimoe"] {
         match resolve_profile(arch).map(|p| p.path) {
             Some(ArchPath::DedicatedOnly { reason }) => assert!(
                 reason.contains("bias"),
