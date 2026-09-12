@@ -124,6 +124,9 @@ function useServingModel(healthModelId: string | null): [Loaded, () => void] {
   return [state, useCallback(() => setNonce((n) => n + 1), [])];
 }
 
+/** How often the switcher re-reads the inventory while a load is in flight. */
+const LOAD_POLL_MS = 1000;
+
 /**
  * Switch the served model without leaving the conversation.
  *
@@ -131,47 +134,111 @@ function useServingModel(healthModelId: string | null): [Loaded, () => void] {
  * per-request parameter — this server serves one checkpoint at a time.
  * The menu says so rather than implying the next message could pick a
  * different model on its own.
+ *
+ * The POST answers `202 Accepted` the moment the load task is QUEUED,
+ * not when the weights are in: a checkpoint takes seconds to minutes to
+ * mmap and probe. So the request's return is not the swap's end. The
+ * switcher polls `GET /admin/models`, whose entry for the target reads
+ * `loading` while the worker runs and then `loaded` or `error`, and the
+ * header shows a spinner with the target's name for the whole of that
+ * window — including after the menu is closed, which is where the old
+ * version went silent and the header kept naming the previous model.
  */
 function ModelSwitcher({
   active,
   onSwitched,
+  onLoadingChange,
 }: {
   active: string | null;
   onSwitched: () => void;
+  /** The id a load is in flight for, or `null` once it has a verdict. */
+  onLoadingChange: (id: string | null) => void;
 }) {
   const [inventory, setInventory] = useState<Inventory | null>(null);
   const [unsupported, setUnsupported] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
+  /** The id a load was accepted for, until the server reports a verdict. */
+  const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Controlled, so that picking an entry closes the menu: the header
+  // trigger carries the spinner from there on, and an error re-opens
+  // nothing -- it is shown the next time the menu is opened.
+  const [open, setOpen] = useState(false);
+  // The parent disables the composer for the same window; one state,
+  // reported outward, so the two cannot disagree about when it ends.
+  useEffect(() => onLoadingChange(loading), [loading, onLoadingChange]);
 
   const refresh = useCallback(() => {
-    getJson<Inventory>(routes.adminModels)
-      .then(setInventory)
+    return getJson<Inventory>(routes.adminModels)
+      .then((inv) => {
+        setInventory(inv);
+        return inv;
+      })
       .catch((e) => {
         if (e instanceof ApiError && e.isMissingEndpoint) setUnsupported(true);
+        return null;
       });
   }, []);
 
+  // While a load is in flight, the inventory is the source of truth for
+  // its outcome: `loading` -> keep waiting, `loaded` -> done, `error` ->
+  // the message the server kept for it. Anything else (the entry gone,
+  // another client unloaded it) ends the wait without a claim.
+  useEffect(() => {
+    if (!loading) return;
+    let cancelled = false;
+    const tick = async () => {
+      const inv = await refresh();
+      if (cancelled || !inv) return;
+      const entry = inv.models.find((m) => m.id === loading);
+      if (entry?.state === "loading") return;
+      if (entry?.state === "loaded" || inv.active === loading) {
+        onSwitched();
+      } else if (entry?.state === "error") {
+        setError(entry.error ?? `Loading ${loading} failed.`);
+      } else {
+        setError(`Loading ${loading} ended without a verdict from the server.`);
+      }
+      setLoading(null);
+    };
+    void tick();
+    const id = setInterval(tick, LOAD_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [loading, refresh, onSwitched]);
+
   const swap = async (id: string) => {
-    setBusy(id);
     setError(null);
     try {
       await postJson(routes.adminModelsLoad, { id });
-      onSwitched();
-      refresh();
+      setLoading(id);
+      setOpen(false);
     } catch (e) {
       setError((e as Error).message);
-    } finally {
-      setBusy(null);
     }
   };
 
   return (
-    <Popover.Root onOpenChange={(open) => open && refresh()}>
+    <Popover.Root
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) void refresh();
+      }}
+    >
       <Popover.Trigger asChild>
-        <Button variant="default" size="sm" className="max-w-[16rem]">
+        <Button
+          variant="default"
+          size="sm"
+          className="max-w-[16rem]"
+          aria-busy={!!loading}
+        >
+          {loading ? (
+            <Loader2 className="size-3.5 shrink-0 animate-spin" />
+          ) : null}
           <span className="truncate font-mono text-2xs">
-            {active ?? "no model loaded"}
+            {loading ?? active ?? "no model loaded"}
           </span>
           <ChevronDown className="text-faint" />
         </Button>
@@ -202,11 +269,15 @@ function ModelSwitcher({
             <ul className="max-h-72 space-y-0.5 overflow-y-auto">
               {inventory.models.map((entry) => {
                 const isActive = entry.id === inventory.active;
+                // The server's own view, so a load started by another
+                // client shows here too, not only one this menu began.
+                const isLoading =
+                  entry.id === loading || entry.state === "loading";
                 return (
                   <li key={entry.id}>
                     <button
                       type="button"
-                      disabled={isActive || !!busy}
+                      disabled={isActive || !!loading || isLoading}
                       onClick={() => swap(entry.id)}
                       className={cn(
                         "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors",
@@ -215,7 +286,7 @@ function ModelSwitcher({
                           : "hover:bg-inset disabled:opacity-50",
                       )}
                     >
-                      {busy === entry.id ? (
+                      {isLoading ? (
                         <Loader2 className="size-3.5 shrink-0 animate-spin" />
                       ) : isActive ? (
                         <Check className="size-3.5 shrink-0" />
@@ -227,9 +298,11 @@ function ModelSwitcher({
                           {entry.id}
                         </span>
                         <span className="block truncate text-2xs text-faint">
-                          {[entry.quant, entry.arch, fmtBytes(entry.size_bytes)]
-                            .filter(Boolean)
-                            .join(" · ")}
+                          {isLoading
+                            ? "loading…"
+                            : [entry.quant, entry.arch, fmtBytes(entry.size_bytes)]
+                                .filter(Boolean)
+                                .join(" · ")}
                         </span>
                       </span>
                     </button>
@@ -471,6 +544,12 @@ function ChatInner({
     : serving.error
       ? `Could not read ${routes.models}: ${serving.error}`
       : "No model is loaded — pick one from the model menu above before sending.";
+  // A load in flight pauses the composer: a message sent now would be
+  // answered by whichever checkpoint happened to be in when it landed.
+  const [loadingModel, setLoadingModel] = useState<string | null>(null);
+  const composerDisabled = loadingModel
+    ? `Loading ${loadingModel}… sending resumes when it is in.`
+    : disabledReason;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -486,7 +565,11 @@ function ChatInner({
         {transcript.mode === "server" ? (
           <ConversationPicker transcript={transcript} />
         ) : null}
-        <ModelSwitcher active={serving.modelId} onSwitched={refreshServing} />
+        <ModelSwitcher
+          active={serving.modelId}
+          onSwitched={refreshServing}
+          onLoadingChange={setLoadingModel}
+        />
         <SamplingPanel value={sampling} onChange={setSampling} />
         <Button variant="ghost" size="sm" onClick={transcript.newChat}>
           <SquarePen />
@@ -557,7 +640,7 @@ function ChatInner({
 
       <div className="min-h-0 flex-1">
         <Thread
-          disabledReason={disabledReason}
+          disabledReason={composerDisabled}
           footer={
             <p className="text-center text-2xs text-faint">
               {transcript.mode === "server"
