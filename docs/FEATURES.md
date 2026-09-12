@@ -91,6 +91,14 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **GLM-4-0414 / GLM-Z1 / GLM-OCR (`glm4`) on the generic path**,
+  audited against libllama at KL 9.7e-15 with no code change: the row
+  had been sent to the GLM-5.2 MLA loader for keys its graph never
+  reads. `ferrox_models::mrope` decides what a vision export's text
+  tower (`rope.dimension_sections`) means per architecture: served as
+  NEOX for `glm4moe` (llama.cpp's M-RoPE on text positions, measured
+  byte-identical), refused for `glm4` (converter-permuted weights, 0.72
+  apart).
 - **GLM-4.5 / 4.5-Air / 4.6 (`glm4moe`) on the generic path**, audited
   against libllama on the 355B shape (per-head Q/K norms) and the Air
   shape, KL 1.5e-15 / 2.4e-15. The pre-FFN norm stored as

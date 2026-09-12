@@ -1337,7 +1337,7 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         && (matches!(
             select_engine_kind(&arch_early),
             Ok(SelectedEngineKind::Mla | SelectedEngineKind::Gemma4)
-        ) || matches!(arch_early.as_str(), "glm-dsa" | "glm4"))
+        ) || arch_early == "glm-dsa")
     {
         // The dedicated engines do not go through `Decoder`, and a
         // flag that is accepted must reach the thing it names.
@@ -1362,8 +1362,10 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     // download fail with "missing hparam glm4moe.attention.q_lora_rank",
     // a true statement about a key the architecture is not supposed to
     // have. It runs on the generic path now, audited against libllama
-    // (`crates/ferrox-models/tests/glm4moe_graphs.rs`).
-    if matches!(arch_early.as_str(), "glm-dsa" | "glm4") {
+    // (`crates/ferrox-models/tests/glm4moe_graphs.rs`), and so does
+    // `glm4` (GLM-4-0414, `tests/glm4_graphs.rs`), which had been sent
+    // here for the same four keys.
+    if arch_early == "glm-dsa" {
         return run_glm52_infer(args, path, &file);
     }
 

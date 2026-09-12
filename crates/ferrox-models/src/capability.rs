@@ -879,8 +879,23 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // (`crate::mtp_blocks`). Two fixtures: the 355B shape with the Q/K
     // norms and the Air shape without. A file whose
     // `rope.dimension_sections` declare M-RoPE (a GLM-4.5V text tower)
-    // is refused by name in the loader.
+    // rotates NEOX here, which is what M-RoPE computes on text
+    // positions (measured byte-identical; `crate::mrope`).
     "glm4moe",
+    // tests/glm4_graphs.rs: GLM-4-0414 (9B, 32B), GLM-Z1, GLM-OCR.
+    // Plain GQA with Q/K/V biases (`glm4.cpp:42`), NORM RoPE over the
+    // first half of each head (`partial_rotary_factor = 0.5`,
+    // llama-model.cpp:2699), Gemma-2's `post_attention_norm` and
+    // `post_ffw_norm` in Gemma-2's slots (`:144-148,166-169`) beside the
+    // ordinary `attn_norm` / `ffn_norm` (`:41,48`), a FUSED SwiGLU `ffn_up`
+    // of `{n_embd, 2 * n_ff}` with no gate (`:50,158-163`, the Phi-3
+    // split), NextN blocks inside `block_count` for GLM-OCR (`:8,54-64`,
+    // `crate::mtp_blocks`), a tied lm_head when `output` is absent. A
+    // GLM-4.1V text tower's `rope.dimension_sections` is REFUSED
+    // (`crate::mrope`): llama.cpp rotates that file M-RoPE over weights
+    // the converter permuted to NEOX, and its logits differ from the
+    // plain file's by 0.72 (measured).
+    "glm4",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1533,6 +1548,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `RouterInput::NormedLayerInput`, tests/parallel_dense_ffn_graphs.rs).
         // NORM RoPE: llama-model.cpp:2588.
         v.push(gqa_norm("arctic"));
+        // `glm4` was a `dedicated` refusal sent to the GLM-5.2 MLA loader;
+        // audited now on the generic NORM path (tests/glm4_graphs.rs).
+        // NORM RoPE: llama-model.cpp:2699 (M-RoPE files refused,
+        // `crate::mrope`).
+        v.push(gqa_norm("glm4"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1674,8 +1694,8 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // Was a `dedicated` refusal on its pre-FFN norm slot; audited
             // now (`norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM`,
             // tests/glm4moe_graphs.rs). NEOX RoPE: llama-model.cpp:2700
-            // (M-RoPE only when `rope.dimension_sections` says so, which
-            // the loader refuses).
+            // (M-RoPE when `rope.dimension_sections` says so, which on
+            // text positions is the same rotation; `crate::mrope`).
             "glm4moe",
         ] {
             v.push(gqa_neox(n));
@@ -2202,10 +2222,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "glm-dsa",
             "use ferrox_models::glm52_decoder / glm52_gguf_loader (DSA), not the generic GQA Decoder",
         ));
-        v.push(dedicated(
-            "glm4",
-            "use ferrox_models::glm52_decoder / glm52_gguf_loader, not the generic GQA Decoder",
-        ));
+        // `glm4` -- GLM-4-0414 9B / 32B, GLM-Z1, GLM-OCR -- was HERE,
+        // sent to the GLM-5.2 MLA loader for four keys `glm4.cpp:3-9`
+        // never read: the `glm4moe` defect a second time. It is plain
+        // GQA with Gemma-2's two post norms in Gemma-2's slots and a
+        // fused SwiGLU, audited on the generic NORM path
+        // (`tests/glm4_graphs.rs`); see `AUDITED_GENERIC_GQA`.
         // `glm4moe` -- GLM-4.5 / GLM-4.5-Air / GLM-4.6 -- was HERE as a
         // `dedicated` refusal, twice over: first pointing at
         // `glm52_gguf_loader` (which asks for a `q_lora_rank` no glm4moe
@@ -3559,12 +3581,20 @@ mod tests {
             }
             other => panic!("llama4 must fail closed, not silent generic GQA: {other:?}"),
         }
+        // `glm4` and `glm4moe` were DedicatedOnly refusals here and are
+        // audited generic rows now (tests/glm4_graphs.rs,
+        // tests/glm4moe_graphs.rs); `glm-dsa` stays on its engine.
         assert!(matches!(
-            resolve_architecture("glm4"),
+            resolve_architecture("glm-dsa"),
             Some(ArchPath::DedicatedOnly { .. })
         ));
-        // `glm4moe` was a DedicatedOnly refusal here and is an audited
-        // generic NEOX row now (tests/glm4moe_graphs.rs).
+        assert!(matches!(
+            resolve_architecture("glm4"),
+            Some(ArchPath::GenericGqa {
+                rope: RopeLayout::Norm
+            })
+        ));
+        assert!(is_audited_generic("glm4"));
         assert!(matches!(
             resolve_architecture("glm4moe"),
             Some(ArchPath::GenericGqa {

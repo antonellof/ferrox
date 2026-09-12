@@ -167,11 +167,12 @@ pub fn load_mla_engine_from_path(path: &std::path::Path) -> Result<ServedEngine,
     Ok(ServedEngine::Mla(mla_gguf_loader::load_mla_engine(&file)?))
 }
 
-/// `glm4moe` is NOT here: GLM-4.5 / 4.5-Air / 4.6 are plain GQA with
-/// a DeepSeek-V3-shaped MoE and run on the generic decoder
-/// (`tests/glm4moe_graphs.rs`).
+/// Neither `glm4moe` nor `glm4` is here: GLM-4.5 / 4.5-Air / 4.6 and
+/// GLM-4-0414 are plain GQA and run on the generic decoder
+/// (`tests/glm4moe_graphs.rs`, `tests/glm4_graphs.rs`); both used to be
+/// sent to this loader for MLA keys their graphs never read.
 fn is_glm52_arch(arch: &str) -> bool {
-    matches!(arch, "glm-dsa" | "glm4")
+    arch == "glm-dsa"
 }
 
 fn is_gemma4_arch(arch: &str) -> bool {
@@ -187,7 +188,7 @@ pub fn load_glm52_engine_from_path(path: &std::path::Path) -> Result<ServedEngin
     if !is_glm52_arch(arch) {
         return Err(LoadError::DedicatedArchitectureRequired(
             arch.to_string(),
-            "not a GLM-5.2 / GLM4 architecture (expected glm-dsa/glm4)",
+            "not a GLM-5.2 architecture (expected glm-dsa)",
         ));
     }
     match select_engine_kind(arch) {
@@ -313,12 +314,16 @@ mod tests {
     }
 
     #[test]
-    fn glm4_is_dedicated_stack_not_generic() {
+    fn glm4_is_generic_and_glm_dsa_is_the_dedicated_stack() {
         assert_eq!(
             select_engine_kind("glm4").unwrap(),
+            SelectedEngineKind::GenericDecoder
+        );
+        assert!(ensure_generic_decoder("glm4").is_ok());
+        assert_eq!(
+            select_engine_kind("glm-dsa").unwrap(),
             SelectedEngineKind::DedicatedStack
         );
-        assert!(ensure_generic_decoder("glm4").is_err());
     }
 
     #[test]

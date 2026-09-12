@@ -17,6 +17,22 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`glm4` runs: GLM-4-0414 (9B, 32B), GLM-Z1 and GLM-OCR on the
+  generic path, audited against libllama.** The row had been sent to
+  the GLM-5.2 MLA loader for `q_lora_rank` and three more keys
+  `src/models/glm4.cpp:3-9` never read -- the `glm4moe` defect on the
+  family's dense members -- so a real GLM-4-9B-0414 failed on a key it
+  is not supposed to have. Plain GQA with Q/K/V biases, NORM RoPE over
+  half the head, Gemma-2's `post_attention_norm` / `post_ffw_norm` in
+  Gemma-2's slots and a fused SwiGLU `ffn_up` (the Phi-3 split): no code
+  changed for the row, its profile moved to `gqa_norm` and the fixture
+  matched at KL 9.67e-15 (`tests/glm4_graphs.rs`). `ferrox_models::mrope`
+  is new: a vision export's text tower declares `rope.dimension_sections`,
+  under which llama.cpp rotates M-RoPE; on text positions that is NEOX
+  band for band, so `glm4moe` serves it (byte-identical, measured) and
+  `glm4` -- NORM, with weights the converter permuted to NEOX order,
+  libllama's logits 0.72 apart -- refuses it by name. `glm-dsa` is the
+  only architecture the GLM-5.2 loader accepts now. 56 audited.
 - **`glm4moe` runs: GLM-4.5, GLM-4.5-Air and GLM-4.6 on the generic
   path, audited against libllama.** The refusal had named the pre-FFN
   norm stored as `blk.N.post_attention_norm` (`glm4-moe.cpp:75,215`,
