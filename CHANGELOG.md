@@ -17,6 +17,36 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`mimo2` (MiMo-V2-Flash, every export) runs on the host paths, on
+  the split K/V head-width seam.** `conversion/mimo.py:154` writes
+  `attention.value_length` from `v_head_dim` apart from the
+  `attention.key_length` the base converter writes from `head_dim`
+  (`192` / `128`), and `src/models/mimo2.cpp:47-48,132-140,152-154`
+  size and view K and V separately with `wo` at `n_embd_head_v *
+  n_head`; every KV cache, attention kernel and projection check here
+  took ONE head width and the loader refused the file.
+  `ferrox_models::kv_head_dims` admits the pair for the one generic-path
+  architecture whose converter writes them apart (fourteen write
+  `value_length`, three apart, two of those on the MLA engine) and keeps
+  refusing it, naming llama.cpp's assert, for everyone else.
+  `ModelConfig::v_head_dim` is `Some` only when the widths differ, so a
+  `head_dim` set alone cannot leave V behind; `KvCache` / `PagedKvStore`
+  size V by it (`new_split`), the three contiguous single-query kernels
+  collapsed onto one `causal_gqa_attention_row` that accumulates over
+  it, the paged kernel reads it off the store, the batched prefill
+  kernel's PV tile takes its own offset and stride, and the projection
+  check, the fused-QKV cut, both batched host bodies and the KV budget
+  read it. Every fused Metal launch, the CUDA resident hook, the slot
+  file and the KV block file refuse a split model. Its second half,
+  `attention.value_scale` (`:180-183`, `0.707` on every export), is
+  `ferrox_models::attn_value_scale`: one reader of 140, applied after
+  `wo` in the one attention tail. Three libllama-golden fixtures, each
+  carrying the per-layer `head_count_kv` array, the per-layer window
+  array with `rope.freq_base_swa`, sinks, sigmoid routing with
+  `exp_probs_b`, partial NEOX RoPE and MoE on every layer: KL 5.42e-15
+  (fused `attn_qkv`), 5.42e-15 (split), 3.49e-15 (no value scale).
+  51 audited, 6 refusing.
+
 - **`bitnet` runs, on the two norms INSIDE the blocks.**
   `src/models/bitnet.cpp:24,36` require `attn_sub_norm` (on the
   attention output BEFORE `wo`, `:101-106`) and `ffn_sub_norm` (on
@@ -106,6 +136,20 @@ are the ones worth reading twice.
 
 ### Fixed
 
+- **`expert_weights_scale` and `expert_weights_norm` were honoured for
+  EVERY architecture; llama.cpp reads the two keys in twenty
+  per-architecture loaders and nowhere else.** Everywhere else the
+  graph passes a literal into `build_moe_ffn` and the key is dead
+  metadata. Found by `mimo2`'s fixture, which declares
+  `expert_weights_scale = 2.5` that `mimo2.cpp` never reads: libllama's
+  golden is unscaled and ferrox was 2e-3 of KL away until the loader's
+  `EXPERT_WEIGHTS_SCALE_READERS` / `EXPERT_WEIGHTS_NORM_READERS` (eight
+  and seven on the generic path, measured) gated the keys on their
+  readers. No real export of a non-reader writes either key, so no
+  published checkpoint changes; a hand-written file would have. In the
+  same measurement, `GATING_LITERAL_ARCHITECTURES` records the one
+  generic-path graph that passes a SIGMOID literal (`mimo2.cpp:227`),
+  so a file's `expert_gating_func` cannot turn it.
 - **YaRN's magnitude term was not applied for ANY architecture on the
   generic path.** `llama-context.cpp:196-231` multiplies
   `rope.scaling.attn_factor` by `get_mscale(factor, 1) /

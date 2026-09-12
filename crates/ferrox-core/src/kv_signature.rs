@@ -288,6 +288,13 @@ fn describe_window(window: Option<usize>) -> String {
 /// its own declared `seq_len` -- `seq_len` is a claim, `k.len()` is the
 /// evidence.
 fn measure_layer(index: usize, layer: &KvCache, per_token: usize) -> Result<usize, SignatureError> {
+    if layer.v_head_dim != layer.head_dim {
+        return Err(SignatureError::SplitKvHeadWidth {
+            layer: index,
+            head_dim: layer.head_dim,
+            v_head_dim: layer.v_head_dim,
+        });
+    }
     if !layer.k.len().is_multiple_of(per_token) {
         return Err(SignatureError::RaggedPayload {
             layer: index,
@@ -338,6 +345,15 @@ pub enum SignatureError {
         layer: usize,
         n_kv_heads: usize,
         head_dim: usize,
+    },
+    /// A layer whose V head width differs from its K head width
+    /// (MiMo-V2). The block format carries ONE `head_dim`, so such a
+    /// payload has no honest encoding; refused rather than written with
+    /// the K width and read back into V rows of the wrong shape.
+    SplitKvHeadWidth {
+        layer: usize,
+        head_dim: usize,
+        v_head_dim: usize,
     },
     /// The payload does not agree with itself: layers of different
     /// shapes or lengths, or a layer whose buffers contradict its own
@@ -402,6 +418,16 @@ impl std::fmt::Display for SignatureError {
             } => write!(
                 f,
                 "KV block layer {layer} is degenerate: {n_kv_heads} kv heads x {head_dim} head dim"
+            ),
+            SignatureError::SplitKvHeadWidth {
+                layer,
+                head_dim,
+                v_head_dim,
+            } => write!(
+                f,
+                "KV block layer {layer} has a V head width ({v_head_dim}) that differs from its K \
+                 head width ({head_dim}); the block format carries one head_dim and cannot \
+                 encode it"
             ),
             SignatureError::RaggedPayload {
                 layer,

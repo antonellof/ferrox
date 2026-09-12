@@ -193,7 +193,7 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **50** do
+   logit comparison against real `libllama`, or a fixture; **51** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
@@ -201,9 +201,9 @@ The error always names the reason. Six things cause it:
    `exaone4`, `exaone-moe`, `smollm3`, `plamo3`, `granite`, `granitemoe`,
    `granite-moe`, `minicpm`, `olmo`, `dbrx`, `grok`, `arcee`, `deci`,
    `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35`,
-   `mistral3`, `smallthinker`, `bitnet`, `gemma`, `gemma2`, `gemma3`,
-   `phi3`, `gpt-oss`, `dots1`).
-   The other **7** stop with `UnauditedArchitecture`.
+   `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `gemma`, `gemma2`,
+   `gemma3`, `phi3`, `gpt-oss`, `dots1`).
+   The other **6** stop with `UnauditedArchitecture`.
    `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
@@ -247,7 +247,7 @@ unmeasured, because measuring it needs a quiet host.
 
 ### What "unaudited" costs you, per architecture
 
-"Unaudited" is not one thing. None of the 7 is a fixture or a single
+"Unaudited" is not one thing. None of the 6 is a fixture or a single
 match arm away any more: they need an attention implementation or a
 reading nobody has done, and the refusal says which, with the
 `llama.cpp/src/models/*.cpp` line that decides it:
@@ -259,7 +259,7 @@ reading nobody has done, and the refusal says which, with the
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 7 have now been read on both sides (`ferrox_models::capability`,
+All 6 have now been read on both sides (`ferrox_models::capability`,
 pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
 distribution is the headline answer to "how far is Ferrox from llama.cpp
 on models":
@@ -268,13 +268,13 @@ on models":
 |---|---|
 | fixture-away | 0 |
 | one match arm | 0 |
-| new code | 6 |
+| new code | 5 |
 | unknown | 1 |
 
 **Both cheap classes are empty.** `gemma` was the last fixture-away row
 and `chatglm` the last one-match-arm row; nothing still refusing is one
 fixture or one arm away. That is a better answer than the count alone:
-the cheap wins are spent, and what is left is 6 rows needing a
+the cheap wins are spent, and what is left is 5 rows needing a
 different graph plus one name nobody can get a file for.
 
 It was 47 until the triage itself removed one. Reading
@@ -330,13 +330,13 @@ loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
 checkpoint carries is 1, and that is what Ferrox runs and pins against
 libllama.
 
-**New code (6).** A different attention or residual structure. The
-recurring shapes, rather than 6 separate stories:
+**New code (5).** A different attention or residual structure. The
+recurring shapes, rather than 5 separate stories:
 
 The column moved for the first time on 2026-09-10, three times: 26 to
 24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times more, 20 to
 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9 to 8, and on
-2026-09-12 twice, 8 to 7 and 7 to 6. The first two took several rows at
+2026-09-12 three times, 8 to 7, 7 to 6 and 6 to 5. The first two took several rows at
 once, and for the same reason -- each found ONE cause behind several
 refusals. The fourth did too, and the count hides it: the per-layer
 RoPE gate closed THREE refusals and only one of them (`exaone-moe`) was
@@ -370,7 +370,71 @@ router operand because the reach was counted over all fifty-nine
 a precomputed `probs_in` share the MECHANISM and not the cause. The
 twelfth is the smallest reach there is: `bitnet` closed ALONE on two
 norm slots that one graph of 140 creates, and the seam is a `bool`
-because there is no second shape to name.
+because there is no second shape to name. The thirteenth is the
+biggest row of the year and the one the KV cache was built without:
+`mimo2` closed ALONE on a V head width that differs from K's, and the
+reach came back as one generic-path converter plus the MLA engine,
+which had carried the pair since it existed.
+
+`mimo2` closed on `ferrox_models::kv_head_dims`. `conversion/mimo.py:
+154` writes `attention.value_length` from `v_head_dim` apart from the
+`attention.key_length` the base converter writes from `head_dim` --
+`192` and `128` on MiMo-V2-Flash, the same on V2.5 -- and `mimo2.cpp:
+47-48,132-140,152-154` size and view K and V separately, with `wo` at
+`n_embd_head_v * n_head` (`:52`). Fourteen converters write
+`value_length`; three write it apart from `key_length`, and two of
+those are MLA (`deepseek.py`, `plm.py`), on the engine that has taken
+two widths since it existed. Eighty-nine graphs assert the two equal.
+So the seam admits the pair for ONE architecture by table and keeps
+refusing it, naming the assert, for everyone else. `ModelConfig::
+v_head_dim` is an `Option<usize>` that is `Some` only when the widths
+differ -- a second `usize` beside `head_dim` would have been two fields
+that must agree with nothing enforcing it, and the first test that
+mutated `head_dim` proved it -- and `v_head_dim()` is the one accessor.
+Every consumer took the V width: `KvCache` and `PagedKvStore` size and
+index V by it (`new_split`; the K width is `head_dim` as before), the
+three contiguous single-query kernels -- plain, windowed, with sinks --
+collapsed onto ONE `causal_gqa_attention_row` that accumulates over it
+(they were one loop varied by a window bound and a sink term, and the
+V width would have been a fourth decoration to add to each), the paged
+kernel reads it off the store, the batched prefill kernel's PV tile
+takes its own offset and stride, `check_gqa_projection_widths` sizes
+`v_proj` and `o_proj` by it, `qkv_fused::FusedQkvRows` cuts the fused
+`attn_qkv` at it, the two batched host bodies split V by it, and the
+KV budget prices K and V separately. What refuses: every fused Metal
+launch through `metal_can_serve_model` (one head width for the KV
+buffers, the attention tile and the `wo` fold), the CUDA resident hook
+(now reached only for a plain full-attention layer at one width), the
+slot file and the KV block file (one `head_dim` in each header). The
+row's second half is `attention.value_scale` (`:14-17,180-183`;
+`0.707` on every real export), one reader of 140 measured over all of
+`src/`, applied after `wo` in the one attention tail
+(`ferrox_models::attn_value_scale`). Three libllama-golden fixtures
+(`tests/split_kv_head_dim_graphs.rs`), each carrying everything a real
+export carries -- the per-layer `head_count_kv` array, the per-layer
+window array with `rope.freq_base_swa`, sinks on every layer, sigmoid
+routing with `exp_probs_b`, partial NEOX RoPE over the 12-wide K head,
+MoE on every layer: KL 5.42e-15 for the converter's fused `attn_qkv`
+(K rows at 12, V rows at 8), 5.42e-15 for the split spelling (libllama
+byte-identical for the two files), 3.49e-15 without the value scale.
+A V width read as K's is refused naming the tensor; the value scale
+dropped or added diverges; the batched body agrees with the row body
+at twelve positions. Building it found two things. `mimo2.cpp:227`
+passes the SIGMOID literal into `build_moe_ffn`, so the file's
+`expert_gating_func` is never read: parsing every `build_moe_ffn` call
+in all 140 graphs, three pass the SIGMOID literal (`llama4`, `mimo2`,
+`nemotron-h`), twenty-six SOFTMAX, nineteen the hparam, and the
+loader's `GATING_LITERAL_ARCHITECTURES` carries the one on this
+engine. And the bisection that found the last 2e-3 of KL found a
+generic defect: ferrox honoured `expert_weights_scale` for EVERY
+architecture, while llama.cpp reads the key in twenty per-architecture
+loaders and nowhere else -- the fixture declares `2.5`, `mimo2.cpp`
+never reads it, and libllama's golden is unscaled. `EXPERT_WEIGHTS_
+SCALE_READERS` and `EXPERT_WEIGHTS_NORM_READERS` in the loader are the
+readers, measured (eight and seven on this path), and a file carrying
+either key on any other architecture now gets the graph's literal, as
+upstream. No real export of a non-reader writes either key, so no
+published checkpoint changed; a hand-written one would have.
 
 `bitnet` closed on `ferrox_models::sub_norms`. `bitnet.cpp:24,36`
 require `attn_sub_norm` `{n_embd}` and `ffn_sub_norm` `{n_ff}`, two
@@ -681,10 +745,10 @@ carries: `conversion/mimo.py` ALWAYS appends three NEXTN blocks inside
 `attention.sliding_window_pattern` as the per-layer `hybrid_layer_pattern`
 ARRAY, which for this architecture is a per-layer bool even as a scalar
 (`get_key_or_arr(..., is_swa_impl, n_layer)` broadcasts it) and not a
-period. Both closed on 2026-09-11 (below) and the row still refuses:
-MiMo-V2-Flash's `head_dim` is 192 and its `v_head_dim` 128, a V width
-that differs from K's on every layer, which no ferrox KV cache or
-attention kernel takes.
+period. Both closed on 2026-09-11 (below), and the last thing --
+MiMo-V2-Flash's `head_dim` of 192 beside a `v_head_dim` of 128, a V
+width that differs from K's on every layer, which no ferrox KV cache
+or attention kernel took -- closed on 2026-09-12 (above).
 
 **The per-layer window ARRAY and the NextN blocks** are two seams that
 landed together on 2026-09-11, because two verdicts named both and a
@@ -878,7 +942,7 @@ files read a per-layer shape somewhere; seventeen honour one in BOTH
 places, and those are `ferrox_models::layer_shapes::PER_LAYER_SHAPE_ARCHS`
 with what each still needs: `deci`, `openelm` and `plamo3` on the
 generic path, and `laguna` and `step35` with them since they closed;
-`mimo2` on the generic path but refused for something else;
+`mimo2` on the generic path, closed on the split K/V head width;
 `nanbeige`, which copies the arrays to loop
 its layers; `gemma4` and `gemma4-assistant` on a dedicated engine; and
 the seven hybrid recurrent rows (`jamba`, `lfm2`, `lfm2moe`,
@@ -954,17 +1018,17 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 
 | Shape | Architectures |
 |---|---|
-| Per-layer head counts or FFN width | CLOSED (`ferrox_models::layer_shapes`): `deci`, `openelm`, `laguna` and `step35` run on it; `mimo2` still refuses for the rows below and its verdict says so |
+| Per-layer head counts or FFN width | CLOSED (`ferrox_models::layer_shapes`): `deci`, `openelm`, `laguna`, `step35` and `mimo2` run on it |
 | A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | `talkie` (`olmo`, `olmo2`, `exaone4`, `dbrx` and `bitnet` were here and are CLOSED; `bitnet`'s two INNER norms are `ferrox_models::sub_norms`) |
 | LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`) and weighted (`dbrx`) forms; the bias group below still refuses for more than the norm |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all six (`ferrox_models::rope_layers`): `exaone-moe`, `smollm3`, EXAONE-4 32B, `afmoe` and `smallthinker` run on it |
 | A branch fed from the raw layer input rather than the post-attention residual | CLOSED for a ROUTER (`ferrox_models::router_input`): `smallthinker` runs on it; `arctic` feeds a whole second norm and expert bank from the same operand, which that seam does not reach, and its verdict says so |
 | Hardcoded scales applied even when the GGUF carries no key | none left (`grok` was here and is CLOSED on the MiniCPM defaults hook; `mistral3` was here by mistake -- its scale comes from a key -- and is CLOSED) |
 | A gated attention tensor (`wqkv_gate`) | CLOSED (`ferrox_models::attn_gate`): `afmoe`, `laguna` and `step35` run on it |
-| Attention sinks outside gpt-oss | CLOSED as a tensor-presence fact (`AttnWeights::sinks`, CPU; the fused Metal launches refuse the layer); `mimo2` still refuses for the rows below |
-| A per-layer sliding-window ARRAY (`is_swa_impl`) | CLOSED (`ferrox_models::swa_layers`): `mellum` and `step35` run on it and the EXAONE / Olmo-3 over-refusal is lifted; `mimo2` still refuses for the rows below and its verdict says so |
+| Attention sinks outside gpt-oss | CLOSED as a tensor-presence fact (`AttnWeights::sinks`, CPU; the fused Metal launches refuse the layer): `mimo2` runs on it |
+| A per-layer sliding-window ARRAY (`is_swa_impl`) | CLOSED (`ferrox_models::swa_layers`): `mellum`, `step35` and `mimo2` run on it and the EXAONE / Olmo-3 over-refusal is lifted |
 | NEXTN/MTP blocks inside `block_count` | CLOSED (`ferrox_models::mtp_blocks`) for the seventeen graphs that read the key, on the generic path and all four dedicated loaders; refused by name elsewhere |
-| A V head width that differs from the K head width | `mimo2` (every real export: `head_dim: 192, v_head_dim: 128`) |
+| A V head width that differs from the K head width | CLOSED (`ferrox_models::kv_head_dims`): `mimo2` runs on it on the host paths; every fused Metal launch, the CUDA resident hook, the slot file and the KV block file refuse a split model |
 | An FFN activation whose PARAMETERS vary by layer (xIELU's four arrays; the SwiGLU clamp arrays by site) | CLOSED (`ferrox_models::act_layers`): `apertus` and `step35` run on it |
 | A second rotary width on the sliding layers (`n_rot(il)`: `rope.dimension_count_swa`, or `step35`'s halved full width) | CLOSED (`ModelConfig::rope_dim_swa`, `ferrox_models::swa_geometry`): `step35` and the Laguna-XS.2 shape run on it; the two `_swa` HEAD-width keys stay refused by name, and two widths with per-band divisors are refused for any architecture but `step35` |
 | An ungated or non-SwiGLU FFN | CLOSED for the ungated ReLU-squared form (`FfnActivation::ReluSqr`), the gated ReLU form (`FfnActivation::Reglu`) and xIELU (`FfnActivation::Xielu`): `arcee`, `smallthinker` and `apertus` run on them; `plm` shares the ReLU-squared FFN and refuses on MLA attention |

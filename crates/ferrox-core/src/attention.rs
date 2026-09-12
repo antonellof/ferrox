@@ -216,14 +216,13 @@ unsafe fn hsum256_ps(acc: std::arch::x86_64::__m256) -> f32 {
 fn online_attn_accumulate(
     q_h: &[f32],
     scale: f32,
-    head_dim: usize,
     out_h: &mut [f32],
     attn_softcap: Option<f32>,
     sink: Option<f32>,
     mut for_each_kv: impl FnMut(&mut dyn FnMut(&[f32], &[f32])),
 ) {
-    debug_assert_eq!(q_h.len(), head_dim);
-    debug_assert_eq!(out_h.len(), head_dim);
+    // `q_h` is one K-width head and `out_h` one V-width head; the two
+    // agree everywhere but MiMo-V2, and nothing here needs them to.
     let mut m = f32::NEG_INFINITY;
     let mut l = 0f32;
     out_h.fill(0.0);
@@ -776,44 +775,24 @@ pub fn causal_gqa_attention_softcap(
     seq_len: usize,
     attn_softcap: Option<f32>,
 ) -> Vec<f32> {
-    assert_eq!(q.len(), n_heads * head_dim);
-    assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
-    assert_eq!(v_cache.len(), seq_len * n_kv_heads * head_dim);
-
-    let group_size = n_heads / n_kv_heads.max(1);
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0f32; n_heads * head_dim];
-
-    for h in 0..n_heads {
-        let kv_h = h / group_size.max(1);
-        let q_h = &q[h * head_dim..(h + 1) * head_dim];
-        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, None, |visit| {
-            for t in 0..seq_len {
-                let k_t = &k_cache
-                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
-                let v_t = &v_cache
-                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
-                visit(k_t, v_t);
-            }
-        });
-    }
-
-    out
+    causal_gqa_attention_row(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        head_dim,
+        seq_len,
+        None,
+        None,
+        attn_softcap,
+    )
 }
 
-/// Same computation as `causal_gqa_attention`, but each query only
-/// attends to the last `window` cached positions (inclusive of itself)
-/// instead of the full causal history -- Mistral/Mixtral/Qwen2-family
-/// sliding-window attention. Confirmed against the real
-/// `sliding_window` config field used by those models (real
-/// `transformers` source for `Qwen2MoeAttention`/Mixtral's equivalent)
-/// and against candle-transformers' `mixtral.rs`/`qwen2_moe.rs`, which
-/// both mask scores where `key_pos + sliding_window < query_pos` --
-/// i.e. only the most recent `window` positions (including the
-/// query's own) stay unmasked. `window >= seq_len` degenerates to
-/// exactly `causal_gqa_attention`'s full-causal behavior (pinned by
-/// `windowed_attention_with_window_covering_full_history_matches_full_causal`).
+/// Sliding-window variant of [`causal_gqa_attention`]: the query (the
+/// last cached position) sees only the most recent `window` positions,
+/// including its own.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_gqa_attention_windowed(
     q: &[f32],
@@ -843,57 +822,26 @@ pub fn causal_gqa_attention_windowed_softcap(
     window: usize,
     attn_softcap: Option<f32>,
 ) -> Vec<f32> {
-    assert_eq!(q.len(), n_heads * head_dim);
-    assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
-    assert_eq!(v_cache.len(), seq_len * n_kv_heads * head_dim);
     assert!(window > 0, "window must be positive");
-
-    let group_size = n_heads / n_kv_heads.max(1);
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0f32; n_heads * head_dim];
-    // The current query is the last position in the cache (position
-    // seq_len - 1); only the most recent `window` positions, including
-    // this one, are visible.
-    let window_start = seq_len.saturating_sub(window);
-
-    for h in 0..n_heads {
-        let kv_h = h / group_size.max(1);
-        let q_h = &q[h * head_dim..(h + 1) * head_dim];
-        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, None, |visit| {
-            for t in window_start..seq_len {
-                let k_t = &k_cache
-                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
-                let v_t = &v_cache
-                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
-                visit(k_t, v_t);
-            }
-        });
-    }
-
-    out
+    causal_gqa_attention_row(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        head_dim,
+        seq_len,
+        Some(window),
+        None,
+        attn_softcap,
+    )
 }
 
-/// Single-query causal GQA with per-head **attention sinks**, optionally
-/// windowed.
-///
-/// `sinks` is one learned logit per *query* head (gpt-oss ships it as
-/// `blk.N.attn_sinks.weight`, length `n_heads`). It joins the softmax
-/// denominator without contributing a value vector, which lets a head
-/// attend to "nothing" instead of being forced to spend its whole
-/// probability mass on real tokens — see [`online_attn_accumulate`] for
-/// the exact llama.cpp form this reproduces.
-///
-/// `window` is `Some(w)` for a sliding-window layer (the query sees only
-/// the last `w` cached positions, itself included, exactly as
-/// [`causal_gqa_attention_windowed`]) and `None` for full causal
-/// attention. gpt-oss alternates the two per layer.
-///
-/// Deliberately one function covering both, and deliberately the
-/// single-query shape: prefill drives it once per query position. That
-/// is slower than the blocked prefill kernel and is the honest trade —
-/// one code path whose numerics are checked against llama.cpp beats
-/// three that are not.
+/// [`causal_gqa_attention`] with gpt-oss / MiMo-V2 attention sinks: one
+/// learned logit per query head that joins the softmax and contributes
+/// nothing to the output (`ggml_soft_max_add_sinks`). Carries no
+/// softcap, as llama.cpp's sink arm carries none.
 #[allow(clippy::too_many_arguments)]
 pub fn causal_gqa_attention_sinks(
     q: &[f32],
@@ -906,18 +854,63 @@ pub fn causal_gqa_attention_sinks(
     window: Option<usize>,
     sinks: &[f32],
 ) -> Vec<f32> {
+    causal_gqa_attention_row(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        head_dim,
+        seq_len,
+        window,
+        Some(sinks),
+        None,
+    )
+}
+
+/// THE contiguous single-query GQA kernel: every arm the decode path
+/// dispatches -- plain, softcapped, windowed, with sinks -- and the
+/// contiguous twin of [`causal_gqa_attention_paged_sinks`].
+///
+/// One body rather than three, because the three it replaced were one
+/// loop varied by a window bound and a sink term, and the V head width
+/// would have been a fourth decoration to add to each of them. `q` is
+/// `[n_heads, head_dim]`; `k_cache` is `[seq_len, n_kv_heads,
+/// head_dim]`; `v_cache` is `[seq_len, n_kv_heads, v_head_dim]`; the
+/// result is `[n_heads, v_head_dim]`. `v_head_dim == head_dim` for every
+/// architecture but MiMo-V2 (`ferrox_models::kv_head_dims`), whose
+/// `head_dim: 192, v_head_dim: 128` is why the two are two arguments:
+/// the score is a dot over the K width and the accumulate is an axpy
+/// over the V width, and nothing in between cares that they agree.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_row(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    v_head_dim: usize,
+    seq_len: usize,
+    window: Option<usize>,
+    sinks: Option<&[f32]>,
+    attn_softcap: Option<f32>,
+) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * head_dim);
     assert_eq!(k_cache.len(), seq_len * n_kv_heads * head_dim);
-    assert_eq!(v_cache.len(), seq_len * n_kv_heads * head_dim);
-    assert_eq!(
-        sinks.len(),
-        n_heads,
-        "attention sinks are per query head (llama.cpp `attn_sinks` is {{n_head}})"
-    );
+    assert_eq!(v_cache.len(), seq_len * n_kv_heads * v_head_dim);
+    if let Some(sinks) = sinks {
+        assert_eq!(
+            sinks.len(),
+            n_heads,
+            "attention sinks are per query head (llama.cpp `attn_sinks` is {{n_head}})"
+        );
+    }
 
     let group_size = n_heads / n_kv_heads.max(1);
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0f32; n_heads * head_dim];
+    let mut out = vec![0f32; n_heads * v_head_dim];
     // The query is the last cached position; a windowed layer sees only
     // the most recent `window` positions including its own.
     let start = match window {
@@ -931,14 +924,14 @@ pub fn causal_gqa_attention_sinks(
     for h in 0..n_heads {
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
-        let sink = sinks[h];
-        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, None, Some(sink), |visit| {
+        let sink = sinks.map(|s| s[h]);
+        let out_h = &mut out[h * v_head_dim..(h + 1) * v_head_dim];
+        online_attn_accumulate(q_h, scale, out_h, attn_softcap, sink, |visit| {
             for t in start..seq_len {
                 let k_t = &k_cache
                     [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
-                let v_t = &v_cache
-                    [(t * n_kv_heads + kv_h) * head_dim..(t * n_kv_heads + kv_h + 1) * head_dim];
+                let v_t = &v_cache[(t * n_kv_heads + kv_h) * v_head_dim
+                    ..(t * n_kv_heads + kv_h + 1) * v_head_dim];
                 visit(k_t, v_t);
             }
         });
@@ -1040,16 +1033,52 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
     attn_softcap: Option<f32>,
     window: Option<usize>,
 ) -> Vec<f32> {
+    causal_gqa_attention_prefill_shared_kv_split(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        head_dim,
+        n_q,
+        kv_prefix,
+        attn_softcap,
+        window,
+    )
+}
+
+/// THE batched prefill kernel; [`causal_gqa_attention_prefill_shared_kv_windowed`]
+/// is this with one head width. `v_cache` is `[kv_len, n_kv_heads,
+/// v_head_dim]` and the result `[n_q, n_heads, v_head_dim]`; the
+/// score tile is over the K width and the PV tile over the V width
+/// (`ferrox_models::kv_head_dims`).
+#[allow(clippy::too_many_arguments)]
+pub fn causal_gqa_attention_prefill_shared_kv_split(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    v_head_dim: usize,
+    n_q: usize,
+    kv_prefix: usize,
+    attn_softcap: Option<f32>,
+    window: Option<usize>,
+) -> Vec<f32> {
     let q_stride = n_heads * head_dim;
     let kv_stride = n_kv_heads * head_dim;
+    let v_stride = n_kv_heads * v_head_dim;
+    let out_stride = n_heads * v_head_dim;
     assert_eq!(q.len(), n_q * q_stride);
     let kv_len = kv_prefix + n_q;
     assert!(k_cache.len() >= kv_len * kv_stride);
-    assert!(v_cache.len() >= kv_len * kv_stride);
+    assert!(v_cache.len() >= kv_len * v_stride);
 
     let group_size = n_heads / n_kv_heads.max(1);
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0f32; n_q * q_stride];
+    let mut out = vec![0f32; n_q * out_stride];
 
     // Blocked three-pass attention in llama.cpp's CPU shape: `KQ` as one
     // real `ggml_mul_mat`, one vectorized softmax over each score row,
@@ -1108,6 +1137,7 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
         };
         let span = t_hi - t_lo;
         let kv_off = t_lo * kv_stride + kv_h * head_dim;
+        let v_off = t_lo * v_stride + kv_h * v_head_dim;
 
         // Pack the block's Q rows for this head contiguously. The
         // GEMM then reads them with `lda = head_dim` instead of
@@ -1163,18 +1193,18 @@ pub fn causal_gqa_attention_prefill_shared_kv_windowed(
         // Zero probabilities contribute `fma(v, 0, acc) == acc`
         // exactly, so dropping the mask here is bit-identical to
         // skipping those positions.
-        acc.resize(n_b * head_dim, 0.0);
+        acc.resize(n_b * v_head_dim, 0.0);
         acc.fill(0.0);
-        pv_tile(scores, n_b, span, v_cache, kv_off, kv_stride, head_dim, acc);
+        pv_tile(scores, n_b, span, v_cache, v_off, v_stride, v_head_dim, acc);
 
         for b in b_start..b_end {
-            let out_h = &mut acc[(b - b_start) * head_dim..][..head_dim];
+            let out_h = &mut acc[(b - b_start) * v_head_dim..][..v_head_dim];
             let l = norms[b - b_start];
             if l > 0.0 {
                 scale_inplace(out_h, 1.0 / l);
             }
             unsafe {
-                out_w.write(b * q_stride + h * head_dim, out_h);
+                out_w.write(b * out_stride + h * v_head_dim, out_h);
             }
         }
     });
@@ -2101,35 +2131,18 @@ pub fn causal_gqa_attention_paged(
     head_dim: usize,
     seq_len: usize,
 ) -> Vec<f32> {
-    assert_eq!(q.len(), n_heads * head_dim);
-    let block_size = store.block_size();
-    assert!(
-        block_table.len() * block_size >= seq_len,
-        "block table too short for seq_len"
-    );
-
-    let group_size = n_heads / n_kv_heads.max(1);
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0f32; n_heads * head_dim];
-
-    for h in 0..n_heads {
-        let kv_h = h / group_size.max(1);
-        let q_h = &q[h * head_dim..(h + 1) * head_dim];
-        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, None, None, |visit| {
-            for t in 0..seq_len {
-                let block_id = block_table[t / block_size];
-                let offset = t % block_size;
-                let k_row = store.k_row(block_id, offset);
-                let v_row = store.v_row(block_id, offset);
-                let k_t = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
-                let v_t = &v_row[kv_h * head_dim..(kv_h + 1) * head_dim];
-                visit(k_t, v_t);
-            }
-        });
-    }
-
-    out
+    causal_gqa_attention_paged_sinks(
+        q,
+        store,
+        block_table,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        seq_len,
+        None,
+        None,
+        None,
+    )
 }
 
 /// [`causal_gqa_attention_paged`] with per-head attention sinks and an
@@ -2176,6 +2189,17 @@ pub fn causal_gqa_attention_paged_sinks(
     attn_softcap: Option<f32>,
 ) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * head_dim);
+    assert_eq!(
+        head_dim,
+        store.head_dim(),
+        "the query's head width must be the store's K head width"
+    );
+    // The V head width is the store's own fact, not an argument: a
+    // store built for a model is built at that model's widths
+    // (`PagedKvStore::new_split`), and a kernel that took it separately
+    // could be handed the K width for it -- which is what every arm did
+    // before MiMo-V2 made the two differ.
+    let v_head_dim = store.v_head_dim();
     let block_size = store.block_size();
     assert!(
         block_table.len() * block_size >= seq_len,
@@ -2191,7 +2215,7 @@ pub fn causal_gqa_attention_paged_sinks(
 
     let group_size = n_heads / n_kv_heads.max(1);
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0f32; n_heads * head_dim];
+    let mut out = vec![0f32; n_heads * v_head_dim];
     // The query is the last cached position; a windowed layer sees only
     // the most recent `window` positions including its own. Identical
     // to the contiguous kernel's `start`, deliberately: a different
@@ -2208,15 +2232,15 @@ pub fn causal_gqa_attention_paged_sinks(
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let sink = sinks.map(|s| s[h]);
-        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-        online_attn_accumulate(q_h, scale, head_dim, out_h, attn_softcap, sink, |visit| {
+        let out_h = &mut out[h * v_head_dim..(h + 1) * v_head_dim];
+        online_attn_accumulate(q_h, scale, out_h, attn_softcap, sink, |visit| {
             for t in start..seq_len {
                 let block_id = block_table[t / block_size];
                 let offset = t % block_size;
                 let k_row = store.k_row(block_id, offset);
                 let v_row = store.v_row(block_id, offset);
                 let k_t = &k_row[kv_h * head_dim..(kv_h + 1) * head_dim];
-                let v_t = &v_row[kv_h * head_dim..(kv_h + 1) * head_dim];
+                let v_t = &v_row[kv_h * v_head_dim..(kv_h + 1) * v_head_dim];
                 visit(k_t, v_t);
             }
         });
@@ -2514,6 +2538,136 @@ pub fn causal_mla_attention_sparse(
 
 #[cfg(test)]
 mod tests {
+
+    /// Deterministic pseudo-random data for the split-width tests.
+    fn lcg_vec(seed: u64, n: usize) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// A V head width that differs from the K width (MiMo-V2's
+    /// `192 / 128`): the row kernel agrees with the MLA kernel, which
+    /// has always taken the two widths separately, on the MHA shape the
+    /// two share -- and with itself on the GQA shape the MLA kernel
+    /// cannot express, through the paged twin over the same rows.
+    #[test]
+    fn split_kv_head_widths_agree_across_the_row_paged_and_mla_kernels() {
+        let (n_heads, n_kv_heads, hd, vd, seq) = (4usize, 2usize, 6usize, 4usize, 7usize);
+        let q = lcg_vec(1, n_heads * hd);
+        let k = lcg_vec(2, seq * n_kv_heads * hd);
+        let v = lcg_vec(3, seq * n_kv_heads * vd);
+        let sinks = lcg_vec(4, n_heads);
+        for (window, sink, cap) in [
+            (None, None, None),
+            (Some(3), None, None),
+            (None, Some(sinks.as_slice()), None),
+            (Some(4), Some(sinks.as_slice()), None),
+            (None, None, Some(5.0)),
+        ] {
+            let row = super::causal_gqa_attention_row(
+                &q, &k, &v, n_heads, n_kv_heads, hd, vd, seq, window, sink, cap,
+            );
+            assert_eq!(row.len(), n_heads * vd);
+            // Paged twin over the same rows.
+            let mut store = crate::cache::PagedKvStore::new_split(2, 8, n_kv_heads, hd, vd);
+            let mut paged = crate::cache::PagedKvCache::new();
+            for t in 0..seq {
+                paged
+                    .push(
+                        &mut store,
+                        &k[t * n_kv_heads * hd..(t + 1) * n_kv_heads * hd],
+                        &v[t * n_kv_heads * vd..(t + 1) * n_kv_heads * vd],
+                    )
+                    .unwrap();
+            }
+            let via_pages = super::causal_gqa_attention_paged_sinks(
+                &q,
+                &store,
+                paged.block_table(),
+                n_heads,
+                n_kv_heads,
+                hd,
+                seq,
+                window,
+                sink,
+                cap,
+            );
+            for (a, b) in row.iter().zip(via_pages.iter()) {
+                assert!((a - b).abs() < 1e-6, "row {a} vs paged {b} ({window:?})");
+            }
+        }
+        // MHA shape: the MLA kernel is the independent reference.
+        let q1 = lcg_vec(5, n_heads * hd);
+        let k1 = lcg_vec(6, seq * n_heads * hd);
+        let v1 = lcg_vec(7, seq * n_heads * vd);
+        let row = super::causal_gqa_attention_row(
+            &q1, &k1, &v1, n_heads, n_heads, hd, vd, seq, None, None, None,
+        );
+        let mla = super::causal_mla_attention(&q1, &k1, &v1, n_heads, hd, vd, seq);
+        for (a, b) in row.iter().zip(mla.iter()) {
+            assert!((a - b).abs() < 1e-6, "row {a} vs mla {b}");
+        }
+        // And the width is not merely tolerated: a V width read as the
+        // K width would be a different vector.
+        assert_ne!(row.len(), n_heads * hd);
+    }
+
+    /// The batched prefill kernel at split widths equals the row kernel
+    /// applied position by position, windowed and not, softcapped and
+    /// not -- the same equivalence the one-width tests below pin, at
+    /// the shape that used to be a refusal.
+    #[test]
+    fn split_kv_head_width_prefill_matches_the_row_kernel_per_position() {
+        let (n_heads, n_kv_heads, hd, vd, prefix, n_q) =
+            (4usize, 2usize, 6usize, 4usize, 3usize, 11usize);
+        let kv_len = prefix + n_q;
+        let q = lcg_vec(11, n_q * n_heads * hd);
+        let k = lcg_vec(12, kv_len * n_kv_heads * hd);
+        let v = lcg_vec(13, kv_len * n_kv_heads * vd);
+        for (window, cap) in [
+            (None, None),
+            (Some(4), None),
+            (None, Some(6.0)),
+            (Some(5), Some(6.0)),
+        ] {
+            let got = super::causal_gqa_attention_prefill_shared_kv_split(
+                &q, &k, &v, n_heads, n_kv_heads, hd, vd, n_q, prefix, cap, window,
+            );
+            assert_eq!(got.len(), n_q * n_heads * vd);
+            for b in 0..n_q {
+                let t = prefix + b + 1;
+                let want = super::causal_gqa_attention_row(
+                    &q[b * n_heads * hd..(b + 1) * n_heads * hd],
+                    &k[..t * n_kv_heads * hd],
+                    &v[..t * n_kv_heads * vd],
+                    n_heads,
+                    n_kv_heads,
+                    hd,
+                    vd,
+                    t,
+                    window,
+                    None,
+                    cap,
+                );
+                let row = &got[b * n_heads * vd..(b + 1) * n_heads * vd];
+                for (a, w) in row.iter().zip(want.iter()) {
+                    assert!(
+                        (a - w).abs() < 1e-5,
+                        "b={b} {a} vs {w} ({window:?}, {cap:?})"
+                    );
+                }
+            }
+        }
+    }
 
     /// A sink takes probability mass away from the real keys without
     /// contributing to the output, so the result shrinks toward zero

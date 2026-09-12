@@ -125,9 +125,18 @@ struct PooledState {
 
 pub struct KvCache {
     pub n_kv_heads: usize,
+    /// The K head width. Also the Q head width and the width RoPE
+    /// rotates within (`n_embd_head_k`).
     pub head_dim: usize,
+    /// The V head width (`n_embd_head_v`). Equal to `head_dim` for every
+    /// architecture but MiMo-V2 (`head_dim: 192, v_head_dim: 128`);
+    /// `ferrox_models::kv_head_dims` is the seam. Every row of `k` is
+    /// `n_kv_heads * head_dim` wide and every row of `v` is
+    /// `n_kv_heads * v_head_dim`, so the two buffers are sized and
+    /// indexed by their OWN width throughout this file.
+    pub v_head_dim: usize,
     pub k: Vec<f32>, // [rows, n_kv_heads, head_dim], flattened
-    pub v: Vec<f32>,
+    pub v: Vec<f32>, // [rows, n_kv_heads, v_head_dim], flattened
     /// Positions this sequence has consumed.
     ///
     /// **Not the same thing as the number of rows in `k`/`v`**, and the
@@ -179,6 +188,7 @@ impl Clone for KvCache {
         KvCache {
             n_kv_heads: self.n_kv_heads,
             head_dim: self.head_dim,
+            v_head_dim: self.v_head_dim,
             k: self.k.clone(),
             v: self.v.clone(),
             positions: self.positions,
@@ -253,17 +263,36 @@ impl KvCache {
     /// a copy of it.
     #[inline]
     pub fn rows(&self) -> usize {
-        let elems_per_position = self.n_kv_heads * self.head_dim;
-        if elems_per_position == 0 {
+        let k_width = self.k_width();
+        if k_width == 0 {
             return 0;
         }
-        self.k.len() / elems_per_position
+        self.k.len() / k_width
     }
 
+    /// One position's K row: `n_kv_heads * head_dim` elements.
+    #[inline]
+    pub fn k_width(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+
+    /// One position's V row: `n_kv_heads * v_head_dim` elements.
+    #[inline]
+    pub fn v_width(&self) -> usize {
+        self.n_kv_heads * self.v_head_dim
+    }
+
+    /// A cache whose K and V heads share one width -- every architecture
+    /// but MiMo-V2. [`Self::new_split`] is the general form.
     pub fn new(n_kv_heads: usize, head_dim: usize) -> Self {
+        Self::new_split(n_kv_heads, head_dim, head_dim)
+    }
+
+    pub fn new_split(n_kv_heads: usize, head_dim: usize, v_head_dim: usize) -> Self {
         KvCache {
             n_kv_heads,
             head_dim,
+            v_head_dim,
             k: Vec::new(),
             v: Vec::new(),
             positions: 0,
@@ -277,12 +306,22 @@ impl KvCache {
     /// `push` never triggers a reallocation-and-copy during decode.
     /// Use this when the maximum context length is known ahead of time
     pub fn with_capacity(n_kv_heads: usize, head_dim: usize, max_seq_len: usize) -> Self {
-        let elems_per_position = n_kv_heads * head_dim;
+        Self::with_capacity_split(n_kv_heads, head_dim, head_dim, max_seq_len)
+    }
+
+    /// [`Self::with_capacity`] with a V head width of its own.
+    pub fn with_capacity_split(
+        n_kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        max_seq_len: usize,
+    ) -> Self {
         KvCache {
             n_kv_heads,
             head_dim,
-            k: Vec::with_capacity(max_seq_len * elems_per_position),
-            v: Vec::with_capacity(max_seq_len * elems_per_position),
+            v_head_dim,
+            k: Vec::with_capacity(max_seq_len * n_kv_heads * head_dim),
+            v: Vec::with_capacity(max_seq_len * n_kv_heads * v_head_dim),
             positions: 0,
             planned_capacity: Some(max_seq_len),
             pool_state: None,
@@ -314,17 +353,28 @@ impl KvCache {
         pool: Arc<Mutex<KvBlockPool>>,
         max_seq_len: usize,
     ) -> Result<Self, KvPoolExhausted> {
+        Self::with_pool_split(n_kv_heads, head_dim, head_dim, pool, max_seq_len)
+    }
+
+    /// [`Self::with_pool`] with a V head width of its own.
+    pub fn with_pool_split(
+        n_kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        pool: Arc<Mutex<KvBlockPool>>,
+        max_seq_len: usize,
+    ) -> Result<Self, KvPoolExhausted> {
         let block_size = pool.lock().unwrap().block_size();
         let blocks_needed = max_seq_len.div_ceil(block_size).max(1);
         if !pool.lock().unwrap().try_acquire(blocks_needed) {
             return Err(KvPoolExhausted);
         }
-        let elems_per_position = n_kv_heads * head_dim;
         Ok(KvCache {
             n_kv_heads,
             head_dim,
-            k: Vec::with_capacity(blocks_needed * block_size * elems_per_position),
-            v: Vec::with_capacity(blocks_needed * block_size * elems_per_position),
+            v_head_dim,
+            k: Vec::with_capacity(blocks_needed * block_size * n_kv_heads * head_dim),
+            v: Vec::with_capacity(blocks_needed * block_size * n_kv_heads * v_head_dim),
             positions: 0,
             planned_capacity: None,
             pool_state: Some(PooledState {
@@ -343,23 +393,23 @@ impl KvCache {
     /// `Err(KvPoolExhausted)` is returned. Caches built with `new` or
     /// `with_capacity` always return `Ok`.
     pub fn push(&mut self, k_step: &[f32], v_step: &[f32]) -> Result<(), KvPoolExhausted> {
-        assert_eq!(k_step.len(), self.n_kv_heads * self.head_dim);
-        assert_eq!(v_step.len(), self.n_kv_heads * self.head_dim);
+        assert_eq!(k_step.len(), self.k_width());
+        assert_eq!(v_step.len(), self.v_width());
 
-        let elems_per_position = self.n_kv_heads * self.head_dim;
+        let (k_width, v_width) = (self.k_width(), self.v_width());
         if let Some(state) = &mut self.pool_state {
-            let capacity_positions = self.k.capacity() / elems_per_position;
+            let capacity_positions = self.k.capacity() / k_width;
             // ROWS, not positions: this asks whether the buffer is
             // full, and an evicting cache's buffer is shorter than its
             // position count. Equal for a cache that never evicts.
-            let rows = self.k.len() / elems_per_position;
+            let rows = self.k.len() / k_width;
             if rows == capacity_positions {
                 if !state.pool.lock().unwrap().try_acquire(1) {
                     return Err(KvPoolExhausted);
                 }
                 state.blocks_held += 1;
-                self.k.reserve_exact(state.block_size * elems_per_position);
-                self.v.reserve_exact(state.block_size * elems_per_position);
+                self.k.reserve_exact(state.block_size * k_width);
+                self.v.reserve_exact(state.block_size * v_width);
             }
         }
 
@@ -376,10 +426,10 @@ impl KvCache {
         if n == 0 {
             return Ok(());
         }
-        let elems_per_position = self.n_kv_heads * self.head_dim;
-        let zeros = vec![0f32; elems_per_position];
+        let k_zeros = vec![0f32; self.k_width()];
+        let v_zeros = vec![0f32; self.v_width()];
         for _ in 0..n {
-            self.push(&zeros, &zeros)?;
+            self.push(&k_zeros, &v_zeros)?;
         }
         Ok(())
     }
@@ -436,10 +486,9 @@ impl KvCache {
              FERROX_KV_WINDOW for a workload that rolls the KV cache back this far.",
             self.window.map(|w| w.window())
         );
-        let elems_per_position = self.n_kv_heads * self.head_dim;
         let keep_rows = rows - dropped;
-        self.k.truncate(keep_rows * elems_per_position);
-        self.v.truncate(keep_rows * elems_per_position);
+        self.k.truncate(keep_rows * self.k_width());
+        self.v.truncate(keep_rows * self.v_width());
         self.positions = new_seq_len;
     }
 
@@ -484,11 +533,11 @@ impl KvCache {
         let Some(window) = self.window else {
             return 0;
         };
-        let elems_per_position = self.n_kv_heads * self.head_dim;
-        if elems_per_position == 0 {
+        let (k_width, v_width) = (self.k_width(), self.v_width());
+        if k_width == 0 {
             return 0;
         }
-        let rows = self.k.len() / elems_per_position;
+        let rows = self.k.len() / k_width;
         let keep = window.rows_after(self.positions).min(rows);
         let drop_rows = rows - keep;
         if drop_rows == 0 {
@@ -497,9 +546,8 @@ impl KvCache {
         // One `drain` per eviction, not one per token: the whole reason
         // `KvWindow` carries slack. This moves `keep` rows down, and it
         // happens once every `slack + 1` positions.
-        let drop_elems = drop_rows * elems_per_position;
-        self.k.drain(..drop_elems);
-        self.v.drain(..drop_elems);
+        self.k.drain(..drop_rows * k_width);
+        self.v.drain(..drop_rows * v_width);
         // `drain` frees no memory, and the saving this exists for is
         // memory. A cache that just absorbed a 32k-token prefill holds
         // 32k rows of capacity behind `window + slack` rows of data
@@ -520,10 +568,10 @@ impl KvCache {
         // blocks; handing the capacity back without handing the blocks
         // back saves nothing and costs that.
         if self.pool_state.is_none() {
-            let want = window.max_rows() * elems_per_position;
-            if self.k.capacity() > want.saturating_mul(2) {
-                self.k.shrink_to(want);
-                self.v.shrink_to(want);
+            let want_k = window.max_rows() * k_width;
+            if self.k.capacity() > want_k.saturating_mul(2) {
+                self.k.shrink_to(want_k);
+                self.v.shrink_to(window.max_rows() * v_width);
             }
         }
         drop_rows
@@ -547,8 +595,7 @@ impl KvCache {
                 // POSITIONS against the plan (the plan was made in
                 // positions), ROWS against the buffer (the buffer holds
                 // rows). Equal unless this cache evicts.
-                self.positions <= cap
-                    && self.k.capacity() >= self.rows() * self.n_kv_heads * self.head_dim
+                self.positions <= cap && self.k.capacity() >= self.rows() * self.k_width()
             }
             None => false,
         }
@@ -571,22 +618,36 @@ impl KvCache {
 pub struct PagedKvStore {
     block_size: usize,
     n_kv_heads: usize,
+    /// K head width; see [`KvCache::head_dim`].
     head_dim: usize,
+    /// V head width; see [`KvCache::v_head_dim`].
+    v_head_dim: usize,
     k: Vec<f32>, // [total_blocks * block_size, n_kv_heads, head_dim], flattened
-    v: Vec<f32>,
+    v: Vec<f32>, // [total_blocks * block_size, n_kv_heads, v_head_dim], flattened
     free_block_ids: Vec<usize>,
 }
 
 impl PagedKvStore {
+    /// One width for K and V; [`Self::new_split`] is the general form.
     pub fn new(block_size: usize, total_blocks: usize, n_kv_heads: usize, head_dim: usize) -> Self {
+        Self::new_split(block_size, total_blocks, n_kv_heads, head_dim, head_dim)
+    }
+
+    pub fn new_split(
+        block_size: usize,
+        total_blocks: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+    ) -> Self {
         assert!(block_size > 0, "block_size must be positive");
-        let elems_per_block = block_size * n_kv_heads * head_dim;
         PagedKvStore {
             block_size,
             n_kv_heads,
             head_dim,
-            k: vec![0.0; total_blocks * elems_per_block],
-            v: vec![0.0; total_blocks * elems_per_block],
+            v_head_dim,
+            k: vec![0.0; total_blocks * block_size * n_kv_heads * head_dim],
+            v: vec![0.0; total_blocks * block_size * n_kv_heads * v_head_dim],
             // Pushed in descending order so `pop()` hands out ascending
             // block IDs -- not load-bearing for correctness (any free ID
             // works), just makes manual debugging/inspection saner.
@@ -610,6 +671,20 @@ impl PagedKvStore {
         self.head_dim
     }
 
+    pub fn v_head_dim(&self) -> usize {
+        self.v_head_dim
+    }
+
+    /// One position's K row: `n_kv_heads * head_dim` elements.
+    pub fn k_width(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+
+    /// One position's V row: `n_kv_heads * v_head_dim` elements.
+    pub fn v_width(&self) -> usize {
+        self.n_kv_heads * self.v_head_dim
+    }
+
     fn acquire_block(&mut self) -> Option<usize> {
         self.free_block_ids.pop()
     }
@@ -618,8 +693,12 @@ impl PagedKvStore {
         self.free_block_ids.push(id);
     }
 
-    fn elems_per_block(&self) -> usize {
-        self.block_size * self.n_kv_heads * self.head_dim
+    fn k_elems_per_block(&self) -> usize {
+        self.block_size * self.k_width()
+    }
+
+    fn v_elems_per_block(&self) -> usize {
+        self.block_size * self.v_width()
     }
 
     /// One position's K (or V) row within block `id` at `offset` (0-based
@@ -628,27 +707,27 @@ impl PagedKvStore {
     /// of shared physical storage via a block table, and by
     /// `PagedKvCache::push` to write a new position into it.
     pub fn k_row(&self, id: usize, offset: usize) -> &[f32] {
-        let elems_per_position = self.n_kv_heads * self.head_dim;
-        let start = id * self.elems_per_block() + offset * elems_per_position;
-        &self.k[start..start + elems_per_position]
+        let width = self.k_width();
+        let start = id * self.k_elems_per_block() + offset * width;
+        &self.k[start..start + width]
     }
 
     pub fn v_row(&self, id: usize, offset: usize) -> &[f32] {
-        let elems_per_position = self.n_kv_heads * self.head_dim;
-        let start = id * self.elems_per_block() + offset * elems_per_position;
-        &self.v[start..start + elems_per_position]
+        let width = self.v_width();
+        let start = id * self.v_elems_per_block() + offset * width;
+        &self.v[start..start + width]
     }
 
     fn k_row_mut(&mut self, id: usize, offset: usize) -> &mut [f32] {
-        let elems_per_position = self.n_kv_heads * self.head_dim;
-        let start = id * self.elems_per_block() + offset * elems_per_position;
-        &mut self.k[start..start + elems_per_position]
+        let width = self.k_width();
+        let start = id * self.k_elems_per_block() + offset * width;
+        &mut self.k[start..start + width]
     }
 
     fn v_row_mut(&mut self, id: usize, offset: usize) -> &mut [f32] {
-        let elems_per_position = self.n_kv_heads * self.head_dim;
-        let start = id * self.elems_per_block() + offset * elems_per_position;
-        &mut self.v[start..start + elems_per_position]
+        let width = self.v_width();
+        let start = id * self.v_elems_per_block() + offset * width;
+        &mut self.v[start..start + width]
     }
 }
 
@@ -864,10 +943,14 @@ impl PagedKvCache {
     /// still reads through the block table and copies nothing, which is
     /// where page sharing actually pays.
     pub fn to_contiguous(&self, store: &PagedKvStore) -> KvCache {
-        let elems_per_position = store.n_kv_heads * store.head_dim;
-        let mut cache = KvCache::with_capacity(store.n_kv_heads, store.head_dim, self.seq_len);
-        cache.k.reserve_exact(self.seq_len * elems_per_position);
-        cache.v.reserve_exact(self.seq_len * elems_per_position);
+        let mut cache = KvCache::with_capacity_split(
+            store.n_kv_heads,
+            store.head_dim,
+            store.v_head_dim,
+            self.seq_len,
+        );
+        cache.k.reserve_exact(self.seq_len * store.k_width());
+        cache.v.reserve_exact(self.seq_len * store.v_width());
         for pos in 0..self.seq_len {
             let block_id = self.block_table[pos / store.block_size];
             let offset = pos % store.block_size;
@@ -896,17 +979,19 @@ impl PagedKvCache {
         v: &[f32],
         count: usize,
     ) -> Result<(), PagedStoreExhausted> {
-        let elems_per_position = store.n_kv_heads * store.head_dim;
-        assert_eq!(k.len(), count * elems_per_position, "k row count");
-        assert_eq!(v.len(), count * elems_per_position, "v row count");
+        let (k_width, v_width) = (store.k_width(), store.v_width());
+        assert_eq!(k.len(), count * k_width, "k row count");
+        assert_eq!(v.len(), count * v_width, "v row count");
         if self.blocks_needed_for(store, count) > store.free_block_count() {
             return Err(PagedStoreExhausted);
         }
         for i in 0..count {
-            let lo = i * elems_per_position;
-            let hi = lo + elems_per_position;
-            self.push(store, &k[lo..hi], &v[lo..hi])
-                .expect("blocks reserved above, so no push here can exhaust the store");
+            self.push(
+                store,
+                &k[i * k_width..(i + 1) * k_width],
+                &v[i * v_width..(i + 1) * v_width],
+            )
+            .expect("blocks reserved above, so no push here can exhaust the store");
         }
         Ok(())
     }

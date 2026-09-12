@@ -185,7 +185,20 @@ pub struct ModelConfig {
     /// Same rule as `n_heads`: per-layer computation reads
     /// [`Self::layer_shape`]; caches come from [`Self::new_kv_caches`].
     pub n_kv_heads: usize,
+    /// The K head width (`attention.key_length`, llama.cpp
+    /// `n_embd_head_k`): the width of every Q and K head, the width RoPE
+    /// rotates within, and the `1/sqrt` of the attention scale.
     pub head_dim: usize,
+    /// The V head width (`attention.value_length`, `n_embd_head_v`)
+    /// WHEN IT DIFFERS from [`Self::head_dim`]; `None` means V heads are
+    /// K's width, which is every architecture but MiMo-V2 (`head_dim:
+    /// 192, v_head_dim: 128`). Read it through [`Self::v_head_dim`],
+    /// never here: an `Option` rather than a second `usize` so that a
+    /// config whose `head_dim` is set or changed cannot leave a stale V
+    /// width beside it -- the two-fields-that-must-agree shape. See
+    /// [`crate::kv_head_dims`] for which architectures may declare them
+    /// apart and which fused paths refuse when they are.
+    pub v_head_dim: Option<usize>,
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
@@ -413,6 +426,13 @@ pub struct ModelConfig {
     /// `Decoder::metal_can_serve_model`, which refuses every fused
     /// launch, since none has a norm at either site.
     pub block_sub_norms: bool,
+    /// `{arch}.attention.value_scale`: MiMo-V2 multiplies the attention
+    /// branch by it AFTER `wo` (`mimo2.cpp:180-183`; every real export
+    /// carries `0.707`). `None` for no scale; see
+    /// [`crate::attn_value_scale`] for the one reader and the values
+    /// that mean none. Applied in `Decoder::attn_out_to_residual_rows`;
+    /// the fused Metal launches refuse a model that has one.
+    pub attn_value_scale: Option<f32>,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -581,6 +601,23 @@ pub enum FfnActivation {
 }
 
 impl ModelConfig {
+    /// The V head width: the width of every V head, of each head's
+    /// attention output, and so of `o_proj`'s input (`n_heads *
+    /// v_head_dim()`). [`Self::head_dim`] unless the file declared
+    /// `attention.value_length` apart from `attention.key_length` on an
+    /// architecture that sizes them apart (`crate::kv_head_dims`).
+    #[inline]
+    pub fn v_head_dim(&self) -> usize {
+        self.v_head_dim.unwrap_or(self.head_dim)
+    }
+
+    /// Whether V heads are a different width from K heads. The fact
+    /// every fused path refuses on.
+    #[inline]
+    pub fn kv_head_dims_split(&self) -> bool {
+        self.v_head_dim() != self.head_dim
+    }
+
     /// Re-picks the LongRoPE factor set now that the run's context size
     /// is known, matching llama.cpp `llama_model::get_rope_factors`:
     /// `rope_freqs.weight` (Llama 3) always wins; otherwise the long set
@@ -851,6 +888,7 @@ pub fn glm_5_2() -> ModelConfig {
         n_heads: 48,
         n_kv_heads: 8,
         head_dim: 128,
+        v_head_dim: None,
         vocab_size: 151552,
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-5,
@@ -899,6 +937,7 @@ pub fn glm_5_2() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        attn_value_scale: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -933,6 +972,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         n_heads: 56,
         n_kv_heads: 8,
         head_dim: 128,
+        v_head_dim: None,
         vocab_size: 129280,
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-6,
@@ -987,6 +1027,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        attn_value_scale: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1025,6 +1066,7 @@ pub fn kimi_k3() -> ModelConfig {
         n_heads: 96,
         n_kv_heads: 96,
         head_dim: 192,
+        v_head_dim: None,
         vocab_size: 163840,
         // Not present in the published text_config; RoPE only ever
         // applies to Gated MLA's 64-dim qk_rope_head_dim slice in the
@@ -1107,6 +1149,7 @@ pub fn kimi_k3() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        attn_value_scale: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1136,6 +1179,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         n_heads: 4,
         n_kv_heads: 2,
         head_dim: 8,
+        v_head_dim: None,
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
@@ -1173,6 +1217,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        attn_value_scale: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1198,6 +1243,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         n_heads: 4,
         n_kv_heads: 2,
         head_dim: 8,
+        v_head_dim: None,
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
@@ -1234,6 +1280,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        attn_value_scale: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1262,6 +1309,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         n_heads: 4,
         n_kv_heads: 2,
         head_dim: 8,
+        v_head_dim: None,
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
@@ -1298,6 +1346,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        attn_value_scale: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,

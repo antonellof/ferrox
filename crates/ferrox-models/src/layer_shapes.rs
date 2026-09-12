@@ -41,7 +41,8 @@
 //!
 //! What it does NOT close, and says so: `nanbeige` rewrites the arrays
 //! to walk its physical layers more than once (`nanbeige.cpp:13-31`);
-//! `mimo2` and `step35` read per-layer heads AND something else
+//! `mimo2` and `step35` read per-layer heads AND something else (both closed since, on
+//! the seams their entries name)
 //! (a V head width differing from K's; per-layer clamp arrays and a
 //! half-width rotary -- their window arrays and NextN blocks are
 //! `crate::swa_layers` and `crate::mtp_blocks` now); `laguna` closed the day after, when its other thing (the
@@ -95,10 +96,12 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
     ),
     (
         "mimo2",
-        "NOT closed by this seam: mimo2.cpp:47-49,111-112 read heads per layer AND :47-48 \
-         size V from a width that differs from K's on every real export, :16,181 apply \
-         value_scale (the sinks at :58 are `AttnWeights::sinks`, the is_swa array at :12 is \
-         `crate::swa_layers` and the NEXTN blocks at :19 are `crate::mtp_blocks` now)",
+        "mimo2.cpp:47-49,111-112 read heads per layer (`swa_num_key_value_heads` on the \
+         sliding layers, the converter's array). Closed with the split K/V head width \
+         (`crate::kv_head_dims`, the V width :47-48 sizes apart from K's) and the value \
+         scale (`crate::attn_value_scale`, :16,181); the sinks at :58 are \
+         `AttnWeights::sinks`, the is_swa array at :12 is `crate::swa_layers` and the NEXTN \
+         blocks at :19 are `crate::mtp_blocks`",
     ),
     (
         "step35",
@@ -490,6 +493,7 @@ pub(crate) fn check_gqa_projection_widths(
     layer: usize,
     shape: AttnShape,
     head_dim: usize,
+    v_head_dim: usize,
     hidden_dim: usize,
     attn: &AttnWeights,
 ) -> Result<(), LoadError> {
@@ -503,9 +507,16 @@ pub(crate) fn check_gqa_projection_widths(
     let want = [
         ("attn_q", attn.q_proj.rows(), n_heads * head_dim),
         ("attn_k", attn.k_proj.rows(), n_kv_heads * head_dim),
-        ("attn_v", attn.v_proj.rows(), n_kv_heads * head_dim),
+        // V and the output projection at the V width: `mimo2.cpp:52`
+        // creates `wo` as `{n_embd_head_v * n_head, n_embd}`
+        // (`crate::kv_head_dims`); one width everywhere else.
+        ("attn_v", attn.v_proj.rows(), n_kv_heads * v_head_dim),
         ("attn_output (rows)", attn.o_proj.rows(), hidden_dim),
-        ("attn_output (cols)", attn.o_proj.cols(), n_heads * head_dim),
+        (
+            "attn_output (cols)",
+            attn.o_proj.cols(),
+            n_heads * v_head_dim,
+        ),
     ];
     for (name, got, expected) in want {
         if got != expected {
@@ -513,8 +524,8 @@ pub(crate) fn check_gqa_projection_widths(
                 format!("blk.{layer}.{name}.weight"),
                 format!(
                     "{got} does not match this layer's head_count {n_heads} / head_count_kv \
-                     {n_kv_heads} x head_dim {head_dim} (expected {expected}); llama.cpp's \
-                     check_tensor_dims refuses the same file"
+                     {n_kv_heads} x head_dim {head_dim} / v_head_dim {v_head_dim} (expected \
+                     {expected}); llama.cpp's check_tensor_dims refuses the same file"
                 ),
             ));
         }
@@ -546,7 +557,13 @@ impl ModelConfig {
     /// wrong for a model whose layers differ.
     pub fn new_kv_caches(&self) -> Vec<KvCache> {
         (0..self.n_layers)
-            .map(|il| KvCache::new(self.layer_shape(il).attention.n_kv_heads(), self.head_dim))
+            .map(|il| {
+                KvCache::new_split(
+                    self.layer_shape(il).attention.n_kv_heads(),
+                    self.head_dim,
+                    self.v_head_dim(),
+                )
+            })
             .collect()
     }
 
@@ -554,9 +571,10 @@ impl ModelConfig {
     pub fn new_kv_caches_with_capacity(&self, max_seq_len: usize) -> Vec<KvCache> {
         (0..self.n_layers)
             .map(|il| {
-                KvCache::with_capacity(
+                KvCache::with_capacity_split(
                     self.layer_shape(il).attention.n_kv_heads(),
                     self.head_dim,
+                    self.v_head_dim(),
                     max_seq_len,
                 )
             })
@@ -572,9 +590,10 @@ impl ModelConfig {
     ) -> Result<Vec<KvCache>, ferrox_core::cache::KvPoolExhausted> {
         (0..self.n_layers)
             .map(|il| {
-                KvCache::with_pool(
+                KvCache::with_pool_split(
                     self.layer_shape(il).attention.n_kv_heads(),
                     self.head_dim,
+                    self.v_head_dim(),
                     std::sync::Arc::clone(pool),
                     max_seq_len,
                 )
@@ -587,11 +606,12 @@ impl ModelConfig {
         SharedPagedKv::from_stores(
             (0..self.n_layers)
                 .map(|il| {
-                    PagedKvStore::new(
+                    PagedKvStore::new_split(
                         block_size,
                         blocks_per_layer,
                         self.layer_shape(il).attention.n_kv_heads(),
                         self.head_dim,
+                        self.v_head_dim(),
                     )
                 })
                 .collect(),
@@ -758,16 +778,19 @@ mod tests {
             sinks: None,
             attn_sub_norm: None,
         };
-        assert!(check_gqa_projection_widths(0, shape, head_dim, hidden, &build(24, 12)).is_ok());
+        assert!(
+            check_gqa_projection_widths(0, shape, head_dim, head_dim, hidden, &build(24, 12))
+                .is_ok()
+        );
         // K sized for 3 KV heads on a 2-KV-head layer.
-        let err =
-            check_gqa_projection_widths(1, shape, head_dim, hidden, &build(24, 18)).unwrap_err();
+        let err = check_gqa_projection_widths(1, shape, head_dim, head_dim, hidden, &build(24, 18))
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("blk.1.attn_k.weight"), "{msg}");
         assert!(msg.contains("head_count_kv 2"), "{msg}");
         // Q sized for 3 heads on a 4-head layer.
-        let err =
-            check_gqa_projection_widths(2, shape, head_dim, hidden, &build(18, 12)).unwrap_err();
+        let err = check_gqa_projection_widths(2, shape, head_dim, head_dim, hidden, &build(18, 12))
+            .unwrap_err();
         assert!(format!("{err}").contains("blk.2.attn_q.weight"), "{err}");
     }
 

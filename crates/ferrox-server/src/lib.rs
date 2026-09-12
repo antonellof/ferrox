@@ -4220,8 +4220,7 @@ async fn run(mcp_config_path: Option<PathBuf>, exit_on_stdin_close: bool) -> any
             };
             let bytes_per_block = block_size
                 * cfg.kv_heads_all_layers()
-                * cfg.head_dim
-                * 2
+                * (cfg.head_dim + cfg.v_head_dim())
                 * std::mem::size_of::<f32>();
             assert!(
                 bytes_per_block > 0,
@@ -8644,6 +8643,7 @@ pub(crate) mod tests {
             n_heads: 1,
             n_kv_heads: 1,
             head_dim: 4,
+            v_head_dim: None,
             vocab_size,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
@@ -8704,6 +8704,7 @@ pub(crate) mod tests {
             attn_temperature: None,
             router_input: ferrox_models::router_input::RouterInput::NormedFfnInput,
             block_sub_norms: false,
+            attn_value_scale: None,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

@@ -28,11 +28,13 @@ use super::{Decoder, LayerWeights};
 
 impl Decoder {
     /// Bias, then clamp, on Q, K and V -- for one row or for a batch of
-    /// rows laid out contiguously (`q_width` / `kv_width` floats per
-    /// row).
+    /// rows laid out contiguously (`q_width` / `kv_width` / `v_width`
+    /// floats per row; K and V differ only on MiMo-V2,
+    /// `crate::kv_head_dims`).
     ///
     /// Elementwise on the clamp and per-row on the bias, so a single
     /// row is the batch of one and both call shapes are the same body.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_qkv_bias_and_clamp(
         &self,
         layer: &LayerWeights,
@@ -41,6 +43,7 @@ impl Decoder {
         v: &mut [f32],
         q_width: usize,
         kv_width: usize,
+        v_width: usize,
     ) {
         let add_bias = |x: &mut [f32], bias: Option<&Vec<f32>>, width: usize| {
             if let Some(bias) = bias {
@@ -54,7 +57,8 @@ impl Decoder {
         };
         add_bias(q, layer.attn.q_bias.as_ref(), q_width);
         add_bias(k, layer.attn.k_bias.as_ref(), kv_width);
-        add_bias(v, layer.attn.v_bias.as_ref(), kv_width);
+        // V at its own width (`crate::kv_head_dims`).
+        add_bias(v, layer.attn.v_bias.as_ref(), v_width);
 
         // AFTER the bias: llama-graph.cpp:1607-1612 adds `wqkv_b` and
         // only then clamps, and :1626-1652 does the same per projection.
@@ -92,7 +96,7 @@ mod tests {
         let mut k = vec![-7.5f32; kv_width];
         let mut v = vec![100.0f32; kv_width];
         let layer = &d.layers[0];
-        d.apply_qkv_bias_and_clamp(layer, &mut q, &mut k, &mut v, q_width, kv_width);
+        d.apply_qkv_bias_and_clamp(layer, &mut q, &mut k, &mut v, q_width, kv_width, kv_width);
         assert!(q.iter().all(|&x| x == 8.0), "{q:?}");
         assert!(k.iter().all(|&x| x == -8.0), "{k:?}");
         assert!(
@@ -115,7 +119,7 @@ mod tests {
         let mut k = vec![-100.0f32; 2 * kv_width];
         let mut v = vec![100.0f32; 2 * kv_width];
         let layer = &d.layers[0];
-        d.apply_qkv_bias_and_clamp(layer, &mut q, &mut k, &mut v, q_width, kv_width);
+        d.apply_qkv_bias_and_clamp(layer, &mut q, &mut k, &mut v, q_width, kv_width, kv_width);
         assert!(q.iter().all(|&x| x == 100.0));
         assert!(k.iter().all(|&x| x == -100.0));
         assert!(v.iter().all(|&x| x == 100.5), "{v:?}");
