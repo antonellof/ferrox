@@ -17,6 +17,20 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`glm4moe` runs: GLM-4.5, GLM-4.5-Air and GLM-4.6 on the generic
+  path, audited against libllama.** The refusal had named the pre-FFN
+  norm stored as `blk.N.post_attention_norm` (`glm4-moe.cpp:75,215`,
+  gpt-oss's slot) for a year; it is one row in
+  `norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM`, and with it the
+  existing fixture matched at KL 1.51e-15 on the first run. `glm4moe`
+  joins `EXPERT_WEIGHTS_SCALE_READERS` / `_NORM_READERS`
+  (`glm4-moe.cpp:13-14`), leaves the GLM-5.2 dispatch everywhere, and
+  three fixtures pin it (`tests/glm4moe_graphs.rs`): the 355B shape with
+  per-head Q/K norms, the Air shape without (KL 2.41e-15), and a
+  GLM-4.5V text tower's `rope.dimension_sections`, under which llama.cpp
+  switches to M-RoPE and its logits on text positions are byte-identical
+  to NEOX (measured), so ferrox rotates NEOX and pins the identity. 55
+  audited.
 - **`ferrox parity` reaches the MLA engine, and the first real MLA
   checkpoint went through it.** `prefill_logits` dispatches `deepseek2`
   / `mistral4` / `plm` to `MlaEngine` where it used to refuse them as

@@ -4,7 +4,7 @@
 //! `.gguf` **file** through either the generic `Decoder` path or
 //! [`ferrox_models::load_mla_engine_from_path`] for MLA architectures
 //! (deepseek2 / mistral4 dense-lead), or [`ferrox_models::load_glm52_engine_from_path`]
-//! for GLM-5.2 / GLM4-family GGUFs (`glm-dsa`, `glm4`, `glm4moe`) when
+//! for GLM-5.2 / GLM4 GGUFs (`glm-dsa`, `glm4`) when
 //! the file itself names via `tokenizer.ggml.model`
 //! (`gpt2` -> `GgufBpeTokenizer`, `llama` -> `GgufSpmTokenizer`, `t5` ->
 //! `GgufUnigramTokenizer`); or a Kimi K3 checkpoint **directory** (real
@@ -378,7 +378,8 @@ fn load_encoder_checkpoint(path: &str) -> anyhow::Result<Arc<ferrox_models::Embe
 /// real download with "missing hparam glm4moe.attention.q_lora_rank" --
 /// true, and about a key the architecture is not supposed to have.
 /// Refusing on the generic path names the norm slot that is genuinely
-/// missing instead. See `ferrox-models/tests/glm4moe_refusal.rs`.
+/// missing instead, and runs it there since 2026-09-12
+/// (`ferrox-models/tests/glm4moe_graphs.rs`).
 fn is_glm52_arch(arch: &str) -> bool {
     matches!(arch, "glm-dsa" | "glm4")
 }

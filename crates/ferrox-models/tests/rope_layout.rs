@@ -260,7 +260,14 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
     //    `LLM_ARCH_GRANITE_MOE` arm of `llama_model_rope_type`) and the
     //    same `GRANITE_MULTIPLIERS` verdict, which is the point of
     //    keeping one blocker string for all three granite rows.
-    const DECLARED: &[&str] = &["phi4", "granite-moe"];
+    //  * `glm4moe` -- llama.cpp decides it per checkpoint
+    //    (`llama-model.cpp:2700`: `MROPE` when `rope.dimension_sections`
+    //    says so, `NEOX` otherwise), so it is deliberately absent from
+    //    the table above. ferrox rotates NEOX, which is the text-tower
+    //    answer in both cases: `tests/glm4moe_graphs.rs` pins that
+    //    libllama's logits under MROPE with text positions are byte
+    //    for byte the NEOX ones.
+    const DECLARED: &[&str] = &["phi4", "granite-moe", "glm4moe"];
     let mut undeclared = Vec::new();
     for p in architecture_catalog() {
         let ArchPath::GenericGqa { rope } = p.path else {

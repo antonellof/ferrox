@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **54** architectures run with
+Honest position, re-audited 2026-09-12. **55** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -37,7 +37,13 @@ the generic path rather than a closure, and the step from 4 to 3 moved
 the refusing number without raising `AUDITED_GENERIC_GQA` -- the
 engine it joined now has a libllama golden, which it never had. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
-without lowering the refusing one. `smollm3` and EXAONE-4 32B closed
+without lowering the refusing one; `glm4moe` (GLM-4.5 / 4.5-Air / 4.6)
+is the same case on 2026-09-12, a `DedicatedOnly` refusal on its norm
+slot that turned out to be ONE row in `norm_sites::
+PRE_FFN_NORM_IS_POST_ATTENTION_NORM` -- the refusal had named the slot
+for a year and nobody had tried the row on the table that already
+served gpt-oss's identical slot; KL 1.5e-15 on the first run
+(`tests/glm4moe_graphs.rs`). `smollm3` and EXAONE-4 32B closed
 with `exaone-moe` and are the same case, one a DedicatedOnly refusal and
 the other a refusal by name; the clamped OLMo-1 checkpoints closed with
 `dbrx` the same way.

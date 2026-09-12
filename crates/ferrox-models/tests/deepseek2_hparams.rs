@@ -13,7 +13,7 @@
 //! about a key no converter has ever written.
 //!
 //! That is the same shape as the `glm4moe` defect
-//! (`tests/glm4moe_refusal.rs`): a loader demanding a hyper-parameter
+//! (`tests/glm4moe_graphs.rs`): a loader demanding a hyper-parameter
 //! the architecture is not supposed to have, and the error naming the
 //! demand rather than the mismatch.
 //!

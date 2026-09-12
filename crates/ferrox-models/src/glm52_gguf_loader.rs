@@ -414,8 +414,7 @@ pub struct Glm52FileMeta {
     pub routed_scaling_factor: f32,
 }
 
-/// Read GLM-5.2 / GLM4-family hparams from an opened GGUF (`glm-dsa`,
-/// `glm4`, `glm4moe`).
+/// Read GLM-5.2 / GLM4 hparams from an opened GGUF (`glm-dsa`, `glm4`).
 pub fn read_glm52_hparams(
     file: &impl TensorSource,
 ) -> Result<(Glm52GgufHparams, Glm52FileMeta), LoadError> {
@@ -423,7 +422,10 @@ pub fn read_glm52_hparams(
         .metadata_str("general.architecture")
         .ok_or_else(|| LoadError::MissingHparam("general.architecture".into()))?
         .to_string();
-    if !matches!(arch.as_str(), "glm-dsa" | "glm4" | "glm4moe") {
+    // `glm4moe` is deliberately not accepted: it is plain GQA on the
+    // generic path (tests/glm4moe_graphs.rs), and this loader's MLA keys
+    // are ones it never carries.
+    if !matches!(arch.as_str(), "glm-dsa" | "glm4") {
         return Err(LoadError::UnsupportedArchitecture(arch));
     }
     let p = |suffix: &str| format!("{arch}.{suffix}");
