@@ -15,6 +15,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `xverse` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `ernie4_5-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `chatglm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `nanbeige` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `granite` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `granitemoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `granite-moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -24,7 +25,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `deci` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mistral3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `arctic` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `nanbeige` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `plm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |

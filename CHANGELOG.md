@@ -17,6 +17,26 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`nanbeige` runs, on the layer-loop seam.** `src/models/nanbeige.cpp:
+  6-31` read `num_loops` and make the logical layer count `n_phys *
+  n_loops`, every logical layer with its own KV cache over shared
+  weights (`:69-73` alias `layers[i + j * n_phys] = layers[i]`), and
+  `:167-175` norm the residual with `output_norm` after every pass but
+  the last unless `skip_loop_final_norm`; ferrox's decoder walked its
+  layer vector once and the row refused as unaudited. One graph of 140
+  reads either key (measured). `ferrox_models::layer_loops` says what
+  the graph says -- the weights are shared and the KV is not:
+  `Decoder::layers` stays physical, `ModelConfig::n_layers` is the
+  logical count every KV cache and per-layer table is sized by,
+  `Decoder::layer_for` / `physical_index` are the one mapping the three
+  host bodies, the gpt-oss side table and the residency plan go
+  through, `LayerShapes::replicated` is the copy `nanbeige.cpp:24-26`
+  makes of the per-layer arrays, and the loop norm sits at the end of
+  both FFN bodies. Every fused Metal launch refuses a looped model.
+  Three libllama-golden fixtures (two passes over two layers, the same
+  with the loop norm skipped, `num_loops = 1`), KL 3.06e-13 to
+  8.70e-13; sabotaging the mapping turns four tests red. 52 audited, 5
+  refusing.
 - **`mimo2` (MiMo-V2-Flash, every export) runs on the host paths, on
   the split K/V head-width seam.** `conversion/mimo.py:154` writes
   `attention.value_length` from `v_head_dim` apart from the

@@ -12,24 +12,24 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **51** architectures run with
+Honest position, re-audited 2026-09-12. **52** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 6 unaudited refusals are now TRIAGED, and the refusal says which of
+The 5 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 5 need new code, 1 is unknown with the question stated. Five
+away**, 4 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
 `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35` and
-`mistral3` on 2026-09-11, and `smallthinker`, `bitnet` and `mimo2` on
-2026-09-12, each with a libllama-golden fixture, which is what moved 46
-to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13
-to 12 to 10 to 9 to 8 to 7 to 6; the step from 28 to 25
+`mistral3` on 2026-09-11, and `smallthinker`, `bitnet`, `mimo2` and
+`nanbeige` on 2026-09-12, each with a libllama-golden fixture, which is
+what moved 46 to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21 to 20 to
+18 to 15 to 13 to 12 to 10 to 9 to 8 to 7 to 6 to 5; the step from 28 to 25
 was moving the three alias rows off
 the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
@@ -44,7 +44,8 @@ needs a different graph.
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
 times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times
 more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9
-to 8, and on 2026-09-12 three times more, 8 to 7, 7 to 6 and 6 to 5. The first two took several rows
+to 8, and on 2026-09-12 four times more, 8 to 7, 7 to 6, 6 to 5 and 5
+to 4. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -99,7 +100,26 @@ there is no single graph to match and its verdict says so. The
 thirteenth is the row the KV cache was built without: `mimo2` closed
 ALONE, 6 to 5, on a V head width that differs from K's, whose reach is
 one generic-path converter plus the MLA engine, which had carried the
-pair since it existed.
+pair since it existed. The fourteenth, `nanbeige`, 5 to 4, is the
+verdict's last sentence taken literally: "it is the copy that has no
+home" closed as a mapping, not a copy.
+
+`nanbeige` closed on `ferrox-models/src/layer_loops.rs`. `nanbeige.cpp:
+6-12` read `num_loops` / `skip_loop_final_norm`; `:19-31` set
+`n_layer_all = n_phys * n_loops` and replicate the per-layer arrays;
+`:69-73` alias `layers[i + j * n_phys] = layers[i]`; `:167-175` norm the
+residual with `output_norm` after every pass but the last unless the
+flag skips it. One graph of 140 reads either key. The weights are
+shared and the KV is not: `Decoder::layers` stays physical,
+`ModelConfig::n_layers` is the logical count every KV cache and
+per-layer table is sized by, `Decoder::layer_for(l)` /
+`physical_index(l)` are the ONE mapping the three host bodies, the
+gpt-oss side table and the residency plan go through,
+`LayerShapes::replicated` is the copy `:24-26` makes of the arrays, and
+the loop norm sits at the end of BOTH FFN bodies. The fused Metal
+launches refuse a looped model (one `l` for weights and KV). KL
+3.06e-13, 4.05e-13 (`skip_loop_final_norm`), 8.70e-13 (`num_loops = 1`,
+plain Llama); sabotaging the mapping turns four tests red.
 
 `mimo2` closed on `ferrox-models/src/kv_head_dims.rs`. `conversion/
 mimo.py:154` writes `attention.value_length` from `v_head_dim` apart
@@ -764,7 +784,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 51
+Those files are why llama.cpp has 140 architectures and ferrox has 52
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

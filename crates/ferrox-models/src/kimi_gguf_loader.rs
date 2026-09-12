@@ -974,6 +974,7 @@ mod tests {
             router_input: crate::router_input::RouterInput::NormedFfnInput,
             block_sub_norms: false,
             attn_value_scale: None,
+            layer_loops: None,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

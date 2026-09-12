@@ -73,6 +73,25 @@ pub(crate) enum BatchedFfnKernels {
 }
 
 impl Decoder {
+    /// The weights logical layer `l` runs: `layers[l]` for every model
+    /// but a looped one, where it is `layers[l % n_phys]`
+    /// (`crate::layer_loops`). THE mapping; the three host bodies
+    /// iterate `0..config.n_layers` and ask it, so a body cannot index
+    /// `layers` with a logical index by mistake.
+    pub fn layer_for(&self, l: usize) -> &LayerWeights {
+        &self.layers[self.physical_index(l)]
+    }
+
+    /// The physical index behind logical layer `l`: the index into
+    /// `layers`, the gpt-oss side table and the residency plan, all of
+    /// which are sized per PHYSICAL layer.
+    pub(crate) fn physical_index(&self, l: usize) -> usize {
+        match self.config.layer_loops {
+            Some(loops) => loops.physical(l),
+            None => l,
+        }
+    }
+
     /// A dense layer's single expert on ONE row: `run_expert`, or its
     /// sub-normed twin when the layer carries BitNet's `ffn_sub_norm`
     /// (`bitnet.cpp:135-140`, `crate::sub_norms`).
@@ -172,6 +191,27 @@ impl Decoder {
             ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
         }
         residual_add(hidden, &ffn_out, self.config.residual_scale);
+        self.apply_loop_norm(layer_idx, hidden, 1);
+    }
+
+    /// Nanbeige's loop norm (`nanbeige.cpp:167-175`): after the last
+    /// logical layer of every pass but the final one, the residual is
+    /// normed with `output_norm` (`crate::layer_loops`). Here, at the
+    /// end of BOTH FFN bodies, so every caller of either gets it; a
+    /// model that does not loop never enters the branch.
+    fn apply_loop_norm(&self, layer_idx: usize, hidden: &mut [f32], rows: usize) {
+        let Some(loops) = self.config.layer_loops else {
+            return;
+        };
+        if !loops.loop_norm_after(layer_idx) {
+            return;
+        }
+        let width = self.config.hidden_dim;
+        debug_assert_eq!(hidden.len(), rows * width);
+        for row in hidden.chunks_mut(width) {
+            let normed = self.final_norm.apply(row, self.config.rms_norm_eps);
+            row.copy_from_slice(&normed);
+        }
     }
 
     /// The batched twin of [`Self::ffn_block_row`]: runs layer
@@ -217,6 +257,7 @@ impl Decoder {
                 let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
                 residual_add(hidden_row, &ffn_out, config.residual_scale);
             }
+            self.apply_loop_norm(layer_idx, hidden_batch, batch_size);
             return;
         }
 
@@ -281,6 +322,7 @@ impl Decoder {
                     .collect();
             }
             residual_add(hidden_batch, &ffn_batch, config.residual_scale);
+            self.apply_loop_norm(layer_idx, hidden_batch, batch_size);
             return;
         }
 
@@ -315,5 +357,6 @@ impl Decoder {
             let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
             residual_add(hidden_row, &ffn_out, config.residual_scale);
         }
+        self.apply_loop_norm(layer_idx, hidden_batch, batch_size);
     }
 }

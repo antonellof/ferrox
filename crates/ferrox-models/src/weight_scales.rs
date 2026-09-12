@@ -28,7 +28,11 @@
 //! 23-32` folds the scale into the weights and writes no tensor, but
 //! older files carry them and libllama still applies them -- measured,
 //! `tests/sub_norm_graphs.rs`: the same fixture with and without seven
-//! `2.0` scales gives DIFFERENT logits under libllama.
+//! `2.0` scales gives DIFFERENT logits under libllama. And `talkie`
+//! (`conversion/talkie.py:26-31`), which writes `attn_output.scale` and
+//! `ffn_down.scale` from its `attn_gain` / `mlp_gain` on every export
+//! and is refused as unaudited before reaching here; its verdict says
+//! closing it means applying exactly those two.
 //!
 //! # Why a refusal by name
 //!

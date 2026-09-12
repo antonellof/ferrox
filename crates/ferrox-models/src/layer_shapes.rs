@@ -113,8 +113,9 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
     ),
     (
         "nanbeige",
-        "NOT closed by this seam: nanbeige.cpp:24-26 rewrites the arrays to loop the physical \
-         layers n_loops times",
+        "nanbeige.cpp:24-26 copies each physical layer's arrays to every logical slot; \
+         `LayerShapes::replicated` does the same and `crate::layer_loops` is the seam the row \
+         closed on",
     ),
     (
         "gemma4",
@@ -251,6 +252,18 @@ pub enum LayerShapes {
 impl LayerShapes {
     pub fn is_uniform(&self) -> bool {
         matches!(self, LayerShapes::Uniform)
+    }
+
+    /// The same shapes for `n_loops` passes over the layers, as
+    /// `nanbeige.cpp:24-26` copies each physical layer's arrays to every
+    /// logical slot (`crate::layer_loops`). Uniform stays uniform.
+    pub fn replicated(self, n_loops: usize) -> Self {
+        match self {
+            LayerShapes::PerLayer(v) if n_loops > 1 => {
+                LayerShapes::PerLayer(v.iter().copied().cycle().take(v.len() * n_loops).collect())
+            }
+            other => other,
+        }
     }
 
     /// Builds the table from the three per-layer arrays, collapsing to

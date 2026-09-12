@@ -433,6 +433,13 @@ pub struct ModelConfig {
     /// that mean none. Applied in `Decoder::attn_out_to_residual_rows`;
     /// the fused Metal launches refuse a model that has one.
     pub attn_value_scale: Option<f32>,
+    /// Nanbeige's `num_loops`: `Some` when the model's logical layers
+    /// are several passes over its physical ones (`nanbeige.cpp:19-31`).
+    /// [`Self::n_layers`] is then the LOGICAL count, `Decoder::layers`
+    /// stays physical, and `Decoder::layer_for` maps one to the other.
+    /// See [`crate::layer_loops`]; the fused Metal launches refuse a
+    /// looped model.
+    pub layer_loops: Option<crate::layer_loops::LayerLoops>,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -938,6 +945,7 @@ pub fn glm_5_2() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         attn_value_scale: None,
+        layer_loops: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1028,6 +1036,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         attn_value_scale: None,
+        layer_loops: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1150,6 +1159,7 @@ pub fn kimi_k3() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         attn_value_scale: None,
+        layer_loops: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1218,6 +1228,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         attn_value_scale: None,
+        layer_loops: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1281,6 +1292,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         attn_value_scale: None,
+        layer_loops: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1347,6 +1359,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
         attn_value_scale: None,
+        layer_loops: None,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
