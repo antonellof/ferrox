@@ -14,7 +14,8 @@
 //!   `ffn_norm` is ABSENT), `phi2.cpp:67,108,116-117`,
 //!   `falcon.cpp:124-135` (Falcon-7B, no `attn_norm_2`),
 //!   `command-r.cpp:68,106-119`, `cohere2.cpp:120-134`,
-//!   `cohere2moe.cpp:222-266`.
+//!   `cohere2moe.cpp:222-266`, `plamo.cpp:59-64,97-98,111-112` (`cur =
+//!   sa_inp`, over an RMSNorm).
 //! - **Two norms** (`TwoNorms`): `x + attn(ln1(x)) + ffn(ln2(x))`,
 //!   `gptneox.cpp:143-166` (`use_parallel_residual`, read at `:5`) and
 //!   `falcon.cpp:79-85` (Falcon-40B, `attn_norm_2`).
@@ -22,14 +23,17 @@
 //! # Reach -- MEASURED
 //!
 //! Over all 140 `src/models/*.cpp` (2026-09-12): `grep -l "par_res\|
-//! parallel residual"` is `gptneox.cpp` and `stablelm.cpp`; the FFN-reads-
-//! the-attention-input shape without the word is `phi2`, `falcon`,
-//! `command-r`, `cohere2`, `cohere2moe` (each found by its `ggml_add(cur,
-//! inpL)` followed by `ggml_add(cur, attn_out)` or the `ffn_output`
-//! equivalent). `gemma4.cpp:260` names an `attn_out` that is ALREADY
-//! `cur + inpL`, so it is sequential and not in the table. Eight graphs,
-//! two spellings, and `stablelm` is the one where BOTH shapes sit behind
-//! one architecture string, decided by tensor presence.
+//! parallel residual"` is `gptneox.cpp` and `stablelm.cpp`; a scan for
+//! TWO consecutive `cur = ggml_add(ctx0, cur, ...)` lines -- the
+//! three-term sum spelled out -- is `cohere2`, `cohere2moe` (twice, the
+//! trunk and its MTP block), `command-r`, `falcon`, `phi2` and `plamo`,
+//! with `gptneox` and `stablelm` separating their two adds by a `cb`
+//! line. `gemma4.cpp:260` names an `attn_out` that is ALREADY `cur +
+//! inpL`, so it is sequential and not in the table. Eight graphs, two
+//! spellings, and `stablelm` is the one where BOTH shapes sit behind one
+//! architecture string, decided by tensor presence. (`plamo` was missed
+//! by a first grep that looked for `attn_out` by name; its attention
+//! output is `sa_out`. The two-adds scan is the measurement.)
 //!
 //! # What this module does today
 //!
@@ -128,6 +132,12 @@ pub const PARALLEL_RESIDUAL_GRAPHS: &[ParallelResidual] = &[
         when: ParallelWhen::Always,
         lines: "src/models/cohere2moe.cpp:222-266",
     },
+    ParallelResidual {
+        arch: "plamo",
+        norm: ParallelNorm::SharedNorm,
+        when: ParallelWhen::Always,
+        lines: "src/models/plamo.cpp:59-64,97-98,111-112",
+    },
 ];
 
 /// The row for an architecture, or `None` for a sequential graph.
@@ -225,6 +235,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), PARALLEL_RESIDUAL_GRAPHS.len());
+        assert_eq!(PARALLEL_RESIDUAL_GRAPHS.len(), 8, "the measured reach");
     }
 
     /// A graph not in the table is sequential on every layer, whatever

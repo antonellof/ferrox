@@ -199,8 +199,8 @@ and the per-head LayerNorm QK norm a layer with `attn_q_norm` builds
 (`ferrox_models::parallel_residual`: eight graphs in two spellings;
 `ferrox_models::qk_layer_norm`: three); the two left say what else.
 The parallel residual is the next seam on this list: its table
-already names `phi2`, `falcon`, `command-r`, `cohere2`, `cohere2moe`
-and `gptneox` beside `stablelm`.
+already names `phi2`, `falcon`, `command-r`, `cohere2`, `cohere2moe`,
+`plamo` and `gptneox` beside `stablelm`.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`
