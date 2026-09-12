@@ -71,8 +71,9 @@ is faster.
   divisors without answering the third question, and both fused Metal
   stacks take an `Option<LayerRope>` per layer. A 64-layer fixture is
   what evidences the 32B, because `exaone4.cpp:4` tests equality.
-  `smallthinker`, `afmoe` and `llama4` are in the same table and still
-  refuse for other things. Found on the way: EXAONE-4 1.2B must ignore a
+  `smallthinker`, `afmoe` and `llama4` are in the same table; the first
+  two closed later on other seams, and `llama4` still refuses for other
+  things. Found on the way: EXAONE-4 1.2B must ignore a
   window its file declares, and `nextn_predict_layers` (MTP blocks
   inside `block_count`) was refused nowhere and was then refused
   everywhere; it is SKIPPED now, as llama.cpp skips it, for the
@@ -90,6 +91,19 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **The MoE router operand**, and with it every SmallThinker
+  (`smallthinker`). `smallthinker.cpp:111` routes on `inpL`, the
+  residual stream as it enters the layer, before `attn_norm` and before
+  attention; every other MoE graph on this engine routes on the normed
+  FFN input the experts read. `ferrox_models::router_input` is the
+  table (fifty-nine `build_moe_ffn` call sites parsed, four pass a
+  precomputed `probs_in`, one on this engine differs in the operand),
+  `Decoder::router_operand` the one place the operand is captured, and
+  the GPU router paths refuse the row through the predicate they
+  already shared. Its gated ReLU experts are `FfnActivation::Reglu`,
+  split from `arcee`'s ungated `ReluSqr` because the aliasing that
+  served `arcee` would have dropped SmallThinker's real gate; its
+  `n_swa` is pinned to 4096 as `smallthinker.cpp:8` pins it.
 - **The per-position attention temperature**, and with it every
   Ministral-3 (`mistral3`). `attention.temperature_scale` is Llama-4's
   "attention temperature tuning" as a GGUF key: llama.cpp multiplies Q

@@ -13,11 +13,13 @@
 //! **How the FFN is spelled.** `ExpertWeights` has three required
 //! matrices and thirty construction sites; the ungated FFN is not given
 //! a fourth shape. `FfnActivation::ReluSqr` maps to
-//! `ferrox_moe::GluAct::Reglu` (`relu(gate) * up`) and the loader
-//! ALIASES the expert's gate to its up matrix, so every gated path --
-//! routed, placed, batched, slotted -- computes `relu(up)^2` with no
+//! `ferrox_moe::GluAct::ReluSqr` (`relu(up)^2`, reading `up` alone) and
+//! the loader ALIASES the expert's gate to its up matrix, so every
+//! gated path -- routed, placed, batched, slotted -- serves it with no
 //! branch, and the dense hot paths (`run_expert`, the batched dense
-//! FFN) skip the aliased matmul through `GluAct::ungated`. The suite
+//! FFN) skip the aliased matmul through `GluAct::ungated`. (It mapped
+//! to `GluAct::Reglu`, `relu(gate) * up`, until SmallThinker's REAL
+//! gate showed that one variant cannot mean both.) The suite
 //! below pins both halves: the aliasing is visible on the loaded
 //! weights, and un-aliasing the gate (a real gate, or SwiGLU on the
 //! pair) diverges from the golden.

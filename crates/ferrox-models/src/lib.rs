@@ -78,6 +78,7 @@ pub mod residency_report;
 pub mod rope_finetuned;
 pub mod rope_layers;
 pub mod rope_ntk_alpha;
+pub mod router_input;
 pub mod safetensors_f32;
 pub(crate) mod sampler_chain;
 pub mod sampler_order;

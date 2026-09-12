@@ -1579,17 +1579,20 @@ mod tests {
         assert!(out.iter().all(|v| v.is_finite()));
     }
 
-    /// The aliasing invariant `GluAct::Reglu` rests on: with `gate`
-    /// the same matrix as `up`, the gated path (`relu(gate) * up`, the
-    /// one every routed/placed/batched site runs) and the ungated
-    /// shortcut (`relu(up)^2`, the one `run_expert` takes) are the same
-    /// FFN, and neither is SwiGLU.
+    /// The aliasing invariant `GluAct::ReluSqr` rests on: with `gate`
+    /// the same matrix as `up`, the `combine` path (the one every
+    /// routed/placed/batched site runs) and the ungated shortcut
+    /// (`relu(up)^2`, the one `run_expert` takes) are the same FFN, and
+    /// so is `GluAct::Reglu` on that pair -- `relu(up) * up` IS
+    /// `relu(up)^2` -- which is why one variant used to serve both and
+    /// why the SmallThinker fixture, whose gate is NOT `up`, was the
+    /// first thing that could see the difference. Neither is SwiGLU.
     ///
     /// If a later change makes `reglu` compute something other than
     /// `relu(gate) * up`, or `relu_sqr` something other than
     /// `relu(up)^2`, the two disagree here before any model does.
     #[test]
-    fn reglu_with_gate_aliased_to_up_is_relu_squared() {
+    fn relu_sqr_with_gate_aliased_to_up_agrees_with_reglu() {
         use ferrox_core::tensor::Tensor;
         let hidden_dim = 4;
         let ffn_dim = 6;
@@ -1618,18 +1621,20 @@ mod tests {
             up_out.iter().any(|&x| x < 0.0) && up_out.iter().any(|&x| x > 0.0),
             "the projection must cross zero or relu is invisible: {up_out:?}"
         );
-        let shortcut = run_expert(&hidden, &expert, GluAct::Reglu);
+        let shortcut = run_expert(&hidden, &expert, GluAct::ReluSqr);
         let gated_out = expert.gate.apply(&hidden);
         let gated = expert.down.apply(&GluAct::Reglu.apply(&gated_out, &up_out));
+        let reglu_expert = run_expert(&hidden, &expert, GluAct::Reglu);
         let slotted: Vec<f32> = gated_out
             .iter()
             .zip(up_out.iter())
-            .map(|(g, u)| GluAct::Reglu.combine(*g, *u))
+            .map(|(g, u)| GluAct::ReluSqr.combine(*g, *u))
             .collect();
         let slotted = expert.down.apply(&slotted);
         for (name, got) in [
             ("run_expert", &shortcut),
-            ("apply", &gated),
+            ("reglu apply on the aliased pair", &gated),
+            ("reglu run_expert on the aliased pair", &reglu_expert),
             ("combine", &slotted),
         ] {
             for (a, b) in got.iter().zip(want.iter()) {
@@ -1645,6 +1650,7 @@ mod tests {
             "SwiGLU on the aliased pair must differ, or the suite cannot see the activation"
         );
         assert_eq!(GluAct::Reglu.fused_kernel_gelu_flag(), None);
+        assert_eq!(GluAct::ReluSqr.fused_kernel_gelu_flag(), None);
         assert_eq!(GluAct::Swiglu.fused_kernel_gelu_flag(), Some(false));
         assert_eq!(GluAct::Geglu.fused_kernel_gelu_flag(), Some(true));
         assert!(GluAct::Swiglu.ungated().is_none() && GluAct::Geglu.ungated().is_none());

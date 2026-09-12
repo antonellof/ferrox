@@ -666,7 +666,19 @@ impl ModelConfig {
             // `n_layer() == 64` at a point where `n_layer_nextn` has not
             // been read yet (`:18`), so a 64-trunk EXAONE-4 with an MTP
             // block appended sees 65 there and gets no window.
-            .filter(|_| !crate::capability::swa_disabled_by_arch(&arch, trunk.block_count));
+            //
+            // `smallthinker` declares a window that llama.cpp REPLACES:
+            // `smallthinker.cpp:8` assigns `n_swa = 4096` on the branch
+            // the file's nonzero value selected. One table decides all
+            // three answers (`capability::swa_window_override`), so a
+            // row cannot be dropped by one reader and pinned by another.
+            .and_then(
+                |w| match crate::capability::swa_window_override(&arch, trunk.block_count) {
+                    crate::capability::SwaWindowOverride::Honour => Some(w),
+                    crate::capability::SwaWindowOverride::Drop => None,
+                    crate::capability::SwaWindowOverride::Pin(pinned) => Some(pinned),
+                },
+            );
 
         // Three graphs rope their SLIDING layers with the scaling
         // switched off -- freq_scale = 1, ext_factor = 0, attn_factor =
@@ -895,6 +907,9 @@ impl ModelConfig {
             // `grok` is StandardGqa and passes `LLM_FFN_GELU`.
             _ if crate::capability::uses_geglu(&arch) => crate::config::FfnActivation::Gelu,
             _ if crate::capability::uses_relu_sqr(&arch) => crate::config::FfnActivation::ReluSqr,
+            // The GATED ReLU (`ggml_reglu_split`), a real gate tensor:
+            // NOT the row above, which aliases gate to up.
+            _ if crate::capability::uses_reglu(&arch) => crate::config::FfnActivation::Reglu,
             // The four per-layer arrays travel IN the variant, read as
             // `apertus.cpp:6-9` reads them (`crate::act_layers`).
             _ if crate::act_layers::uses_xielu(&arch) => crate::config::FfnActivation::Xielu(
@@ -1271,6 +1286,7 @@ impl ModelConfig {
             // `exaone4` decides both off the same layer count and the
             // two must not be able to disagree.
             rope_layers: crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some()),
+            router_input: crate::router_input::router_input(&arch),
             layer_shapes,
             moe: MoeLayerConfig {
                 n_experts: n_experts.max(1),

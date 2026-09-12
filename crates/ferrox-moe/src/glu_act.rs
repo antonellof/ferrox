@@ -36,22 +36,35 @@ use ferrox_core::matmul::{geglu, swiglu};
 /// llama.cpp's `grok` (`src/models/grok.cpp`, `LLM_FFN_GELU` passed to
 /// `build_moe_ffn`).
 ///
-/// [`Reglu`](GluAct::Reglu) is `relu(gate) * up`, and it exists for an
-/// FFN that has NO gate at all: llama.cpp's `LLM_FFN_RELU_SQR` under
-/// `LLM_FFN_SEQ` with a null gate (`arcee.cpp:123-128`, also `plm`,
-/// `nemotron`, `jais2`, `nemotron-h`) is `down(relu(up(x))^2)`. The
-/// loader aliases the expert's `gate` to its `up` matrix, so
-/// `relu(gate) * up` is `relu(up)^2` on every gated path without a
-/// branch, and [`GluAct::ungated`] lets the dense hot paths skip the
-/// aliased matmul. See `ferrox_core::matmul::reglu`.
+/// [`ReluSqr`](GluAct::ReluSqr) is `relu(up)^2`, for an FFN that has
+/// NO gate at all: llama.cpp's `LLM_FFN_RELU_SQR` under `LLM_FFN_SEQ`
+/// with a null gate (`arcee.cpp:123-128`, also `plm`, `nemotron`,
+/// `jais2`, `nemotron-h`) is `down(relu(up(x))^2)`. The loader aliases
+/// the expert's `gate` to its `up` matrix so the gated struct serves
+/// it; [`GluAct::combine`] reads the `up` operand and ignores the
+/// aliased gate, and [`GluAct::ungated`] lets the dense hot paths skip
+/// the aliased matmul.
+///
+/// [`Reglu`](GluAct::Reglu) is `relu(gate) * up` on a REAL gate --
+/// llama.cpp's `LLM_FFN_RELU` in `build_moe_ffn` with `gate_exps`
+/// present, `ggml_reglu_split` (`llama-graph.cpp:2195-2197`,
+/// `smallthinker.cpp:158`). It USED to be the spelling of `ReluSqr` as
+/// well, "with the gate aliased to up", and that overload is the
+/// defect the SmallThinker fixture found: `ungated()` answered
+/// `relu(up)^2` for it, so `run_expert` skipped the gate matmul on a
+/// model whose gate is a real tensor and computed `relu(up)^2` where
+/// libllama computed `relu(gate) * up` -- silently, at full speed. The
+/// two are two variants now; a variant whose meaning depends on what
+/// the loader did to the weights is two structures that must agree
+/// with nothing enforcing it. See `ferrox_core::matmul::reglu`.
 ///
 /// [`Xielu`](GluAct::Xielu) is the second ungated one, and the first
 /// that carries parameters: `down(xielu(up(x)))` with the four scalars
 /// of THIS layer (`apertus.cpp:132-138`). The loader aliases gate to up
-/// exactly as for `Reglu`, and [`GluAct::combine`] reads the `up`
-/// operand and ignores the aliased gate -- unlike `Reglu`, there is no
-/// `f(gate) * up` spelling of it, so every site that used to assume
-/// that shape (`gate_fn`) is a `combine` now.
+/// exactly as for `ReluSqr`, and [`GluAct::combine`] reads the `up`
+/// operand and ignores the aliased gate -- there is no `f(gate) * up`
+/// spelling of it, so every site that used to assume that shape
+/// (`gate_fn`) is a `combine` now.
 ///
 /// [`SwigluClamped`](GluAct::SwigluClamped) is SwiGLU with ONE scalar
 /// that llama.cpp reads per layer (`step35.cpp:28-29`, and
@@ -84,8 +97,10 @@ pub enum GluAct {
     },
     /// `gelu(gate) * up`.
     Geglu,
-    /// `relu(gate) * up`; with `gate` aliased to `up`, `relu(up)^2`.
+    /// `relu(gate) * up`, on a real gate.
     Reglu,
+    /// `relu(up)^2`; `gate` is an alias of `up` and is not read.
+    ReluSqr,
     /// `xielu(up)` with this layer's parameters; `gate` is an alias of
     /// `up` and is not read.
     Xielu(XieluParams),
@@ -167,6 +182,7 @@ impl GluAct {
             GluAct::Swiglu => swiglu(gate, up),
             GluAct::Geglu => geglu(gate, up),
             GluAct::Reglu => ferrox_core::matmul::reglu(gate, up),
+            GluAct::ReluSqr => relu_sqr(up),
             GluAct::SwigluClamped { .. } | GluAct::Xielu(_) => gate
                 .iter()
                 .zip(up)
@@ -193,6 +209,10 @@ impl GluAct {
             }
             GluAct::Geglu => ferrox_core::matmul::gelu(gate) * up,
             GluAct::Reglu => ferrox_core::matmul::relu(gate) * up,
+            GluAct::ReluSqr => {
+                let r = ferrox_core::matmul::relu(up);
+                r * r
+            }
             GluAct::Xielu(p) => p.apply(up),
         }
     }
@@ -217,7 +237,9 @@ impl GluAct {
         match self {
             GluAct::Swiglu => Some(false),
             GluAct::Geglu => Some(true),
-            GluAct::Reglu | GluAct::SwigluClamped { .. } | GluAct::Xielu(_) => None,
+            GluAct::Reglu | GluAct::ReluSqr | GluAct::SwigluClamped { .. } | GluAct::Xielu(_) => {
+                None
+            }
         }
     }
 
@@ -226,14 +248,18 @@ impl GluAct {
     /// genuinely gated activation.
     ///
     /// The dense hot path (`run_expert`) uses it to skip the aliased
-    /// gate matmul. Every other path runs the gated form on the aliased
-    /// pair, which is the same arithmetic --
-    /// `reglu_with_gate_aliased_to_up_is_relu_squared` and
-    /// `xielu_ignores_the_aliased_gate` pin that.
+    /// gate matmul. Every other path runs `combine` on the aliased
+    /// pair, which reads `up` alone for these two and is the same
+    /// arithmetic -- `relu_sqr_reads_up_alone_and_reglu_reads_the_gate`
+    /// and `xielu_ignores_the_aliased_gate` pin that.
+    ///
+    /// `Reglu` is `None`: its gate is real, and answering `ReluSqr` for
+    /// it is exactly the bug the two variants exist to make
+    /// unspellable.
     pub fn ungated(self) -> Option<Ungated> {
         match self {
-            GluAct::Swiglu | GluAct::SwigluClamped { .. } | GluAct::Geglu => None,
-            GluAct::Reglu => Some(Ungated::ReluSqr),
+            GluAct::Swiglu | GluAct::SwigluClamped { .. } | GluAct::Geglu | GluAct::Reglu => None,
+            GluAct::ReluSqr => Some(Ungated::ReluSqr),
             GluAct::Xielu(p) => Some(Ungated::Xielu(p)),
         }
     }
@@ -261,8 +287,8 @@ impl Ungated {
     }
 }
 
-/// `relu(x)^2`, elementwise: the ungated form [`GluAct::Reglu`] stands
-/// for once the gate is known to be `up` itself.
+/// `relu(x)^2`, elementwise: [`GluAct::ReluSqr`] over a whole
+/// projection.
 pub fn relu_sqr(up: &[f32]) -> Vec<f32> {
     up.iter()
         .map(|&x| {
@@ -320,6 +346,43 @@ mod tests {
         assert!(!act.is_swiglu());
     }
 
+    /// The two ReLU forms are two ops. `ReluSqr` reads `up` alone --
+    /// fed DIFFERENT gate and up vectors, the gate has no effect, on
+    /// `apply`, `combine` and the ungated shortcut alike -- and `Reglu`
+    /// reads the gate and has NO shortcut. Before the split one variant
+    /// was both, and `run_expert` computed `relu(up)^2` on
+    /// SmallThinker's real gate.
+    #[test]
+    fn relu_sqr_reads_up_alone_and_reglu_reads_the_gate() {
+        let up = [-1.0f32, -0.2, 0.0, 0.3, 2.0];
+        let gate = [5.0f32, -5.0, 5.0, -5.0, 0.5];
+        let sqr: Vec<f32> = up
+            .iter()
+            .map(|&x| if x > 0.0 { x * x } else { 0.0 })
+            .collect();
+        assert_eq!(GluAct::ReluSqr.apply(&gate, &up), sqr);
+        for (i, &u) in up.iter().enumerate() {
+            assert_eq!(GluAct::ReluSqr.combine(gate[i], u), sqr[i]);
+        }
+        assert_eq!(GluAct::ReluSqr.ungated().expect("ungated").apply(&up), sqr);
+
+        let gated: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(&g, &u)| if g > 0.0 { g * u } else { 0.0 })
+            .collect();
+        assert_eq!(GluAct::Reglu.apply(&gate, &up), gated);
+        for (i, &u) in up.iter().enumerate() {
+            assert_eq!(GluAct::Reglu.combine(gate[i], u), gated[i]);
+        }
+        assert!(GluAct::Reglu.ungated().is_none(), "the gate is real");
+        assert_ne!(gated, sqr, "the vectors must tell the two apart");
+        for act in [GluAct::Reglu, GluAct::ReluSqr] {
+            assert_eq!(act.fused_kernel_gelu_flag(), None);
+            assert!(!act.is_swiglu());
+        }
+    }
+
     /// The clamp, against llama-graph.cpp:1751-1768 written out by
     /// hand: `up` is clamped on both sides, `silu(gate)` from above
     /// only, and the two multiply. A gate below the limit and an `up`
@@ -355,6 +418,7 @@ mod tests {
             GluAct::SwigluClamped { limit: 0.5 },
             GluAct::Geglu,
             GluAct::Reglu,
+            GluAct::ReluSqr,
             GluAct::Xielu(XieluParams::from_gguf(0.8, 0.8, 0.5, -1e-6)),
         ] {
             let whole = act.apply(&gate, &up);

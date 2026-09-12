@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 9,
+        n, 8,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -125,7 +125,15 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          140, the other two on their own engines: `llama4` seeds the constants from \
          literals and `deepseek2` / `mistral4` read the same key, which the MLA loader now \
          refuses by name where it dropped it; its `yarn_log_multiplier` half found YaRN's \
-         magnitude term missing for every architecture (`ferrox_models::yarn_magnitude`) \
+         magnitude term missing for every architecture (`ferrox_models::yarn_magnitude`), \
+         and 9 until `smallthinker` closed on the router operand \
+         (`ferrox_models::router_input`, tests/router_input_graphs.rs) -- the reach \
+         measured first over all 59 `build_moe_ffn` call sites: four pass a precomputed \
+         `probs_in`, and only this one on the generic path routes on something other \
+         than the normed FFN input; its gated ReLU experts split `GluAct::ReluSqr` from \
+         `GluAct::Reglu`, because the one variant that had served `arcee` by aliasing \
+         answered `relu(up)^2` for a real gate, and its `n_swa = 4096` pin is a third \
+         answer on the one table `swa_disabled_by_arch` is derived from \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -377,7 +385,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 9);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 8);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -450,11 +458,10 @@ fn batch_two_verdicts_are_pinned_to_what_was_read() {
     // existed. Their absence from this list is asserted by
     // `grok_and_dbrx_are_audited_and_carry_no_stale_verdict` below.
     let cases: &[(&str, TriageClass, &str)] = &[
-        (
-            "smallthinker",
-            TriageClass::NewCode,
-            "router reads a DIFFERENT tensor",
-        ),
+        // `smallthinker` was HERE, NEW CODE on the router operand, and
+        // is audited now (tests/router_input_graphs.rs); its absence is
+        // asserted by `smallthinker_is_audited_and_carries_no_stale_verdict`
+        // below.
         ("bitnet", TriageClass::NewCode, "attn_sub_norm"),
         // `minicpm3` was HERE, and the triage that produced this list
         // is what removed it: reading `minicpm3.cpp:5-6,41-46` showed an
@@ -489,32 +496,30 @@ fn batch_two_verdicts_are_pinned_to_what_was_read() {
     }
 }
 
-/// `smallthinker`'s blocker leads with the routing input, not with the
-/// activation.
-///
-/// It has three separate blockers and they are not equally severe. The
-/// ReLU experts are one match arm on their own; the router reading
-/// `inpL` instead of the normed FFN input, and the unkeyed NoPE layers,
-/// are both "computes something else" and neither leaves a tensor or a
-/// metadata key behind. A verdict that named only the activation would
-/// read as one match arm and be wrong by two.
+/// `smallthinker`'s verdict led with the routing input, then the
+/// activation, then the window pin, and said the NoPE layers were no
+/// longer a blocker. All three landed (`ferrox_models::router_input`,
+/// `FfnActivation::Reglu`, `capability::swa_window_override`) and the
+/// row is audited on three libllama-golden fixtures
+/// (tests/router_input_graphs.rs), so it carries no verdict: a verdict
+/// on an audited row is never rendered and would be dead text.
 #[test]
-fn smallthinker_names_the_routing_input_and_the_nope_layers() {
-    let t = unaudited_triage("smallthinker").expect("verdict");
-    assert_eq!(t.class, TriageClass::NewCode);
-    for claim in ["inpL", "n_no_rope_layer_step", "smollm3", "LLM_FFN_RELU"] {
-        assert!(
-            t.blocker.contains(claim),
-            "smallthinker's verdict drops {claim:?}: {}",
-            t.blocker
-        );
-    }
-    let routing = t.blocker.find("inpL").expect("inpL");
-    let relu = t.blocker.find("LLM_FFN_RELU").expect("relu");
+fn smallthinker_is_audited_and_carries_no_stale_verdict() {
+    assert!(is_audited_generic("smallthinker"));
+    assert!(unaudited_triage("smallthinker").is_none());
+    // The seam's own census agrees about which row it serves.
+    assert!(ferrox_models::router_input::ROUTER_INPUT_TABLE
+        .iter()
+        .any(|(name, input, _)| *name == "smallthinker"
+            && *input == ferrox_models::router_input::RouterInput::RawLayerInput));
+    // `arctic`'s verdict used to say it shares `smallthinker`'s shape;
+    // it must now point at the seam and say why the seam does not
+    // reach it (a whole expert bank, not a logit vector).
+    let arctic = unaudited_triage("arctic").expect("arctic still refuses");
     assert!(
-        routing < relu,
-        "the severe blocker must lead: {}",
-        t.blocker
+        arctic.blocker.contains("router_input") && arctic.blocker.contains("does not reach it"),
+        "{}",
+        arctic.blocker
     );
 }
 
@@ -979,21 +984,11 @@ fn the_per_layer_rope_gate_is_no_longer_anybody_s_leading_blocker() {
     // `afmoe` was the second row here and closed on the gated attention
     // the day after; its fixture's layer 3 is the unrotated one.
     assert!(is_audited_generic("afmoe") && unaudited_triage("afmoe").is_none());
-    {
-        let arch = "smallthinker";
-        let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
-        assert!(
-            t.blocker.contains("NO LONGER a blocker: the NoPE layers"),
-            "`{arch}` must say the per-layer RoPE gate is implemented: {}",
-            t.blocker
-        );
-        assert!(
-            !t.blocker.starts_with("gated attention plus NoPE")
-                && !t.blocker.contains("which ferrox refuses outright"),
-            "`{arch}` still leads with, or refuses on, a feature ferrox implements: {}",
-            t.blocker
-        );
-    }
+    // `smallthinker` was the third row here, said the gate was NO
+    // LONGER its blocker, and closed on its router operand the day
+    // after (tests/router_input_graphs.rs); its fixtures' layers 0 and
+    // 4 are the unrotated ones, the OTHER phase from smollm3's.
+    assert!(is_audited_generic("smallthinker") && unaudited_triage("smallthinker").is_none());
     // And the census in `rope_layers` names both, so the verdict text
     // and the table cannot drift apart about which rows carry the gate.
     for arch in ["afmoe", "smallthinker", "exaone-moe"] {
@@ -1075,7 +1070,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 8, 1),
+        (0, 0, 7, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1122,7 +1117,15 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          engine) and `deepseek2` / `mistral4` (the same key, the MLA engine, which \
          refuses it by name now) say so. Its verdict's other half, \
          `yarn_log_multiplier`, turned out to adjust a YaRN magnitude term ferrox did \
-         not apply for ANY architecture (`ferrox_models::yarn_magnitude`). \
+         not apply for ANY architecture (`ferrox_models::yarn_magnitude`), and 8 to 7 \
+         when `smallthinker` closed on the router operand \
+         (`ferrox_models::router_input`) -- the reach measured first over every \
+         `build_moe_ffn` call site: four graphs pass a precomputed `probs_in`, \
+         `grovemoe` among them, and `grovemoe` shares the MECHANISM and not the cause \
+         (it routes on the normed FFN input; its blocker is a second expert bank), so \
+         this closed alone and the column says why. Its gated ReLU experts found the \
+         one `GluAct` variant that had served `arcee` by aliasing answering \
+         `relu(up)^2` for a REAL gate; it is two variants now. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1131,7 +1134,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 9);
+    assert_eq!(fixture + arm + new_code + unknown, 8);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

@@ -17,6 +17,41 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`smallthinker` (every SmallThinker export) runs, on the MoE
+  router-operand seam.** `src/models/smallthinker.cpp:111` computes
+  the router logits from `inpL` -- the residual stream as it ENTERS
+  the layer, before `attn_norm` and before attention -- and `:151-161`
+  hands them to `build_moe_ffn` as a precomputed `probs`; every ferrox
+  MoE body routed on the normed FFN input, which is `build_moe_ffn`'s
+  own default and what the experts read. `ferrox_models::router_input`
+  is one two-variant enum and one table row; `Decoder::router_operand`
+  is the one constructor, called where each host body applies
+  `attn_norm`, and it carries logits rather than the operand so the
+  post-attention residual (the same `Vec`, mutated in place) cannot
+  reach the router by mistake; the GPU router paths refuse the row
+  through `gpu_router_matches_host_routing`, the predicate they
+  already shared. The reach was measured before it was written: all
+  fifty-nine `build_moe_ffn` call sites in the 140 graphs, four pass a
+  precomputed `probs_in`, and only this one on the generic path routes
+  on something other than the normed FFN input (`grovemoe` shares the
+  mechanism and not the cause; `gemma4` and `nemotron-h` are on other
+  engines). Its `LLM_FFN_RELU` experts have a REAL gate, so
+  `FfnActivation::Reglu` (`relu(gate) * up`) is split from `arcee`'s
+  ungated `ReluSqr` -- the one `GluAct` variant that existed served
+  `arcee` by aliasing gate to up, and a SmallThinker loaded through it
+  would have dropped its gate tensors and computed `relu(up) * up`.
+  `smallthinker.cpp:8` pins `n_swa` to 4096 over whatever the file
+  declares (`capability::swa_window_override`, a third answer beside
+  honour and drop; libllama's logits for a fixture declaring 3 and the
+  same fixture declaring 4096 are byte-identical, measured). Three
+  libllama-golden fixtures: window declared with sigmoid gating and
+  NoPE on layers 0 and 4, no window with softmax gating, and a keyed
+  `sliding_window_pattern = 2` beside the literal NoPE step. KL
+  6.56e-15 to 1.27e-14. The three batched FFN tails (the Metal-prefill
+  and host arms of the prefill body, and the multi-sequence body)
+  collapsed onto one `Decoder::ffn_block_batch` on the way, because
+  the seam needed an eighth fact in all of them. 49 audited, 8
+  refusing.
 - **`mistral3` (every Ministral-3 export) runs, on the per-position
   attention temperature seam.** `src/models/mistral3.cpp:5,14-17,153-156`
   reads `attention.temperature_scale`, floors it on `n_ctx_orig_yarn`

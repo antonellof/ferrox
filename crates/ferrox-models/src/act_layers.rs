@@ -324,9 +324,12 @@ impl ModelConfig {
                 LayerFfnActs::same(GluAct::Swiglu)
             }
             FfnActivation::Gelu => LayerFfnActs::same(GluAct::Geglu),
-            // Ungated on disk, gated in the enum: the loader aliases
-            // gate to up. See `FfnActivation::ReluSqr`.
-            FfnActivation::ReluSqr => LayerFfnActs::same(GluAct::Reglu),
+            // Ungated on disk: the loader aliases gate to up and the
+            // body reads `up` alone. See `FfnActivation::ReluSqr`.
+            FfnActivation::ReluSqr => LayerFfnActs::same(GluAct::ReluSqr),
+            // Gated on disk and in the body: a real gate. See
+            // `FfnActivation::Reglu`.
+            FfnActivation::Reglu => LayerFfnActs::same(GluAct::Reglu),
             FfnActivation::Xielu(layers) => LayerFfnActs::same(GluAct::Xielu(layers.layer(il))),
             FfnActivation::SwigluClamped(clamps) => LayerFfnActs {
                 routed: clamps.routed(il),
@@ -351,7 +354,8 @@ impl ModelConfig {
             FfnActivation::Swiglu
             | FfnActivation::SwigluFused
             | FfnActivation::Gelu
-            | FfnActivation::ReluSqr => Some(self.layer_ffn_acts(0).dense),
+            | FfnActivation::ReluSqr
+            | FfnActivation::Reglu => Some(self.layer_ffn_acts(0).dense),
         }
     }
 
@@ -367,7 +371,8 @@ impl ModelConfig {
             FfnActivation::Swiglu
             | FfnActivation::SwigluFused
             | FfnActivation::SwigluClamped(_)
-            | FfnActivation::Gelu => false,
+            | FfnActivation::Gelu
+            | FfnActivation::Reglu => false,
         }
     }
 }
@@ -449,7 +454,10 @@ mod tests {
             (FfnActivation::Swiglu, GluAct::Swiglu, false),
             (FfnActivation::SwigluFused, GluAct::Swiglu, false),
             (FfnActivation::Gelu, GluAct::Geglu, false),
-            (FfnActivation::ReluSqr, GluAct::Reglu, true),
+            (FfnActivation::ReluSqr, GluAct::ReluSqr, true),
+            // NOT aliased: the gate is a real tensor, and the body is
+            // the one that reads it.
+            (FfnActivation::Reglu, GluAct::Reglu, false),
         ] {
             let mut cfg = base_config();
             cfg.ffn_activation = kind.clone();

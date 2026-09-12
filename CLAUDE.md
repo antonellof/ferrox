@@ -12,23 +12,23 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-11. **48** architectures run with
+Honest position, re-audited 2026-09-12. **49** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 9 unaudited refusals are now TRIAGED, and the refusal says which of
+The 8 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 8 need new code, 1 is unknown with the question stated. Five
+away**, 7 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
 `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35` and
-`mistral3` on 2026-09-11, each with a
+`mistral3` on 2026-09-11, and `smallthinker` on 2026-09-12, each with a
 libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
-to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10 to 9; the step from 28 to 25
+to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10 to 9 to 8; the step from 28 to 25
 was moving the three alias rows off
 the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
@@ -43,7 +43,7 @@ needs a different graph.
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
 times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times
 more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9
-to 8. The first two took several rows
+to 8, and on 2026-09-12 once more, 8 to 7. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -82,7 +82,45 @@ rows closed on it, 11 to 9. The tenth is what a reach measurement looks
 like when it comes back with ONE: `mistral3` closed alone, 9 to 8,
 because the other two graphs that build the temperature input are on
 other engines, and its verdict's second half -- one GGUF key -- found
-a defect in every YaRN checkpoint on the generic path.
+a defect in every YaRN checkpoint on the generic path. The eleventh
+is the same measurement answering ONE for a different reason:
+`smallthinker`'s router MECHANISM (a precomputed `probs_in`) is shared
+with three graphs and its CAUSE (routing on the raw layer input) with
+none on this engine.
+
+`smallthinker` closed on `ferrox-models/src/router_input.rs`. Every
+`build_moe_ffn(` call in all 140 graphs was parsed for its `probs_in`
+argument before a line was written: fifty-nine sites, four pass one.
+`smallthinker.cpp:111` computes the router logits from `inpL`, the
+residual as it ENTERS the layer, before `attn_norm` and before
+attention; `grovemoe.cpp:133` routes on the normed FFN input (the
+default) and precomputes only to share the logits between two expert
+banks; `gemma4.cpp:289-294` and `nemotron-h.cpp:210-232` route on
+something else again on their own engines. So `RouterInput` is two
+variants and one table row; `Decoder::router_operand` is the ONE
+constructor, called where each host body applies `attn_norm`, and it
+carries LOGITS rather than the operand so the post-attention residual
+-- the same `Vec`, mutated in place -- cannot reach the router by
+mistake; `gpu_router_matches_host_routing`, the predicate every GPU
+router path already shares, answers false for the row. Its verdict's
+"one match arm", the `LLM_FFN_RELU` experts, was NOT one: `GluAct::
+Reglu` existed and had served `arcee` by ALIASING gate to up, so
+`ffn_is_ungated` answered "no gate on disk" for it, and a SmallThinker
+loaded through that variant would have dropped its REAL gate tensors
+and computed `relu(up) * up`. `FfnActivation::ReluSqr` (ungated) and
+`::Reglu` (gated, `smallthinker` alone -- `t5.cpp`'s two hits are a
+NULL-gate `build_ffn` on the encoder-decoder engine) are two variants,
+and a test pins that `ffn_is_ungated` and `layer_ffn_acts` agree for
+every one. The third thing, `smallthinker.cpp:4-8` reading
+`attention.sliding_window`, testing it for `> 0` and then assigning
+4096 over it, is a third answer (`Pin`) on the one table
+`swa_disabled_by_arch` is derived from; the fixture declares 3 and
+libllama's logits for it and for the same file declaring 4096 are
+byte-identical, measured. KL 1.13e-14, 1.27e-14 (no window, the
+converter's softmax arm), 6.56e-15 (a keyed `sliding_window_pattern =
+2` beside the literal NoPE step of 4). Building it collapsed the THREE
+batched FFN tails onto one `Decoder::ffn_block_batch`, because the
+seam needed an eighth fact in all of them.
 
 `mistral3` closed on `ferrox-models/src/attn_temperature.rs`. `grep -ln
 'attn_temp\|temperature_scale\|build_inp_attn_scale' src/models/*.cpp`
@@ -471,8 +509,9 @@ disjunct false -- identical, not similar. `smollm3.cpp:5,69` is another
 variant of the same enum, `(il + 1) % 4 != 0`. llama.cpp gates rotation
 this way in SIX architectures, always from a literal and never from a
 GGUF key, and `ferrox-models/src/rope_layers.rs` is one table for all
-six; `smallthinker`, `afmoe` and `llama4` are in it and still refuse
-for other things, and their verdicts now say so. The durable part is
+six; `smallthinker`, `afmoe` and `llama4` are in it, the first two
+closed later on other seams, and `llama4` still refuses for other
+things and its verdict says so. The durable part is
 the type, not the arms: `ModelConfig::layer_rope` returns
 `Option<(base, divisors)>`, so no rotation site can take the pair
 without answering whether to rotate -- the CPU head loop, the YaRN
@@ -635,7 +674,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 48
+Those files are why llama.cpp has 140 architectures and ferrox has 49
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

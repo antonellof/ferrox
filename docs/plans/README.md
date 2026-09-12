@@ -55,20 +55,20 @@ work ranked below the goal with the condition that brings it back, and
 
 ## Where the project stands
 
-Re-audited 2026-09-11, by what happens when a real checkpoint loads
+Re-audited 2026-09-12, by what happens when a real checkpoint loads
 rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **48** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **49** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 9 |
+| Refuses as **unaudited**, now triaged | 8 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (48 of
+regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (49 of
 them audited), 58 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
@@ -78,8 +78,8 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 9 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-8 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 8 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+7 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
 refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
@@ -100,7 +100,13 @@ per-layer window array, `apertus` and `step35` together on the
 per-layer activation parameters, and `mistral3` on the per-position
 attention temperature (`ferrox_models::attn_temperature`, whose
 reach -- three graphs of 140 -- was measured first and came back with
-one generic-path row). Each with a libllama-golden fixture. `minicpm` closed on
+one generic-path row), and on 2026-09-12 `smallthinker` on the MoE
+router operand (`ferrox_models::router_input`: fifty-nine
+`build_moe_ffn` call sites parsed first, four pass a precomputed
+`probs_in`, one on this engine routes on something other than the
+normed FFN input; its "one match arm" ReLU experts turned out to need
+a variant, because the one that existed served `arcee` by aliasing a
+gate SmallThinker really has). Each with a libllama-golden fixture. `minicpm` closed on
 2026-09-10 and is not in that arithmetic: it was refused BY NAME rather
 than as unaudited, so it raises the audited count without lowering the
 refusing one; `smollm3` and EXAONE-4 32B closed with `exaone-moe` on
@@ -190,8 +196,8 @@ NONE`, `exaone-moe.cpp:136,155-161` is `is_swa(il)` around the same two
 similar. `smollm3.cpp:5,69` is a different variant of the same enum
 (`(il + 1) % 4 != 0`, no window). `ferrox_models::rope_layers` is one
 table for all six architectures llama.cpp gates this way, with
-`smallthinker`, `afmoe` and `llama4` in it and still refused for other
-things. The durable part is the type: `ModelConfig::layer_rope` returns
+`smallthinker`, `afmoe` and `llama4` in it; the first two closed later
+on other seams and `llama4` is still refused for other things. The durable part is the type: `ModelConfig::layer_rope` returns
 `Option<(base, divisors)>`, so a rotation site cannot take the pair
 without answering whether to rotate, and the Metal stacks take an
 `Option<LayerRope>` per layer -- their RoPE dispatch had been written in
