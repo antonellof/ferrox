@@ -91,6 +91,14 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **The same physical layers run more than once**, and with it Nanbeige
+  (`nanbeige`). `num_loops` makes the logical layer count `n_phys *
+  n_loops`, each logical layer with its own KV cache over shared
+  weights, and `output_norm` between the passes unless
+  `skip_loop_final_norm`. `ferrox_models::layer_loops`: `Decoder::layers`
+  stays physical, `n_layers` is logical, one mapping serves the host
+  bodies, and the loop norm sits at the end of both FFN bodies. The
+  fused Metal launches refuse a looped model.
 - **A V head width that differs from the K head width**, and with it
   MiMo-V2 (`mimo2`: `head_dim: 192, v_head_dim: 128` on every export).
   `ferrox_models::kv_head_dims` admits the pair for the one generic-path

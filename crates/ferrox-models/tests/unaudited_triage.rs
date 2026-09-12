@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 6,
+        n, 5,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -146,7 +146,11 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          contiguous arms collapsed onto, the batched prefill kernel, the projection \
          check and the fused-QKV cut all took the V width, and building it found \
          `expert_weights_scale` honoured for every architecture where llama.cpp reads it \
-         in twenty loaders (`EXPERT_WEIGHTS_SCALE_READERS`) \
+         in twenty loaders (`EXPERT_WEIGHTS_SCALE_READERS`), and 6 until `nanbeige` \
+         closed on the layer loop (`ferrox_models::layer_loops`, \
+         tests/layer_loop_graphs.rs) -- one graph of 140 reads `num_loops`; the weights \
+         are shared and the KV is not, so `Decoder::layers` stays physical, `n_layers` is \
+         logical, and one mapping serves the three bodies \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -398,7 +402,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 6);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 5);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -556,6 +560,21 @@ fn bitnet_is_audited_and_carries_no_stale_verdict() {
         .all(|(name, _)| is_audited_generic(name)));
 }
 
+/// `nanbeige`'s verdict named one thing, the layer loop, and said the
+/// per-layer arrays were not the blocker; the loop landed
+/// (`ferrox_models::layer_loops`), the arrays are replicated as
+/// `nanbeige.cpp:24-26` replicates them, and the row is audited on
+/// three libllama-golden fixtures (tests/layer_loop_graphs.rs), so it
+/// carries no verdict.
+#[test]
+fn nanbeige_is_audited_and_carries_no_stale_verdict() {
+    assert!(is_audited_generic("nanbeige"));
+    assert!(unaudited_triage("nanbeige").is_none());
+    assert!(ferrox_models::layer_loops::LOOP_READERS
+        .iter()
+        .all(|(name, _)| is_audited_generic(name)));
+}
+
 /// `grok` and `dbrx` are audited, and neither carries a verdict any
 /// more.
 ///
@@ -703,11 +722,14 @@ fn the_per_layer_shape_seam_closed_two_rows_and_its_reach_is_recorded_on_the_res
             && unaudited_triage("mimo2").is_none()
             && per_layer_shapes_read_by_llama_cpp("mimo2")
     );
-    // `nanbeige` reads the arrays too and is NOT served: it rewrites
-    // them to loop its physical layers, which is a different graph.
-    let t = unaudited_triage("nanbeige").expect("still refuses");
-    assert!(t.blocker.contains("crate::layer_shapes"), "{}", t.blocker);
-    assert!(t.blocker.contains("not the blocker"), "{}", t.blocker);
+    // `nanbeige` reads the arrays too and replicates them per pass;
+    // it closed on `ferrox_models::layer_loops`, whose `LayerShapes::
+    // replicated` is the copy `nanbeige.cpp:24-26` makes.
+    assert!(
+        is_audited_generic("nanbeige")
+            && unaudited_triage("nanbeige").is_none()
+            && per_layer_shapes_read_by_llama_cpp("nanbeige")
+    );
     // And `granite` reads `n_head(il)` in its graph alone
     // (`granite.cpp:204`) while sizing tensors from layer 0, so it is
     // deliberately absent from the table.
@@ -872,11 +894,11 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         ("arctic", TriageClass::NewCode, "PARALLEL dense+MoE"),
         // `mistral3` was here on "attention temperature tuning" and is
         // audited; see `tests/attn_temperature_graphs.rs`.
-        (
-            "nanbeige",
-            TriageClass::NewCode,
-            "RUNS THE SAME PHYSICAL LAYERS MORE THAN ONCE",
-        ),
+        // `nanbeige` was HERE, NEW CODE on RUNNING THE SAME PHYSICAL
+        // LAYERS MORE THAN ONCE, and is audited now (`ferrox_models::
+        // layer_loops`, tests/layer_loop_graphs.rs); its absence is
+        // asserted by `nanbeige_is_audited_and_carries_no_stale_verdict`
+        // below.
         // `mellum` was HERE, NEW CODE on "two per-layer RoPE
         // variants" and, second, the sliding-window ARRAY. The array is
         // `ferrox_models::swa_layers` and the row is audited on a
@@ -1103,7 +1125,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 5, 1),
+        (0, 0, 4, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1166,7 +1188,9 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          5 when `mimo2` closed on the split K/V head width (`ferrox_models::kv_head_dims`), \
          whose reach is one generic-path converter and the MLA engine, which has carried \
          the pair since it existed; the seam is one `Option<usize>` on `ModelConfig` and \
-         a V width beside every K width in the cache, the kernels and the checks. \
+         a V width beside every K width in the cache, the kernels and the checks. And 5 \
+         to 4 when `nanbeige` closed on the layer loop (`ferrox_models::layer_loops`): a \
+         logical-to-physical mapping and a loop norm at the end of both FFN bodies. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1175,7 +1199,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 6);
+    assert_eq!(fixture + arm + new_code + unknown, 5);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

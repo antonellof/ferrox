@@ -416,7 +416,14 @@ impl ModelConfig {
         // `exaone4.cpp:4`'s layer-count gate and the per-layer array
         // lengths -- and nowhere else.
         let trunk = crate::mtp_blocks::trunk_layers(file, &arch, block_count)?;
-        let n_layers = trunk.n_layers;
+        // Nanbeige's `num_loops`: the trunk is the PHYSICAL count and
+        // `n_layers` the logical one from here on (`crate::layer_loops`);
+        // the per-layer arrays below are read at physical length and
+        // replicated per pass, as `nanbeige.cpp:24-26` replicate them.
+        let layer_loops = crate::layer_loops::read_layer_loops(file, &arch, trunk.n_layers)?;
+        let n_layers = layer_loops
+            .map(|l| l.logical_layers())
+            .unwrap_or(trunk.n_layers);
         // Baichuan is one architecture string covering two positional
         // schemes: 7B rotates, 13B uses ALiBi and no RoPE at all
         // (`src/models/baichuan.cpp:11-14`, `:57-58`, where `inp_pos` is
@@ -636,7 +643,8 @@ impl ModelConfig {
             &kv_heads_per_layer,
             ffn_per_layer.as_deref(),
             expert_ffn_dim,
-        )?;
+        )?
+        .replicated(layer_loops.map_or(1, |l| l.n_loops));
         // The OTHER half of llama.cpp's dense-vs-MoE rule.
         // `ModelConfig::layer_is_dense` implements the leading-dense
         // prefix and not the `(il + 1) % n_moe_layer_step == 0` at
@@ -1348,6 +1356,7 @@ impl ModelConfig {
             name,
             n_layers,
             n_mtp_blocks: trunk.n_mtp_blocks,
+            layer_loops,
             hidden_dim,
             n_heads,
             n_kv_heads,
@@ -2474,9 +2483,15 @@ impl Decoder {
         // of the whole vocabulary tensor being widened to f32 up front.
         let embedding = load_weight_matrix(&file, "token_embd.weight")?;
 
-        let mut layers = Vec::with_capacity(config.n_layers);
+        // PHYSICAL layers: the blocks the file holds tensors for. A
+        // looped model (`crate::layer_loops`) has more logical layers
+        // than this, and they run these same weights.
+        let n_physical = config
+            .layer_loops
+            .map_or(config.n_layers, |loops| loops.n_phys);
+        let mut layers = Vec::with_capacity(n_physical);
         let mut refined_qk_norm = config.qk_norm_style;
-        for l in 0..config.n_layers {
+        for l in 0..n_physical {
             // THIS layer's head counts and FFN width. Uniform for every
             // architecture but the per-layer ones (`crate::layer_shapes`),
             // and the loader reads the shape rather than the scalars so
@@ -2939,8 +2954,8 @@ impl Decoder {
         let skipped = crate::mtp_blocks::note_mtp_blocks_skipped(
             &file,
             &crate::mtp_blocks::TrunkLayers {
-                block_count: decoder.config.n_layers + decoder.config.n_mtp_blocks,
-                n_layers: decoder.config.n_layers,
+                block_count: n_physical + decoder.config.n_mtp_blocks,
+                n_layers: n_physical,
                 n_mtp_blocks: decoder.config.n_mtp_blocks,
             },
         );
@@ -2949,13 +2964,12 @@ impl Decoder {
                 "ferrox: skipping {} NextN/MTP block(s) after layer {} ({skipped} tensors), as \
                  llama.cpp does",
                 decoder.config.n_mtp_blocks,
-                decoder.config.n_layers - 1
+                n_physical - 1
             );
         }
         // Slots llama.cpp creates and never reads (`crate::unread_tensors`):
         // ignored as upstream ignores them, and said so.
-        let ignored =
-            crate::unread_tensors::note_unread_layer_tensors(&file, &arch, decoder.config.n_layers);
+        let ignored = crate::unread_tensors::note_unread_layer_tensors(&file, &arch, n_physical);
         if !ignored.is_empty() {
             eprintln!(
                 "ferrox: ignoring {} tensor(s) llama.cpp creates and never reads for `{}` \
@@ -3714,23 +3728,23 @@ mod tests {
     /// `AUDITED_GENERIC_GQA` would have gone unnoticed.
     #[test]
     fn an_unaudited_generic_architecture_refuses_rather_than_guessing() {
-        // `nanbeige` is on the generic path and is not in the audited
-        // list. It is the third name to hold this slot: `starcoder` was
+        // `talkie` is on the generic path and is not in the audited
+        // list. It is the fourth name to hold this slot: `starcoder` was
         // first, until an audit found it REQUIRES a fused
         // `attn_qkv.bias` and a learned `position_embd` the generic
         // decoder has no slot for, so it refuses for a stronger reason;
         // then `xverse`, until it was admitted with a libllama-golden
-        // fixture (`tests/fixture_away_graphs.rs`). `nanbeige` cannot go
-        // the same way soon: it runs the same physical layers more than
-        // once (`src/models/nanbeige.cpp:13-31`), which is NEW CODE, and
-        // its blocker is invisible in metadata, so nothing but this gate
-        // stops it.
+        // fixture (`tests/fixture_away_graphs.rs`); then `nanbeige`,
+        // until the layer loop became `crate::layer_loops`. `talkie` has
+        // no norm weights, a per-head scalar Q gain and a learned skip
+        // stream (`src/models/talkie.cpp`), and its blockers are
+        // invisible in metadata, so nothing but this gate stops it.
         assert!(
-            !crate::capability::is_audited_generic("nanbeige"),
+            !crate::capability::is_audited_generic("talkie"),
             "this test needs an arch that is generic AND unaudited"
         );
-        match config_for_arch("nanbeige") {
-            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "nanbeige"),
+        match config_for_arch("talkie") {
+            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "talkie"),
             other => panic!("expected an unaudited refusal, got {other:?}"),
         }
     }

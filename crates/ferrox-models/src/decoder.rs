@@ -892,6 +892,10 @@ impl Decoder {
             // No fused kernel scales the branch after its `wo` fold
             // (`crate::attn_value_scale`).
             && config.attn_value_scale.is_none()
+            // Every fused launch indexes `layers[l]` and `metal_kvs[l]`
+            // with ONE `l`; a looped model's logical layers outnumber
+            // its weights (`crate::layer_loops`).
+            && config.layer_loops.is_none()
             // `model_ffn_act` is `None` for an activation that varies
             // by layer (xIELU's parameters), which no fused kernel
             // takes; `fused_kernel_gelu_flag` is `None` for one no
@@ -1885,7 +1889,7 @@ impl Decoder {
     /// store, continuous-batch / CPU readers). Safe no-op without Metal KV.
     #[cfg(feature = "metal")]
     pub fn sync_metal_attn_kv_to_host(&self, kv_caches: &mut [KvCache]) {
-        assert_eq!(kv_caches.len(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
         let guard = Self::lock_metal_attn_kv(&self.metal_attn_kv);
         let Some(metal_kvs) = guard.as_ref() else {
             return;
@@ -1965,7 +1969,7 @@ impl Decoder {
         #[cfg(feature = "metal")]
         ferrox_metal::gpu::clear_resident_activation();
 
-        assert_eq!(kv_caches.len(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
         // Read only by the Metal arms below: the host layer body moved
         // into `attn_block` / `ffn_block_row`, which read the geometry
         // off `self.config` themselves.
@@ -2530,7 +2534,8 @@ impl Decoder {
         }
 
         if run_cpu_layers {
-            for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
+            for (l, cache) in kv_caches.iter_mut().enumerate() {
+                let layer = self.layer_for(l);
                 // --- attention block ---
                 #[cfg(feature = "metal")]
                 if metal_moe_resident
@@ -2812,7 +2817,7 @@ impl Decoder {
                                                                 &logits,
                                                                 &self.config,
                                                                 hidden_dim,
-                                                                residency.as_ref().map(|p| p.layer_plan(l)),
+                                                                residency.as_ref().map(|p| p.layer_plan(self.physical_index(l))),
                                                             );
                                                             residual_add(
                                                                 &mut hidden,
@@ -2903,7 +2908,9 @@ impl Decoder {
                                 layer,
                                 &mut hidden,
                                 None,
-                                residency.as_ref().map(|p| p.layer_plan(l)),
+                                residency
+                                    .as_ref()
+                                    .map(|p| p.layer_plan(self.physical_index(l))),
                                 operand,
                             );
                         }
@@ -2911,7 +2918,10 @@ impl Decoder {
                     }
                 }
 
-                let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
+                let oai = self
+                    .gpt_oss
+                    .as_ref()
+                    .map(|g| &g.layers[self.physical_index(l)]);
                 if let Some(projected) =
                     self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache))
                 {
@@ -2922,7 +2932,9 @@ impl Decoder {
                     layer,
                     &mut hidden,
                     oai,
-                    residency.as_ref().map(|p| p.layer_plan(l)),
+                    residency
+                        .as_ref()
+                        .map(|p| p.layer_plan(self.physical_index(l))),
                     operand,
                 );
             }
@@ -2964,8 +2976,8 @@ impl Decoder {
         kv_caches: &mut [PagedKvCache],
         stores: &SharedPagedKv,
     ) -> Result<Vec<f32>, PagedStoreExhausted> {
-        assert_eq!(kv_caches.len(), self.layers.len());
-        assert_eq!(stores.layer_count(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
+        assert_eq!(stores.layer_count(), self.config.n_layers);
         // All layers advance or none do. Pushing per layer with `?` and
         // failing at layer 3 of 4 leaves layers 0..2 holding a position
         // the rest do not, and nothing downstream reports it: the next
@@ -2997,7 +3009,8 @@ impl Decoder {
         let mut hidden = self.embed_token(token_id);
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
-        for (l, (layer, cache)) in self.layers.iter().zip(kv_caches.iter_mut()).enumerate() {
+        for (l, cache) in kv_caches.iter_mut().enumerate() {
+            let layer = self.layer_for(l);
             // --- attention block ---
             let operand = self.router_operand(layer, &hidden, 1);
             let normed = layer
@@ -3011,7 +3024,10 @@ impl Decoder {
             // `post_attn_norm`, `post_ffn_norm`, gpt-oss's `o_bias` and
             // `gpt_oss_ffn` -- five features that each produce a
             // plausible distribution rather than an error.
-            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
+            let oai = self
+                .gpt_oss
+                .as_ref()
+                .map(|g| &g.layers[self.physical_index(l)]);
             if let Some(projected) = self.attn_block(
                 l,
                 layer,
@@ -3029,7 +3045,9 @@ impl Decoder {
                 layer,
                 &mut hidden,
                 oai,
-                residency.as_ref().map(|p| p.layer_plan(l)),
+                residency
+                    .as_ref()
+                    .map(|p| p.layer_plan(self.physical_index(l))),
                 operand,
             );
         }
@@ -3809,8 +3827,8 @@ impl Decoder {
         kv_caches: &mut [PagedKvCache],
         stores: &SharedPagedKv,
     ) -> Result<Vec<f32>, PagedStoreExhausted> {
-        assert_eq!(kv_caches.len(), self.layers.len());
-        assert_eq!(stores.layer_count(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
+        assert_eq!(stores.layer_count(), self.config.n_layers);
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -3892,7 +3910,7 @@ impl Decoder {
         // host cache with real rows on every path and has nothing to
         // choose between.
         let _ = host_kv_authoritative;
-        assert_eq!(kv_caches.len(), self.layers.len());
+        assert_eq!(kv_caches.len(), self.config.n_layers);
         let batch_size = tokens.len();
         if batch_size == 0 {
             return Vec::new();
@@ -3984,13 +4002,13 @@ impl Decoder {
             }
         }
 
-        let n_layers = self.layers.len();
+        let n_layers = self.config.n_layers;
         let mut l = 0usize;
         // Labelled for the Metal arm inside the `'attention` block below,
         // whose `continue` must name the loop it leaves.
         #[allow(unused_labels)]
         'layers: while l < n_layers {
-            let layer = &self.layers[l];
+            let layer = self.layer_for(l);
             // THIS layer's head counts. Zero for the two attention-less
             // shapes, which leave the loop below before a width is used;
             // the Metal arms only run on a uniform model
@@ -4128,7 +4146,10 @@ impl Decoder {
                 .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
-            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
+            let oai = self
+                .gpt_oss
+                .as_ref()
+                .map(|g| &g.layers[self.physical_index(l)]);
 
             // The GQA body, or the two shapes that have none of it
             // (`crate::layer_shapes::AttnShape`): a labelled block so the
@@ -4287,7 +4308,9 @@ impl Decoder {
                             &mut hidden_batch,
                             batch_size,
                             oai,
-                            residency.as_ref().map(|p| p.layer_plan(l)),
+                            residency
+                                .as_ref()
+                                .map(|p| p.layer_plan(self.physical_index(l))),
                             operand,
                             ffn_block::BatchedFfnKernels::Prefill,
                         );
@@ -4446,7 +4469,9 @@ impl Decoder {
                 &mut hidden_batch,
                 batch_size,
                 oai,
-                residency.as_ref().map(|p| p.layer_plan(l)),
+                residency
+                    .as_ref()
+                    .map(|p| p.layer_plan(self.physical_index(l))),
                 operand,
                 ffn_block::BatchedFfnKernels::Prefill,
             );
@@ -4510,7 +4535,7 @@ impl Decoder {
             return Vec::new();
         }
         for seq in 0..batch_size {
-            assert_eq!(kv.layers_per_seq(seq), self.layers.len());
+            assert_eq!(kv.layers_per_seq(seq), self.config.n_layers);
         }
 
         let hidden_dim = self.config.hidden_dim;
@@ -4522,7 +4547,8 @@ impl Decoder {
 
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
-        for (l, layer) in self.layers.iter().enumerate() {
+        for l in 0..self.config.n_layers {
+            let layer = self.layer_for(l);
             // THIS layer's head counts; see the prefill body.
             let shape = self.config.layer_shape(l);
             let (n_heads, n_kv_heads) = (shape.attention.n_heads(), shape.attention.n_kv_heads());
@@ -4533,7 +4559,10 @@ impl Decoder {
                 .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
                 .flatten()
                 .collect();
-            let oai = self.gpt_oss.as_ref().map(|g| &g.layers[l]);
+            let oai = self
+                .gpt_oss
+                .as_ref()
+                .map(|g| &g.layers[self.physical_index(l)]);
 
             'attention: {
                 match shape.attention {
@@ -4654,7 +4683,9 @@ impl Decoder {
                 &mut hidden_batch,
                 batch_size,
                 oai,
-                residency.as_ref().map(|p| p.layer_plan(l)),
+                residency
+                    .as_ref()
+                    .map(|p| p.layer_plan(self.physical_index(l))),
                 operand,
                 ffn_block::BatchedFfnKernels::PerRow,
             );
@@ -6869,6 +6900,29 @@ mod metal_rope_tests {
         assert!(!Decoder::metal_prefill_dense_layer_eligible(
             &d.layers[0],
             &scaled,
+            false
+        ));
+    }
+
+    /// A looped model keeps off every fused Metal path: each launch
+    /// indexes weights and KV buffers with one `l`, and a looped model's
+    /// logical layers outnumber its weights (`crate::layer_loops`). Only
+    /// reachable in a `--features metal` build.
+    #[test]
+    fn a_layer_loop_keeps_the_model_off_every_fused_metal_path() {
+        let plain = plain_config_with_metal_view();
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.layer_supports_metal_attn(&d.layers[0]), "the premise");
+        let mut looped = plain;
+        looped.layer_loops = Some(crate::layer_loops::LayerLoops {
+            n_phys: 1,
+            n_loops: 2,
+            skip_loop_final_norm: false,
+        });
+        assert!(!Decoder::metal_can_serve_model(&looped, false));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &looped,
             false
         ));
     }

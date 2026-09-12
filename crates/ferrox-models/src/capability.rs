@@ -786,6 +786,27 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // at 8), the split spelling, and the same file without the value
     // scale.
     "mimo2",
+    // tests/layer_loop_graphs.rs: `nanbeige`, NEW CODE on RUNNING THE
+    // SAME PHYSICAL LAYERS MORE THAN ONCE. `nanbeige.cpp:6-12` read
+    // `num_loops` / `skip_loop_final_norm`, `:19-31` set `n_layer_all =
+    // n_phys * n_loops` and replicate the per-layer arrays, `:69-73`
+    // alias `layers[i + j * n_phys] = layers[i]`, and `:167-175` norm
+    // the residual with `output_norm` after every pass but the last
+    // unless the flag skips it. One graph of 140 reads either key
+    // (measured, `crate::layer_loops`). The weights are shared and the
+    // KV is not, and the seam says that rather than copying weights:
+    // `Decoder::layers` stays physical, `ModelConfig::n_layers` is the
+    // logical count every KV cache and per-layer table is sized by,
+    // `Decoder::layer_for(l)` / `physical_index(l)` are the ONE mapping
+    // the three host bodies, the gpt-oss side table and the residency
+    // plan go through, and the loop norm sits at the end of BOTH FFN
+    // bodies so every caller gets it. The fused Metal launches refuse a
+    // looped model (one `l` for weights and KV). Everything inside a
+    // pass is plain Llama (NORM RoPE, `LlamaModel` converter). Three
+    // fixtures: two passes over two layers with the loop norm, the same
+    // with `skip_loop_final_norm`, and `num_loops = 1`, which is the
+    // plain path every real export without looping takes.
+    "nanbeige",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1092,20 +1113,12 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // as the floor (`deepseek2.cpp:46-49`) -- the MLA loader REFUSES
     // that by name now, where it used to drop it, because that engine
     // has no golden to check an implementation against.
-    (
-        "nanbeige",
-        TriageClass::NewCode,
-        "nanbeige RUNS THE SAME PHYSICAL LAYERS MORE THAN ONCE. \
-         src/models/nanbeige.cpp:13-31 sets `n_layer_all = n_layer_phys * n_loops` and \
-         rewrites the per-layer head/ff/swa arrays so the graph walks n_layer_all steps over \
-         n_layer_phys sets of weights, and :167 applies `output_norm` to the running \
-         residual inside the loop at the end of each pass. ferrox's decoder walks its layer \
-         vector exactly once and has no concept of a loop count. The per-layer arrays \
-         themselves (`crate::layer_shapes`) are not the blocker: :24-26 copies them, it \
-         does not vary them, and it is the copy that has no home. Everything inside one \
-         pass (:52-63, :106-155) is plain llama, which is what makes this deceptive: the \
-         tensor set alone looks generic",
-    ),
+    // `nanbeige` was HERE, NEW CODE on running the same physical layers
+    // more than once, and is audited now: `crate::layer_loops` is the
+    // seam and `tests/layer_loop_graphs.rs` carries three fixtures.
+    // The verdict's last sentence was the design: "the copy has no
+    // home" -- it has one now, and it is a mapping, not a copy. See
+    // `AUDITED_GENERIC_GQA`.
     // `arcee` was HERE, NEW CODE on `UNGATED_RELU_SQR`, and is audited
     // now: the FFN is `FfnActivation::ReluSqr` and
     // `tests/ungated_ffn_graphs.rs` carries the fixture.
@@ -1211,7 +1224,11 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          which is neither of ferrox's two QkNormStyle variants. Each layer then adds \
          `inp_skip * out_scale` (:123-126) with a per-layer learned scalar `out_scale` \
          (:32), a second residual stream the generic decoder has no slot for, and :5 reads \
-         {arch}.logit_scale as REQUIRED",
+         {arch}.logit_scale as REQUIRED. Its converter (`conversion/talkie.py:26-31`) also \
+         writes `blk.N.attn_output.scale` and `blk.N.ffn_down.scale`, the per-tensor \
+         companions `build_lora_mm` multiplies by (`wo_s`, `ffn_down_s`), which \
+         `crate::weight_scales` refuses by name today: talkie is the one real writer of \
+         two of them, and closing it means applying those two",
     ),
     // `mimo2` was HERE, NEW CODE on the split K/V head width, and is
     // audited now: `crate::kv_head_dims` is the seam,
@@ -1393,6 +1410,13 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `crate::qkv_fused` and has a libllama-golden fixture
         // (`tests/one_match_arm_graphs.rs`), so the class is empty now.
         v.push(gqa_norm("chatglm"));
+        // `nanbeige` was NEW CODE in `NORM_ROPE_TRIAGED` on the layer
+        // loop (`nanbeige.cpp:19-31`), audited now on
+        // `crate::layer_loops` (`tests/layer_loop_graphs.rs`). NORM RoPE:
+        // its converter is `LlamaModel` (`conversion/nanbeige.py:8`) and
+        // `LLM_ARCH_NANBEIGE` sits in the NORM group, which
+        // `tests/rope_layout.rs` pins.
+        v.push(gqa_norm("nanbeige"));
         // The Granite family. All three were NEW CODE in
         // `NORM_ROPE_TRIAGED` on the four scalar multipliers, which
         // `crate::scalar_multipliers` now implements once for all of
@@ -3112,7 +3136,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 6,
+            seen == 5,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -3191,19 +3215,22 @@ mod audit_tests {
              until `mimo2` closed on the split K/V head width (`crate::kv_head_dims`, \
              tests/split_kv_head_dim_graphs.rs) -- the reach measured over the fourteen \
              converters that write `value_length`: three write it apart from \
-             `key_length`, two on the MLA engine, one here. \
-             What is left is 5 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             `key_length`, two on the MLA engine, one here, and 6 until `nanbeige` closed \
+             on the layer loop (`crate::layer_loops`, tests/layer_loop_graphs.rs) -- one \
+             graph of 140 reads `num_loops`, and the seam is a mapping from logical to \
+             physical layer rather than a copy of the weights. \
+             What is left is 4 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
              closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
              `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
-             `step35`, `mistral3`, `smallthinker`, `bitnet` and `mimo2`, and each closure \
-             but `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, `smallthinker`'s, `bitnet`'s \
-             and `mimo2`'s took more than one row at a time because each found ONE cause \
+             `step35`, `mistral3`, `smallthinker`, `bitnet`, `mimo2` and `nanbeige`, and each \
+             closure but `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, `smallthinker`'s, \
+             `bitnet`'s, `mimo2`'s and `nanbeige`'s took more than one row at a time because each found ONE cause \
              behind several refusals; `mellum`'s cause IS shared and moved three verdicts, \
              but only one of them was closable by it, `mistral3`'s is shared with two rows \
              on other engines, `smallthinker`'s mechanism (a precomputed `probs`) is shared \
              with three rows whose CAUSE it is not, `bitnet`'s is shared with nothing, and \
              `mimo2`'s is shared with the MLA engine, which has carried the two widths \
-             since it existed"
+             since it existed, and `nanbeige`'s with nothing"
         );
     }
 
