@@ -76,6 +76,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("deci", Presence::Optional),
     ("ernie4_5", Presence::Optional),
     ("gpt-oss", Presence::Required),
+    ("gptneox", Presence::Required),
     ("granite", Presence::Optional),
     ("granitemoe", Presence::Optional),
     ("granite-moe", Presence::Optional),
@@ -94,6 +95,7 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
 pub const FFN_BIAS_CREATORS: &[(&str, Presence, bool)] = &[
     ("codeshell", Presence::Required, false),
     ("deci", Presence::Optional, true),
+    ("gptneox", Presence::Required, false),
     ("granite", Presence::Optional, true),
     ("granitemoe", Presence::Optional, true),
     ("granite-moe", Presence::Optional, true),

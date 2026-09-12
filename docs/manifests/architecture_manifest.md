@@ -32,6 +32,8 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `codeshell` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `jais2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `stablelm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `gptneox` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `plamo` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -79,9 +81,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `cohere2` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `cohere2moe` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `falcon` | TextGeneration | StandardGqa | KvGqa | dedicated |
-| `gptneox` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `phi2` | TextGeneration | PhiFamily | KvGqa | dedicated |
-| `plamo` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `minicpm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `phi3` | TextGeneration | PhiFamily | KvGqa | generic-gqa |
 | `phi4` | TextGeneration | PhiFamily | KvGqa | generic-gqa |

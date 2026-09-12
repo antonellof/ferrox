@@ -14,7 +14,8 @@
 //!   `ffn_norm` is ABSENT), `phi2.cpp:67,108,116-117`,
 //!   `falcon.cpp:124-135` (Falcon-7B, no `attn_norm_2`),
 //!   `command-r.cpp:68,106-119`, `cohere2.cpp:120-134`,
-//!   `cohere2moe.cpp:222-266`.
+//!   `cohere2moe.cpp:222-266`, `plamo.cpp:59-64,97-98,111-112` (`cur =
+//!   sa_inp`, over an RMSNorm).
 //! - **Two norms** (`TwoNorms`): `x + attn(ln1(x)) + ffn(ln2(x))`,
 //!   `gptneox.cpp:143-166` (`use_parallel_residual`, read at `:5`) and
 //!   `falcon.cpp:79-85` (Falcon-40B, `attn_norm_2`).
@@ -22,31 +23,48 @@
 //! # Reach -- MEASURED
 //!
 //! Over all 140 `src/models/*.cpp` (2026-09-12): `grep -l "par_res\|
-//! parallel residual"` is `gptneox.cpp` and `stablelm.cpp`; the FFN-reads-
-//! the-attention-input shape without the word is `phi2`, `falcon`,
-//! `command-r`, `cohere2`, `cohere2moe` (each found by its `ggml_add(cur,
-//! inpL)` followed by `ggml_add(cur, attn_out)` or the `ffn_output`
-//! equivalent). `gemma4.cpp:260` names an `attn_out` that is ALREADY
-//! `cur + inpL`, so it is sequential and not in the table. Eight graphs,
-//! two spellings, and `stablelm` is the one where BOTH shapes sit behind
-//! one architecture string, decided by tensor presence.
+//! parallel residual"` is `gptneox.cpp` and `stablelm.cpp`; a scan for
+//! TWO consecutive `cur = ggml_add(ctx0, cur, ...)` lines -- the
+//! three-term sum spelled out -- is `cohere2`, `cohere2moe` (twice, the
+//! trunk and its MTP block), `command-r`, `falcon`, `phi2` and `plamo`,
+//! with `gptneox` and `stablelm` separating their two adds by a `cb`
+//! line. `gemma4.cpp:260` names an `attn_out` that is ALREADY `cur +
+//! inpL`, so it is sequential and not in the table. Eight graphs, two
+//! spellings, and `stablelm` is the one where BOTH shapes sit behind one
+//! architecture string, decided by tensor presence. (`plamo` was missed
+//! by a first grep that looked for `attn_out` by name; its attention
+//! output is `sa_out`. The two-adds scan is the measurement.)
 //!
-//! # What this module does today
+//! # How it is served
 //!
-//! Refuses, by name, from a fixture llama.cpp runs
-//! (`tests/fixtures/stablelm_parallel_tiny.gguf`, libllama's logits
-//! differ from the sequential file's by 8.85, measured). The
-//! `stablelm` row is decided per layer, as `stablelm.cpp:129` decides
-//! it: a layer with no `ffn_norm.weight` is a parallel layer. The
-//! `use_parallel_residual` key the converter writes (`conversion/
-//! stablelm.py`) is read by NOTHING in `stablelm.cpp` and is dead
-//! metadata there -- libllama's logits with and without it are
-//! byte-identical (measured, `tests/stablelm_graphs.rs`) -- so it is
-//! not consulted here either. The seam that SERVES the shape is the
-//! next PR on the plan (`docs/plans/README.md`, `b2-close-the-68`): the
-//! two batched host bodies and the row body each add the FFN output to
-//! the ATTENTION output's residual, and the parallel shape needs them
-//! to add it to the layer input instead, in one place.
+//! The sequential bodies already compute `h = x + attn(attn_norm(x))`
+//! and then `h + ffn(normed2)`; `(x + attn) + ffn` IS the three-term
+//! sum, so the parallel shape differs from the sequential one in
+//! exactly one thing: WHAT `normed2` is. Sequential: `ffn_norm(h)`.
+//! Parallel: a norm of `x`, the LAYER INPUT, which attention has
+//! already been added on top of by the time the FFN body runs. So the
+//! FFN input is captured BEFORE attention, at the same point
+//! `crate::router_input` captures the router's operand, and the two
+//! travel together as `decoder::ffn_block::BranchInputs` -- one
+//! constructor, `Decoder::branch_inputs`, called at the top of every
+//! layer of every host body, so a body cannot take one and forget the
+//! other. `MoeWeights::parallel` is the per-layer fact (the `stablelm`
+//! row is decided per layer, as `stablelm.cpp:129` decides it), and
+//! for a `SharedNorm` layer the pre-FFN slot is `NormOp::None`,
+//! because there is no tensor and the norm was applied when attention
+//! took its input. `ModelConfig::parallel_residual` is the model-level
+//! fact `Decoder::metal_can_serve_model` reads: every fused Metal
+//! launch bakes `ffn_norm` over the post-attention residual into its
+//! kernel, so a model with a parallel layer stays on the host bodies.
+//!
+//! Evidence (`tests/parallel_residual_graphs.rs`): `gptneox` under the
+//! key, both values, and `plamo`, against libllama; the `stablelm`
+//! shape that was refused by this module for one PR
+//! (`tests/stablelm_graphs.rs`) matches now. `use_parallel_residual`
+//! is read by `gptneox.cpp:5` and by NOTHING in `stablelm.cpp`
+//! (libllama's logits with and without it are byte-identical there,
+//! measured), which is why `stablelm`'s rule is the tensor and
+//! `gptneox`'s is the key.
 
 use ferrox_gguf::TensorSource;
 
@@ -128,6 +146,12 @@ pub const PARALLEL_RESIDUAL_GRAPHS: &[ParallelResidual] = &[
         when: ParallelWhen::Always,
         lines: "src/models/cohere2moe.cpp:222-266",
     },
+    ParallelResidual {
+        arch: "plamo",
+        norm: ParallelNorm::SharedNorm,
+        when: ParallelWhen::Always,
+        lines: "src/models/plamo.cpp:59-64,97-98,111-112",
+    },
 ];
 
 /// The row for an architecture, or `None` for a sequential graph.
@@ -155,37 +179,18 @@ pub fn layer_is_parallel(file: &impl TensorSource, arch: &str, l: usize) -> bool
     }
 }
 
-/// The refusal reason for a file whose trunk has a parallel layer, or
-/// `None` when every layer is sequential. Names the first parallel
-/// layer and the rule that decided it.
-pub fn parallel_residual_refusal(
-    file: &impl TensorSource,
-    arch: &str,
-    n_layers: usize,
-) -> Option<String> {
+/// The FFN input rule for layer `l` of `arch` in `file`: `Some(norm)`
+/// for a parallel layer, `None` for a sequential one (every graph not in
+/// the table, and a table row whose rule does not fire on this layer).
+pub fn layer_parallel_norm(file: &impl TensorSource, arch: &str, l: usize) -> Option<ParallelNorm> {
     let row = parallel_residual(arch)?;
-    let l = (0..n_layers).find(|&l| layer_is_parallel(file, arch, l))?;
-    let decided_by = match row.when {
-        ParallelWhen::Always => "every layer of this graph".to_string(),
-        ParallelWhen::FfnNormAbsent => format!("`blk.{l}.ffn_norm.weight` is absent"),
-        ParallelWhen::ParallelResidualKey => {
-            format!("`{arch}.use_parallel_residual` is true")
-        }
-        ParallelWhen::AttnNorm2Present => format!("`blk.{l}.attn_norm_2.weight` is present"),
-    };
-    let reads = match row.norm {
-        ParallelNorm::SharedNorm => "the normed input attention read",
-        ParallelNorm::TwoNorms => "its own norm of the layer input",
-    };
-    Some(format!(
-        "layer {l} is a PARALLEL residual, `x + attn(norm(x)) + ffn(norm(x))`: {decided_by}, \
-         so llama.cpp feeds the FFN {reads} and sums the three terms once ({}). The generic \
-         decoder adds the FFN output to the attention output's residual on every layer, which \
-         is a different graph; libllama's logits for this shape differ from the sequential \
-         file's by 8.85 (measured, tests/fixtures/stablelm_parallel_tiny.gguf), so it stops \
-         rather than run the sequential one (`ferrox_models::parallel_residual`)",
-        row.lines
-    ))
+    layer_is_parallel(file, arch, l).then_some(row.norm)
+}
+
+/// Whether any trunk layer of `arch` in `file` is parallel: the
+/// model-level fact the fused Metal launches refuse on.
+pub fn model_has_parallel_layer(file: &impl TensorSource, arch: &str, n_layers: usize) -> bool {
+    (0..n_layers).any(|l| layer_is_parallel(file, arch, l))
 }
 
 #[cfg(test)]
@@ -193,11 +198,11 @@ mod tests {
     use super::*;
 
     /// Every row names a real architecture string llama.cpp has, and the
-    /// generic-path row is the only one the loader can reach; the rest
+    /// rows the loader can reach are exactly the audited ones; the rest
     /// are refused or deferred before any tensor is read, which is what
     /// makes their `when` a recorded fact rather than a live rule.
     #[test]
-    fn every_row_is_a_registered_architecture_and_only_stablelm_is_generic() {
+    fn every_row_is_a_registered_architecture_and_the_generic_ones_are_audited() {
         for row in PARALLEL_RESIDUAL_GRAPHS {
             assert!(
                 crate::capability::resolve_profile(row.arch).is_some(),
@@ -211,8 +216,9 @@ mod tests {
             );
             assert_eq!(
                 generic,
-                row.arch == "stablelm",
-                "`{}`: a second generic-path row means the seam must serve it, not refuse",
+                matches!(row.arch, "stablelm" | "gptneox" | "plamo"),
+                "`{}`: a generic-path row here must have a golden in \
+                 tests/parallel_residual_graphs.rs",
                 row.arch
             );
         }
@@ -225,6 +231,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), PARALLEL_RESIDUAL_GRAPHS.len());
+        assert_eq!(PARALLEL_RESIDUAL_GRAPHS.len(), 8, "the measured reach");
     }
 
     /// A graph not in the table is sequential on every layer, whatever
@@ -233,41 +240,31 @@ mod tests {
     fn a_sequential_graph_is_never_parallel() {
         let file = crate::test_source::StubSource::with_tensors(&[]);
         assert!(!layer_is_parallel(&file, "llama", 0));
-        assert!(parallel_residual_refusal(&file, "llama", 4).is_none());
+        assert_eq!(layer_parallel_norm(&file, "llama", 0), None);
+        assert!(!model_has_parallel_layer(&file, "llama", 4));
     }
 
     /// The `stablelm` rule: parallel exactly when the layer's
-    /// `ffn_norm.weight` is missing, per layer, and the refusal names the
-    /// first such layer.
+    /// `ffn_norm.weight` is missing, per layer, with the shared norm.
     #[test]
     fn stablelm_is_decided_by_ffn_norm_presence_per_layer() {
         use crate::test_source::StubSource;
         let sequential =
             StubSource::with_tensors(&["blk.0.ffn_norm.weight", "blk.1.ffn_norm.weight"]);
-        assert!(!layer_is_parallel(&sequential, "stablelm", 0));
-        assert!(!layer_is_parallel(&sequential, "stablelm", 1));
-        assert!(parallel_residual_refusal(&sequential, "stablelm", 2).is_none());
+        assert_eq!(layer_parallel_norm(&sequential, "stablelm", 0), None);
+        assert_eq!(layer_parallel_norm(&sequential, "stablelm", 1), None);
+        assert!(!model_has_parallel_layer(&sequential, "stablelm", 2));
 
         let mixed = StubSource::with_tensors(&["blk.0.ffn_norm.weight"]);
-        assert!(!layer_is_parallel(&mixed, "stablelm", 0));
-        assert!(layer_is_parallel(&mixed, "stablelm", 1));
-        let reason = parallel_residual_refusal(&mixed, "stablelm", 2).expect("refused");
-        assert!(
-            reason.contains("layer 1 is a PARALLEL residual"),
-            "{reason}"
+        assert_eq!(layer_parallel_norm(&mixed, "stablelm", 0), None);
+        assert_eq!(
+            layer_parallel_norm(&mixed, "stablelm", 1),
+            Some(ParallelNorm::SharedNorm)
         );
-        assert!(
-            reason.contains("`blk.1.ffn_norm.weight` is absent"),
-            "{reason}"
-        );
-        assert!(
-            reason.contains("stablelm.cpp:38-39,129-138,147"),
-            "{reason}"
-        );
-
+        assert!(model_has_parallel_layer(&mixed, "stablelm", 2));
         // The trunk length bounds the scan: a parallel block past it is
         // not this loader's layer.
-        assert!(parallel_residual_refusal(&mixed, "stablelm", 1).is_none());
+        assert!(!model_has_parallel_layer(&mixed, "stablelm", 1));
     }
 
     /// The other three rules, on the rows that carry them, so the
@@ -281,10 +278,10 @@ mod tests {
         assert!(!layer_is_parallel(&neox_seq, "gptneox", 0));
         let neox_par = StubSource::with_tensors(&["blk.0.ffn_norm.weight"])
             .with_key("gptneox.use_parallel_residual", GgufValue::Bool(true));
-        assert!(layer_is_parallel(&neox_par, "gptneox", 0));
-        assert!(parallel_residual_refusal(&neox_par, "gptneox", 1)
-            .expect("refused")
-            .contains("`gptneox.use_parallel_residual` is true"));
+        assert_eq!(
+            layer_parallel_norm(&neox_par, "gptneox", 0),
+            Some(ParallelNorm::TwoNorms)
+        );
 
         let falcon_7b = StubSource::with_tensors(&["blk.0.attn_norm.weight"]);
         assert!(!layer_is_parallel(&falcon_7b, "falcon", 0));
@@ -292,6 +289,13 @@ mod tests {
         assert!(layer_is_parallel(&falcon_40b, "falcon", 0));
 
         let phi2 = StubSource::with_tensors(&["blk.0.ffn_norm.weight"]);
-        assert!(layer_is_parallel(&phi2, "phi2", 0));
+        assert_eq!(
+            layer_parallel_norm(&phi2, "phi2", 0),
+            Some(ParallelNorm::SharedNorm)
+        );
+        assert_eq!(
+            layer_parallel_norm(&falcon_40b, "falcon", 0),
+            Some(ParallelNorm::TwoNorms)
+        );
     }
 }

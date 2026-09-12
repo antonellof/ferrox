@@ -253,6 +253,15 @@ pub struct MoeWeights {
     /// Applied by the FFN bodies to the whole branch output before the
     /// post-FFN norm.
     pub parallel_sum_scale: Option<f32>,
+    /// `Some` when this layer is a PARALLEL residual, `x + attn(norm(x))
+    /// + ffn(norm(x))`, and under which norm the FFN reads the layer
+    /// input (`crate::parallel_residual`): the vector attention read
+    /// (`SharedNorm`, and then `norm_weight` is `NormOp::None` because
+    /// there is no tensor) or its own `ffn_norm` of the layer input
+    /// (`TwoNorms`). `None` is the sequential layer, `ffn_norm(h)` over
+    /// the post-attention residual. Read by ONE constructor,
+    /// `Decoder::branch_inputs`, before attention runs.
+    pub parallel: Option<crate::parallel_residual::ParallelNorm>,
     /// How many times each routed expert (index into `experts`) has been
     /// selected by `route_top_k` across every `forward_token`/
     /// `forward_batch` call so far. Real observed hotness, not a
@@ -775,6 +784,7 @@ impl Decoder {
                 down_scale: None,
                 exps_norm: None,
                 parallel_sum_scale: None,
+                parallel: None,
                 dense_bias: None,
                 router: wm(rng.vec(n_experts * hidden), vec![n_experts, hidden]),
                 experts: ExpertBacking::Resident(experts),
@@ -941,6 +951,10 @@ impl Decoder {
             // kernel norms between attention and `wo`, or between the
             // activation and `down`.
             && !config.block_sub_norms
+            // Every fused launch bakes the pre-FFN norm over the
+            // POST-ATTENTION residual into its kernel; a parallel layer
+            // norms the layer INPUT (`crate::parallel_residual`).
+            && !config.parallel_residual
             // Every fused launch takes ONE head width for K and V (the
             // KV buffers, the attention tile, the `wo` fold); MiMo-V2's
             // split widths stay on the host (`crate::kv_head_dims`).
@@ -2639,7 +2653,7 @@ impl Decoder {
                 // Metal stack never serves that shape
                 // (`gpu_router_matches_host_routing`), so `hidden` is not
                 // stale for the one architecture that reads it here.
-                let operand = self.router_operand(layer, &hidden, 1);
+                let inputs = self.branch_inputs(layer, &hidden, 1);
                 #[cfg(feature = "metal")]
                 let normed = if metal_moe_resident {
                     // Residual is on-device; host rms_norm would use stale hidden.
@@ -2995,7 +3009,7 @@ impl Decoder {
                                 residency
                                     .as_ref()
                                     .map(|p| p.layer_plan(self.physical_index(l))),
-                                operand,
+                                inputs,
                                 skip_rows.as_deref().map(|rows| SkipStream { rows }),
                             );
                         }
@@ -3020,7 +3034,7 @@ impl Decoder {
                     residency
                         .as_ref()
                         .map(|p| p.layer_plan(self.physical_index(l))),
-                    operand,
+                    inputs,
                     skip_rows.as_deref().map(|rows| SkipStream { rows }),
                 );
             }
@@ -3099,7 +3113,7 @@ impl Decoder {
         for (l, cache) in kv_caches.iter_mut().enumerate() {
             let layer = self.layer_for(l);
             // --- attention block ---
-            let operand = self.router_operand(layer, &hidden, 1);
+            let inputs = self.branch_inputs(layer, &hidden, 1);
             let normed = layer
                 .attn
                 .norm_weight
@@ -3135,7 +3149,7 @@ impl Decoder {
                 residency
                     .as_ref()
                     .map(|p| p.layer_plan(self.physical_index(l))),
-                operand,
+                inputs,
                 skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
         }
@@ -4272,7 +4286,7 @@ impl Decoder {
             }
 
             // --- attention block ---
-            let operand = self.router_operand(layer, &hidden_batch, batch_size);
+            let inputs = self.branch_inputs(layer, &hidden_batch, batch_size);
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
                 .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
@@ -4443,7 +4457,7 @@ impl Decoder {
                             residency
                                 .as_ref()
                                 .map(|p| p.layer_plan(self.physical_index(l))),
-                            operand,
+                            inputs,
                             ffn_block::BatchedFfnKernels::Prefill,
                             skip_rows.as_deref().map(|rows| SkipStream { rows }),
                         );
@@ -4604,7 +4618,7 @@ impl Decoder {
                 residency
                     .as_ref()
                     .map(|p| p.layer_plan(self.physical_index(l))),
-                operand,
+                inputs,
                 ffn_block::BatchedFfnKernels::Prefill,
                 skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
@@ -4687,7 +4701,7 @@ impl Decoder {
             let shape = self.config.layer_shape(l);
             let (n_heads, n_kv_heads) = (shape.attention.n_heads(), shape.attention.n_kv_heads());
             // --- attention block ---
-            let operand = self.router_operand(layer, &hidden_batch, batch_size);
+            let inputs = self.branch_inputs(layer, &hidden_batch, batch_size);
             let normed_batch: Vec<f32> = hidden_batch
                 .par_chunks(hidden_dim)
                 .map(|h| layer.attn.norm_weight.apply(h, self.config.rms_norm_eps))
@@ -4819,7 +4833,7 @@ impl Decoder {
                 residency
                     .as_ref()
                     .map(|p| p.layer_plan(self.physical_index(l))),
-                operand,
+                inputs,
                 ffn_block::BatchedFfnKernels::PerRow,
                 skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
@@ -6986,6 +7000,35 @@ mod metal_rope_tests {
     /// activation and `down`; a BitNet layer served by one would skip
     /// both norms at full speed (`crate::sub_norms`). Only reachable in
     /// a `--features metal` build.
+    /// A parallel-residual model (`crate::parallel_residual`) stays off
+    /// every fused Metal path: each of them bakes the pre-FFN norm over
+    /// the POST-ATTENTION residual into its kernel, and a parallel layer
+    /// norms the layer INPUT. The model-level flag is what the
+    /// predicate reads, because the per-layer fact lives on
+    /// `MoeWeights` and the two config-only callers cannot see it. Only
+    /// reachable in a `--features metal` build.
+    #[test]
+    fn a_parallel_residual_keeps_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+        let mut parallel = plain;
+        parallel.parallel_residual = true;
+        let d = Decoder::new_random_small(parallel.clone(), 1, 32);
+        assert!(!d.layer_supports_metal_attn(&d.layers[0]));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &parallel,
+            false
+        ));
+        assert!(!Decoder::metal_can_serve_model(&parallel, false));
+    }
+
     #[test]
     fn the_inner_norms_keep_the_model_off_every_fused_metal_path() {
         let mut plain = phi_like_config();

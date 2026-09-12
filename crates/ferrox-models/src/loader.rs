@@ -1382,6 +1382,9 @@ impl ModelConfig {
             rope_layers: crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some()),
             router_input: crate::router_input::router_input(&arch),
             block_sub_norms: crate::sub_norms::block_sub_norms(&arch),
+            parallel_residual: crate::parallel_residual::model_has_parallel_layer(
+                file, &arch, n_layers,
+            ),
             attn_value_scale: crate::attn_value_scale::resolve_attn_value_scale(
                 &arch,
                 file.metadata_f32(&key("attention.value_scale")),
@@ -2489,18 +2492,6 @@ impl Decoder {
             .layer_loops
             .map_or(config.n_layers, |loops| loops.n_phys);
         let mut layers = Vec::with_capacity(n_physical);
-        // A parallel-residual layer (`crate::parallel_residual`): the
-        // FFN reads the layer input, which no body here does. Decided
-        // per layer by tensor presence, so it is asked over the whole
-        // trunk before any layer is built.
-        if let Some(reason) =
-            crate::parallel_residual::parallel_residual_refusal(&file, &arch, n_physical)
-        {
-            return Err(LoadError::UnsupportedFeature(
-                config.name.to_string(),
-                reason,
-            ));
-        }
         let mut refined_qk_norm = config.qk_norm_style;
         for l in 0..n_physical {
             // THIS layer's head counts and FFN width. Uniform for every
@@ -2508,6 +2499,10 @@ impl Decoder {
             // and the loader reads the shape rather than the scalars so
             // that a deci / openelm layer is sized by its own header.
             let shape = config.layer_shape(l);
+            // Whether THIS layer's FFN reads the layer input rather
+            // than the post-attention residual, and under which norm
+            // (`crate::parallel_residual`).
+            let parallel = crate::parallel_residual::layer_parallel_norm(&file, &arch, l);
             // BitNet's two inner norms, REQUIRED when the architecture
             // has them and untouched otherwise (`crate::sub_norms`).
             let sub_norms = crate::sub_norms::load_sub_norms(
@@ -2953,11 +2948,17 @@ impl Decoder {
                 // pre-FFN tensor's NAME comes from the same row that
                 // decided the post-attention slot must not read it. An
                 // FFN-free layer (`deci.cpp:52-54`) has no such tensor.
-                norm_weight: if shape.ffn_dim == 0 {
+                // A parallel layer with ONE shared norm has no pre-FFN
+                // tensor and no pre-FFN norm: the FFN reads the vector
+                // attention read (`crate::parallel_residual`).
+                norm_weight: if shape.ffn_dim == 0
+                    || parallel == Some(crate::parallel_residual::ParallelNorm::SharedNorm)
+                {
                     NormOp::None
                 } else {
                     norm_sites.load_pre_norm(norm_sites.ffn, &file, Some(l))?
                 },
+                parallel,
                 activation_counts,
                 #[cfg(feature = "metal")]
                 packed_q4,
