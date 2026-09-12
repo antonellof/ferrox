@@ -71,7 +71,7 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | MiroThinker | Works via `qwen3moe` |
 | Qwen2-MoE / Qwen1.5-MoE | Loads. Not in the current suite (OLMoE is the MoE entry) |
 | Mixtral | In the suite, skipped on 32 GiB Host B (`--fit-host`) |
-| MLA (`deepseek2` / `mistral4` / `plm`) | Dense-lead + MoE-after-dense via `MlaEngine`; `plm` (PLM-1.8B) is checked against libllama (`tests/plm_graphs.rs`, KL 1.87e-13), the engine's first golden. The lite DeepSeek-V2 layer counts take the direct-Q form with it. A `rope.scaling.type` other than `none` is REFUSED by name (every real DeepSeek-V2 / V3 export is YaRN, and the engine has neither the frequency rewrite nor the mscale in `kq_scale`) |
+| MLA (`deepseek2` / `mistral4` / `plm`) | Dense-lead + MoE-after-dense via `MlaEngine`, checked against libllama: `deepseek2` in BOTH tensor forms -- the split `attn_k_b` / `attn_v_b` every real export carries (the absorbed attention over a latent cache, `ferrox_core::mla_absorbed`; refused until 2026-09-12) and the legacy combined `attn_kv_b` -- KL 2.35e-15 and 3.57e-15 (`tests/deepseek2_graphs.rs`), and `plm` (PLM-1.8B) KL 1.87e-13 (`tests/plm_graphs.rs`). The lite DeepSeek-V2 layer counts take the direct-Q form. A `rope.scaling.type` other than `none` is still REFUSED by name (every real DeepSeek-V2 / V3 export is YaRN, and the engine has neither the frequency rewrite nor the mscale in `kq_scale`), so no real DeepSeek runs yet; that is the next thing this engine needs |
 | GLM4 / glm4moe | Loads via the GLM-5.2 path when the tensors are there. Never measured in the suite |
 | Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. |
 | gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal stops with an error, because no Metal kernel implements attention sinks. The paged-KV decode path runs it: all three attention arms are bit-identical to their contiguous twins |
@@ -722,8 +722,10 @@ byte-identical to the file that declares the key. KL 9.16e-15 on both,
 with a floor of 2 that steps TWICE inside the six-token prompt, and
 5.14e-15 on the plain file. The MLA engine (`deepseek2` / `mistral4`,
 which is Mistral-Large-3) REFUSES a nonzero scale by name now, where
-it used to load and drop both keys: it has no golden to check an
-implementation against, so an implementation there would be a guess.
+it used to load and drop both keys: it had no golden to check an
+implementation against when that landed (it has `plm`'s and
+`deepseek2`'s since 2026-09-12), so an implementation there would have
+been a guess.
 `llama4`'s verdict says the temperature is this seam plus a per-layer
 gate, and names what it still needs.
 

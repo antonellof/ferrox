@@ -48,7 +48,7 @@ use crate::config::LayerAttentionKind;
 use crate::kda::KdaAttnWeights;
 use crate::kimi_decoder::DenseMlpWeights;
 use crate::latent_moe::{KimiExpertBacking, KimiExpertWeights, KimiLatentMoeWeights};
-use crate::mla::{MlaAttnWeights, MlaQProj};
+use crate::mla::{MlaAttnWeights, MlaKvB, MlaQProj};
 use ferrox_core::expert_store::{ExpertKey, ExpertSource, ExpertStore};
 
 #[derive(Debug, Error)]
@@ -213,12 +213,12 @@ pub fn load_mla_attn(
             hidden_dim,
         )?,
         kv_a_layernorm: load_f32_vec(shard, &format!("{prefix}.self_attn.kv_a_layernorm.weight"))?,
-        kv_b_proj: load_weight_matrix(
+        kv_b: MlaKvB::Combined(load_weight_matrix(
             shard,
             &format!("{prefix}.self_attn.kv_b_proj.weight"),
             num_heads * (qk_nope_head_dim + v_head_dim),
             kv_lora_rank,
-        )?,
+        )?),
         o_proj: load_weight_matrix(
             shard,
             &format!("{prefix}.self_attn.o_proj.weight"),

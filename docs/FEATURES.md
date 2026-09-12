@@ -91,6 +91,14 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **MLA with the absorption optimization, and DeepSeek-2 checked
+  against libllama in both tensor forms.** `ferrox_models::mla::MlaKvB`:
+  the combined `attn_kv_b` (legacy exports, `plm`) and the split
+  `attn_k_b` / `attn_v_b` (every DeepSeek export since the `_mla` keys),
+  the latter attending over a latent cache `kv_lora_rank + qk_rope` wide
+  (`ferrox_core::mla_absorbed`). KL 2.35e-15 and 3.57e-15
+  (`tests/deepseek2_graphs.rs`). YaRN on this engine is still refused by
+  name, which is what a real DeepSeek-V2 / V3 file hits next.
 - **A dense FFN summed with the routed experts, and a routed branch
   fed from the layer input**, and with them Arctic (`arctic`) and
   Grok-2. `ferrox_models::parallel_dense_ffn` is the table of the two

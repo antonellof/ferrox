@@ -252,7 +252,7 @@ mod tests {
     use crate::kda::KdaAttnWeights;
     use crate::latent_moe::KimiExpertBacking;
     use crate::latent_moe::KimiExpertWeights;
-    use crate::mla::{MlaAttnWeights, MlaQProj};
+    use crate::mla::{MlaAttnWeights, MlaKvB, MlaQProj};
     use ferrox_core::tensor::Tensor;
 
     const HIDDEN_DIM: usize = 8;
@@ -913,11 +913,11 @@ mod tests {
                 },
                 kv_a_proj_with_mqa: wm(&MLA_KV_A_PROJ, MLA_KV_LORA + MLA_QK_ROPE, HIDDEN_DIM),
                 kv_a_layernorm: MLA_KV_A_NORM_W.to_vec(),
-                kv_b_proj: wm(
+                kv_b: MlaKvB::Combined(wm(
                     &MLA_KV_B_PROJ,
                     MLA_NUM_HEADS * (MLA_QK_NOPE + MLA_V_HEAD_DIM),
                     MLA_KV_LORA,
-                ),
+                )),
                 o_proj: wm(&MLA_O_PROJ, HIDDEN_DIM, MLA_PROJ),
                 g_proj: Some(wm(&MLA_G_PROJ, MLA_PROJ, HIDDEN_DIM)),
             })),

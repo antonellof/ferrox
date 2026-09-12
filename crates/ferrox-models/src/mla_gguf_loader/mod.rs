@@ -26,7 +26,7 @@ use crate::engine::{
 };
 use crate::loader::LoadError;
 use crate::loader::{load_f32_vec, load_weight_matrix, split_expert_tensor};
-use crate::mla::{MlaAttnWeights, MlaQProj};
+use crate::mla::{MlaAttnWeights, MlaKvB, MlaQProj};
 use crate::mla_arch::{mla_arch, MlaArch, MlaOutputHead, QProjRule};
 
 /// Hyperparameters read from `{arch}.*` GGUF metadata.
@@ -327,18 +327,70 @@ fn load_mla_attn(
     let kv_a = load_weight_matrix(file, &format!("blk.{l}.attn_kv_a_mqa.weight"))?;
     let o_proj = load_weight_matrix(file, &format!("blk.{l}.attn_output.weight"))?;
 
-    // Prefer combined `attn_kv_b`; else refuse split k_b/v_b until concat lands.
-    let kv_b_proj = if file
-        .find_tensor(&format!("blk.{l}.attn_kv_b.weight"))
-        .is_some()
-    {
-        load_weight_matrix(file, &format!("blk.{l}.attn_kv_b.weight"))?
-    } else {
-        return Err(LoadError::Gguf(ferrox_gguf::GgufError::TensorNotFound(
-            format!(
-                "blk.{l}.attn_kv_b.weight (split attn_k_b/attn_v_b not wired for MlaEngine yet)"
-            ),
-        )));
+    // Combined `attn_kv_b` or split `attn_k_b` / `attn_v_b`
+    // (`crate::mla::MlaKvB`): the file carries one set, and llama.cpp
+    // decides which it EXPECTS from the `_mla` keys (`is_mla()`). Read
+    // by presence here, and refused when the file has both or neither,
+    // because each such file fails in llama.cpp's own loader.
+    let combined = format!("blk.{l}.attn_kv_b.weight");
+    let k_b_name = format!("blk.{l}.attn_k_b.weight");
+    let v_b_name = format!("blk.{l}.attn_v_b.weight");
+    let kv_b = match (
+        file.find_tensor(&combined).is_some(),
+        file.find_tensor(&k_b_name).is_some(),
+        file.find_tensor(&v_b_name).is_some(),
+    ) {
+        (true, false, false) => MlaKvB::Combined(load_weight_matrix(file, &combined)?),
+        (false, true, true) => {
+            // ne = [qk_nope, kv_lora, n_head] and [kv_lora, v_head, n_head]
+            // (`deepseek2.cpp:120-122`): the per-head leading split is
+            // the same cut `split_expert_tensor` makes for experts, and
+            // gives `k_b[h]` as `[kv_lora, qk_nope]` (the absorb
+            // direction, transposed by `conversion/deepseek.py:426`)
+            // and `v_b[h]` as `[v_head, kv_lora]`.
+            let k_b = split_expert_tensor(file, &k_b_name, hp.n_heads)?;
+            let v_b = split_expert_tensor(file, &v_b_name, hp.n_heads)?;
+            for (h, (k, v)) in k_b.iter().zip(v_b.iter()).enumerate() {
+                if k.rows() != hp.kv_lora_rank
+                    || k.cols() != hp.qk_nope_head_dim
+                    || v.rows() != hp.v_head_dim
+                    || v.cols() != hp.kv_lora_rank
+                {
+                    return Err(LoadError::UnsupportedFeature(
+                        hp.arch.clone(),
+                        format!(
+                            "{k_b_name} / {v_b_name} head {h}: k_b is {}x{}, v_b is {}x{}; expected \
+                             k_b [kv_lora_rank {}, qk_nope {}] and v_b [v_head {}, kv_lora_rank {}] \
+                             (deepseek2.cpp:120-122)",
+                            k.rows(),
+                            k.cols(),
+                            v.rows(),
+                            v.cols(),
+                            hp.kv_lora_rank,
+                            hp.qk_nope_head_dim,
+                            hp.v_head_dim,
+                            hp.kv_lora_rank
+                        ),
+                    ));
+                }
+            }
+            MlaKvB::Split { k_b, v_b }
+        }
+        (false, false, false) => {
+            return Err(LoadError::Gguf(ferrox_gguf::GgufError::TensorNotFound(
+                format!("{combined} (or the split {k_b_name} / {v_b_name})"),
+            )));
+        }
+        (has_combined, has_k, has_v) => {
+            return Err(LoadError::UnsupportedFeature(
+                hp.arch.clone(),
+                format!(
+                    "layer {l} carries attn_kv_b={has_combined}, attn_k_b={has_k}, \
+                     attn_v_b={has_v}: llama.cpp creates the combined tensor OR the split pair \
+                     (deepseek2.cpp:118-123), never a mix"
+                ),
+            ));
+        }
     };
 
     let kv_a_ln = load_f32_vec_optional(file, &format!("blk.{l}.attn_kv_a_norm.weight"))?
@@ -348,7 +400,7 @@ fn load_mla_attn(
         q,
         kv_a_proj_with_mqa: kv_a,
         kv_a_layernorm: kv_a_ln,
-        kv_b_proj,
+        kv_b,
         o_proj,
         g_proj: None,
     })
