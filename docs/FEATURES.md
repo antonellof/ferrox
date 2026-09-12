@@ -91,6 +91,15 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **Projection biases on the dense path, and with them StarCoder2
+  (`starcoder2`), CodeShell (`codeshell`) and Jais-2 (`jais2`).**
+  `ferrox_models::proj_bias`: `attn_output.bias` after `wo` and the
+  dense FFN's `ffn_{up,gate,down}.bias` where `build_ffn` adds them, for
+  exactly the architectures whose graph creates the tensors (33 and 27
+  of 140, measured, most OPTIONAL -- a `llama` file with biases used to
+  be refused as unread and matches libllama now, 2.7e-13). The ungated
+  GELU (`FfnActivation::GeluUngated`) landed with it. Every fused Metal
+  dense launch refuses a biased layer.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row

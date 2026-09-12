@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **58** architectures run with
+Honest position, re-audited 2026-09-12. **61** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -698,9 +698,39 @@ forgotten, and the six the group still holds each say what else they
 need (`attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` for
 `starcoder2`, `codeshell`, `jais2`; those plus learned positions for
 `starcoder`; a parallel residual for `stablelm`; an `output.bias` and
-LongRoPE for `phimoe`). Nemotron's OPTIONAL projection biases are
+LongRoPE for `phimoe`). Nemotron's OPTIONAL projection biases were
 refused as unread from a fixture whose libllama logits differ by 8.07
-from the plain file's.
+from the plain file's -- for one PR.
+
+`ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
+`jais2` the same day, and it is the reach measurement that says what
+the seam is: `grep -l 'ATTN_OUT, "bias"'` over the 140 graphs is 33
+files and `FFN_UP, "bias"` 27, MOST of them OPTIONAL -- `llama.cpp`'s
+own graph, `granite`, `deci`, `mistral3`, `minicpm`, `nemotron` create
+the biases `TENSOR_NOT_REQUIRED` and `build_ffn` / `build_attn` add
+them when present -- so a `llama` file WITH biases was one ferrox
+refused as carrying unread tensors while llama.cpp ran it. The
+arithmetic is the same in every graph (`up_b` / `gate_b` before the
+activation, `down_b` after `down`, `wo_b` after `wo` and after `wo_s`),
+so it lives in two slots -- `AttnWeights::o_bias` in the ONE attention
+tail, where gpt-oss's bias moved from its side table, and
+`MoeWeights::dense_bias` (`ferrox_moe::DenseBias`,
+`run_expert_biased`, whose gate/up projections come from the same
+`gate_up_projections` the unbiased body uses) in the row and batched
+dense bodies -- and the per-architecture fact is which graphs CREATE
+the tensors, two tables with a `Required` / `Optional` column, so a
+bias on an architecture whose graph never creates it stays unread and
+refused as llama.cpp refuses the file. The two GELU rows needed
+`FfnActivation::GeluUngated` (`LLM_FFN_GELU` under `LLM_FFN_SEQ`,
+eleven graphs, measured), aliased as `ReluSqr` is. Every fused Metal
+dense launch and the attention view fence on the two fields. Four
+goldens (`tests/proj_bias_graphs.rs`): `jais2` 6.6e-13, a `llama` with
+all four biases 2.7e-13 (the one file that exercises `ffn_gate.bias`),
+`starcoder2` and `codeshell` at 4.7e-7 / 4.7e-6 KL with 3e-3 / 8e-3
+max deltas that are ENTIRELY llama.cpp's f16 GELU table -- with
+ferrox's GELU made to emulate the table (input and output rounded to
+f16) both agree to 2e-13 / 1e-12 -- and `nemotron_biases`, refused the
+PR before, at 2.1e-13.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are ONE residual
 topology: no `attn_norm` and no `ffn_norm` tensor, both sublayers

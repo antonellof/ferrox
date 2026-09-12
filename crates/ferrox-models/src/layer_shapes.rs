@@ -477,6 +477,7 @@ pub(crate) fn load_non_gqa_attention(
         // that has these (`bitnet`) has a uniform GQA shape.
         attn_sub_norm: None,
         o_scale: None,
+        o_bias: None,
     })
 }
 
@@ -792,6 +793,7 @@ mod tests {
             sinks: None,
             attn_sub_norm: None,
             o_scale: None,
+            o_bias: None,
         };
         assert!(
             check_gqa_projection_widths(0, shape, head_dim, head_dim, hidden, &build(24, 12))

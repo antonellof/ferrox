@@ -995,6 +995,9 @@ impl ModelConfig {
             // `grok` is StandardGqa and passes `LLM_FFN_GELU`.
             _ if crate::capability::uses_geglu(&arch) => crate::config::FfnActivation::Gelu,
             _ if crate::capability::uses_relu_sqr(&arch) => crate::config::FfnActivation::ReluSqr,
+            _ if crate::capability::uses_gelu_ungated(&arch) => {
+                crate::config::FfnActivation::GeluUngated
+            }
             // The GATED ReLU (`ggml_reglu_split`), a real gate tensor:
             // NOT the row above, which aliases gate to up.
             _ if crate::capability::uses_reglu(&arch) => crate::config::FfnActivation::Reglu,
@@ -1616,12 +1619,8 @@ fn load_gpt_oss_layer(
             ),
         ));
     }
-    let o_bias = load_f32_vec(file, &format!("blk.{l}.attn_output.bias"))?;
-    want(
-        &format!("blk.{l}.attn_output.bias"),
-        o_bias.len(),
-        config.hidden_dim,
-    )?;
+    // `attn_output.bias` is `AttnWeights::o_bias` now, read by
+    // `crate::proj_bias` (gpt-oss is a REQUIRED row of its table).
     let router_bias = load_f32_vec(file, &format!("blk.{l}.ffn_gate_inp.bias"))?;
     want(
         &format!("blk.{l}.ffn_gate_inp.bias"),
@@ -1657,7 +1656,6 @@ fn load_gpt_oss_layer(
         .collect();
 
     Ok(crate::decoder::GptOssLayer {
-        o_bias,
         router_bias,
         expert_bias,
     })
@@ -2615,6 +2613,12 @@ impl Decoder {
                             l,
                             "attn_output",
                         )?,
+                        o_bias: crate::proj_bias::load_attn_out_bias(
+                            &file,
+                            &arch,
+                            l,
+                            config.hidden_dim,
+                        )?,
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,
@@ -2878,6 +2882,31 @@ impl Decoder {
                 exp_probs_bias,
                 exps_norm,
                 parallel_sum_scale,
+                // The dense FFN's biases (`crate::proj_bias`), on a dense
+                // layer; a routed layer's experts carry none on the
+                // generic path (gpt-oss's are its side table's).
+                dense_bias: if is_dense_layer && shape.ffn_dim > 0 {
+                    let bias = crate::proj_bias::load_dense_ffn_bias(
+                        &file,
+                        &arch,
+                        l,
+                        config.hidden_dim,
+                        shape.ffn_dim,
+                        config.ffn_is_ungated(),
+                    )?;
+                    if bias.is_some() && sub_norms.is_some() {
+                        return Err(LoadError::UnsupportedFeature(
+                            arch.clone(),
+                            format!(
+                                "layer {l} has both an inner FFN norm and FFN biases; no llama.cpp \
+                                 graph has both and the dense body has one arm for each"
+                            ),
+                        ));
+                    }
+                    bias
+                } else {
+                    None
+                },
                 ffn_sub_norm: sub_norms.map(|n| n.ffn),
                 down_scale: {
                     let gain =

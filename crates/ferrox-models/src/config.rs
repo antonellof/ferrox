@@ -574,6 +574,16 @@ pub enum FfnActivation {
     /// fused device kernel spells it, so `fused_kernel_gelu_flag` is
     /// `None`.
     ReluSqr,
+    /// UNGATED GELU: `down(gelu(up(x)))`, two matrices in sequence and
+    /// no `ffn_gate` -- llama.cpp's `LLM_FFN_GELU` under `LLM_FFN_SEQ`
+    /// with a null gate (`starcoder2.cpp:125-131`, `codeshell.cpp:
+    /// 120-126`; eleven graphs of 140 pass the pair, measured,
+    /// `capability::uses_gelu_ungated`). Aliased and served exactly as
+    /// [`Self::ReluSqr`], mapping to `ferrox_moe::GluAct::GeluUngated`;
+    /// no fused device kernel spells it. `ggml_gelu` is the tanh form
+    /// with an f16 table on the CPU, so its goldens hold at the GeGLU
+    /// tolerance.
+    GeluUngated,
     /// GATED ReLU, `down(relu(gate(x)) * up(x))` with a REAL gate
     /// matrix -- llama.cpp's `LLM_FFN_RELU` under `build_moe_ffn` with
     /// `gate_exps` present, which takes `ggml_reglu_split(gate, up)`

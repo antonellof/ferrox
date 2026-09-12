@@ -125,12 +125,22 @@ impl Decoder {
         act: ferrox_moe::GluAct,
         eps: f32,
     ) -> Vec<f32> {
-        layer
-            .moe
-            .with_expert(0, |ex| match &layer.moe.ffn_sub_norm {
-                None => ferrox_moe::run_expert(normed2, ex, act),
-                Some(w) => ferrox_moe::run_expert_sub_normed(normed2, ex, act, w, eps),
-            })
+        layer.moe.with_expert(0, |ex| {
+            match (&layer.moe.ffn_sub_norm, &layer.moe.dense_bias) {
+                (None, None) => ferrox_moe::run_expert(normed2, ex, act),
+                (Some(w), None) => ferrox_moe::run_expert_sub_normed(normed2, ex, act, w, eps),
+                // `crate::proj_bias`: the biases before the activation
+                // and after `down`. No graph has both a bias and an
+                // inner norm (`bitnet` has neither bias), so the pair
+                // is a loader-refused shape rather than a fourth body.
+                (None, Some(bias)) => ferrox_moe::run_expert_biased(normed2, ex, act, bias),
+                (Some(_), Some(_)) => {
+                    unreachable!(
+                        "a dense layer with both an inner norm and biases is refused at load"
+                    )
+                }
+            }
+        })
     }
 
     /// THE constructor for [`RouterOperand`]. `hidden_before_attn` is

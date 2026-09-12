@@ -175,8 +175,15 @@ fn gpt_oss_loader_wires_the_whole_graph() {
             Some(decoder.config.n_heads)
         );
     }
+    // `attn_output.bias` is `AttnWeights::o_bias` now, filled for every
+    // graph that creates the tensor (`ferrox_models::proj_bias`).
+    for layer in &decoder.layers {
+        assert_eq!(
+            layer.attn.o_bias.as_ref().map(Vec::len),
+            Some(decoder.config.hidden_dim)
+        );
+    }
     for layer in &g.layers {
-        assert_eq!(layer.o_bias.len(), decoder.config.hidden_dim);
         assert_eq!(layer.router_bias.len(), decoder.config.moe.n_experts);
         assert_eq!(layer.expert_bias.len(), decoder.config.moe.n_experts);
     }
@@ -275,8 +282,8 @@ fn gpt_oss_golden_is_not_vacuous() {
     // 4. No attention output bias.
     {
         let mut decoder = load();
-        for layer in decoder.gpt_oss.as_mut().unwrap().layers.iter_mut() {
-            layer.o_bias.iter_mut().for_each(|b| *b = 0.0);
+        for layer in decoder.layers.iter_mut() {
+            layer.attn.o_bias = None;
         }
         let mut caches: Vec<KvCache> = decoder.config.new_kv_caches();
         let broken = decoder.forward_batch_last(&PROMPT, 0, &mut caches);

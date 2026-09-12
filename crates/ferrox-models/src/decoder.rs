@@ -140,6 +140,15 @@ pub struct AttnWeights {
     /// `crate::weight_scales`). The fused Metal launches refuse a layer
     /// that has one through the destructure in `metal_attn_view`.
     pub o_scale: Option<f32>,
+    /// `blk.N.attn_output.bias`, added right after `wo` (and after
+    /// `o_scale`, the order `build_attn` has). Loaded for the
+    /// architectures whose graph creates the tensor
+    /// (`crate::proj_bias::ATTN_OUT_BIAS_CREATORS`), which includes
+    /// gpt-oss, whose bias used to live on its side table; `None`
+    /// everywhere else, where a present tensor is refused as unread.
+    /// The fused Metal launches refuse a layer that has one through
+    /// the destructure in `metal_attn_view`.
+    pub o_bias: Option<Vec<f32>>,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -224,6 +233,12 @@ pub struct MoeWeights {
     /// dense FFN's output right after `down` (`crate::weight_scales`);
     /// refused on a routed layer, whose experts carry their own.
     pub down_scale: Option<f32>,
+    /// The dense FFN's `blk.N.ffn_{up,gate,down}.bias`
+    /// (`crate::proj_bias`), on a dense layer whose architecture's
+    /// graph creates them and whose file carries at least one; `None`
+    /// otherwise. Applied by `run_dense_expert` and `dense_ffn_batch`,
+    /// whose fused Metal launch has no bias site and is fenced on it.
+    pub dense_bias: Option<ferrox_moe::DenseBias>,
     /// Arctic's `blk.N.ffn_norm_exps.weight`, `[hidden_dim]`: the SECOND
     /// per-layer norm, applied to the layer INPUT to make the routed
     /// branch's operand (`arctic.cpp:45,136-139`;
@@ -440,9 +455,10 @@ pub struct LayerWeights {
 /// `build_attn_mha`. What keeps the whole-graph rule intact is that
 /// the loader refuses a gpt-oss file whose sinks are absent.
 pub struct GptOssLayer {
-    /// `blk.N.attn_output.bias`, added after the output projection.
-    pub o_bias: Vec<f32>,
     /// `blk.N.ffn_gate_inp.bias`, added to the router logits.
+    /// (`attn_output.bias` used to be here too and is
+    /// [`AttnWeights::o_bias`] now: `crate::proj_bias` fills that slot
+    /// for every graph that creates the tensor, gpt-oss among them.)
     pub router_bias: Vec<f32>,
     /// `blk.N.ffn_{gate,up,down}_exps.bias`, one entry per expert.
     pub expert_bias: Vec<ferrox_moe::ExpertBias>,
@@ -714,6 +730,7 @@ impl Decoder {
                 sinks: None,
                 attn_sub_norm: None,
                 o_scale: None,
+                o_bias: None,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -758,6 +775,7 @@ impl Decoder {
                 down_scale: None,
                 exps_norm: None,
                 parallel_sum_scale: None,
+                dense_bias: None,
                 router: wm(rng.vec(n_experts * hidden), vec![n_experts, hidden]),
                 experts: ExpertBacking::Resident(experts),
                 shared_experts,
@@ -1146,11 +1164,16 @@ impl Decoder {
             sinks,
             attn_sub_norm,
             o_scale,
+            o_bias,
         } = &layer.attn;
         // No Metal attention kernel gates, sinks, norms between the V
-        // sum and `wo`, or scales after it; a layer with any of the four
-        // runs on the host.
-        if output_gate.is_some() || sinks.is_some() || attn_sub_norm.is_some() || o_scale.is_some()
+        // sum and `wo`, scales after it, or adds a bias to it; a layer
+        // with any of the five runs on the host.
+        if output_gate.is_some()
+            || sinks.is_some()
+            || attn_sub_norm.is_some()
+            || o_scale.is_some()
+            || o_bias.is_some()
         {
             return None;
         }
@@ -1222,8 +1245,10 @@ impl Decoder {
     #[cfg(feature = "metal")]
     fn layer_supports_metal_dense_ffn(layer: &LayerWeights) -> bool {
         Self::is_dense_layer(layer)
-            // No fused FFN kernel scales after `down` (`crate::weight_scales`).
+            // No fused FFN kernel scales after `down` (`crate::weight_scales`)
+            // or adds a bias anywhere (`crate::proj_bias`).
             && layer.moe.down_scale.is_none()
+            && layer.moe.dense_bias.is_none()
             && layer.moe.with_expert(0, |ex| {
                 Self::metal_matvec_launch(&ex.gate).is_some()
                     && Self::metal_matvec_launch(&ex.up).is_some()
@@ -1242,6 +1267,7 @@ impl Decoder {
     ) -> bool {
         Self::is_dense_layer(layer)
             && layer.moe.down_scale.is_none()
+            && layer.moe.dense_bias.is_none()
             && Self::metal_can_serve_model(config, lora_attached)
     }
 
@@ -3587,11 +3613,13 @@ impl Decoder {
         // four copies of a `batch x ffn_dim` tensor. Not for a layer
         // with a norm between the activation and `down`
         // (`ffn_sub_norm`): the kernel has no such site.
+        // ...nor a bias at any of its three sites (`crate::proj_bias`).
         #[cfg(feature = "metal")]
-        if let (true, Some(gelu), None) = (
+        if let (true, Some(gelu), None, None) = (
             ferrox_core::weight_matrix::metal_dense_enabled(),
             act.fused_kernel_gelu_flag(),
             layer.moe.ffn_sub_norm.as_ref(),
+            layer.moe.dense_bias.as_ref(),
         ) {
             let fused = layer.moe.with_expert(0, |ex| {
                 let (g, u, d) = (
@@ -3615,12 +3643,20 @@ impl Decoder {
         }
         Some(layer.moe.with_expert(0, |ex| {
             let ffn_acts = ex.gate.quantize_batch_acts(normed2_batch, batch_size);
-            let gate = ex
-                .gate
-                .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-            let up = ex
+            let mut gate =
+                ex.gate
+                    .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
+            let mut up = ex
                 .up
                 .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
+            // `build_ffn`: `up_b` / `gate_b` before the activation
+            // (`crate::proj_bias`). On an ungated layer `gate` is an
+            // alias of `up` and only `up_b` exists; `act.apply` reads
+            // `up` alone for it, so the gate copy going unbiased is not
+            // read.
+            if let Some(bias) = &layer.moe.dense_bias {
+                bias.add_pre_activation(&mut gate, &mut up, batch_size);
+            }
             let mut activated = act.apply(&gate, &up);
             // bitnet.cpp:135-140, per row, on the same vector the row
             // body norms in `ferrox_moe::run_expert_sub_normed`.
@@ -3631,7 +3667,11 @@ impl Decoder {
                     .flat_map(|row| rms_norm(row, w, config.rms_norm_eps))
                     .collect();
             }
-            ex.down.apply_batch(&activated, batch_size)
+            let mut down = ex.down.apply_batch(&activated, batch_size);
+            if let Some(bias) = &layer.moe.dense_bias {
+                bias.add_post_down(&mut down, batch_size);
+            }
+            down
         }))
     }
 
@@ -4542,7 +4582,6 @@ impl Decoder {
                 self.evict_layer_kv(l, cache);
 
                 let projected_batch = self.attn_out_to_residual_rows(
-                    l,
                     layer,
                     &normed_batch,
                     &mut attn_out_batch,
@@ -4757,7 +4796,6 @@ impl Decoder {
                 }
 
                 let projected_batch = self.attn_out_to_residual_rows(
-                    l,
                     layer,
                     &normed_batch,
                     &mut attn_out_batch,
@@ -5239,11 +5277,11 @@ mod tests {
         let n_layers = d.layers.len();
         for (l, layer) in d.layers.iter_mut().enumerate() {
             layer.attn.sinks = Some((0..n_heads).map(|h| 0.1 + (l + h) as f32 * 0.05).collect());
+            layer.attn.o_bias = Some((0..hidden).map(|j| 0.02 * (j as f32 - 8.0)).collect());
         }
         d.gpt_oss = Some(GptOssWeights {
             layers: (0..n_layers)
                 .map(|_| GptOssLayer {
-                    o_bias: (0..hidden).map(|j| 0.02 * (j as f32 - 8.0)).collect(),
                     router_bias: (0..n_experts).map(|e| 0.03 * e as f32).collect(),
                     expert_bias: (0..n_experts)
                         .map(|e| ferrox_moe::ExpertBias {
