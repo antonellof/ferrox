@@ -909,6 +909,19 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // are refused as unread when a file carries them.
     "orion",
     "nemotron",
+    // tests/proj_bias_graphs.rs: the three rows of the old
+    // "LayerNorm-with-bias group" whose other blocker was the projection
+    // biases (`crate::proj_bias`: `attn_output.bias`, `ffn_up.bias`,
+    // `ffn_down.bias`, all REQUIRED). `starcoder2` (StarCoder2-3B/7B/15B):
+    // the biased LayerNorm, Q/K/V biases, an ungated GELU FFN
+    // (`FfnActivation::GeluUngated`, `starcoder2.cpp:125-131`), NEOX RoPE.
+    // `codeshell` (CodeShell-7B): the same shape with a partial rotary
+    // (`codeshell.cpp:26,81-95`). `jais2` (Jais-2): the biased LayerNorm,
+    // Q/K/V biases, the ungated ReLU-squared FFN (`jais2.cpp:130-136`),
+    // NEOX RoPE, a tied lm_head when `output` is absent (`:16-19`).
+    "starcoder2",
+    "codeshell",
+    "jais2",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1054,16 +1067,20 @@ pub fn uses_weighted_layer_norm(arch: &str) -> bool {
 ///   `TENSOR_NOT_REQUIRED`) that a file carrying them leaves UNREAD
 ///   here, which `assert_every_tensor_consumed` refuses.
 ///
-/// The six the group still holds, each for something ELSE on top of
-/// this norm (the norm is done for all of them): `starcoder2` and
-/// `codeshell` and `jais2` REQUIRE `attn_output.bias`, `ffn_up.bias`
-/// and `ffn_down.bias`, which have no slot on the generic dense path;
-/// `starcoder` those plus a learned `position_embd` with no RoPE;
-/// `stablelm` a parallel residual (`stablelm.cpp`) and its own QK norm
-/// order; `phimoe` an `attn_output.bias`, an `output.bias` on the LM
-/// head and LongRoPE. `tests/attn_bias.rs` pins all six as refused
-/// with the bias named.
-pub const BIASED_LAYER_NORM: &[&str] = &["orion", "nemotron"];
+/// Three more closed the same day once `crate::proj_bias` served the
+/// REQUIRED `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` that
+/// had been their other blocker: `starcoder2` (`starcoder2.cpp:23,35,44`,
+/// an ungated GELU FFN), `codeshell` (`codeshell.cpp:24,31,39`, the
+/// same with a partial rotary) and `jais2` (`jais2.cpp:20,30,44`, the
+/// ReLU-squared FFN); `tests/proj_bias_graphs.rs`.
+///
+/// The three the group still holds, each for something ELSE on top of
+/// this norm (the norm is done for all of them): `starcoder` a learned
+/// `position_embd` with no RoPE; `stablelm` a parallel residual
+/// (`stablelm.cpp`) and its own QK norm order; `phimoe` an
+/// `output.bias` on the LM head and LongRoPE. `tests/attn_bias.rs`
+/// pins all three as refused with the bias named.
+pub const BIASED_LAYER_NORM: &[&str] = &["orion", "nemotron", "starcoder2", "codeshell", "jais2"];
 
 /// See [`BIASED_LAYER_NORM`].
 pub fn uses_biased_layer_norm(arch: &str) -> bool {
@@ -1609,6 +1626,13 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // llama-model.cpp:2653-2654.
         v.push(gqa_neox("orion"));
         v.push(gqa_neox("nemotron"));
+        // The three whose LAST blocker was the projection biases
+        // (`crate::proj_bias`, tests/proj_bias_graphs.rs). NEOX RoPE:
+        // llama-model.cpp:2649 (starcoder2), :2652 (codeshell), :2662
+        // (jais2).
+        v.push(gqa_neox("starcoder2"));
+        v.push(gqa_neox("codeshell"));
+        v.push(gqa_neox("jais2"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1856,25 +1880,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // Every one of these loads clean and answers fluently, which is
         // why they are refused here rather than left to a tensor gate.
         // Pinned by `tests/attn_bias.rs`.
+        // `codeshell`, `jais2` and `starcoder2` were HERE for their
+        // REQUIRED projection biases on top of the LayerNorm biases, and
+        // closed together on `crate::proj_bias` (tests/proj_bias_graphs.rs)
+        // once the norm had closed on `orion` / `nemotron`.
         for (n, rope, reason) in [
-            (
-                "codeshell",
-                Neox,
-                "required bias tensors with no slot in the generic decoder: \
-                 `attn_output.bias`, `ffn_down.bias`, `ffn_up.bias` \
-                 (src/models/codeshell.cpp:36,42,45), plus the LayerNorm biases \
-                 `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:24,31,39) \
-                 -- the generic decoder is RMSNorm-only and drops all six",
-            ),
-            (
-                "jais2",
-                Neox,
-                "required bias tensors with no slot in the generic decoder: \
-                 `attn_output.bias`, `ffn_up.bias`, `ffn_down.bias` \
-                 (src/models/jais2.cpp:41,48,50), plus the LayerNorm biases \
-                 `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:20,30,44). \
-                 Only its Q/K/V biases (:38-40) would have been applied",
-            ),
             (
                 "starcoder",
                 Norm,
@@ -1885,14 +1895,6 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                  biases `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` \
                  (:24,37,46). It also adds a learned `position_embd` to the \
                  embeddings (:75) that the generic decoder has no slot for",
-            ),
-            (
-                "starcoder2",
-                Neox,
-                "required bias tensors with no slot in the generic decoder: \
-                 `attn_output.bias`, `ffn_down.bias`, `ffn_up.bias` \
-                 (src/models/starcoder2.cpp:41,50,51), plus the LayerNorm biases \
-                 `output_norm.bias`, `attn_norm.bias`, `ffn_norm.bias` (:23,35,44)",
             ),
             (
                 "phimoe",
@@ -2680,6 +2682,24 @@ pub fn uses_geglu(arch: &str) -> bool {
 /// implemented and named here.
 pub fn uses_relu_sqr(arch: &str) -> bool {
     matches!(arch, "arcee" | "plm" | "nemotron" | "jais2" | "nemotron-h")
+}
+
+/// Architectures whose FFN is the UNGATED GELU MLP:
+/// `build_ffn(up, up_b, NULL gate, down, down_b, LLM_FFN_GELU,
+/// LLM_FFN_SEQ)`, i.e. `down(gelu(up(x) + up_b)) + down_b`
+/// (`starcoder2.cpp:125-131`, `codeshell.cpp:120-126`).
+///
+/// Eleven graphs pass `LLM_FFN_GELU` under `LLM_FFN_SEQ` upstream --
+/// measured, `grep -l 'LLM_FFN_GELU, *LLM_FFN_SEQ' src/models/*.cpp`:
+/// `bert`, `bloom`, `codeshell`, `falcon`, `gptneox`, `gpt2`, `mpt`,
+/// `phi2`, `starcoder`, `starcoder2`, `wavtokenizer-dec`. The two
+/// listed reach the generic path with nothing else in the way once the
+/// projection biases are served (`crate::proj_bias`); `bert` and
+/// `wavtokenizer-dec` are not decoders, `bloom` / `gpt2` / `mpt` /
+/// `starcoder` have no RoPE, `falcon` / `gptneox` / `phi2` a parallel
+/// residual. The two here map to `FfnActivation::GeluUngated`.
+pub fn uses_gelu_ungated(arch: &str) -> bool {
+    matches!(arch, "starcoder2" | "codeshell")
 }
 
 #[cfg(test)]
@@ -3788,14 +3808,24 @@ mod tests {
         // The sequential-residual siblings stay on the generic path --
         // this is a named list, not a family-wide ban.
         //
-        // `phimoe` and `starcoder2` used to be checked here too. They
-        // left the generic path for an unrelated reason (the required
-        // bias tensors pinned by `tests/attn_bias.rs`), so asserting them
-        // generic would now assert the wrong thing; what still has to
-        // hold is that neither they nor the archs below are refused for
-        // a *residual* reason they do not have. `nemotron` was with them
-        // and is generic again (`BIASED_LAYER_NORM`).
-        for arch in ["phi3", "plamo3", "qwen2", "llama", "nemotron", "orion"] {
+        // `phimoe`, `starcoder2` and `nemotron` used to be checked here
+        // too. They left the generic path for an unrelated reason (the
+        // required bias tensors pinned by `tests/attn_bias.rs`); what
+        // still has to hold is that neither they nor the archs below
+        // are refused for a *residual* reason they do not have.
+        // `nemotron` and `starcoder2` are generic again
+        // (`BIASED_LAYER_NORM`, `crate::proj_bias`); `phimoe` is not.
+        for arch in [
+            "phi3",
+            "plamo3",
+            "qwen2",
+            "llama",
+            "nemotron",
+            "orion",
+            "starcoder2",
+            "codeshell",
+            "jais2",
+        ] {
             assert!(
                 matches!(
                     resolve_architecture(arch),
@@ -3804,7 +3834,7 @@ mod tests {
                 "{arch} must stay generic"
             );
         }
-        for arch in ["phimoe", "starcoder2"] {
+        for arch in ["phimoe"] {
             match resolve_architecture(arch) {
                 Some(ArchPath::DedicatedOnly { reason }) => assert!(
                     reason.contains("bias"),

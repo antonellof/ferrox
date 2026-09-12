@@ -101,6 +101,11 @@ pub enum GluAct {
     Reglu,
     /// `relu(up)^2`; `gate` is an alias of `up` and is not read.
     ReluSqr,
+    /// `gelu(up)`; `gate` is an alias of `up` and is not read --
+    /// llama.cpp's `LLM_FFN_GELU` under `LLM_FFN_SEQ` with a null gate
+    /// (`starcoder2.cpp:125-131`, `codeshell.cpp:120-126`), `ggml_gelu`'s
+    /// tanh form, the same function [`Self::Geglu`] applies to its gate.
+    GeluUngated,
     /// `xielu(up)` with this layer's parameters; `gate` is an alias of
     /// `up` and is not read.
     Xielu(XieluParams),
@@ -183,6 +188,7 @@ impl GluAct {
             GluAct::Geglu => geglu(gate, up),
             GluAct::Reglu => ferrox_core::matmul::reglu(gate, up),
             GluAct::ReluSqr => relu_sqr(up),
+            GluAct::GeluUngated => up.iter().map(|&x| ferrox_core::matmul::gelu(x)).collect(),
             GluAct::SwigluClamped { .. } | GluAct::Xielu(_) => gate
                 .iter()
                 .zip(up)
@@ -213,6 +219,7 @@ impl GluAct {
                 let r = ferrox_core::matmul::relu(up);
                 r * r
             }
+            GluAct::GeluUngated => ferrox_core::matmul::gelu(up),
             GluAct::Xielu(p) => p.apply(up),
         }
     }
@@ -237,9 +244,11 @@ impl GluAct {
         match self {
             GluAct::Swiglu => Some(false),
             GluAct::Geglu => Some(true),
-            GluAct::Reglu | GluAct::ReluSqr | GluAct::SwigluClamped { .. } | GluAct::Xielu(_) => {
-                None
-            }
+            GluAct::Reglu
+            | GluAct::ReluSqr
+            | GluAct::GeluUngated
+            | GluAct::SwigluClamped { .. }
+            | GluAct::Xielu(_) => None,
         }
     }
 
@@ -260,6 +269,7 @@ impl GluAct {
         match self {
             GluAct::Swiglu | GluAct::SwigluClamped { .. } | GluAct::Geglu | GluAct::Reglu => None,
             GluAct::ReluSqr => Some(Ungated::ReluSqr),
+            GluAct::GeluUngated => Some(Ungated::Gelu),
             GluAct::Xielu(p) => Some(Ungated::Xielu(p)),
         }
     }
@@ -273,6 +283,8 @@ impl GluAct {
 pub enum Ungated {
     /// `relu(x)^2`.
     ReluSqr,
+    /// `gelu(x)`, the tanh form.
+    Gelu,
     /// `xielu(x)` with the layer's parameters.
     Xielu(XieluParams),
 }
@@ -282,6 +294,7 @@ impl Ungated {
     pub fn apply(self, up: &[f32]) -> Vec<f32> {
         match self {
             Ungated::ReluSqr => relu_sqr(up),
+            Ungated::Gelu => up.iter().map(|&x| ferrox_core::matmul::gelu(x)).collect(),
             Ungated::Xielu(p) => up.iter().map(|&x| p.apply(x)).collect(),
         }
     }

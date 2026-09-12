@@ -17,6 +17,28 @@ are the ones worth reading twice.
 
 ### Added
 
+- **Projection biases on the dense path; `starcoder2`, `codeshell`
+  and `jais2` run, and a `llama` file with biases loads.**
+  `ferrox_models::proj_bias` reads `attn_output.bias` into
+  `AttnWeights::o_bias` (added after `wo` and `o_scale`, `build_attn`'s
+  order; gpt-oss's bias moved here from its side table) and the dense
+  FFN's `ffn_{up,gate,down}.bias` into `MoeWeights::dense_bias`
+  (`ferrox_moe::DenseBias`; `run_expert_biased` adds `up_b` / `gate_b`
+  before the activation and `down_b` after `down`, on the same
+  gate/up projections the unbiased body uses), for exactly the
+  architectures whose graph creates the tensors: two tables measured
+  over all 140 graphs (33 create `wo_b`, 27 the FFN biases, most
+  OPTIONAL) with a `Required` / `Optional` column, so a bias on an
+  architecture whose graph never creates it stays refused as unread.
+  `FfnActivation::GeluUngated` (`LLM_FFN_GELU` under `LLM_FFN_SEQ`,
+  eleven graphs) is aliased like `ReluSqr`. Every fused Metal dense
+  launch and the attention view fence on the two fields. Goldens
+  (`tests/proj_bias_graphs.rs`): `jais2` KL 6.6e-13; a `llama` with
+  all four biases 2.7e-13 (the gate bias's only exercise); `starcoder2`
+  4.7e-7 and `codeshell` 4.7e-6 at a documented 1e-2 line, because
+  their 3e-3 / 8e-3 max deltas are entirely llama.cpp's f16 GELU table
+  (emulated: 2e-13 / 1e-12); Nemotron's optional biases, refused the
+  PR before, 2.1e-13. 61 audited.
 - **`orion` and `nemotron` run: the LayerNorm with a bias.**
   `NormOp::LayerNormBias` is `build_norm(x, w, b, LLM_NORM, il)` --
   multiply, then add -- the variant `capability::WEIGHTED_LAYER_NORM`

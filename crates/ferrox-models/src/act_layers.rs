@@ -327,6 +327,7 @@ impl ModelConfig {
             // Ungated on disk: the loader aliases gate to up and the
             // body reads `up` alone. See `FfnActivation::ReluSqr`.
             FfnActivation::ReluSqr => LayerFfnActs::same(GluAct::ReluSqr),
+            FfnActivation::GeluUngated => LayerFfnActs::same(GluAct::GeluUngated),
             // Gated on disk and in the body: a real gate. See
             // `FfnActivation::Reglu`.
             FfnActivation::Reglu => LayerFfnActs::same(GluAct::Reglu),
@@ -355,6 +356,7 @@ impl ModelConfig {
             | FfnActivation::SwigluFused
             | FfnActivation::Gelu
             | FfnActivation::ReluSqr
+            | FfnActivation::GeluUngated
             | FfnActivation::Reglu => Some(self.layer_ffn_acts(0).dense),
         }
     }
@@ -367,7 +369,7 @@ impl ModelConfig {
     /// have been forgotten.
     pub fn ffn_is_ungated(&self) -> bool {
         match &self.ffn_activation {
-            FfnActivation::ReluSqr | FfnActivation::Xielu(_) => true,
+            FfnActivation::ReluSqr | FfnActivation::GeluUngated | FfnActivation::Xielu(_) => true,
             FfnActivation::Swiglu
             | FfnActivation::SwigluFused
             | FfnActivation::SwigluClamped(_)
@@ -455,6 +457,7 @@ mod tests {
             (FfnActivation::SwigluFused, GluAct::Swiglu, false),
             (FfnActivation::Gelu, GluAct::Geglu, false),
             (FfnActivation::ReluSqr, GluAct::ReluSqr, true),
+            (FfnActivation::GeluUngated, GluAct::GeluUngated, true),
             // NOT aliased: the gate is a real tensor, and the body is
             // the one that reads it.
             (FfnActivation::Reglu, GluAct::Reglu, false),

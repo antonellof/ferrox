@@ -140,12 +140,12 @@ impl Decoder {
         self.apply_attn_temperature(&mut q, q_width, |_| pos);
 
         let mut attn_out = self.push_and_attend_row(kv, layer_idx, layer, &k, &v, &q);
-        Some(self.attn_out_to_residual_rows(layer_idx, layer, normed, &mut attn_out, 1))
+        Some(self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1))
     }
 
     /// Everything between the softmax-weighted V sum and the residual
-    /// add, for `rows` rows at once: the output gate, `o_proj`,
-    /// gpt-oss's `o_bias`, and `post_attn_norm`.
+    /// add, for `rows` rows at once: the output gate, `o_proj`, its
+    /// scale and bias, and `post_attn_norm`.
     ///
     /// ONE body for the row path (`rows == 1`) and the two batched
     /// host bodies. Before the gate existed each of the three spelled
@@ -156,7 +156,6 @@ impl Decoder {
     /// projects the gate from (`crate::attn_gate`).
     pub(crate) fn attn_out_to_residual_rows(
         &self,
-        layer_idx: usize,
         layer: &LayerWeights,
         normed: &[f32],
         attn_out: &mut [f32],
@@ -186,19 +185,22 @@ impl Decoder {
         } else {
             layer.attn.o_proj.apply_batch(attn_out, rows)
         };
-        if let Some(oai) = self.gpt_oss.as_ref().map(|g| &g.layers[layer_idx]) {
-            let hidden = oai.o_bias.len();
-            for row in projected.chunks_mut(hidden) {
-                for (x, b) in row.iter_mut().zip(oai.o_bias.iter()) {
-                    *x += b;
-                }
-            }
-        }
         // `build_lora_mm(wo, cur, wo_s)`: the `{1}` companion multiplied
-        // onto the projection's output (`crate::weight_scales`).
+        // onto the projection's output (`crate::weight_scales`)...
         if let Some(scale) = layer.attn.o_scale {
             for x in projected.iter_mut() {
                 *x *= scale;
+            }
+        }
+        // ...and THEN `wo_b`, the order `build_attn` has
+        // (`crate::proj_bias`; gpt-oss's, starcoder2's, every graph
+        // that creates the tensor).
+        if let Some(b) = &layer.attn.o_bias {
+            let hidden = b.len();
+            for row in projected.chunks_mut(hidden) {
+                for (x, b) in row.iter_mut().zip(b.iter()) {
+                    *x += b;
+                }
             }
         }
         // mimo2.cpp:180-183: the branch scaled AFTER `wo`, before the

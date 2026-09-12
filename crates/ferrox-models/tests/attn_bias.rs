@@ -25,7 +25,7 @@
 //!   three fields by the same spans that split the fused weight. The
 //!   fused spelling was unread until 2026-09-10, which is why `qwen`
 //!   and `chatglm` were refused; both are audited now.
-//! - `GptOssLayer::{o_bias, router_bias}` — gpt-oss's
+//! - `AttnWeights::o_bias` and `GptOssLayer::router_bias` -- gpt-oss's
 //!   `blk.N.attn_output.bias` and `blk.N.ffn_gate_inp.bias`, on the
 //!   gpt-oss path only.
 //!
@@ -246,11 +246,31 @@ const GPT_OSS_EXEMPTION: &str = "gpt-oss";
 /// filter below asks the capability list instead.
 const LAYER_NORM_BIASES: &[&str] = &["output_norm.bias", "attn_norm.bias", "ffn_norm.bias"];
 
+/// The projection biases, applied for exactly the architectures whose
+/// graph creates them (`ferrox_models::proj_bias`'s two tables).
+const PROJECTION_BIASES: &[&str] = &[
+    "attn_output.bias",
+    "ffn_up.bias",
+    "ffn_down.bias",
+    "ffn_gate.bias",
+];
+
+fn creates_projection_bias(arch: &str, bias: &str) -> bool {
+    use ferrox_models::proj_bias::{ATTN_OUT_BIAS_CREATORS, FFN_BIAS_CREATORS};
+    match bias {
+        "attn_output.bias" => ATTN_OUT_BIAS_CREATORS.iter().any(|(n, _)| *n == arch),
+        "ffn_up.bias" | "ffn_down.bias" => FFN_BIAS_CREATORS.iter().any(|(n, _, _)| *n == arch),
+        "ffn_gate.bias" => FFN_BIAS_CREATORS.iter().any(|(n, _, g)| *n == arch && *g),
+        _ => false,
+    }
+}
+
 /// Whether the generic path applies `bias` for `arch`.
 fn applied(arch: &str, bias: &str) -> bool {
     GENERIC_DECODER_APPLIES.contains(&bias)
         || (LAYER_NORM_BIASES.contains(&bias)
             && ferrox_models::capability::uses_biased_layer_norm(arch))
+        || (PROJECTION_BIASES.contains(&bias) && creates_projection_bias(arch, bias))
 }
 
 /// gpt-oss's exemption has to be backed by code, not by this constant.
@@ -332,7 +352,7 @@ fn the_layer_norm_bias_entry_is_backed_by_real_code() {
 
 #[test]
 fn the_gpt_oss_exemption_is_backed_by_real_fields() {
-    let _o_bias: fn(&ferrox_models::decoder::GptOssLayer) -> &Vec<f32> = |l| &l.o_bias;
+    let _o_bias: fn(&ferrox_models::decoder::AttnWeights) -> &Option<Vec<f32>> = |a| &a.o_bias;
     let _router_bias: fn(&ferrox_models::decoder::GptOssLayer) -> &Vec<f32> = |l| &l.router_bias;
     assert!(matches!(
         resolve_profile(GPT_OSS_EXEMPTION).map(|p| p.path),
@@ -397,15 +417,9 @@ fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path()
 /// moment that other reason is fixed.
 #[test]
 fn the_bias_refusals_name_the_bias() {
-    // `nemotron` and `orion` were here; their biases are applied now.
-    for arch in [
-        "codeshell",
-        "jais2",
-        "stablelm",
-        "starcoder",
-        "starcoder2",
-        "phimoe",
-    ] {
+    // `nemotron`, `orion`, `codeshell`, `jais2` and `starcoder2` were
+    // here; their biases are applied now.
+    for arch in ["stablelm", "starcoder", "phimoe"] {
         match resolve_profile(arch).map(|p| p.path) {
             Some(ArchPath::DedicatedOnly { reason }) => assert!(
                 reason.contains("bias"),

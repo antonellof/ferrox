@@ -8,6 +8,7 @@
 //! scheduler rather than copied CLI-flag parsing code. See
 //! docs/THIRD_PARTY_NOTICES.md.
 
+pub mod dense_bias;
 pub mod glu_act;
 
 use ferrox_core::weight_matrix::WeightMatrix;
@@ -945,6 +946,7 @@ pub fn run_expert_oai(
     out
 }
 
+pub use dense_bias::{run_expert_biased, DenseBias};
 pub use glu_act::{relu_sqr, GluAct, Ungated, XieluParams};
 
 /// Runs one token's hidden state through a single expert's gated FFN.
@@ -996,8 +998,8 @@ pub fn run_expert_sub_normed(
 /// the down projection reads, on the fastest path the weights and the
 /// backend admit.
 ///
-/// The one body behind [`run_expert`] and [`run_expert_sub_normed`]; a
-/// fifth arm added here reaches both.
+/// The one body behind [`run_expert`], [`run_expert_sub_normed`] and
+/// `dense_bias::run_expert_biased`; a fifth arm added here reaches all.
 fn expert_activated(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f32> {
     // Ungated: `gate` is an alias of `up`, so one projection is the
     // whole FFN input. `apply` is the full matvec dispatcher (int-dot,
@@ -1006,6 +1008,16 @@ fn expert_activated(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<
         let up = expert.up.apply(hidden);
         return f.apply(&up);
     }
+    let (gate, up) = gate_up_projections(hidden, expert);
+    act.apply(&gate, &up)
+}
+
+/// `gate(x)` and `up(x)` for one gated expert, on the fastest path the
+/// weights and the backend admit: one GPU multi-matvec, one shared Q8
+/// activation quant, or two host matvecs in parallel. The projections
+/// BEFORE any activation, which is where a bias lands
+/// (`dense_bias::run_expert_biased`).
+pub(crate) fn gate_up_projections(hidden: &[f32], expert: &ExpertWeights) -> (Vec<f32>, Vec<f32>) {
     #[cfg(any(feature = "cuda", feature = "metal"))]
     {
         // Gate and up share `hidden` — one GPU upload / multi-matvec.
@@ -1015,7 +1027,7 @@ fn expert_activated(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<
         {
             let up = outs.pop().unwrap();
             let gate = outs.pop().unwrap();
-            return act.apply(&gate, &up);
+            return (gate, up);
         }
     }
     // Share one Q8 activation quant across gate+up when INT_DOT is on
@@ -1033,12 +1045,10 @@ fn expert_activated(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<
             || expert.up.apply_cpu_q8(&act_q8),
         );
         if let (Some(gate), Some(up)) = (g, u) {
-            return act.apply(&gate, &up);
+            return (gate, up);
         }
     }
-    let (gate, up) =
-        ferrox_core::par::join2(|| expert.gate.apply(hidden), || expert.up.apply(hidden));
-    act.apply(&gate, &up)
+    ferrox_core::par::join2(|| expert.gate.apply(hidden), || expert.up.apply(hidden))
 }
 
 /// `run_expert`, but actually consulting `placement` instead of always

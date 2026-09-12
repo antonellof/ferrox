@@ -77,6 +77,7 @@ pub mod parallel_dense_ffn;
 pub mod penalty_window;
 pub mod pooling;
 pub mod prefix_cache;
+pub mod proj_bias;
 pub(crate) mod qkv_fused;
 pub mod rank_head;
 pub mod recurrent_engine;

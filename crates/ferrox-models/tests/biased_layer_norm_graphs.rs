@@ -13,14 +13,14 @@
 //!   and no `rope.freq_base` in the file (`conversion/orion.py:13-37`).
 //! - `nemotron` (Nemotron-4, Minitron): the ungated ReLU-squared FFN
 //!   `arcee` already serves, partial NEOX RoPE, and three OPTIONAL
-//!   biases (`nemotron.cpp:31,40-41`) the generic dense path has no slot
-//!   for -- a file carrying them is refused as unread.
+//!   biases (`nemotron.cpp:31,40-41`), served through
+//!   `ferrox_models::proj_bias`.
 //!
 //! | fixture | what it isolates |
 //! |---|---|
 //! | `orion` | the converter's shape: six per-layer norm tensors and two output-norm tensors, NEOX at the defaults |
 //! | `nemotron` | the same norm on the ReLU-squared graph with a half-width rotary and `rope.scaling.type = none` |
-//! | `nemotron_biases` | the optional `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` present; libllama applies them (its logits move by 8.07), ferrox refuses the file rather than drop them |
+//! | `nemotron_biases` | the optional `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` present; libllama applies them (its logits move by 8.07) and so does ferrox (`ferrox_models::proj_bias`; the file was refused as unread until then) |
 //!
 //! # Where the numbers come from
 //!
@@ -32,6 +32,7 @@
 //! |---|---|---|
 //! | `orion` | 2.33e-11 | 1.64e-05 (see `ORION_TOL`) |
 //! | `nemotron` | 5.13e-13 | 4.86e-06 |
+//! | `nemotron_biases` | 2.12e-13 | 1.67e-06 |
 //!
 //! ```text
 //! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_orion_fixture.py \
@@ -46,13 +47,13 @@
 mod common;
 use common::{
     assert_all_three_paths_match, assert_all_three_paths_match_within,
-    assert_decoder_matches_on_all_three_paths, graph_caches, graph_fixture_path, kl_vs_golden,
-    load_graph_fixture, worst_vs, GRAPH_PROMPT, GRAPH_TOL,
+    assert_decoder_matches_on_all_three_paths, graph_caches, kl_vs_golden, load_graph_fixture,
+    worst_vs, GRAPH_PROMPT, GRAPH_TOL,
 };
 use ferrox_models::capability::{resolve_architecture, ArchPath, BIASED_LAYER_NORM};
 use ferrox_models::config::RopeLayout;
 use ferrox_models::norm::NormOp;
-use ferrox_models::{Decoder, FfnActivation, ModelConfig};
+use ferrox_models::{Decoder, FfnActivation};
 
 const ORION: &str = "orion";
 const NEMOTRON: &str = "nemotron";
@@ -173,6 +174,57 @@ const NEMOTRON_GOLDEN: [f32; 48] = [
     -4.941042,
 ];
 
+const NEMOTRON_BIASES_GOLDEN: [f32; 48] = [
+    -0.099040985,
+    1.3401679,
+    2.5483196,
+    3.285528,
+    0.7544235,
+    0.7297962,
+    -0.5689188,
+    -0.63956916,
+    3.7740033,
+    1.2493689,
+    -0.21804833,
+    -1.5416384,
+    4.326164,
+    3.3956451,
+    1.4229816,
+    6.002896,
+    -1.0376884,
+    3.2586145,
+    1.7087011,
+    0.9277668,
+    1.2896775,
+    -3.8718052,
+    0.20172691,
+    2.3414617,
+    -2.0978575,
+    6.188236,
+    -0.6020012,
+    -0.21268833,
+    1.4116925,
+    -4.145981,
+    3.3045216,
+    -3.8645248,
+    1.1280957,
+    3.9081452,
+    -2.9068446,
+    3.806527,
+    3.7238379,
+    -2.73756,
+    0.490641,
+    1.7376442,
+    3.0176234,
+    -0.113073766,
+    0.86612034,
+    -1.4732623,
+    0.44669294,
+    0.3666135,
+    0.53473485,
+    3.1325328,
+];
+
 fn decode(decoder: &Decoder) -> Vec<f32> {
     let mut kv = graph_caches(decoder);
     let mut out = Vec::new();
@@ -194,7 +246,11 @@ fn nemotron_matches_llama_cpp_on_all_three_paths() {
 
 #[test]
 fn report_kl_against_llama_cpp() {
-    for (name, golden) in [(ORION, &ORION_GOLDEN), (NEMOTRON, &NEMOTRON_GOLDEN)] {
+    for (name, golden) in [
+        (ORION, &ORION_GOLDEN),
+        (NEMOTRON, &NEMOTRON_GOLDEN),
+        (NEMOTRON_BIASES, &NEMOTRON_BIASES_GOLDEN),
+    ] {
         let out = decode(&load_graph_fixture(name));
         println!(
             "{name}: KL(llama.cpp || ferrox) = {:.3e}, max |delta| = {:.3e}",
@@ -210,7 +266,7 @@ fn report_kl_against_llama_cpp() {
 /// FFN are what the graphs read.
 #[test]
 fn the_loaded_layers_are_the_two_graphs() {
-    assert_eq!(BIASED_LAYER_NORM, &["orion", "nemotron"]);
+    assert!(BIASED_LAYER_NORM.starts_with(&["orion", "nemotron"]));
     for name in [ORION, NEMOTRON] {
         assert!(matches!(
             resolve_architecture(name),
@@ -257,25 +313,21 @@ fn the_loaded_layers_are_the_two_graphs() {
     assert_eq!(nemotron.config.ffn_activation, FfnActivation::ReluSqr);
 }
 
-/// Nemotron's optional projection biases: llama.cpp applies them (the
-/// two goldens differ by 8.07), the generic dense path has no slot for
-/// them, and the file is refused rather than run unbiased. The plain
-/// file, which differs only by those three tensors per layer, loads.
+/// Nemotron's optional projection biases: `nemotron.cpp:31,40-41`
+/// create them `TENSOR_NOT_REQUIRED` and llama.cpp applies them (the
+/// two goldens differ by 8.07). They are served through
+/// `ferrox_models::proj_bias` -- the file used to be refused as
+/// carrying unread tensors -- and match libllama.
 #[test]
-fn nemotrons_optional_projection_biases_are_refused_not_dropped() {
-    let file =
-        ferrox_gguf::GgufFile::open(graph_fixture_path(NEMOTRON_BIASES)).expect("fixture opens");
-    let config = ModelConfig::from_gguf(&file).expect("the config reads");
-    let err = Decoder::from_gguf(graph_fixture_path(NEMOTRON_BIASES), config)
-        .err()
-        .expect("a file with biases the generic path cannot apply is refused");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("ffn_up.bias")
-            || msg.contains("attn_output.bias")
-            || msg.contains("ffn_down.bias"),
-        "the refusal names a bias: {msg}"
-    );
+fn nemotrons_optional_projection_biases_are_applied() {
+    assert_all_three_paths_match(NEMOTRON_BIASES, &NEMOTRON_BIASES_GOLDEN);
+    let d = load_graph_fixture(NEMOTRON_BIASES);
+    for layer in &d.layers {
+        assert!(layer.attn.o_bias.is_some());
+        let bias = layer.moe.dense_bias.as_ref().expect("read");
+        assert!(bias.up.is_some() && bias.down.is_some() && bias.gate.is_none());
+    }
+    assert!(worst_vs(&NEMOTRON_GOLDEN, &NEMOTRON_BIASES_GOLDEN) > 1.0);
 }
 
 /// Each half of the norm, sabotaged on the loaded decoder: the bias
