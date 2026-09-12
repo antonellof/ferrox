@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **64** architectures run with
+Honest position, re-audited 2026-09-12. **65** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -757,9 +757,19 @@ and not only by a test that flips it. `gptneox` also drew on three
 seams from the two days before -- the biased LayerNorm, the fused
 `attn_qkv` bias, the required projection biases with the ungated GELU
 -- which is what "one row per PR" buys: the next row finds its other
-blockers already named. `command-r`, `cohere2`, `cohere2moe`, `falcon`
-and `phi2` stay refused with what each needs ON TOP of the residual
-written into the reason.
+blockers already named. `command-r` (Command-R 35B, Aya-23) is the
+proof of that one PR later: what it needed on top of the residual was
+`dbrx`'s weighted LayerNorm without a bias and the `logit_scale`
+multiply `grok` / `talkie` already had, in an OPTIONAL form
+(`command-r.cpp:4` reads it `required = false`, `:137` skips it at
+zero; `LogitScaleUse::AsIsOptional`, with a fixture that omits the key
+and matches libllama's unscaled logits, ratio 0.0625 to the scaled
+file's). KL 1.0e-15 (`tests/command_r_graphs.rs`). Command-R+ (64
+layers) carries the per-head LayerNorm QK norm llama.cpp REQUIRES at
+that depth (`:28-31`) and is refused by name from a 64-layer fixture
+libllama runs. `cohere2`, `cohere2moe`, `falcon` and `phi2` stay
+refused with what each needs ON TOP of the residual written into the
+reason.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what
@@ -848,9 +858,8 @@ expressible, and the fixture that evidences it declares NO key at all --
 the only fixture shape that can tell the hook from its absence. A second
 one declares all three and pins that the file still wins, because a hook
 merged the wrong way round would agree with llama.cpp on exactly the
-files that prove it exists. Command-R's parallel residual is served
-since 2026-09-12 (below); what keeps it off the generic path is the
-weighted LayerNorm without a bias and the `logit_scale` multiply.
+files that prove it exists. Command-R closed on 2026-09-12 once its
+parallel residual was served (below).
 
 `grok` closed on 2026-09-11 on that same hook, one day after it landed,
 and the verdict had predicted it: `grok.cpp:5-12` seeds SEVEN

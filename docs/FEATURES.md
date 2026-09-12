@@ -127,6 +127,16 @@ is faster.
   `false` (libllama differs by 3.73 between them; both matched, at the
   f16 GELU-table line), `plamo` KL 1.6e-13; the `stablelm` parallel
   fixture, refused the PR before, matches.
+- **Command-R (`command-r`): Command-R 35B and Aya-23 run.** The
+  shared-norm parallel residual over the weighted LayerNorm WITHOUT a
+  bias (`capability::WEIGHTED_LAYER_NORM`'s second caller after `dbrx`),
+  a `logit_scale` MULTIPLY the graph skips when the key is absent or
+  zero (`LogitScaleUse::AsIsOptional`; a fixture without the key pins
+  it), a tied lm_head, NORM RoPE at base 8e6. KL 1.0e-15
+  (`tests/command_r_graphs.rs`). Command-R+ (64 layers) carries the
+  per-head LayerNorm QK norm llama.cpp REQUIRES at that depth and is
+  refused by name (`ferrox_models::qk_layer_norm`) from a 64-layer
+  fixture libllama runs.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row
@@ -322,10 +332,10 @@ is faster.
   `rope.scaling.finetuned = false` stops too, because llama.cpp then
   runs it with no rotation at all and there is no way to express that
   here.
-- **Five parallel-residual architectures still do not load**:
-  `command-r`, `cohere2`, `cohere2moe`, `falcon`, `phi2`. The residual
-  itself is served (`ferrox_models::parallel_residual`, below); each of
-  these names what it needs on top of it.
+- **Four parallel-residual architectures still do not load**:
+  `cohere2`, `cohere2moe`, `falcon`, `phi2`. The residual itself is
+  served (`ferrox_models::parallel_residual`, below); each of these
+  names what it needs on top of it.
 
 Full matrix: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·

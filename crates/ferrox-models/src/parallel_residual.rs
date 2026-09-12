@@ -60,7 +60,9 @@
 //! Evidence (`tests/parallel_residual_graphs.rs`): `gptneox` under the
 //! key, both values, and `plamo`, against libllama; the `stablelm`
 //! shape that was refused by this module for one PR
-//! (`tests/stablelm_graphs.rs`) matches now. `use_parallel_residual`
+//! (`tests/stablelm_graphs.rs`) matches now, and `command-r` followed
+//! on the shared-norm arm over a weighted LayerNorm
+//! (`tests/command_r_graphs.rs`). `use_parallel_residual`
 //! is read by `gptneox.cpp:5` and by NOTHING in `stablelm.cpp`
 //! (libllama's logits with and without it are byte-identical there,
 //! measured), which is why `stablelm`'s rule is the tensor and
@@ -216,9 +218,9 @@ mod tests {
             );
             assert_eq!(
                 generic,
-                matches!(row.arch, "stablelm" | "gptneox" | "plamo"),
+                matches!(row.arch, "stablelm" | "gptneox" | "plamo" | "command-r"),
                 "`{}`: a generic-path row here must have a golden in \
-                 tests/parallel_residual_graphs.rs",
+                 tests/parallel_residual_graphs.rs or its own graph test",
                 row.arch
             );
         }
