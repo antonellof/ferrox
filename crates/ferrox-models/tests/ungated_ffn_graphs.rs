@@ -7,8 +7,9 @@
 //! `down(relu(up(x))^2)`. The verdict shared that constant with `plm`
 //! and predicted the pair would close together; reading `plm.cpp`
 //! against `arcee.cpp` before assuming so found MLA attention in it, so
-//! only this row closed and `plm`'s verdict now says which half is done
-//! (`capability::UNGATED_RELU_SQR`).
+//! only this row closed then; `plm` closed the next day on the MLA
+//! engine, whose loader aliases the gate the same way
+//! (`ferrox_models::mla_arch`, tests/plm_graphs.rs).
 //!
 //! **How the FFN is spelled.** `ExpertWeights` has three required
 //! matrices and thirty construction sites; the ungated FFN is not given

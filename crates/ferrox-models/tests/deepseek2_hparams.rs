@@ -101,7 +101,7 @@ fn the_per_head_dims_are_derived_the_way_llama_cpp_derives_them() {
     );
     assert_eq!(hp.v_head_dim, V_HEAD, "v_head = value_length_mla");
     assert_eq!(hp.kv_lora_rank, KV_LORA);
-    assert_eq!(hp.q_lora_rank, Q_LORA);
+    assert_eq!(hp.q_lora_rank, Some(Q_LORA));
 }
 
 /// The trap this replaced, and the reason the fix is not "read

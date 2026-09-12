@@ -252,7 +252,7 @@ mod tests {
     use crate::kda::KdaAttnWeights;
     use crate::latent_moe::KimiExpertBacking;
     use crate::latent_moe::KimiExpertWeights;
-    use crate::mla::MlaAttnWeights;
+    use crate::mla::{MlaAttnWeights, MlaQProj};
     use ferrox_core::tensor::Tensor;
 
     const HIDDEN_DIM: usize = 8;
@@ -902,13 +902,15 @@ mod tests {
         let layer1 = KimiDecoderLayerWeights {
             input_layernorm_weight: L1_INPUT_LAYERNORM_W.to_vec(),
             attn: KimiLayerAttention::Mla(Box::new(MlaAttnWeights {
-                q_a_proj: wm(&MLA_Q_A_PROJ, MLA_Q_LORA, HIDDEN_DIM),
-                q_a_layernorm: MLA_Q_A_NORM_W.to_vec(),
-                q_b_proj: wm(
-                    &MLA_Q_B_PROJ,
-                    MLA_NUM_HEADS * (MLA_QK_NOPE + MLA_QK_ROPE),
-                    MLA_Q_LORA,
-                ),
+                q: MlaQProj::LowRank {
+                    a: wm(&MLA_Q_A_PROJ, MLA_Q_LORA, HIDDEN_DIM),
+                    norm: MLA_Q_A_NORM_W.to_vec(),
+                    b: wm(
+                        &MLA_Q_B_PROJ,
+                        MLA_NUM_HEADS * (MLA_QK_NOPE + MLA_QK_ROPE),
+                        MLA_Q_LORA,
+                    ),
+                },
                 kv_a_proj_with_mqa: wm(&MLA_KV_A_PROJ, MLA_KV_LORA + MLA_QK_ROPE, HIDDEN_DIM),
                 kv_a_layernorm: MLA_KV_A_NORM_W.to_vec(),
                 kv_b_proj: wm(

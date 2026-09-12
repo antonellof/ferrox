@@ -48,7 +48,7 @@ use crate::config::LayerAttentionKind;
 use crate::kda::KdaAttnWeights;
 use crate::kimi_decoder::DenseMlpWeights;
 use crate::latent_moe::{KimiExpertBacking, KimiExpertWeights, KimiLatentMoeWeights};
-use crate::mla::MlaAttnWeights;
+use crate::mla::{MlaAttnWeights, MlaQProj};
 use ferrox_core::expert_store::{ExpertKey, ExpertSource, ExpertStore};
 
 #[derive(Debug, Error)]
@@ -191,19 +191,21 @@ pub fn load_mla_attn(
 ) -> Result<MlaAttnWeights, KimiLoadError> {
     let q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
     Ok(MlaAttnWeights {
-        q_a_proj: load_weight_matrix(
-            shard,
-            &format!("{prefix}.self_attn.q_a_proj.weight"),
-            q_lora_rank,
-            hidden_dim,
-        )?,
-        q_a_layernorm: load_f32_vec(shard, &format!("{prefix}.self_attn.q_a_layernorm.weight"))?,
-        q_b_proj: load_weight_matrix(
-            shard,
-            &format!("{prefix}.self_attn.q_b_proj.weight"),
-            num_heads * q_head_dim,
-            q_lora_rank,
-        )?,
+        q: MlaQProj::LowRank {
+            a: load_weight_matrix(
+                shard,
+                &format!("{prefix}.self_attn.q_a_proj.weight"),
+                q_lora_rank,
+                hidden_dim,
+            )?,
+            norm: load_f32_vec(shard, &format!("{prefix}.self_attn.q_a_layernorm.weight"))?,
+            b: load_weight_matrix(
+                shard,
+                &format!("{prefix}.self_attn.q_b_proj.weight"),
+                num_heads * q_head_dim,
+                q_lora_rank,
+            )?,
+        },
         kv_a_proj_with_mqa: load_weight_matrix(
             shard,
             &format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),

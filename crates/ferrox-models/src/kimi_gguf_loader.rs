@@ -46,7 +46,7 @@ use crate::kimi_decoder::{
 use crate::latent_moe::{KimiExpertBacking, KimiExpertWeights, KimiLatentMoeWeights};
 use crate::loader::LoadError;
 use crate::loader::{load_f32_vec, load_weight_matrix, split_expert_tensor};
-use crate::mla::MlaAttnWeights;
+use crate::mla::{MlaAttnWeights, MlaQProj};
 
 /// Real per-layer hyperparameters needed to load any layer from a real
 /// Kimi K3 GGUF file -- the GGUF counterpart of
@@ -234,9 +234,11 @@ fn load_mla_attn(
     );
 
     Ok(MlaAttnWeights {
-        q_a_proj,
-        q_a_layernorm: load_f32_vec(file, &format!("blk.{l}.attn_q_a_norm.weight"))?,
-        q_b_proj,
+        q: MlaQProj::LowRank {
+            a: q_a_proj,
+            norm: load_f32_vec(file, &format!("blk.{l}.attn_q_a_norm.weight"))?,
+            b: q_b_proj,
+        },
         kv_a_proj_with_mqa,
         kv_a_layernorm: load_f32_vec(file, &format!("blk.{l}.attn_kv_a_norm.weight"))?,
         kv_b_proj: load_weight_matrix(file, &format!("blk.{l}.attn_kv_b.weight"))?,
