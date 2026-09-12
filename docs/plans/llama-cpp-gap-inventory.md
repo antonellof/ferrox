@@ -1052,3 +1052,49 @@ belongs in the gap inventory because "same or better performance on the
 same models" is the goal and a KL of 7.7e-3 is the sort of thing that
 becomes a wrong answer at a longer context or a narrower top-2 margin —
 gemma-2's margin here is 4.7e-2, which is not much headroom.
+
+### 10.1 Measured 2026-09-12: on PLM's MLA, Q8_0 drifts too, and it is llama.cpp's loss
+
+The section above says `Q8_0` activations MATCH. That held for every
+generic-path checkpoint measured (Llama-3.2-1B Q8_0: 2.4e-4 with flash
+attention off, 6.9e-4 with it on) and does NOT hold for the first real
+MLA checkpoint put in front of `ferrox parity`: **PLM-1.8B-Instruct
+Q8_0** reads `WRONG` at KL 3.54e-2 (top-1 agrees, top-10 overlap 9/10).
+
+The arbiter is the dequantized file (`scripts/dequantize_gguf.py`
+writes the same checkpoint as ALL_F32; 6.8 GiB), run through both
+engines with `--dump-logits`, on the same five token ids:
+
+| | KL |
+|---|---|
+| llama.cpp f32 vs ferrox f32 (the graph) | **4.53e-5** |
+| llama.cpp f32 vs llama.cpp Q8_0 (llama.cpp's own quantization loss) | **3.72e-2** |
+| llama.cpp f32 vs ferrox Q8_0 (ferrox's) | **4.52e-5** |
+| ferrox f32 vs ferrox Q8_0 | 2.8e-9 |
+| llama.cpp Q8_0 vs ferrox Q8_0 (what `parity` reports) | 3.54e-2 |
+
+So the graph agrees to 4.5e-5 (the residual is llama.cpp's F16 KV
+cache; the F32 fixtures agree to 1e-13), ferrox's Q8_0 inference is
+2.8e-9 from its own f32 -- Q8_0 WEIGHTS are that lossless -- and the
+entire `WRONG` is the reference's 8-bit ACTIVATION quantization, which
+on this graph costs three orders of magnitude more than on a Llama.
+Where it bites was bisected on a real-dims synthetic fixture, quantizing
+one tensor at a time: `attn_kv_a_mqa` and `attn_kv_b` Q8_0 each move
+llama.cpp 7e-2 from the f32 answer, `attn_q` 8e-3, `attn_output` 1e-4,
+`ffn_up` 4e-8. The compressed latent (`kv_lora_rank = 512` wide,
+RMS-normed) is quantized to Q8_0 in 32-wide blocks before `kv_b`
+re-expands it into every head's K and V, and MLA latents carry the
+outlier channels that per-block 8-bit quantization is worst at.
+
+Two things follow. `ferrox parity`'s `WRONG` line for Q8_0 (1e-2
+absolute, from llama.cpp's build-to-build spread) assumes the reference
+is exact to within noise on Q8_0, and on MLA it is not; the dequantized
+file is the way to tell, and the recipe is in `docs/CLI.md`. And the
+number worth having about PLM is the other one: ferrox serves the Q8_0
+file at 4.5e-5 from f32 where llama.cpp serves it at 3.7e-2.
+
+The same run found that llama.cpp aborts on this file with flash
+attention on (`ggml_set_rows: GGML_ASSERT(a->ne[0] == b->ne[0])` from
+`build_attn`, K head 192 / V head 128; 1269cb1), so
+`LLAMA_LOGITS_FLASH_ATTN=0` was added to the dumper; that is
+llama.cpp's defect, not measured here beyond noting it.
