@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use attn_block::KvStep;
 use ferrox_core::attention::{
-    causal_gqa_attention_prefill_shared_kv_windowed, causal_gqa_attention_softcap,
+    causal_gqa_attention_prefill_shared_kv_split, causal_gqa_attention_row,
+    causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
@@ -884,6 +885,13 @@ impl Decoder {
             // kernel norms between attention and `wo`, or between the
             // activation and `down`.
             && !config.block_sub_norms
+            // Every fused launch takes ONE head width for K and V (the
+            // KV buffers, the attention tile, the `wo` fold); MiMo-V2's
+            // split widths stay on the host (`crate::kv_head_dims`).
+            && !config.kv_head_dims_split()
+            // No fused kernel scales the branch after its `wo` fold
+            // (`crate::attn_value_scale`).
+            && config.attn_value_scale.is_none()
             // `model_ffn_act` is `None` for an activation that varies
             // by layer (xIELU's parameters), which no fused kernel
             // takes; `fused_kernel_gelu_flag` is `None` for one no
@@ -3892,6 +3900,7 @@ impl Decoder {
 
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
+        let v_head_dim = self.config.v_head_dim();
         // The Metal KV plane holds ONE geometry, and `use_metal_attn`
         // below is false for a per-layer-shape model
         // (`metal_can_serve_model`), so the widest layer's count is
@@ -3991,6 +4000,8 @@ impl Decoder {
             let (n_heads, n_kv_heads) = (shape.attention.n_heads(), shape.attention.n_kv_heads());
             let q_width = n_heads * head_dim;
             let kv_width = n_kv_heads * head_dim;
+            let v_width = n_kv_heads * v_head_dim;
+            let out_width = n_heads * v_head_dim;
 
             // Multi-layer dense prefill: one CB, activations stay on GPU.
             #[cfg(feature = "metal")]
@@ -4168,6 +4179,7 @@ impl Decoder {
                     &mut v_batch,
                     q_width,
                     kv_width,
+                    v_width,
                 );
 
                 self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
@@ -4335,7 +4347,7 @@ impl Decoder {
                     cache
                         .push(
                             &k_batch[b * kv_width..(b + 1) * kv_width],
-                            &v_batch[b * kv_width..(b + 1) * kv_width],
+                            &v_batch[b * v_width..(b + 1) * v_width],
                         )
                         .expect("unbounded/planned KvCache growth is infallible");
                 }
@@ -4361,34 +4373,36 @@ impl Decoder {
                 // samples while doing the *same* KV work as this one - at
                 // `pp512` the 512-wide window covers the whole prompt.
                 let mut attn_out_batch = if let Some(sinks) = layer.attn.sinks.as_deref() {
-                    let mut out = vec![0f32; batch_size * q_width];
-                    out.par_chunks_mut(q_width)
+                    let mut out = vec![0f32; batch_size * out_width];
+                    out.par_chunks_mut(out_width)
                         .enumerate()
                         .for_each(|(b, dest)| {
                             let seq_len_b = base_seq_len + b + 1;
-                            let cache_elems = seq_len_b * kv_width;
-                            let attn_out = ferrox_core::causal_gqa_attention_sinks(
+                            let attn_out = causal_gqa_attention_row(
                                 &q_batch[b * q_width..(b + 1) * q_width],
-                                &cache_k[..cache_elems],
-                                &cache_v[..cache_elems],
+                                &cache_k[..seq_len_b * kv_width],
+                                &cache_v[..seq_len_b * v_width],
                                 n_heads,
                                 n_kv_heads,
                                 head_dim,
+                                v_head_dim,
                                 seq_len_b,
                                 window,
-                                sinks,
+                                Some(sinks),
+                                None,
                             );
                             dest.copy_from_slice(&attn_out);
                         });
                     out
                 } else {
-                    causal_gqa_attention_prefill_shared_kv_windowed(
+                    causal_gqa_attention_prefill_shared_kv_split(
                         &q_batch,
                         cache_k,
                         cache_v,
                         n_heads,
                         n_kv_heads,
                         head_dim,
+                        v_head_dim,
                         batch_size,
                         base_seq_len,
                         softcap,
@@ -4501,6 +4515,7 @@ impl Decoder {
 
         let hidden_dim = self.config.hidden_dim;
         let head_dim = self.config.head_dim;
+        let v_head_dim = self.config.v_head_dim();
 
         // [batch, hidden], flattened row-major.
         let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens);
@@ -4558,6 +4573,8 @@ impl Decoder {
 
                 let q_width = n_heads * head_dim;
                 let kv_width = n_kv_heads * head_dim;
+                let v_width = n_kv_heads * v_head_dim;
+                let out_width = n_heads * v_head_dim;
 
                 self.apply_qkv_bias_and_clamp(
                     layer,
@@ -4566,6 +4583,7 @@ impl Decoder {
                     &mut v_batch,
                     q_width,
                     kv_width,
+                    v_width,
                 );
 
                 self.apply_qk_norms_pre_rope(layer, &mut q_batch, &mut k_batch, q_width, kv_width);
@@ -4600,7 +4618,7 @@ impl Decoder {
                 self.apply_attention_scale(&mut q_batch);
                 self.apply_attn_temperature(&mut q_batch, q_width, |b| positions[b]);
 
-                let mut attn_out_batch = vec![0f32; batch_size * q_width];
+                let mut attn_out_batch = vec![0f32; batch_size * out_width];
                 for b in 0..batch_size {
                     let attn_out = self.push_and_attend(
                         kv,
@@ -4608,10 +4626,10 @@ impl Decoder {
                         l,
                         layer,
                         &k_batch[b * kv_width..(b + 1) * kv_width],
-                        &v_batch[b * kv_width..(b + 1) * kv_width],
+                        &v_batch[b * v_width..(b + 1) * v_width],
                         &q_batch[b * q_width..(b + 1) * q_width],
                     );
-                    attn_out_batch[b * q_width..(b + 1) * q_width].copy_from_slice(&attn_out);
+                    attn_out_batch[b * out_width..(b + 1) * out_width].copy_from_slice(&attn_out);
                 }
 
                 let projected_batch = self.attn_out_to_residual_rows(
@@ -6822,6 +6840,37 @@ mod metal_rope_tests {
         assert!(d.metal_attn_view(&d.layers[0]).is_some());
         d.layers[0].attn.attn_sub_norm = Some(vec![1.0; d.config.hidden_dim]);
         assert!(d.metal_attn_view(&d.layers[0]).is_none());
+    }
+
+    /// A V head width that differs from K's, and a scale after `wo`,
+    /// each keep the model off every fused Metal path through the same
+    /// predicate: every fused launch takes ONE head width for its KV
+    /// buffers, its attention tile and its `wo` fold, and none scales
+    /// after the fold (`crate::kv_head_dims`, `crate::attn_value_scale`).
+    /// Only reachable in a `--features metal` build.
+    #[test]
+    fn a_split_kv_head_width_or_a_value_scale_keeps_the_model_off_every_fused_metal_path() {
+        let plain = plain_config_with_metal_view();
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(d.layer_supports_metal_attn(&d.layers[0]), "the premise");
+
+        let mut split = plain.clone();
+        split.v_head_dim = Some(plain.head_dim / 2);
+        assert!(!Decoder::metal_can_serve_model(&split, false));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &split,
+            false
+        ));
+
+        let mut scaled = plain;
+        scaled.attn_value_scale = Some(0.707);
+        assert!(!Decoder::metal_can_serve_model(&scaled, false));
+        assert!(!Decoder::metal_prefill_dense_layer_eligible(
+            &d.layers[0],
+            &scaled,
+            false
+        ));
     }
 
     fn plain_config_with_metal_view() -> ModelConfig {

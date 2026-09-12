@@ -44,7 +44,8 @@ use ferrox_gguf::{GgufError, TensorSource};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FusedQkvRows {
     q: usize,
-    kv: usize,
+    k: usize,
+    v: usize,
 }
 
 impl FusedQkvRows {
@@ -56,21 +57,25 @@ impl FusedQkvRows {
     /// tensor to split; the other two shapes never reach this.
     pub(crate) fn of(config: &ModelConfig, layer: usize) -> Self {
         let shape = config.layer_shape(layer).attention;
+        // K at the K width, V at the V width: `mimo2.cpp:132-140` views
+        // the fused tensor exactly so, and for every other architecture
+        // the two widths are one (`crate::kv_head_dims`).
         Self {
             q: shape.n_heads() * config.head_dim,
-            kv: shape.n_kv_heads() * config.head_dim,
+            k: shape.n_kv_heads() * config.head_dim,
+            v: shape.n_kv_heads() * config.v_head_dim(),
         }
     }
 
     /// Total rows a fused `attn_qkv` tensor must have, and the length a
     /// fused `attn_qkv.bias` must have.
     pub(crate) fn total(self) -> usize {
-        self.q + 2 * self.kv
+        self.q + self.k + self.v
     }
 
     /// `(start, len)` for Q, K and V, in file order.
     pub(crate) fn spans(self) -> [(usize, usize); 3] {
-        [(0, self.q), (self.q, self.kv), (self.q + self.kv, self.kv)]
+        [(0, self.q), (self.q, self.k), (self.q + self.k, self.v)]
     }
 }
 
@@ -128,7 +133,7 @@ pub(crate) fn load_fused_or_split_qkv(
             config.name.to_string(),
             format!(
                 "{fused_name} has {} rows; expected q+k+v = {} \
-                 (n_heads*head_dim + 2*n_kv_heads*head_dim)",
+                 (n_heads*head_dim + n_kv_heads*head_dim + n_kv_heads*v_head_dim)",
                 fused.rows(),
                 rows.total()
             ),
@@ -207,7 +212,7 @@ fn split_fused_bias(
             config.name.to_string(),
             format!(
                 "{name} has {} elements; expected q+k+v = {} \
-                 (n_heads*head_dim + 2*n_kv_heads*head_dim)",
+                 (n_heads*head_dim + n_kv_heads*head_dim + n_kv_heads*v_head_dim)",
                 bias.len(),
                 rows.total()
             ),
@@ -228,10 +233,16 @@ mod tests {
     /// impossible to add quietly.
     #[test]
     fn the_three_spans_tile_the_fused_tensor_exactly() {
-        for (n_heads, n_kv_heads, head_dim) in [(4, 2, 8), (32, 32, 128), (7, 1, 64)] {
+        for (n_heads, n_kv_heads, head_dim, v_head_dim) in [
+            (4, 2, 8, 8),
+            (32, 32, 128, 128),
+            (7, 1, 64, 64),
+            (4, 2, 12, 8),
+        ] {
             let rows = FusedQkvRows {
                 q: n_heads * head_dim,
-                kv: n_kv_heads * head_dim,
+                k: n_kv_heads * head_dim,
+                v: n_kv_heads * v_head_dim,
             };
             let spans = rows.spans();
             assert_eq!(spans[0].0, 0);
@@ -255,7 +266,11 @@ mod tests {
     /// backwards is the classic GQA off-by-a-factor.
     #[test]
     fn k_and_v_have_the_same_width_and_q_is_the_gqa_multiple() {
-        let rows = FusedQkvRows { q: 32, kv: 16 };
+        let rows = FusedQkvRows {
+            q: 32,
+            k: 16,
+            v: 16,
+        };
         let spans = rows.spans();
         assert_eq!(spans[1].1, spans[2].1);
         assert_eq!(spans[0].1, 2 * spans[1].1);

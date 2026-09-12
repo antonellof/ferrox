@@ -757,6 +757,35 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // (`crate::weight_scales`) from a fixture that carries them and
     // whose libllama logits differ from the unscaled file's (measured).
     "bitnet",
+    // tests/split_kv_head_dim_graphs.rs: `mimo2` (MiMo-V2-Flash), NEW
+    // CODE on a V HEAD WIDTH THAT DIFFERS FROM THE K HEAD WIDTH --
+    // `head_dim: 192, v_head_dim: 128` in every real export
+    // (`conversion/mimo.py:154`), `mimo2.cpp:47-48,132-140,152-154`
+    // sizing and viewing K and V separately and `wo` at `n_embd_head_v
+    // * n_head` (`:52`). `crate::kv_head_dims` is the seam: fourteen
+    // converters write `value_length`, three write it apart from
+    // `key_length`, one on this engine (measured). `ModelConfig::
+    // v_head_dim` is the one value; `KvCache` / `PagedKvStore` size V by
+    // it, `causal_gqa_attention_row` -- ONE kernel now for the plain,
+    // windowed, softcapped and sink-bearing arms, which were three
+    // copies -- and the batched prefill kernel accumulate over it, the
+    // projection check and the fused-QKV cut read it, and every fused
+    // Metal launch, the CUDA resident hook, the slot file and the KV
+    // block file refuse a model whose two widths differ. Its second
+    // half, `attention.value_scale` (`:14-17,180-183`, 0.707 on every
+    // export), is `crate::attn_value_scale`: one reader of 140,
+    // applied after `wo` in the one attention tail. Everything else the
+    // row needs had landed: the per-layer `head_count_kv` array, the
+    // per-layer window array with `rope.freq_base_swa`, sinks by
+    // tensor, NextN blocks inside `block_count`, sigmoid gating with
+    // `exp_probs_b` and `expert_weights_scale`, dense-or-MoE per layer
+    // by tensor presence, partial NEOX RoPE. `mimo2.cpp:227` passes the
+    // SIGMOID literal into `build_moe_ffn`, so the key is never read
+    // (`GATING_LITERAL_ARCHITECTURES`, measured over every call). Three
+    // fixtures: the converter's fused `attn_qkv` (K rows at 12, V rows
+    // at 8), the split spelling, and the same file without the value
+    // scale.
+    "mimo2",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1184,34 +1213,13 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          (:32), a second residual stream the generic decoder has no slot for, and :5 reads \
          {arch}.logit_scale as REQUIRED",
     ),
-    (
-        "mimo2",
-        TriageClass::NewCode,
-        "a V head width that differs from the K head width, in every real export. \
-         conversion/mimo.py:154 writes `attention.value_length` from `v_head_dim` separately \
-         from `attention.key_length`, and MiMo-V2-Flash's config.json is `head_dim: 192, \
-         v_head_dim: 128` (`swa_v_head_dim: 128` too), so src/models/mimo2.cpp:47-48 sizes K \
-         and V per layer from two widths and :132-140,152-154 view Q/K at `n_embd_head_k` \
-         and V at `n_embd_head_v`; ferrox's KV cache, attention kernels and every fused Metal \
-         launch take ONE head width, and the loader refuses a file whose two differ \
-         (`split K/V head dims`). Second, small: :14-17 and :180-183 scale the attention \
-         output by `{arch}.attention.value_scale` after `wo` when the config sets \
-         `attention_value_scale` (mimo.py:163-165; MiMo-V2-Flash sets 0.707), a key ferrox \
-         neither reads nor gates. NO LONGER a blocker: the NEXTN blocks -- every export \
-         appends three inside block_count (mimo.py:22,27,167; :19-20, :31-37,51-52 create \
-         them TENSOR_SKIP), and `crate::mtp_blocks` skips them as llama.cpp does. NO \
-         LONGER a blocker: the per-layer sliding-window ARRAY -- mimo.py:148-153 writes \
-         `hybrid_layer_pattern` at block_count length, :12 `get_key_or_arr(..., \
-         is_swa_impl, n_layer())` BEFORE :19 reads nextn so the length is n_layer_all, and \
-         `crate::swa_layers` honours the array for this architecture and broadcasts a \
-         scalar as a bool rather than a period. NO LONGER a blocker: the attention sinks \
-         -- :58 creates `attn_sinks` `{n_head}` and :177 passes it into the SAME \
-         `build_attn_mha` as `openai-moe.cpp:115`, and `AttnWeights::sinks` loads by \
-         tensor presence. NO LONGER a blocker: the per-layer shapes -- :47-49 and \
-         :111-112 read n_head / n_head_kv PER LAYER, which `crate::layer_shapes` carries. \
-         The dense-or-MoE-per-layer choice at :200-223 \
-         and the fused-or-split QKV at :127-155 ferrox already has",
-    ),
+    // `mimo2` was HERE, NEW CODE on the split K/V head width, and is
+    // audited now: `crate::kv_head_dims` is the seam,
+    // `crate::attn_value_scale` its small second half, and
+    // `tests/split_kv_head_dim_graphs.rs` carries three fixtures. Its
+    // verdict had already said the NextN blocks, the window array, the
+    // sinks and the per-layer shapes were no longer blockers; they were
+    // not, and the fixture carries all four. See `AUDITED_GENERIC_GQA`.
     // `afmoe` was HERE, NEW CODE on the gated attention (`afmoe.cpp:73`)
     // and the `sqrt(n_embd)` embedding scale (`:120`). Both are
     // implemented -- `crate::attn_gate` and
@@ -1559,6 +1567,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // `crate::sub_norms` (`tests/sub_norm_graphs.rs`). NEOX
             // RoPE: llama-model.cpp:2625.
             "bitnet",
+            // Was NEW CODE in `NEOX_ROPE_TRIAGED` on the split K/V head
+            // width (`mimo2.cpp:47-48`), audited now on
+            // `crate::kv_head_dims` (`tests/split_kv_head_dim_graphs.rs`).
+            // NEOX RoPE: `LLM_ARCH_MIMO2` is in the NEOX group,
+            // `tests/rope_layout.rs` pins it.
+            "mimo2",
         ] {
             v.push(gqa_neox(n));
         }
@@ -3098,7 +3112,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 7,
+            seen == 6,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -3173,17 +3187,23 @@ mod audit_tests {
              served `arcee` by aliasing would have skipped a real gate, and 8 until \
              `bitnet` closed on the two norms INSIDE the blocks (`crate::sub_norms`, \
              tests/sub_norm_graphs.rs) -- the reach measured first: one graph of 140 \
-             creates either tensor, so the seam is a `bool` and it closed alone. \
-             What is left is 6 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             creates either tensor, so the seam is a `bool` and it closed alone, and 7 \
+             until `mimo2` closed on the split K/V head width (`crate::kv_head_dims`, \
+             tests/split_kv_head_dim_graphs.rs) -- the reach measured over the fourteen \
+             converters that write `value_length`: three write it apart from \
+             `key_length`, two on the MLA engine, one here. \
+             What is left is 5 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
              closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
              `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
-             `step35`, `mistral3`, `smallthinker` and `bitnet`, and each closure but \
-             `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, `smallthinker`'s and `bitnet`'s \
-             took more than one row at a time because each found ONE cause behind several \
-             refusals; `mellum`'s cause IS shared and moved three verdicts, but only one of \
-             them was closable by it, `mistral3`'s is shared with two rows on other \
-             engines, `smallthinker`'s mechanism (a precomputed `probs`) is shared with \
-             three rows whose CAUSE it is not, and `bitnet`'s is shared with nothing"
+             `step35`, `mistral3`, `smallthinker`, `bitnet` and `mimo2`, and each closure \
+             but `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, `smallthinker`'s, `bitnet`'s \
+             and `mimo2`'s took more than one row at a time because each found ONE cause \
+             behind several refusals; `mellum`'s cause IS shared and moved three verdicts, \
+             but only one of them was closable by it, `mistral3`'s is shared with two rows \
+             on other engines, `smallthinker`'s mechanism (a precomputed `probs`) is shared \
+             with three rows whose CAUSE it is not, `bitnet`'s is shared with nothing, and \
+             `mimo2`'s is shared with the MLA engine, which has carried the two widths \
+             since it existed"
         );
     }
 

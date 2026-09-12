@@ -200,8 +200,14 @@ pub enum KvLayout {
     /// vector of `n_kv_heads * head_dim` per token, per layer. MHA is
     /// just the `n_kv_heads == n_heads` case -- there is no separate
     /// variant for it, and the halving GQA buys shows up entirely in
-    /// `n_kv_heads`.
-    Gqa { n_kv_heads: usize, head_dim: usize },
+    /// `n_kv_heads`. `head_dim` is the K head width and `v_head_dim`
+    /// the V's; equal for every architecture but MiMo-V2
+    /// (`crate::kv_head_dims`).
+    Gqa {
+        n_kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+    },
     /// MLA in its *absorbed* form: the cache holds only the compressed
     /// latent plus the decoupled RoPE slice, `kv_lora_rank + rope_dim`
     /// scalars per token per layer, and K/V are reconstructed from it
@@ -236,7 +242,8 @@ impl KvLayout {
             KvLayout::Gqa {
                 n_kv_heads,
                 head_dim,
-            } => 2 * n_kv_heads as u64 * head_dim as u64,
+                v_head_dim,
+            } => n_kv_heads as u64 * (head_dim as u64 + v_head_dim as u64),
             KvLayout::MlaLatent {
                 kv_lora_rank,
                 qk_rope_head_dim,
@@ -256,7 +263,17 @@ impl KvLayout {
             KvLayout::Gqa {
                 n_kv_heads,
                 head_dim,
-            } => format!("2 (K+V) x {n_kv_heads} kv-heads x {head_dim} head-dim"),
+                v_head_dim,
+            } if head_dim == v_head_dim => {
+                format!("2 (K+V) x {n_kv_heads} kv-heads x {head_dim} head-dim")
+            }
+            KvLayout::Gqa {
+                n_kv_heads,
+                head_dim,
+                v_head_dim,
+            } => {
+                format!("{n_kv_heads} kv-heads x ({head_dim} K head-dim + {v_head_dim} V head-dim)")
+            }
             KvLayout::MlaLatent {
                 kv_lora_rank,
                 qk_rope_head_dim,
@@ -318,6 +335,7 @@ impl KvShape {
             layout: KvLayout::Gqa {
                 n_kv_heads: config.n_kv_heads,
                 head_dim: config.head_dim,
+                v_head_dim: config.v_head_dim(),
             },
             elem,
         }
@@ -874,6 +892,7 @@ mod tests {
             layout: KvLayout::Gqa {
                 n_kv_heads: 8,
                 head_dim: 128,
+                v_head_dim: 128,
             },
             elem: KvElem::F32,
         }
@@ -936,6 +955,7 @@ mod tests {
             layout: KvLayout::Gqa {
                 n_kv_heads: 32,
                 head_dim: 128,
+                v_head_dim: 128,
             },
             ..gqa
         };
@@ -1281,6 +1301,7 @@ mod tests {
             layout: KvLayout::Gqa {
                 n_kv_heads: 128,
                 head_dim: 128,
+                v_head_dim: 128,
             },
             ..latent
         };

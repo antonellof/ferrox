@@ -114,6 +114,70 @@ pub enum LoadError {
 const SIGMOID_GATING_ARCHITECTURES: &[&str] =
     &["afmoe", "deepseek2", "glm4moe", "laguna", "step35"];
 
+/// Architectures whose graph passes a gating LITERAL into
+/// `build_moe_ffn`, so the file's `expert_gating_func` is never read:
+/// the literal wins even over a key that says otherwise.
+///
+/// Measured 2026-09-12 by parsing every `build_moe_ffn(` call's
+/// arguments in all 140 `src/models/*.cpp`: three graphs pass
+/// `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID` (`llama4.cpp`, `mimo2.cpp:227`,
+/// `nemotron-h.cpp`), twenty-six pass `_SOFTMAX`, nineteen pass
+/// `hparams.expert_gating_func`. Only `mimo2` of the three is on this
+/// loader. The twenty-six softmax literals are not tabled: every
+/// converter for them writes no key or writes SOFTMAX, so the key and
+/// the literal agree on every real file, and a table of twenty-six
+/// hand-copied rows would be a bigger risk than the hand-written file
+/// it guards against. `conversion/mimo.py` writes SIGMOID from
+/// `scoring_func`, so on a real MiMo file the two agree too; the row
+/// exists because the literal is what llama.cpp runs.
+const GATING_LITERAL_ARCHITECTURES: &[(&str, GatingFunction)] =
+    &[("mimo2", GatingFunction::Sigmoid)];
+/// The names alone, for the cross-table test.
+#[cfg(test)]
+const GATING_LITERAL_NAMES: &[&str] = &["mimo2"];
+
+/// Architectures whose `load_arch_hparams` reads
+/// `{arch}.expert_weights_scale` (`LLM_KV_EXPERT_WEIGHTS_SCALE`) -- and
+/// so the only ones whose `build_moe_ffn` call sees a nonzero
+/// `hparams.expert_weights_scale`. On every other architecture the key
+/// is dead metadata upstream: the field stays 0 and the multiply is
+/// skipped, whatever the file says.
+///
+/// Measured 2026-09-12: `grep -l LLM_KV_EXPERT_WEIGHTS_SCALE
+/// src/models/*.cpp` is twenty graphs; these are the eight on this
+/// loader (`deepseek2` / `deepseek32` / `deepseek2ocr` / `deepseek4` /
+/// `glm-dsa` / `glm4-moe` / `kimi-linear` / `minimax-m3` / `dflash` /
+/// `nemotron-h` / `hy-v3` / `cohere2moe` are on other engines, refused,
+/// or unknown here). Found by `mimo2`'s fixture: `mimo2.cpp` reads the
+/// key nowhere, libllama ran the fixture unscaled, and ferrox -- which
+/// honoured the key for any architecture -- scaled it by 2.5.
+const EXPERT_WEIGHTS_SCALE_READERS: &[&str] = &[
+    "afmoe",
+    "bailingmoe",
+    "bailingmoe2",
+    "deepseek",
+    "dots1",
+    "exaone-moe",
+    "laguna",
+    "step35",
+];
+
+/// The same for `{arch}.expert_weights_norm` (`LLM_KV_EXPERT_WEIGHTS_NORM`):
+/// eighteen graphs read it upstream, seven on this loader; every other
+/// graph passes `norm_w` as a LITERAL into `build_moe_ffn`, and the
+/// literal is what `NO_TOPK_RENORMALIZE_ARCHITECTURES` and its default
+/// transcribe. `deepseek` reads the scale but not the norm
+/// (`deepseek.cpp` passes `false`).
+const EXPERT_WEIGHTS_NORM_READERS: &[&str] = &[
+    "afmoe",
+    "bailingmoe",
+    "bailingmoe2",
+    "dots1",
+    "exaone-moe",
+    "laguna",
+    "step35",
+];
+
 /// Names that appear in a behaviour table above but are `DedicatedOnly`
 /// or `Deferred`, together with the module that actually applies the
 /// behaviour for them.
@@ -431,19 +495,14 @@ impl ModelConfig {
                 hidden_dim / h0
             }
         };
-        let v_head_dim = file
-            .metadata_u64(&key("attention.value_length"))
-            .map(|v| v as usize)
-            .unwrap_or(head_dim);
-        if v_head_dim != head_dim {
-            return Err(LoadError::UnsupportedFeature(
-                arch.clone(),
-                format!(
-                    "split K/V head dims (key_length={head_dim}, value_length={v_head_dim}); \
-                     generic decoder requires equal head dims"
-                ),
-            ));
-        }
+        let v_head_dim = crate::kv_head_dims::resolve_v_head_dim(
+            &arch,
+            head_dim,
+            file.metadata_u64(&key("attention.value_length"))
+                .map(|v| v as usize),
+        )?;
+        // `Some` only when it differs: see `ModelConfig::v_head_dim`.
+        let v_head_dim = (v_head_dim != head_dim).then_some(v_head_dim);
         let vocab_size = file
             .metadata("tokenizer.ggml.tokens")
             .and_then(|v| match v {
@@ -599,10 +658,18 @@ impl ModelConfig {
         // carries it; otherwise fall back to the same architecture-name
         // convention the hand-written presets in config.rs use (see
         // docs/MODELS.md for the citations behind that list).
-        let gating = match metadata_u64_any(file, &[key("expert_gating_func")]) {
-            Some(2) => GatingFunction::Sigmoid,
-            Some(1) => GatingFunction::Softmax,
-            _ => {
+        let gating_literal = GATING_LITERAL_ARCHITECTURES
+            .iter()
+            .find(|(name, _)| *name == arch)
+            .map(|(_, g)| *g);
+        let gating = match (
+            gating_literal,
+            metadata_u64_any(file, &[key("expert_gating_func")]),
+        ) {
+            (Some(literal), _) => literal,
+            (None, Some(2)) => GatingFunction::Sigmoid,
+            (None, Some(1)) => GatingFunction::Softmax,
+            (None, _) => {
                 if SIGMOID_GATING_ARCHITECTURES.contains(&arch.as_str()) {
                     GatingFunction::Sigmoid
                 } else {
@@ -622,7 +689,15 @@ impl ModelConfig {
         // checkpoints do not carry it, which is why the fallback below
         // exists at all -- but when one does, the file's own answer wins
         // over an architecture-name guess.
-        let norm_topk_prob = match file.metadata_bool(&key("expert_weights_norm")) {
+        // The key only where llama.cpp reads it (`EXPERT_WEIGHTS_NORM_READERS`);
+        // everywhere else the graph's literal, which the table below
+        // transcribes, whatever the file says.
+        let norm_key = if EXPERT_WEIGHTS_NORM_READERS.contains(&arch.as_str()) {
+            file.metadata_bool(&key("expert_weights_norm"))
+        } else {
+            None
+        };
+        let norm_topk_prob = match norm_key {
             Some(v) => v,
             None => {
                 // See `NO_TOPK_RENORMALIZE_ARCHITECTURES`'s doc comment:
@@ -640,9 +715,14 @@ impl ModelConfig {
         // `{arch}.expert_weights_scale` (`LLM_KV_EXPERT_WEIGHTS_SCALE`).
         // llama.cpp's `build_moe_ffn` skips the multiply for both 0.0 and
         // 1.0, so both mean "no scaling" and both land on 1.0 here.
-        let expert_weights_scale = metadata_f32_any(file, &[key("expert_weights_scale")])
-            .filter(|s| *s != 0.0)
-            .unwrap_or(1.0);
+        // And only where llama.cpp reads it (`EXPERT_WEIGHTS_SCALE_READERS`).
+        let expert_weights_scale = if EXPERT_WEIGHTS_SCALE_READERS.contains(&arch.as_str()) {
+            metadata_f32_any(file, &[key("expert_weights_scale")])
+                .filter(|s| *s != 0.0)
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
 
         // Real GGUF key (`{arch}.attention.sliding_window`, confirmed
         // against `gguf-py/gguf/constants.py`'s real
@@ -1272,6 +1352,7 @@ impl ModelConfig {
             n_heads,
             n_kv_heads,
             head_dim,
+            v_head_dim,
             vocab_size,
             rope_theta,
             rms_norm_eps,
@@ -1288,6 +1369,10 @@ impl ModelConfig {
             rope_layers: crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some()),
             router_input: crate::router_input::router_input(&arch),
             block_sub_norms: crate::sub_norms::block_sub_norms(&arch),
+            attn_value_scale: crate::attn_value_scale::resolve_attn_value_scale(
+                &arch,
+                file.metadata_f32(&key("attention.value_scale")),
+            ),
             layer_shapes,
             moe: MoeLayerConfig {
                 n_experts: n_experts.max(1),
@@ -2496,6 +2581,7 @@ impl Decoder {
                         l,
                         shape.attention,
                         config.head_dim,
+                        config.v_head_dim(),
                         config.hidden_dim,
                         &attn,
                     )?;
@@ -3435,6 +3521,26 @@ mod tests {
     /// Same shape as the `deepseek` top-k renormalisation bug, and as
     /// `phi3`'s sliding window: the file is silent and the architecture
     /// decides.
+    /// The literal table and its name list are two spellings of one
+    /// fact; this is what keeps them one.
+    #[test]
+    fn the_gating_literal_names_are_the_gating_literal_table() {
+        let from_table: Vec<&str> = GATING_LITERAL_ARCHITECTURES
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(from_table, GATING_LITERAL_NAMES);
+        // `mimo2.cpp:227` passes the SIGMOID literal, so the key is
+        // never read there; a hand-written SOFTMAX key must not turn it.
+        assert!(matches!(
+            GATING_LITERAL_ARCHITECTURES
+                .iter()
+                .find(|(n, _)| *n == "mimo2")
+                .map(|(_, g)| *g),
+            Some(GatingFunction::Sigmoid)
+        ));
+    }
+
     #[test]
     fn the_architectures_llama_cpp_defaults_to_sigmoid_gating_are_pinned() {
         for arch in ["afmoe", "deepseek2", "glm4moe", "laguna", "step35"] {
@@ -3476,6 +3582,9 @@ mod tests {
     fn every_architecture_keyed_behaviour_table_names_a_real_generic_row() {
         let tables: &[(&str, &[&str])] = &[
             ("SIGMOID_GATING_ARCHITECTURES", SIGMOID_GATING_ARCHITECTURES),
+            ("GATING_LITERAL_ARCHITECTURES", GATING_LITERAL_NAMES),
+            ("EXPERT_WEIGHTS_SCALE_READERS", EXPERT_WEIGHTS_SCALE_READERS),
+            ("EXPERT_WEIGHTS_NORM_READERS", EXPERT_WEIGHTS_NORM_READERS),
             (
                 "NO_TOPK_RENORMALIZE_ARCHITECTURES",
                 NO_TOPK_RENORMALIZE_ARCHITECTURES,

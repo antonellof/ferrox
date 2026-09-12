@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 7,
+        n, 6,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -139,7 +139,14 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          so the seam is a `bool` on `ModelConfig` and the row closed alone; its optional \
          per-projection `.scale` tensors are a refusal by name now \
          (`ferrox_models::weight_scales`) from a fixture whose libllama logits differ \
-         from the unscaled file's \
+         from the unscaled file's, and 7 until `mimo2` closed on the split K/V head \
+         width (`ferrox_models::kv_head_dims`, tests/split_kv_head_dim_graphs.rs) -- \
+         three converters of fourteen write `value_length` apart from `key_length`, one \
+         on this engine; `KvCache`, `PagedKvStore`, the one row kernel the three \
+         contiguous arms collapsed onto, the batched prefill kernel, the projection \
+         check and the fused-QKV cut all took the V width, and building it found \
+         `expert_weights_scale` honoured for every architecture where llama.cpp reads it \
+         in twenty loaders (`EXPERT_WEIGHTS_SCALE_READERS`) \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -391,7 +398,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 7);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 6);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -577,28 +584,29 @@ fn grok_and_dbrx_are_audited_and_carry_no_stale_verdict() {
 /// per-layer ARRAYS its converter writes. That is gone with the row --
 /// `layer_shapes::read_u64_per_layer` reads both spellings and the
 /// architecture is audited -- and `granite` had left this list the
-/// same way before it. With no live example the rule is pinned on the
-/// property it exists for: a verdict for an architecture that is
-/// refused EARLIER, by name, must say so. `mimo2` is refused by the
-/// loader's `split K/V head dims` check before the unaudited gate --
-/// every real MiMo-V2 export has `head_dim: 192, v_head_dim: 128` --
-/// and its verdict leads with exactly that. (Its NEXTN blocks used to
-/// be the earlier refusal, through `unsupported_feature_keys`; they are
-/// skipped now, `ferrox_models::mtp_blocks`, and the verdict says so.)
+/// same way before it, and `mimo2` -- refused by the loader's `split
+/// K/V head dims` check before the unaudited gate, which its verdict
+/// led with -- closed on `ferrox_models::kv_head_dims` after both.
+/// With no live example the rule is pinned on the property it exists
+/// for: a verdict for an architecture that is refused EARLIER, by
+/// name, must say so, and every row that has carried the rule is
+/// audited now, so the misleading messages they disclosed cannot be
+/// produced any more.
 #[test]
 fn verdicts_disclose_when_an_earlier_refusal_fires_first() {
-    let (arch, marker) = ("mimo2", "split K/V head dims");
-    let t = unaudited_triage(arch).expect("verdict");
-    assert!(
-        t.blocker.contains(marker),
-        "`{arch}` must name the feature an earlier gate refuses on: {}",
-        t.blocker
-    );
-    // The row that used to carry this rule is audited and carries no
-    // verdict; the misleading message it disclosed cannot be produced
-    // any more.
-    assert!(unaudited_triage("openelm").is_none());
-    assert!(ferrox_models::capability::is_audited_generic("openelm"));
+    for arch in ["openelm", "granite", "mimo2"] {
+        assert!(unaudited_triage(arch).is_none(), "{arch}");
+        assert!(
+            ferrox_models::capability::is_audited_generic(arch),
+            "{arch}"
+        );
+    }
+    // The gate that used to fire first for `mimo2` admits its real pair
+    // now and still refuses it for everyone else, naming the assert.
+    assert!(ferrox_models::kv_head_dims::resolve_v_head_dim("mimo2", 192, Some(128)).is_ok());
+    let err = ferrox_models::kv_head_dims::resolve_v_head_dim("llama", 192, Some(128))
+        .expect_err("llama asserts the widths equal");
+    assert!(err.to_string().contains("split K/V head dims"));
 }
 
 /// Batch 3: the alias rows and the plain long-tail.
@@ -687,23 +695,13 @@ fn the_per_layer_shape_seam_closed_two_rows_and_its_reach_is_recorded_on_the_res
             "{arch}"
         );
     }
-    // `mimo2` is the one row in the reach table still refusing.
-    let arch = "mimo2";
-    let t = unaudited_triage(arch).expect("still refuses");
-    assert_eq!(t.class, TriageClass::NewCode);
+    // `mimo2` was the one row in the reach table still refusing, and
+    // closed on the split K/V head width (`ferrox_models::kv_head_dims`);
+    // its fixture carries the converter's `head_count_kv` array.
     assert!(
-        t.blocker.contains("NO LONGER a blocker: the per-layer"),
-        "`{arch}` must say the per-layer half is done: {}",
-        t.blocker
-    );
-    assert!(
-        t.blocker.contains("crate::layer_shapes"),
-        "`{arch}` must point at the seam: {}",
-        t.blocker
-    );
-    assert!(
-        per_layer_shapes_read_by_llama_cpp(arch),
-        "{arch} is in the reach table"
+        is_audited_generic("mimo2")
+            && unaudited_triage("mimo2").is_none()
+            && per_layer_shapes_read_by_llama_cpp("mimo2")
     );
     // `nanbeige` reads the arrays too and is NOT served: it rewrites
     // them to loop its physical layers, which is a different graph.
@@ -887,18 +885,13 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         // refusal by name (`swa_geometry`) for a file with both a window
         // and a scaling, which every real Mellum2 is.
         ("talkie", TriageClass::NewCode, "NO norm weights"),
-        // `mimo2`'s leading blocker WAS "attention sinks", then "NEXTN
-        // blocks and a window array". Sinks load by tensor presence,
-        // the blocks are skipped (`ferrox_models::mtp_blocks`) and the
-        // array honoured (`ferrox_models::swa_layers`); what is left is
-        // what every real MiMo-V2 export has and no seam yet serves: a
-        // V head width that differs from K's (`head_dim: 192,
-        // v_head_dim: 128`).
-        (
-            "mimo2",
-            TriageClass::NewCode,
-            "a V head width that differs from the K head width",
-        ),
+        // `mimo2` was HERE. Its leading blocker WAS "attention sinks",
+        // then "NEXTN blocks and a window array", then "a V head width
+        // that differs from the K head width", and each landed in turn:
+        // sinks by tensor presence, `ferrox_models::mtp_blocks`,
+        // `ferrox_models::swa_layers`, and `ferrox_models::kv_head_dims`
+        // (tests/split_kv_head_dim_graphs.rs). Its absence is asserted
+        // by `mimo2_is_audited_and_carries_no_stale_verdict` below.
         // Batch 5. `plamo3` was here, FIXTURE-AWAY. Building its
         // fixture found the verdict was wrong by one tensor name -- it
         // is the only architecture upstream that spells its two
@@ -1057,18 +1050,32 @@ fn the_gated_attention_seam_closed_two_rows_and_narrowed_the_third() {
             "`{arch}` is not in ATTN_GATE_ARCHS"
         );
     }
-    let t = unaudited_triage("mimo2").expect("mimo2 still refuses");
-    assert!(
-        t.blocker
-            .contains("NO LONGER a blocker: the attention sinks"),
-        "`mimo2` must say sinks are a tensor-presence fact now: {}",
-        t.blocker
-    );
-    assert!(
-        !t.blocker.starts_with("attention sinks"),
-        "`mimo2` still leads with a feature ferrox implements: {}",
-        t.blocker
-    );
+    // `mimo2`'s sinks are a tensor-presence fact and the row closed on
+    // its split K/V head width; its fixture carries sinks on every layer.
+    assert!(is_audited_generic("mimo2") && unaudited_triage("mimo2").is_none());
+}
+
+/// `mimo2`'s verdict named a split K/V head width and a value scale and
+/// said four earlier blockers were done; the two landed
+/// (`ferrox_models::kv_head_dims`, `ferrox_models::attn_value_scale`),
+/// the four were, and the row is audited on three libllama-golden
+/// fixtures (tests/split_kv_head_dim_graphs.rs), so it carries no
+/// verdict. Building it found `expert_weights_scale` honoured for every
+/// architecture where llama.cpp reads it in twenty loaders and nowhere
+/// else; the loader's `EXPERT_WEIGHTS_SCALE_READERS` is the measurement.
+#[test]
+fn mimo2_is_audited_and_carries_no_stale_verdict() {
+    assert!(is_audited_generic("mimo2"));
+    assert!(unaudited_triage("mimo2").is_none());
+    assert!(ferrox_models::kv_head_dims::admits_split_kv_head_dims(
+        "mimo2"
+    ));
+    assert!(ferrox_models::kv_head_dims::SPLIT_KV_HEAD_DIM_ARCHS
+        .iter()
+        .all(|(name, _)| is_audited_generic(name)));
+    assert!(ferrox_models::attn_value_scale::VALUE_SCALE_READERS
+        .iter()
+        .all(|(name, _)| is_audited_generic(name)));
 }
 
 /// Every one of the 47 now carries a verdict, and the four classes are
@@ -1096,7 +1103,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 6, 1),
+        (0, 0, 5, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1155,7 +1162,11 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          closed on the two norms INSIDE the blocks (`ferrox_models::sub_norms`): the \
          reach came back with one graph of 140, so the fact is a `bool` read by the \
          loader and by the Metal predicate, and the arithmetic landed in the one \
-         attention tail and the one dense FFN row body that already existed. \
+         attention tail and the one dense FFN row body that already existed. And 6 to \
+         5 when `mimo2` closed on the split K/V head width (`ferrox_models::kv_head_dims`), \
+         whose reach is one generic-path converter and the MLA engine, which has carried \
+         the pair since it existed; the seam is one `Option<usize>` on `ModelConfig` and \
+         a V width beside every K width in the cache, the kernels and the checks. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1164,7 +1175,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 7);
+    assert_eq!(fixture + arm + new_code + unknown, 6);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

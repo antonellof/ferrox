@@ -155,7 +155,8 @@ pub enum PatternKeyRead {
 /// Every graph that reads the key ONLY as the per-layer array, with the
 /// line. `gemma4` and `gemma4-assistant` run on their own engine
 /// (`gemma4_gguf_loader.rs` has read the array since it existed);
-/// `dflash`, `step35` and `mimo2` refuse for other things.
+/// `step35` and `mimo2` closed on other seams and run on this one;
+/// `dflash` is deferred.
 pub const PER_LAYER_ARRAY_READERS: &[(&str, &str)] = &[
     ("gemma4", "src/models/gemma4.cpp:5"),
     ("gemma4-assistant", "src/models/gemma4-assistant.cpp:7"),

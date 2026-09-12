@@ -153,11 +153,10 @@ pub(crate) fn encode(identity: &SlotIdentity, payload: &SlotPayload) -> Vec<u8> 
     // (`serving_identity`); this is the writer's own check, so the
     // format can never describe layer 0 and store layer 3.
     assert!(
-        payload
-            .layers
-            .iter()
-            .all(|l| l.n_kv_heads == n_kv_heads && l.head_dim == head_dim),
-        "slot file format holds one KV geometry; the layers differ"
+        payload.layers.iter().all(|l| l.n_kv_heads == n_kv_heads
+            && l.head_dim == head_dim
+            && l.v_head_dim == head_dim),
+        "slot file format holds one KV geometry; the layers differ, or V is not K's width"
     );
 
     let mut header = Vec::new();

@@ -202,6 +202,21 @@ fn serving_identity(active: &ActiveModel) -> Result<(SlotIdentity, Arc<Decoder>)
             "unsupported_feature",
         ));
     }
+    // The same header holds ONE `head_dim` for K and V; a model whose V
+    // head width differs (MiMo-V2, `ferrox_models::kv_head_dims`) has no
+    // faithful encoding either.
+    if decoder.config.kv_head_dims_split() {
+        return Err(error(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "slots are implemented for models whose K and V heads share one width; this \
+                 model's are {} and {}, and the slot file header holds one head_dim",
+                decoder.config.head_dim,
+                decoder.config.v_head_dim()
+            ),
+            "unsupported_feature",
+        ));
+    }
     let fingerprint = identity::fingerprint_gguf(path).map_err(|e| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,

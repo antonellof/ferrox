@@ -15,7 +15,7 @@
 //! the same one llama.cpp reached by overloading `build_attn` on its
 //! memory-input type.
 
-use ferrox_core::attention::{causal_gqa_attention_softcap, causal_gqa_attention_windowed_softcap};
+use ferrox_core::attention::causal_gqa_attention_row;
 use ferrox_core::cache::{KvCache, PagedKvCache, SharedPagedKv};
 use ferrox_core::matmul::rms_norm;
 
@@ -124,8 +124,8 @@ impl Decoder {
 
         // Whole rows here: one token's Q and K. See
         // `Decoder::qk_norm_after_rope` for why the norm has two homes.
-        let (q_width, kv_width) = (q.len(), k.len());
-        self.apply_qkv_bias_and_clamp(layer, &mut q, &mut k, &mut v, q_width, kv_width);
+        let (q_width, kv_width, v_width) = (q.len(), k.len(), v.len());
+        self.apply_qkv_bias_and_clamp(layer, &mut q, &mut k, &mut v, q_width, kv_width, v_width);
         self.apply_qk_norms_pre_rope(layer, &mut q, &mut k, q_width, kv_width);
         self.apply_rope_attn_factor(&mut q, &mut k, layer_idx);
 
@@ -194,6 +194,13 @@ impl Decoder {
                 }
             }
         }
+        // mimo2.cpp:180-183: the branch scaled AFTER `wo`, before the
+        // residual (`crate::attn_value_scale`).
+        if let Some(scale) = self.config.attn_value_scale {
+            for x in projected.iter_mut() {
+                *x *= scale;
+            }
+        }
         if let Some(post) = &layer.attn.post_attn_norm {
             let hidden = post.len();
             projected = projected
@@ -236,20 +243,33 @@ impl Decoder {
             "layer {layer_idx} has no KV to push ({shape:?})"
         );
         let head_dim = self.config.head_dim;
+        let v_head_dim = self.config.v_head_dim();
         let window = self.config.layer_sliding_window(layer_idx);
+        // The sink arm carries no softcap, matching llama.cpp's.
+        let softcap = if sinks.is_some() {
+            None
+        } else {
+            self.config.attn_logit_softcap
+        };
         // Derived from the variant rather than passed as a flag; see
-        // `KvStep::Batched`.
+        // `KvStep::Batched`. The CUDA resident hook serves the plain
+        // full-attention arm only, at one head width: a windowed layer,
+        // a layer with sinks, or a model whose V width differs
+        // (`crate::kv_head_dims`) takes the host kernel.
         let cuda_resident_layer = match &kv {
-            KvStep::Decode(_) => Some(layer_idx),
-            KvStep::Batched(_) | KvStep::Paged { .. } => None,
+            KvStep::Decode(_) if window.is_none() && sinks.is_none() && v_head_dim == head_dim => {
+                Some(layer_idx)
+            }
+            KvStep::Decode(_) | KvStep::Batched(_) | KvStep::Paged { .. } => None,
         };
         match kv {
             KvStep::Decode(cache) | KvStep::Batched(cache) => {
                 cache
                     .push(k, v)
                     .expect("unbounded/planned KvCache growth is infallible");
-                let out = if let Some(sinks) = sinks {
-                    ferrox_core::causal_gqa_attention_sinks(
+                let out = match cuda_resident_layer {
+                    Some(l) => self.gqa_attention(
+                        l,
                         q,
                         &cache.k,
                         &cache.v,
@@ -257,43 +277,22 @@ impl Decoder {
                         n_kv_heads,
                         head_dim,
                         cache.rows(),
+                    ),
+                    // ONE kernel for plain, windowed, softcapped and
+                    // sink-bearing layers, at the cache's own two widths.
+                    None => causal_gqa_attention_row(
+                        q,
+                        &cache.k,
+                        &cache.v,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        v_head_dim,
+                        cache.rows(),
                         window,
                         sinks,
-                    )
-                } else {
-                    match (window, cuda_resident_layer) {
-                        (Some(window), _) => causal_gqa_attention_windowed_softcap(
-                            q,
-                            &cache.k,
-                            &cache.v,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            cache.rows(),
-                            window,
-                            self.config.attn_logit_softcap,
-                        ),
-                        (None, Some(l)) => self.gqa_attention(
-                            l,
-                            q,
-                            &cache.k,
-                            &cache.v,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            cache.rows(),
-                        ),
-                        (None, None) => causal_gqa_attention_softcap(
-                            q,
-                            &cache.k,
-                            &cache.v,
-                            n_heads,
-                            n_kv_heads,
-                            head_dim,
-                            cache.rows(),
-                            self.config.attn_logit_softcap,
-                        ),
-                    }
+                        softcap,
+                    ),
                 };
                 // AFTER the read, never inside `push`: the rows this
                 // drops are rows every kernel above has finished with
@@ -328,13 +327,7 @@ impl Decoder {
                     cache.seq_len(),
                     window,
                     sinks,
-                    // The sink arm carries no softcap, matching the
-                    // contiguous dispatch above.
-                    if sinks.is_some() {
-                        None
-                    } else {
-                        self.config.attn_logit_softcap
-                    },
+                    softcap,
                 )
             }
         }

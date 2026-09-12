@@ -51,8 +51,8 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `step35` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `smallthinker` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `bitnet` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `talkie` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mimo2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `talkie` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `grovemoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `gpt2` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `mpt` | TextGeneration | StandardGqa | KvGqa | dedicated |

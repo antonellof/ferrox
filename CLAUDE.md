@@ -12,24 +12,24 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **50** architectures run with
+Honest position, re-audited 2026-09-12. **51** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 7 unaudited refusals are now TRIAGED, and the refusal says which of
+The 6 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 6 need new code, 1 is unknown with the question stated. Five
+away**, 5 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
 `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35` and
-`mistral3` on 2026-09-11, and `smallthinker` and `bitnet` on 2026-09-12,
-each with a libllama-golden fixture, which is what moved 46 to 41 to 34
-to 31 to 29 to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10
-to 9 to 8 to 7; the step from 28 to 25
+`mistral3` on 2026-09-11, and `smallthinker`, `bitnet` and `mimo2` on
+2026-09-12, each with a libllama-golden fixture, which is what moved 46
+to 41 to 34 to 31 to 29 to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13
+to 12 to 10 to 9 to 8 to 7 to 6; the step from 28 to 25
 was moving the three alias rows off
 the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
@@ -44,7 +44,7 @@ needs a different graph.
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
 times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times
 more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9
-to 8, and on 2026-09-12 twice more, 8 to 7 and 7 to 6. The first two took several rows
+to 8, and on 2026-09-12 three times more, 8 to 7, 7 to 6 and 6 to 5. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -95,7 +95,53 @@ as much: `grovemoe`'s graph, read against `modeling_grove_moe.py`,
 feeds its chunk experts the routed experts' OUTPUT (`grovemoe.cpp:
 148-152`) and gathers their weights at the CHUNK index
 (`llama-graph.cpp:2035-2039`) where the reference does neither, so
-there is no single graph to match and its verdict says so.
+there is no single graph to match and its verdict says so. The
+thirteenth is the row the KV cache was built without: `mimo2` closed
+ALONE, 6 to 5, on a V head width that differs from K's, whose reach is
+one generic-path converter plus the MLA engine, which had carried the
+pair since it existed.
+
+`mimo2` closed on `ferrox-models/src/kv_head_dims.rs`. `conversion/
+mimo.py:154` writes `attention.value_length` from `v_head_dim` apart
+from the `attention.key_length` the base converter writes from
+`head_dim` (`192` / `128` on MiMo-V2-Flash), and `mimo2.cpp:47-48,
+132-140,152-154` size and view K and V separately with `wo` at
+`n_embd_head_v * n_head` (`:52`). Fourteen converters write
+`value_length`, three apart from `key_length`, two of those MLA;
+eighty-nine graphs assert the two equal. So the seam admits the pair
+for one architecture by table and keeps refusing it, naming the
+assert, for everyone else. `ModelConfig::v_head_dim` is an
+`Option<usize>`, `Some` only when the widths differ -- a second `usize`
+beside `head_dim` was tried first and the first test that mutated
+`head_dim` left V behind -- and `v_head_dim()` the one accessor. Every
+consumer took it: `KvCache` / `PagedKvStore` (`new_split`), the three
+contiguous single-query kernels collapsed onto ONE
+`causal_gqa_attention_row` (they were one loop varied by a window
+bound and a sink term), the paged kernel reads it off the store, the
+batched prefill kernel's PV tile takes its own offset and stride,
+`check_gqa_projection_widths`, `qkv_fused::FusedQkvRows`, both batched
+host bodies, the KV budget. Refusing: every fused Metal launch
+(`metal_can_serve_model`), the CUDA resident hook, the slot file, the
+KV block file (one `head_dim` in each header). The row's second half,
+`attention.value_scale` (`:14-17,180-183`, `0.707` on every export),
+is `ferrox-models/src/attn_value_scale.rs`: one reader of 140, applied
+after `wo` in the one attention tail. KL 5.42e-15 (the converter's
+fused `attn_qkv`, K rows at 12, V rows at 8), 5.42e-15 (split
+spelling; libllama byte-identical for the two), 3.49e-15 (no value
+scale); each fixture carries the per-layer `head_count_kv` array, the
+window array with `rope.freq_base_swa`, sinks, sigmoid routing with
+`exp_probs_b`, partial NEOX RoPE and MoE on every layer, as a real
+export does. Two findings. `mimo2.cpp:227` passes the SIGMOID literal
+into `build_moe_ffn`, so the key is never read: parsing every
+`build_moe_ffn` call in all 140 graphs, three pass SIGMOID, twenty-six
+SOFTMAX, nineteen the hparam (`GATING_LITERAL_ARCHITECTURES`). And the
+bisection that found the last 2e-3 of KL found ferrox honouring
+`expert_weights_scale` for EVERY architecture where llama.cpp reads
+the key in twenty per-architecture loaders and nowhere else -- the
+fixture declares `2.5`, `mimo2.cpp` never reads it, libllama's golden
+is unscaled. `EXPERT_WEIGHTS_SCALE_READERS` / `EXPERT_WEIGHTS_NORM_
+READERS` are the readers, measured; no real export of a non-reader
+writes either key.
 
 `bitnet` closed on `ferrox-models/src/sub_norms.rs`. `bitnet.cpp:24,36`
 require `attn_sub_norm` `{n_embd}` and `ffn_sub_norm` `{n_ff}`, two
@@ -319,10 +365,10 @@ layer with the `nextn.*` tensors silently unread. All four dedicated
 loaders take the trunk from `trunk_layers` now, and the MLA loader has
 a trunk-only fixture that fails without it. K-EXAONE's real shape --
 one block, the array at trunk length -- has a fixture, KL 1.09e-14.
-`mimo2` still refuses, and its verdict leads with what no seam touches:
+`mimo2` still refused for one more day, on what no seam touched:
 MiMo-V2-Flash is `head_dim: 192, v_head_dim: 128`, a V width that
-differs from K's, which every KV cache and attention kernel here takes
-as one number. `step35` led with its clamp arrays and its half-width
+differs from K's, which every KV cache and attention kernel here took
+as one number until `kv_head_dims` (above). `step35` led with its clamp arrays and its half-width
 rotary on the full layers, and closed on both the same day (above).
 
 `afmoe` and `laguna` are ONE seam, `ferrox-models/src/attn_gate.rs`.
@@ -372,8 +418,8 @@ Real Laguna-M.1 has neither; real Laguna-XS.2 has both. `mimo2`'s sinks moved of
 the TENSOR (`AttnWeights::sinks`; four graphs pass it into the one
 `build_attn_mha`) without closing the row, because every real MiMo-V2
 export carries three MTP blocks inside `block_count` and a per-layer
-window ARRAY; both are seams now (below) and its verdict leads with its
-split K/V head width.
+window ARRAY; both became seams (below), and the row closed on its
+split K/V head width the day after (above).
 
 `deci` and `openelm` are ONE seam, `ferrox-models/src/layer_shapes.rs`.
 llama.cpp reads `head_count`, `head_count_kv` and `feed_forward_length`
@@ -718,7 +764,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 50
+Those files are why llama.cpp has 140 architectures and ferrox has 51
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

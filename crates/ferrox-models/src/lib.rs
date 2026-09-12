@@ -11,6 +11,7 @@
 pub mod act_layers;
 pub mod attn_gate;
 pub mod attn_temperature;
+pub mod attn_value_scale;
 pub mod bert_encoder;
 pub mod bert_gguf_loader;
 pub mod block_residual;
@@ -51,6 +52,7 @@ pub mod kimi_loader;
 pub mod kimi_tokenizer;
 pub mod kimi_validate;
 pub mod kv_budget;
+pub mod kv_head_dims;
 pub mod latent_moe;
 pub mod layer_shapes;
 pub mod llama4_engine;

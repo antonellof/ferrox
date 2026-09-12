@@ -91,6 +91,20 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **A V head width that differs from the K head width**, and with it
+  MiMo-V2 (`mimo2`: `head_dim: 192, v_head_dim: 128` on every export).
+  `ferrox_models::kv_head_dims` admits the pair for the one generic-path
+  architecture whose converter writes them apart and keeps refusing it,
+  naming llama.cpp's assert, for everyone else. `KvCache` and
+  `PagedKvStore` size V by its own width, the single-query and batched
+  prefill kernels accumulate over it, the projection check and the
+  fused-QKV cut read it; every fused Metal launch, the CUDA resident
+  hook, the slot file and the KV block file refuse a split model, so
+  MiMo-V2 runs on the host paths. Its `attention.value_scale` is
+  `ferrox_models::attn_value_scale`, one reader of 140. Building it
+  found `expert_weights_scale` / `expert_weights_norm` honoured for
+  every architecture where llama.cpp reads them in twenty loaders; the
+  loader's `EXPERT_WEIGHTS_*_READERS` tables are the measurement.
 - **The two norms inside the blocks**, and with it BitNet (`bitnet`).
   `bitnet.cpp:24,36` require `attn_sub_norm` on the attention output
   BEFORE `wo` and `ffn_sub_norm` on `silu(gate) * up` BEFORE `down`,

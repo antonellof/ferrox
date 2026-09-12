@@ -393,6 +393,7 @@ mod tests {
             layout: KvLayout::Gqa {
                 n_kv_heads: 1,
                 head_dim: 4,
+                v_head_dim: 4,
             },
             elem: KvElem::F32,
         }

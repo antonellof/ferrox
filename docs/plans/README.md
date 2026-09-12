@@ -60,15 +60,15 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **50** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **51** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 7 |
+| Refuses as **unaudited**, now triaged | 6 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (50 of
+regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (51 of
 them audited), 58 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
@@ -78,8 +78,8 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 7 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-6 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 6 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+5 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
 refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
@@ -110,7 +110,13 @@ gate SmallThinker really has), and `bitnet` on the two norms INSIDE
 the blocks (`ferrox_models::sub_norms`: one graph of 140 creates
 either tensor, so the seam is a `bool`; its optional per-projection
 `.scale` tensors, which llama.cpp applies for every architecture, are
-refused by name in `ferrox_models::weight_scales`). Each with a
+refused by name in `ferrox_models::weight_scales`), and `mimo2` on the
+split K/V head width (`ferrox_models::kv_head_dims`: one generic-path
+converter writes the two widths apart, the KV cache, the one row
+kernel the three contiguous arms collapsed onto, the batched prefill
+kernel and every check took the V width, and the bisection to its
+last 2e-3 of KL found `expert_weights_scale` honoured for every
+architecture where llama.cpp reads it in twenty loaders). Each with a
 libllama-golden fixture. `minicpm` closed on
 2026-09-10 and is not in that arithmetic: it was refused BY NAME rather
 than as unaudited, so it raises the audited count without lowering the
@@ -140,7 +146,8 @@ the same last word, `wqkv_gate`, and reading the three graphs side by
 side found one op with two free parameters (`ferrox_models::attn_gate`),
 so two closed and the third says the gate is done. `mimo2`'s sinks
 became a tensor-presence fact on the same day without closing it:
-every real export carries MTP blocks and a per-layer window array.
+every real export carries MTP blocks and a per-layer window array;
+it closed on 2026-09-12 on its split K/V head width.
 The tenth, `mistral3`, is what a reach measurement looks like when it
 comes back with one: the other two graphs that build the temperature
 input are on other engines (`llama4` from literals, `deepseek2` /
