@@ -55,6 +55,8 @@ pub mod latent_moe;
 pub mod layer_shapes;
 pub mod llama4_engine;
 pub mod loader;
+pub mod lora;
+pub mod lora_attach;
 pub mod minimax_engine;
 pub mod mla;
 pub mod mla_gguf_loader;

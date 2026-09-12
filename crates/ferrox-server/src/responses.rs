@@ -681,6 +681,7 @@ fn to_chat_request(req: &ResponsesRequest) -> Result<ChatCompletionRequest, ApiE
         grammar: None,
         // Not on the Responses wire.
         logit_bias: None,
+        lora: None,
     };
     request.validate_supported_fields()?;
     Ok(request)

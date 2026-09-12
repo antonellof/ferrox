@@ -272,6 +272,23 @@ pub struct InferArgs {
     #[arg(long = "model-draft", short = 'd', value_name = "FILE")]
     pub model_draft: Option<String>,
 
+    /// LoRA adapter GGUF (llama.cpp's `--lora`), applied at scale 1.
+    /// Repeatable, and comma-separated values are accepted as upstream
+    /// accepts them. The file is what `convert_lora_to_gguf.py` writes.
+    ///
+    /// Every adapter is applied inside the projections it names
+    /// (`W x + scale * alpha / rank * B (A x)`); the fused Metal stacks
+    /// cannot see it and are refused for the whole model, so an adapted
+    /// model runs on the per-matrix path on every backend.
+    #[arg(long = "lora", value_name = "FILE", action = clap::ArgAction::Append)]
+    pub lora: Vec<String>,
+
+    /// LoRA adapter with a scale, `FILE:SCALE` (llama.cpp's
+    /// `--lora-scaled`). Repeatable; adapters are numbered in the order
+    /// given, every `--lora` before every `--lora-scaled`.
+    #[arg(long = "lora-scaled", value_name = "FILE:SCALE", action = clap::ArgAction::Append)]
+    pub lora_scaled: Vec<String>,
+
     /// Tokens the drafter proposes per verification step (llama.cpp's
     /// `--draft-max`, also spelled `--draft`).
     #[arg(
@@ -1313,6 +1330,22 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
         .unwrap_or("unknown")
         .to_string();
     ferrox_models::mmproj::eprint_mmproj_if_present(path, Some(arch_early.as_str()));
+    let lora_specs =
+        ferrox_models::lora_attach::LoraSpec::from_flags(&args.lora, &args.lora_scaled)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !lora_specs.is_empty()
+        && (matches!(
+            select_engine_kind(&arch_early),
+            Ok(SelectedEngineKind::Mla | SelectedEngineKind::Gemma4)
+        ) || matches!(arch_early.as_str(), "glm-dsa" | "glm4"))
+    {
+        // The dedicated engines do not go through `Decoder`, and a
+        // flag that is accepted must reach the thing it names.
+        anyhow::bail!(
+            "--lora is not implemented for the {arch_early} engine (only the generic decoder \
+             attaches adapters); refusing rather than running the base weights"
+        );
+    }
     if matches!(select_engine_kind(&arch_early), Ok(SelectedEngineKind::Mla)) {
         return run_mla_infer(args, path, &file);
     }
@@ -1394,7 +1427,11 @@ pub fn run_infer(args: InferArgs) -> anyhow::Result<()> {
     // request, from `cparams.n_ctx_seq`).
     let mut config = config;
     config.apply_runtime_context(ctx_size);
-    let decoder = load_decoder_streaming_if_needed(path, config)?;
+    let mut decoder = load_decoder_streaming_if_needed(path, config)?;
+    decoder
+        .attach_lora_specs(&file, &lora_specs)
+        .map_err(|e| anyhow::anyhow!("lora: {e}"))?;
+    let decoder = decoder;
     eprintln!("ferrox: loaded in {:.2}s", load_t.elapsed().as_secs_f64());
 
     let mut tokens = tokenizer.encode(&prompt, SpecialTokens::Parse);

@@ -59,6 +59,33 @@ are the ones worth reading twice.
   a nonzero scale by name now, from a fixture that carries both keys,
   rather than implementing a multiply that engine has no golden to
   check.
+- **LoRA adapters, llama.cpp's `--lora` / `--lora-scaled`,
+  `GET`/`POST /lora-adapters` and the per-request `lora` field.** An
+  adapter GGUF (the file `convert_lora_to_gguf.py` writes) is applied
+  as `build_lora_mm` applies it, `W x + scale * alpha / rank * B (A x)`
+  on every projection it names, `token_embd` and `output` included,
+  with two adapters on one weight summing. The delta is a decoration
+  on `WeightMatrix` itself (`WeightMatrix::Adapted`,
+  `ferrox-core/src/weight_matrix/lora.rs`), so the CPU row body, the
+  batched host bodies and the per-matrix Metal and CUDA launches serve
+  it through the one method they already call; the fused Metal stacks
+  cannot see it and are fenced off for the whole model through the
+  predicate they share (`metal_can_serve_model`), so an adapted model
+  on Metal runs on the per-matrix path with the same tokens as CPU.
+  Checked against libllama loaded with the same adapter: KL at or
+  under 5.0e-13 on a fixture whose adapters were converted by
+  upstream's own script, and 5.2e-4 on Llama-3.2-1B-Instruct Q8_0
+  with a rank-8 adapter (base floor 1.9e-4; the adapter moves the
+  distribution by 1.5e-1); scale 0 is byte-identical to no adapter,
+  as it is upstream. Refused by name rather than approximated: an
+  adapter for another architecture, a tensor the base lacks or does
+  not fit (`llama-adapter.cpp`'s three checks), a routed-expert
+  target (`build_lora_mm_id`), an activated LoRA, the embedding pair
+  on a tied output head (libllama aborts in `ggml_mul_mat` on it,
+  measured), and the dedicated engines. The server's scales are one
+  atomic per adapter read at apply time; a `POST` or a per-request
+  override runs exclusively against the generations in flight and the
+  response cache keys on the scales a generation ran under.
 
 ## [0.21.0] - 2026-09-11
 

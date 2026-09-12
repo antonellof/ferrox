@@ -12,6 +12,13 @@
 //
 // Run:
 //   /tmp/gptoss_ref model.gguf 3 7 11 19 23 5
+//   /tmp/gptoss_ref --lora adapter.gguf:0.5 model.gguf 3 7 11 19 23 5
+//
+// `--lora FNAME[:SCALE]` (repeatable, before the model path) loads a
+// LoRA adapter GGUF through `llama_adapter_lora_init` and applies it at
+// SCALE (default 1.0) through `llama_set_adapters_lora`, which is what
+// `llama-cli --lora-scaled` does. It is the reference half of ferrox's
+// LoRA coverage test.
 //
 // Prints one float per line, full precision, for the LAST position.
 
@@ -19,16 +26,35 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <vector>
 
 int main(int argc, char ** argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s model.gguf tok0 [tok1 ...]\n", argv[0]);
+    std::vector<std::string> lora_paths;
+    std::vector<float>       lora_scales;
+    int argi = 1;
+    while (argi + 1 < argc && strcmp(argv[argi], "--lora") == 0) {
+        std::string spec = argv[argi + 1];
+        float scale = 1.0f;
+        size_t colon = spec.rfind(':');
+        if (colon != std::string::npos) {
+            scale = (float) atof(spec.c_str() + colon + 1);
+            spec.resize(colon);
+        }
+        lora_paths.push_back(spec);
+        lora_scales.push_back(scale);
+        argi += 2;
+    }
+
+    if (argc - argi < 2) {
+        fprintf(stderr, "usage: %s [--lora adapter.gguf[:scale]]... model.gguf tok0 [tok1 ...]\n", argv[0]);
         return 2;
     }
 
+    const char * model_path = argv[argi];
     std::vector<llama_token> toks;
-    for (int i = 2; i < argc; ++i) {
+    for (int i = argi + 1; i < argc; ++i) {
         toks.push_back((llama_token) atoi(argv[i]));
     }
 
@@ -37,10 +63,20 @@ int main(int argc, char ** argv) {
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
 
-    llama_model * model = llama_model_load_from_file(argv[1], mparams);
+    llama_model * model = llama_model_load_from_file(model_path, mparams);
     if (!model) {
         fprintf(stderr, "failed to load model\n");
         return 1;
+    }
+
+    std::vector<llama_adapter_lora *> adapters;
+    for (const auto & path : lora_paths) {
+        llama_adapter_lora * a = llama_adapter_lora_init(model, path.c_str());
+        if (!a) {
+            fprintf(stderr, "failed to load lora adapter %s\n", path.c_str());
+            return 1;
+        }
+        adapters.push_back(a);
     }
 
     llama_context_params cparams = llama_context_default_params();
@@ -62,6 +98,13 @@ int main(int argc, char ** argv) {
     if (!ctx) {
         fprintf(stderr, "failed to create context\n");
         return 1;
+    }
+
+    if (!adapters.empty()) {
+        if (llama_set_adapters_lora(ctx, adapters.data(), adapters.size(), lora_scales.data()) != 0) {
+            fprintf(stderr, "failed to set lora adapters\n");
+            return 1;
+        }
     }
 
     llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
@@ -89,6 +132,9 @@ int main(int argc, char ** argv) {
 
     llama_batch_free(batch);
     llama_free(ctx);
+    for (auto * a : adapters) {
+        llama_adapter_lora_free(a);
+    }
     llama_model_free(model);
     llama_backend_free();
     return 0;

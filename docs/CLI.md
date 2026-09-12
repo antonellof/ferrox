@@ -90,6 +90,8 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--list-devices` | Print compiled, detected devices and exit |
 | `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, `auto`, `all`, or a count at/above the layer count. A *partial* count is refused, see below |
 | `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4`, `turbo3` (falls back). **Metal only**, see below. Sets `FERROX_CTK` |
+| `--lora FILE` | A LoRA adapter GGUF (what `convert_lora_to_gguf.py` writes), applied at scale 1. Repeatable; comma-separated as llama.cpp accepts it. See below |
+| `--lora-scaled FILE:SCALE` | The same with a scale. Adapters are numbered in the order given, every `--lora` before every `--lora-scaled` |
 | `--system` | Chat mode only |
 | `--no-cnv` | Skip chat-template wrap |
 | `-e` / `--escape` | Expand `\n` `\t` `\r` `\\` in `-p`. **On by default**, as in llama.cpp |
@@ -985,6 +987,37 @@ main binary and needs the optional `serve` feature at build time.
 `ferrox-server` is that same server as its own executable, and both
 parse identical arguments through the same code.
 
+### LoRA adapters
+
+`--lora adapter.gguf` and `--lora-scaled adapter.gguf:0.5` load the
+file llama.cpp's `convert_lora_to_gguf.py` writes from a PEFT adapter
+directory and apply it exactly as `build_lora_mm` does: every
+projection the adapter names computes `W x + scale * alpha / rank *
+B (A x)`, `token_embd` and `output` included, and two adapters on one
+weight are two terms of the sum. Checked against libllama with the
+same adapter: KL at or under 5.0e-13 on the fixture graph (five adapter and scale combinations), and on
+Llama-3.2-1B-Instruct Q8_0 with a rank-8 adapter 5.2e-4 against a
+base-only floor of 1.9e-4 (the adapter itself moves the distribution
+by 1.5e-1).
+
+What is refused, by name, rather than approximated: an adapter for
+another architecture, one naming a tensor the base does not carry or
+of a shape it does not fit (the three checks `llama-adapter.cpp`
+makes), a routed-expert (`*_exps`) target, an activated LoRA
+(`adapter.alora.invocation_tokens`), the embedding pair on a model
+whose output head is tied to its embedding (libllama aborts in
+`ggml_mul_mat` on that pair), and the flag on the MLA, Gemma-4,
+GLM-5.2 and Kimi engines.
+
+On Metal an adapted model runs on the per-matrix path -- each
+projection's matvec on the device, the rank-sized delta on the host --
+because the fused stacks read weight bytes past the seam the delta
+lives in and are fenced off for the whole model. The output is the
+same tokens as CPU (measured), at per-matrix speed: Llama-3.2-1B Q8_0
+decodes at 44 tok/s with an adapter against 117 tok/s fused without
+one on an M2 Pro. CUDA and CPU serve the adapter on every path they
+have.
+
 ### Server flags, and llama.cpp's spellings
 
 `llama-server` commands mostly run unchanged:
@@ -1002,6 +1035,8 @@ parse identical arguments through the same code.
 | `-cb` / `--cont-batching`, `-np` / `--parallel` | Continuous batching and its sequence cap. Read back as `ferrox_scheduler_max_seqs` on `GET /metrics` |
 | `-b` / `--batch-size`, `-ub` / `--ubatch-size` | Prompt tokens per forward pass, on both decode paths. Resolved to one number the way llama.cpp does (the smaller of whichever was named); read back as `ferrox_scheduler_prefill_chunk` |
 | `--slot-save-path DIR` | Directory for `POST /slots/{id}?action=save\|restore`. Refused at startup when it is not a directory; without it the route answers 501 naming this flag, as llama.cpp does. Slots restore into the prefix cache, so `FERROX_PREFIX_CACHE_ENTRIES` must be set too |
+| `--lora FILE`, `--lora-scaled FILE:SCALE` | LoRA adapters, as on the completion side (above). Sets `FERROX_LORA`; every model load, including `/admin/models/load`, attaches the same adapters or refuses the checkpoint by name. `GET /lora-adapters` lists them, `POST /lora-adapters` and a request's `lora` field set their scales, see [`API.md`](API.md#lora-adapters) |
+| `--lora-init-without-apply` | Load the adapters at scale 0 until a `POST /lora-adapters` sets them. Sets `FERROX_LORA_INIT_WITHOUT_APPLY` |
 | `--reasoning-budget N` | Token budget for thinking, llama.cpp's flag and range: `-1` unrestricted (default), `0` immediate end, `N>0` a budget. The server default a request's `reasoning_budget_tokens` falls back to when absent or `-1`. Enforced in the sampler: after N tokens of thought the closing tag is forced, so the answer still arrives. Sets `FERROX_REASONING_BUDGET` |
 | `--prefill-assistant` / `--no-prefill-assistant` | Whether a trailing assistant message is continued rather than closed, llama.cpp's flag; on by default. A request's own `continue_final_message` (including `false`) still wins. Sets `FERROX_PREFILL_ASSISTANT` |
 | `--jinja` | Accepted, and already the default: ferrox always compiles and evaluates the GGUF's own `tokenizer.chat_template` |

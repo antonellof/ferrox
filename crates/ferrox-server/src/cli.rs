@@ -213,6 +213,28 @@ pub struct ServerArgs {
     #[arg(long = "slot-save-path", value_name = "DIR")]
     slot_save_path: Option<PathBuf>,
 
+    /// LoRA adapter GGUF (llama.cpp's `--lora`), applied at scale 1.
+    /// Repeatable; comma-separated values are accepted as upstream
+    /// accepts them. Sets `FERROX_LORA` together with `--lora-scaled`,
+    /// and every load -- the first and each `/admin/models/load` --
+    /// attaches the same adapters or refuses the checkpoint by name.
+    #[arg(long = "lora", value_name = "FILE", action = clap::ArgAction::Append)]
+    lora: Vec<String>,
+
+    /// LoRA adapter with a scale, `FILE:SCALE` (llama.cpp's
+    /// `--lora-scaled`). Repeatable; adapters are numbered in the order
+    /// given, every `--lora` before every `--lora-scaled`, and that
+    /// number is the `id` `POST /lora-adapters` and a request's `lora`
+    /// field address.
+    #[arg(long = "lora-scaled", value_name = "FILE:SCALE", action = clap::ArgAction::Append)]
+    lora_scaled: Vec<String>,
+
+    /// Load the adapters but apply none of them until a
+    /// `POST /lora-adapters` sets their scales (llama.cpp's
+    /// `--lora-init-without-apply`). Sets `FERROX_LORA_INIT_WITHOUT_APPLY`.
+    #[arg(long = "lora-init-without-apply", default_value_t = false)]
+    lora_init_without_apply: bool,
+
     /// Start even though another ferrox process is already holding a
     /// model. Off by default: two models on one box do not share it,
     /// they thrash it, and both serve slower than either would alone.
@@ -586,6 +608,32 @@ pub(crate) fn apply_cli_overrides(args: &ServerArgs) -> anyhow::Result<()> {
         }
         // SAFETY: called before the runtime starts worker threads.
         unsafe { std::env::set_var("FERROX_CB_MAX_SEQS", n.to_string()) };
+    }
+
+    let lora_specs =
+        ferrox_models::lora_attach::LoraSpec::from_flags(&args.lora, &args.lora_scaled)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !lora_specs.is_empty() {
+        for spec in &lora_specs {
+            if !spec.path.is_file() {
+                anyhow::bail!(
+                    "--lora {}: no such file. An adapter that cannot be opened would be \
+                     discovered at model load rather than at startup",
+                    spec.path.display()
+                );
+            }
+        }
+        let value = lora_specs
+            .iter()
+            .map(|s| format!("{}:{}", s.path.display(), s.scale))
+            .collect::<Vec<_>>()
+            .join(",");
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var(crate::lora::ENV_SPECS, value) };
+    }
+    if args.lora_init_without_apply {
+        // SAFETY: called before the runtime starts worker threads.
+        unsafe { std::env::set_var(crate::lora::ENV_INIT_WITHOUT_APPLY, "1") };
     }
 
     if let Some(dir) = &args.slot_save_path {

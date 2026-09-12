@@ -1122,6 +1122,12 @@ pub struct GenerationParams {
     /// the tokenizer -- and the sampler refuses a `Requested` budget
     /// rather than run without it. See [`crate::reasoning_budget`].
     pub reasoning_budget: crate::reasoning_budget::ReasoningBudget,
+    /// A per-request override of every LoRA adapter's scale, by id --
+    /// the request's `lora: [{id, scale}]` field resolved against the
+    /// loaded adapters (`crate::lora::resolve_request`). `None` runs
+    /// with the scales `POST /lora-adapters` (or the command line) set;
+    /// `Some` makes the generation exclusive for its duration.
+    pub lora: Option<Vec<f32>>,
 }
 
 impl GenerationParams {
@@ -1990,6 +1996,7 @@ mod tests {
             cancel: None,
             ignore_eos: false,
             reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         }
     }
 
@@ -2369,6 +2376,7 @@ mod tests {
                 cancel: None,
                 ignore_eos: false,
                 reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+                lora: None,
             },
             None,
             None,
@@ -2532,6 +2540,7 @@ mod tests {
             cancel: None,
             ignore_eos: false,
             reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         }
     }
 
@@ -2828,6 +2837,7 @@ mod tests {
                 cancel: None,
                 ignore_eos: false,
                 reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+                lora: None,
             },
             None,
             None,

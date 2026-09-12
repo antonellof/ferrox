@@ -16,11 +16,13 @@ use ferrox_gguf::GgmlType;
 use crate::tensor::Tensor;
 
 pub mod gpu_backend;
+pub mod lora;
 mod repack_cache;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan"))]
 use gpu_backend::BackendDispatch;
 use gpu_backend::{with_gpu_backend_caps, with_gpu_backends, BackendCaps, Cuda, Metal};
+pub use lora::{LoraDelta, LoraScale, LoraShapeError, LoraStack};
 pub use repack_cache::MapId;
 use repack_cache::{
     get_or_repack_q4_0x4, get_or_repack_q4k, get_or_repack_q5k, get_or_repack_q6k,
@@ -644,14 +646,66 @@ pub enum WeightMatrix {
         rows: usize,
         cols: usize,
     },
+    /// `base` with one or more LoRA adapters attached: every product
+    /// this matrix computes is `W x + Σ_i s_i · B_i (A_i x)`, the
+    /// low-rank term added inside the same method that computed `W x`
+    /// (see [`lora`]). `base` is never itself `Adapted`:
+    /// [`Self::attach_lora`] pushes onto the existing stack instead.
+    ///
+    /// A fourth variant rather than a field on the other three, so that
+    /// every place that reaches PAST the methods for raw bytes -- a
+    /// fused Metal stack, a simdgroup-GEMM descriptor, a Q8 row dot --
+    /// has to say what it does with an adapter, and the answer written
+    /// into each of them is `None`: those callers fall back to the
+    /// methods, which serve the delta, rather than run the base weights
+    /// and drop it.
+    Adapted {
+        base: Box<WeightMatrix>,
+        lora: LoraStack,
+    },
 }
 
 impl WeightMatrix {
+    /// Attaches one adapter's `(A, B)` pair. A second adapter on the
+    /// same weight joins the first's stack; the base is boxed exactly
+    /// once.
+    pub fn attach_lora(&mut self, delta: LoraDelta) {
+        assert_eq!(delta.rows(), self.rows(), "LoRA delta rows");
+        assert_eq!(delta.cols(), self.cols(), "LoRA delta cols");
+        if let WeightMatrix::Adapted { lora, .. } = self {
+            lora.push(delta);
+            return;
+        }
+        let placeholder = WeightMatrix::F32(Tensor::new(Vec::new(), vec![0, 0]));
+        let base = std::mem::replace(self, placeholder);
+        *self = WeightMatrix::Adapted {
+            base: Box::new(base),
+            lora: LoraStack::new(delta),
+        };
+    }
+
+    /// The adapters on this matrix, if any.
+    pub fn lora(&self) -> Option<&LoraStack> {
+        match self {
+            WeightMatrix::Adapted { lora, .. } => Some(lora),
+            _ => None,
+        }
+    }
+
+    /// The weights under any adapter: `self` when there is none.
+    pub fn base(&self) -> &WeightMatrix {
+        match self {
+            WeightMatrix::Adapted { base, .. } => base,
+            _ => self,
+        }
+    }
+
     /// Raw quantized byte length, or 0 for a float matrix. For
     /// comparing two backings of the same weight.
     pub fn bytes_len(&self) -> usize {
         match self {
             WeightMatrix::Quantized { data, .. } => data.len(),
+            WeightMatrix::Adapted { base, .. } => base.bytes_len(),
             _ => 0,
         }
     }
@@ -662,7 +716,7 @@ impl WeightMatrix {
     /// resident one disagree about a model's output, is the difference
     /// in the WEIGHTS or downstream of them?
     pub fn bytes_eq(&self, other: &WeightMatrix) -> bool {
-        match (self, other) {
+        match (self.base(), other.base()) {
             (WeightMatrix::Quantized { data: a, .. }, WeightMatrix::Quantized { data: b, .. }) => {
                 a.as_slice() == b.as_slice()
             }
@@ -675,6 +729,7 @@ impl WeightMatrix {
             WeightMatrix::F32(t) => t.rows(),
             WeightMatrix::Quantized { rows, .. } => *rows,
             WeightMatrix::Mxfp4 { rows, .. } => *rows,
+            WeightMatrix::Adapted { base, .. } => base.rows(),
         }
     }
 
@@ -685,6 +740,7 @@ impl WeightMatrix {
         match self {
             WeightMatrix::Quantized { kind, .. } => Some(*kind),
             WeightMatrix::F32(_) | WeightMatrix::Mxfp4 { .. } => None,
+            WeightMatrix::Adapted { base, .. } => base.quant_kind(),
         }
     }
 
@@ -693,6 +749,7 @@ impl WeightMatrix {
             WeightMatrix::F32(t) => t.cols(),
             WeightMatrix::Quantized { cols, .. } => *cols,
             WeightMatrix::Mxfp4 { cols, .. } => *cols,
+            WeightMatrix::Adapted { base, .. } => base.cols(),
         }
     }
 
@@ -1032,6 +1089,11 @@ impl WeightMatrix {
                 ferrox_quant::dequant_mxfp4_row(p, sc)
                     .expect("row slices are group-aligned by construction")
             }
+            WeightMatrix::Adapted { base, lora } => {
+                let mut row = base.dequant_row(r);
+                lora.add_row_to(r, &mut row);
+                row
+            }
         }
     }
 
@@ -1084,7 +1146,7 @@ impl WeightMatrix {
     #[cfg(any(feature = "metal", feature = "cuda"))]
     pub fn prefers_gpu_batch(&self) -> bool {
         !matches!(
-            self,
+            self.base(),
             WeightMatrix::Quantized {
                 kind: QuantKind::IQ4NL
                     | QuantKind::IQ1S
@@ -1116,6 +1178,11 @@ impl WeightMatrix {
             "activation length must match matrix column count"
         );
         crate::activation_tap::observe(self, x, 1);
+        if let WeightMatrix::Adapted { base, lora } = self {
+            let mut out = base.apply(x);
+            lora.add_to(x, &mut out);
+            return out;
+        }
         #[cfg(feature = "cuda")]
         {
             if cuda_dense_enabled() {
@@ -1550,6 +1617,11 @@ impl WeightMatrix {
                 });
                 out
             }
+            WeightMatrix::Adapted { base, lora } => {
+                let mut out = base.apply_cpu_inner(x);
+                lora.add_to(x, &mut out);
+                out
+            }
         }
     }
 
@@ -1827,6 +1899,11 @@ impl WeightMatrix {
     /// unsupported kind or width — so callers can pass the result straight
     /// to [`Self::apply_batch_with_acts`] unconditionally.
     pub fn quantize_batch_acts(&self, x_batch: &[f32], batch_size: usize) -> Option<BatchActs> {
+        if let WeightMatrix::Adapted { base, .. } = self {
+            // The activations the BASE consumes; the delta reads the
+            // f32 batch itself.
+            return base.quantize_batch_acts(x_batch, batch_size);
+        }
         #[cfg(feature = "metal")]
         {
             if metal_dense_enabled()
@@ -1916,6 +1993,11 @@ impl WeightMatrix {
             return Vec::new();
         }
         crate::activation_tap::observe(self, x_batch, batch_size);
+        if let WeightMatrix::Adapted { base, lora } = self {
+            let mut out = base.apply_batch_with_acts(x_batch, batch_size, shared);
+            lora.add_batch_to(x_batch, batch_size, &mut out);
+            return out;
+        }
 
         /// Raw pointer to this function's `[batch][rows]` output, shared
         /// across rayon tasks.
@@ -2698,6 +2780,7 @@ impl WeightMatrix {
                 });
                 out
             }
+            WeightMatrix::Adapted { .. } => unreachable!("handled before dispatch"),
         }
     }
 
@@ -2709,6 +2792,7 @@ impl WeightMatrix {
             WeightMatrix::F32(t) => t.len() * 4,
             WeightMatrix::Quantized { data, .. } => data.len(),
             WeightMatrix::Mxfp4 { packed, scale, .. } => packed.len() + scale.len(),
+            WeightMatrix::Adapted { base, lora } => base.resident_bytes() + lora.resident_bytes(),
         }
     }
 
@@ -2731,6 +2815,11 @@ impl WeightMatrix {
             self.cols(),
             "activation length must match matrix column count"
         );
+        if let WeightMatrix::Adapted { base, lora } = self {
+            let mut out = base.apply_gpu(x)?;
+            lora.add_to(x, &mut out);
+            return Some(out);
+        }
 
         // F32 stays on CPU in apply_gpu: a lone small router matvec is
         // faster as host GEMV than a Metal sync. F32 Metal launches are
@@ -2824,6 +2913,18 @@ impl WeightMatrix {
             mats[0].cols(),
             "activation length must match matrix column count"
         );
+        if mats.iter().any(|m| m.lora().is_some()) {
+            // The fused launch runs over the bases; each adapter's
+            // delta is added to its own output on the host.
+            let bases: Vec<&WeightMatrix> = mats.iter().map(|m| m.base()).collect();
+            let mut outs = Self::apply_gpu_multi(&bases, x)?;
+            for (m, out) in mats.iter().zip(outs.iter_mut()) {
+                if let Some(lora) = m.lora() {
+                    lora.add_to(x, out);
+                }
+            }
+            return Some(outs);
+        }
 
         // Try CUDA first if enabled.
         #[cfg(feature = "cuda")]
@@ -3053,6 +3154,11 @@ impl WeightMatrix {
     pub fn apply_gpu_batch(&self, x_batch: &[f32], batch_size: usize) -> Option<Vec<f32>> {
         if !metal_dense_enabled() || batch_size == 0 {
             return None;
+        }
+        if let WeightMatrix::Adapted { base, lora } = self {
+            let mut out = base.apply_gpu_batch(x_batch, batch_size)?;
+            lora.add_batch_to(x_batch, batch_size, &mut out);
+            return Some(out);
         }
         let WeightMatrix::Quantized {
             data,

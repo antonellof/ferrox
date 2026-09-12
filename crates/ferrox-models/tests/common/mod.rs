@@ -199,9 +199,21 @@ pub fn assert_all_three_paths_match(name: &str, golden: &[f32]) {
 /// and the weaker one would be invisible. Only [`GELU_TABLE_TOL`] is
 /// ever passed here, and only by the GeGLU rows.
 pub fn assert_all_three_paths_match_within(name: &str, golden: &[f32], tol: f32) {
-    let decoder = load_graph_fixture(name);
+    assert_decoder_matches_on_all_three_paths(&load_graph_fixture(name), golden, tol, name);
+}
 
-    let mut kv = graph_caches(&decoder);
+/// The three paths over a decoder the caller has already built -- one
+/// it has attached a LoRA adapter to, say -- rather than one loaded by
+/// fixture name. The two named helpers above are this one applied to
+/// `load_graph_fixture`, so a fourth path added here reaches every
+/// suite at once.
+pub fn assert_decoder_matches_on_all_three_paths(
+    decoder: &Decoder,
+    golden: &[f32],
+    tol: f32,
+    name: &str,
+) {
+    let mut kv = graph_caches(decoder);
     assert_close(
         &decoder.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),
         golden,
@@ -209,14 +221,14 @@ pub fn assert_all_three_paths_match_within(name: &str, golden: &[f32], tol: f32)
         &format!("{name}: prefill (forward_batch_last)"),
     );
 
-    let mut kv = graph_caches(&decoder);
+    let mut kv = graph_caches(decoder);
     let mut out = Vec::new();
     for (pos, &tok) in GRAPH_PROMPT.iter().enumerate() {
         out = decoder.forward_token(tok, pos, &mut kv);
     }
     assert_close(&out, golden, tol, &format!("{name}: decode"));
 
-    let mut kv = vec![graph_caches(&decoder)];
+    let mut kv = vec![graph_caches(decoder)];
     let mut out = Vec::new();
     for (pos, &tok) in GRAPH_PROMPT.iter().enumerate() {
         let batch = decoder.forward_multi_seq(&[tok], &[pos], &mut kv);

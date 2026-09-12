@@ -237,6 +237,10 @@ pub(crate) struct CompletionsRequest {
     /// `ChatCompletionRequest::ignore_eos`.
     #[serde(default)]
     ignore_eos: Option<bool>,
+    /// llama.cpp's per-request `lora: [{id, scale}]`; see
+    /// `ChatCompletionRequest::lora`.
+    #[serde(default)]
+    lora: Option<Vec<ferrox_api::LoraScaleRequest>>,
     // Fields this server does not implement. Deserialized ONLY so they
     // can be refused by name -- serde would otherwise drop each one
     // silently, which is indistinguishable from having honoured it.
@@ -513,6 +517,7 @@ pub async fn completions(
         // A raw completion has no reasoning format (`reasoning: None`
         // above), so there is no block for a budget to bound.
         reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+        lora: crate::lora::resolve_request(active.generative()?, req.lora.as_deref())?,
     };
     let (chunks, finish, usage) = crate::decode_task::buffered(
         crate::decode_task::DecodeHandles::take(&state, &active)?,

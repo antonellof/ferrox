@@ -636,7 +636,7 @@ These are the rows that matter most, because nothing errors.
 | `--rope-scaling`, `--rope-freq-base`, `--rope-freq-scale`, `--yarn-*` | `arg.cpp:2281-2340` | ALL MISSING | medium | M |
 | `-ot` / `--override-tensor`, `-cmoe` / `--cpu-moe`, `-ncmoe` | `arg.cpp:2670,2676,2683` | MISSING. **Notable**: this is per-tensor CPU/GPU placement, which is exactly what ferrox's `ferrox-core` expert-residency stack was built to execute and which nothing currently drives | high | L |
 | `-sm` / `--split-mode`, `-mg` / `--main-gpu`, `-ts` / `--tensor-split` | `arg.cpp:2717,2768,2741` | MISSING; ferrox has no multi-GPU concept | medium | XL |
-| `--lora` / `--lora-scaled` | `arg.cpp:2865,2875` | MISSING; no LoRA anywhere in the workspace | medium | XL |
+| `--lora` / `--lora-scaled` | `arg.cpp:2865,2875` | **DONE** (`run.rs`, `ferrox-server/src/cli.rs`; the adapter is a `WeightMatrix::Adapted` decoration in `ferrox-core/src/weight_matrix/lora.rs`, attached by name in `ferrox-models/src/lora_attach.rs`). Routed-expert targets, aLoRA and the dedicated engines refuse by name | -- | -- |
 | `-l` / `--logit-bias` | `arg.cpp:2193` | MISSING; the API refuses it by name on `/v1/completions` (`openai_extra.rs:198-207`) and silently drops it on chat (§3.2/E5) | medium | M |
 | `--keep`, `-r` / `--reverse-prompt`, `-sp` / `--special`, `--in-prefix`/`--in-suffix` | `arg.cpp:1630,1835,1842,1898,1906` | ALL MISSING | medium | S-M |
 | `--jinja` / `--no-jinja` | `arg.cpp:3571` | MISSING; ferrox always uses its own engine (`chat_template.rs`) | medium | S |
@@ -667,7 +667,7 @@ ferrox ships two binaries. Subcommands: `crates/ferrox-cli/src/main.rs:43-393`.
 | **`tools/perplexity`** (ppl, hellaswag, winogrande, KL-divergence) | **NONE.** `verify` / `parity` / `layer-divergence` compare against a reference implementation, not a corpus. Nothing in ferrox can answer "did this quantization hurt the model" -- which `roadmap.md:82` already names as `tooling-quality-eval` | high | M |
 | `tools/imatrix` | NONE | medium | L |
 | `tools/gguf-split` | NONE. ferrox *reads* shards (`ferrox_gguf::ShardedGguf`) but cannot produce or merge them | medium | M |
-| `tools/export-lora` | NONE | medium | L |
+| `tools/export-lora` | NONE. The adapter format and the merge arithmetic exist now (`ferrox_models::lora`), so this is a `quantize`-adjacent write path: dequantize each named tensor, add `scale * B A`, requantize, write. Not built with `--lora` because it did not fall out of it | medium | M |
 | `tools/mtmd` (multimodal) | NONE | medium | XL |
 | `tools/tokenize` | Partial: `ferrox parity tokenize` (`main.rs:202`) is a comparison harness, not a dump | low | S |
 | `tools/rpc`, `tools/tts`, `tools/cvector-generator` | NONE | low | XL |
@@ -733,7 +733,7 @@ llama.cpp's routes are one contiguous block,
 | **`POST /tokenize`** | `:259` | **PATH MISMATCH.** ferrox mounts `/v1/tokenize` (`lib.rs:4274`, `routes.rs:21`); llama.cpp has no `/v1/` spelling and ferrox has no bare one. Neither client works against the other | high | S |
 | **`POST /detokenize`** | `:260` | **PATH MISMATCH**, same (`lib.rs:4275`, `routes.rs:22`) | high | S |
 | `POST /apply-template` | `:261` | MISSING, despite an 860-line `chat_template.rs` | medium | S |
-| `GET /lora-adapters`, `POST /lora-adapters` | `:269-270` | MISSING | medium | XL |
+| `GET /lora-adapters`, `POST /lora-adapters` | `:269-270` | **DONE** (`ferrox-server/src/lora.rs`), with the per-request `lora` field on the three completion routes. Differences from upstream are named there: an unknown id is a 400 rather than ignored, and a scale change is exclusive against the generations in flight rather than a per-slot list | -- | -- |
 | **`GET /slots`** | `:272` | **MISSING.** Nearest are ferrox-only and differently shaped: `/v1/stats` (`lib.rs:4252`), `/v1/requests` (`:4253`), `/v1/cache/status` (`:4254`) | high | M |
 | `POST /slots/:id` (save/restore/erase) | `:273` | MISSING; no KV save/restore to disk | medium | L |
 | `POST /models`, `/models/load`, `/models/unload` | `:226-228` | ferrox has `/admin/models{,/load,/unload}` (`lib.rs:4283-4285`) -- same capability, different paths | low | S |

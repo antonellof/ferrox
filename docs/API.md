@@ -31,6 +31,7 @@ comes back the same way.
 | `POST /v1/conversations/{conversation_id}/delete` | Delete. Spelled as a POST suffix because the CORS allow-list is `GET, POST`, so a `DELETE` method would work from curl and fail from every cross-origin browser |
 | `POST /v1/admin/prepare-stop` | Close admission, seal the accounting, and make the receipt durable (see below) |
 | `POST /slots/{id_slot}?action=save\|restore` | llama.cpp's slot save/restore: persist a prompt prefix's KV to disk and load it back after a restart. Needs `--slot-save-path` and `FERROX_PREFIX_CACHE_ENTRIES` (see below). `action=erase` is refused by name |
+| `GET /lora-adapters` · `POST /lora-adapters` | llama.cpp's LoRA listing and scale setting; the per-request `lora` field is honoured on `/v1/chat/completions`, `/v1/completions` and `/completion` (see below) |
 | `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
 | `/admin/*` | Control surface (see below) |
 | `GET /` | 404. The web UI in [`ui/`](../ui) is a separate app and this server does not serve it |
@@ -998,6 +999,53 @@ Slots are implemented for the generic GGUF decoder. The dedicated
 engines (Kimi, MLA, Gemma-4, GLM-5.2) refuse by name; so does a server
 without a checkpoint on disk.
 
+## LoRA adapters
+
+llama.cpp's `GET /lora-adapters`, `POST /lora-adapters` and the
+per-request `lora` field, over adapters loaded with `--lora` /
+`--lora-scaled` (see [`CLI.md`](CLI.md#lora-adapters)).
+
+```sh
+ferrox-server -m model.gguf --lora style.gguf --lora-scaled tone.gguf:0.5
+
+curl localhost:8383/lora-adapters
+# [{"id":0,"path":"style.gguf","scale":1.0,"task_name":"","prompt_prefix":""},
+#  {"id":1,"path":"tone.gguf","scale":0.5,"task_name":"","prompt_prefix":""}]
+
+# Set the scales for every request that does not override them. An
+# adapter not named goes to 0, as upstream's construct_lora_list sets it.
+curl localhost:8383/lora-adapters -d '[{"id":1,"scale":1.0}]'
+# {"success":true}
+
+# One request under its own scales; the server's are untouched after.
+curl localhost:8383/v1/chat/completions -d '{"model":"m",
+  "messages":[{"role":"user","content":"hi"}], "lora":[{"id":0,"scale":0.25}]}'
+```
+
+`GET` reports the scale currently applied, which is what
+`--lora-init-without-apply` starts at (0) rather than the flag's
+number. `POST` takes the `[{id, scale}]` array (`scale` absent reads
+0, as upstream's `json_value` default); an `id` no adapter has is a
+400 naming the range, where upstream ignores it. A request's `lora`
+list means what `construct_lora_list` makes it mean -- every adapter
+named gets its scale, every other adapter 0 for that request -- and
+an EMPTY list means the server's own scales, as upstream reads it.
+Naming an adapter on a server that loaded none is a 400; the field on
+a checkpoint served by a dedicated engine (MLA, Gemma-4, GLM-5.2,
+Kimi) is a 501.
+
+An adapter's scale is one atomic read by every projection at apply
+time, so a change costs nothing and recomputes nothing. What it costs
+instead is exclusivity: a `POST`, or a request whose `lora` list
+differs from what is applied, waits for the generations in flight and
+runs alone, then the request's override is restored. A request whose
+list names exactly the current scales is an ordinary concurrent
+request. This is llama.cpp's rule -- two slots with different LoRA
+lists are never co-batched -- at the granularity of the whole server
+rather than the batch. The response cache keys on the scales a
+generation ran under, so a `POST` between two identical requests does
+not serve the first answer to the second.
+
 ## MCP
 
 `--mcp-config PATH` loads server metadata under `ferrox_mcp` in
@@ -1223,7 +1271,7 @@ naming the field:
 not ids) · `n_indent` · `n_keep` (ferrox refuses an oversized request
 rather than shifting context, so there is nothing to protect) ·
 `n_cmpl` · `n_cache_reuse` · `t_max_predict_ms` · `id_slot` (no slots)
-· `lora` · `response_fields` · `return_progress` · `timings_per_token`
+· `response_fields` · `return_progress` · `timings_per_token`
 · `sse_ping_interval` (the keepalive is fixed at 15s).
 
 Also refused: `logit_bias` (through the same rule both OpenAI routes
@@ -1424,8 +1472,7 @@ streamed tool calls on the continuous-batching path · a speculative
 decode path in the server, so every speculation field in `usage` is
 absent today · llama.cpp's `/infill`, `/props`, `GET /slots` (the live
 slot listing; `POST /slots/{id}` save/restore is supported, see above),
-`/apply-template` and `/lora-adapters`, none of which have a
-ferrox counterpart.
+and `/apply-template`, none of which has a ferrox counterpart.
 
 A few request fields deserialize and then go nowhere, accepted so a
 stock client's body does not fail validation over something this server

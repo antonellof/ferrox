@@ -75,6 +75,15 @@ pub struct GenerationKey {
     /// The requested reasoning budget, `None` when unrestricted. A
     /// budget cuts the thought and so changes the answer.
     pub reasoning_budget: Option<u32>,
+    /// The LoRA scales the generation ran under, by adapter id, as f32
+    /// bits; `None` when the model holds no adapter. KEYED because the
+    /// scales are the weights: `POST /lora-adapters` changes the answer
+    /// to an identical request on an identical model, and so does a
+    /// request's own `lora` field. `crate::lora::resolve_request` fills
+    /// the EFFECTIVE vector in whenever an adapter is loaded, precisely
+    /// so this key can see a change made by a POST between two
+    /// identical requests.
+    pub lora: Option<Vec<u32>>,
 }
 
 /// A compiled grammar, in a form a hashed cache key can hold.
@@ -157,6 +166,7 @@ pub fn generation_key(params: &GenerationParams) -> GenerationKey {
         cancel: _,
         ignore_eos,
         reasoning_budget,
+        lora,
     } = params;
     GenerationKey {
         max_tokens: *max_tokens,
@@ -175,6 +185,9 @@ pub fn generation_key(params: &GenerationParams) -> GenerationKey {
         // The number, not the plan: the plan is derived from the number,
         // the model and the prompt, all three already keyed.
         reasoning_budget: reasoning_budget.key(),
+        lora: lora
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.to_bits()).collect()),
     }
 }
 
@@ -500,6 +513,7 @@ mod tests {
             cancel: None,
             ignore_eos: false,
             reasoning_budget: crate::reasoning_budget::ReasoningBudget::Unrestricted,
+            lora: None,
         }
     }
 
