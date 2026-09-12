@@ -41,7 +41,7 @@
 //! that every name is a row this loader can reach.
 
 use crate::loader::load_f32_vec;
-use crate::norm::{norm_function, NormFunction, NormOp};
+use crate::norm::{norm_function, NormFunction, NormOp, NormParam};
 use crate::LoadError;
 use ferrox_gguf::{GgufError, TensorSource};
 
@@ -147,8 +147,15 @@ impl StoredNorm {
         }
     }
 
-    /// Every full tensor name this site accepts, in lookup order.
+    /// Every full tensor name this site accepts for its weight, in
+    /// lookup order.
     fn candidates(&self, layer: Option<usize>) -> Vec<String> {
+        self.candidates_for(layer, NormParam::Weight)
+    }
+
+    /// The names for one part. The bare name (no suffix) is a weight
+    /// spelling some exporters use and is never a bias.
+    fn candidates_for(&self, layer: Option<usize>, part: NormParam) -> Vec<String> {
         self.names
             .iter()
             .flat_map(|base| {
@@ -156,7 +163,10 @@ impl StoredNorm {
                     Some(l) => format!("blk.{l}.{base}"),
                     None => (*base).to_string(),
                 };
-                [format!("{full}.weight"), full]
+                match part {
+                    NormParam::Weight => vec![format!("{full}.weight"), full],
+                    NormParam::Bias => vec![format!("{full}.bias")],
+                }
             })
             .collect()
     }
@@ -179,18 +189,23 @@ impl StoredNorm {
         Ok(None)
     }
 
-    /// The weight of a REQUIRED site.
-    fn load_required(
+    /// One REQUIRED part of a REQUIRED site: the weight, or the bias of
+    /// a `LayerNormBias` architecture, which `orion.cpp:18,25,31` and
+    /// `nemotron.cpp:19,26,35` create with `create_tensor(..., 0)`.
+    fn load_required_part(
         &self,
         file: &impl TensorSource,
         layer: Option<usize>,
+        part: NormParam,
     ) -> Result<Vec<f32>, LoadError> {
-        debug_assert!(self.required, "load_required on an optional site");
-        self.load(file, layer)?.ok_or_else(|| {
-            LoadError::Gguf(GgufError::TensorNotFound(
-                self.candidates(layer).join(" | "),
-            ))
-        })
+        debug_assert!(self.required, "load_required_part on an optional site");
+        let candidates = self.candidates_for(layer, part);
+        match candidates.iter().find(|n| file.find_tensor(n).is_some()) {
+            Some(name) => load_f32_vec(file, name),
+            None => Err(LoadError::Gguf(GgufError::TensorNotFound(
+                candidates.join(" | "),
+            ))),
+        }
     }
 }
 
@@ -263,7 +278,9 @@ impl NormSites {
     ) -> Result<NormOp, LoadError> {
         match site {
             None => Ok(NormOp::None),
-            Some(stored) => self.function.resolve(|| stored.load_required(file, layer)),
+            Some(stored) => self
+                .function
+                .resolve(|part| stored.load_required_part(file, layer, part)),
         }
     }
 

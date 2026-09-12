@@ -239,6 +239,20 @@ const LLAMA_REQUIRED_BIASES: &[(&str, &[&str], &str)] = &[
 /// because ferrox implements those two on the gpt-oss path.
 const GPT_OSS_EXEMPTION: &str = "gpt-oss";
 
+/// The three LayerNorm biases, applied for exactly the architectures
+/// `capability::BIASED_LAYER_NORM` names (`NormOp::LayerNormBias`), and
+/// dropped everywhere else -- so they are not in
+/// [`GENERIC_DECODER_APPLIES`], which is architecture-blind, and the
+/// filter below asks the capability list instead.
+const LAYER_NORM_BIASES: &[&str] = &["output_norm.bias", "attn_norm.bias", "ffn_norm.bias"];
+
+/// Whether the generic path applies `bias` for `arch`.
+fn applied(arch: &str, bias: &str) -> bool {
+    GENERIC_DECODER_APPLIES.contains(&bias)
+        || (LAYER_NORM_BIASES.contains(&bias)
+            && ferrox_models::capability::uses_biased_layer_norm(arch))
+}
+
 /// gpt-oss's exemption has to be backed by code, not by this constant.
 ///
 /// If `GptOssLayer` ever loses either field the exemption below becomes
@@ -279,6 +293,43 @@ fn the_fused_qkv_bias_entry_is_backed_by_real_code() {
     }
 }
 
+/// The LayerNorm-bias entry has to be backed by a loader that reads the
+/// bias and a norm that adds it, not by the capability list saying so:
+/// the orion fixture's every norm site comes back as the biased variant
+/// with a bias that is the file's.
+#[test]
+fn the_layer_norm_bias_entry_is_backed_by_real_code() {
+    for arch in ferrox_models::capability::BIASED_LAYER_NORM {
+        let path = format!(
+            "{}/tests/fixtures/{arch}_tiny.gguf",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let file = ferrox_gguf::GgufFile::open(&path).expect("fixture opens");
+        assert!(
+            file.find_tensor("blk.0.attn_norm.bias").is_some(),
+            "{arch}: the fixture must carry the bias, or this proves nothing"
+        );
+        let config = ferrox_models::ModelConfig::from_gguf(&file).expect("config parses");
+        let d = ferrox_models::Decoder::from_gguf(&path, config).expect("fixture loads");
+        for (i, layer) in d.layers.iter().enumerate() {
+            assert!(
+                matches!(
+                    layer.attn.norm_weight,
+                    ferrox_models::norm::NormOp::LayerNormBias { .. }
+                ) && matches!(
+                    layer.moe.norm_weight,
+                    ferrox_models::norm::NormOp::LayerNormBias { .. }
+                ),
+                "{arch} layer {i}: the LayerNorm biases were not read into the biased variant"
+            );
+        }
+        assert!(matches!(
+            d.final_norm,
+            ferrox_models::norm::NormOp::LayerNormBias { .. }
+        ));
+    }
+}
+
 #[test]
 fn the_gpt_oss_exemption_is_backed_by_real_fields() {
     let _o_bias: fn(&ferrox_models::decoder::GptOssLayer) -> &Vec<f32> = |l| &l.o_bias;
@@ -302,12 +353,14 @@ fn the_gpt_oss_exemption_is_backed_by_real_fields() {
 /// was computing a different normalisation at every layer of every one
 /// of them.
 ///
-/// EIGHT of the nine are still refused. `qwen` left, because its only
+/// SIX of the nine are still refused. `qwen` left, because its only
 /// dropped bias was the fused `attn_qkv.bias` and `qkv_fused` applies
-/// that now; it is audited against libllama in
-/// `tests/one_match_arm_graphs.rs`. That is what this test is for -- a
-/// row leaves it by the blocker being implemented, not by the row being
-/// edited.
+/// that now (`tests/one_match_arm_graphs.rs`); `orion` and `nemotron`
+/// left on 2026-09-12, because their only dropped biases were the three
+/// LayerNorm biases and `NormOp::LayerNormBias` applies them
+/// (`tests/biased_layer_norm_graphs.rs`). That is what this test is for
+/// -- a row leaves it by the blocker being implemented, not by the row
+/// being edited.
 #[test]
 fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path() {
     let mut admitted = Vec::new();
@@ -318,7 +371,7 @@ fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path()
         let dropped: Vec<&str> = biases
             .iter()
             .copied()
-            .filter(|b| !GENERIC_DECODER_APPLIES.contains(b))
+            .filter(|b| !applied(arch, b))
             .collect();
         if dropped.is_empty() {
             continue;
@@ -344,11 +397,10 @@ fn an_architecture_whose_required_bias_ferrox_drops_is_not_on_the_generic_path()
 /// moment that other reason is fixed.
 #[test]
 fn the_bias_refusals_name_the_bias() {
+    // `nemotron` and `orion` were here; their biases are applied now.
     for arch in [
         "codeshell",
         "jais2",
-        "nemotron",
-        "orion",
         "stablelm",
         "starcoder",
         "starcoder2",

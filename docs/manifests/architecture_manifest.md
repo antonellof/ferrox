@@ -26,6 +26,8 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `mistral3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `arctic` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `glm4` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `orion` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `nemotron` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -65,8 +67,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `starcoder` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `starcoder2` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `phimoe` | TextGeneration | StandardGqa | KvGqa | dedicated |
-| `nemotron` | TextGeneration | StandardGqa | KvGqa | dedicated |
-| `orion` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `stablelm` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `qwen3` | TextGeneration | Qwen3Family | KvGqa | generic-gqa |
 | `qwen3moe` | TextGeneration | Qwen3Family | KvGqa | generic-gqa |
