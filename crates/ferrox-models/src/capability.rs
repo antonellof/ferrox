@@ -922,6 +922,18 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     "starcoder2",
     "codeshell",
     "jais2",
+    // tests/stablelm_graphs.rs: `stablelm` (StableLM-2-1.6B, StableLM-3B-
+    // 4E1T), the sixth row of the old group, on the same
+    // `NormOp::LayerNormBias` with the OPTIONAL `ffn_norm.bias`
+    // (`stablelm.cpp:39`) required beside its weight, Q/K/V biases
+    // through `create_tensor_qkv`, partial NEOX RoPE, SwiGLU. Two shapes
+    // behind the same string are refused by name: a layer with no
+    // `ffn_norm` is the PARALLEL residual (`:129-138`,
+    // `crate::parallel_residual`) and a layer with `attn_q_norm` applies
+    // a per-head LAYERNORM (`:34-35,84-97`, `crate::qk_layer_norm`);
+    // StableLM-2-12B has both. `use_parallel_residual` is read by
+    // nothing in the graph and ignored here as there (measured).
+    "stablelm",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1036,8 +1048,8 @@ pub fn uses_non_parametric_rms_norm(arch: &str) -> bool {
 /// `phimoe` group all create `*_norm.bias` as REQUIRED and `build_norm`
 /// adds it after the multiply. That is the `LayerNorm(w, b)` variant,
 /// [`BIASED_LAYER_NORM`], which arrived on 2026-09-12 when `orion` and
-/// `nemotron` turned out to need nothing else; the other six still
-/// refuse for something on top.
+/// `nemotron` turned out to need nothing else; six of the group are on
+/// it now and `starcoder` / `phimoe` still refuse for something on top.
 pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx"];
 
 /// Does this architecture normalise with a weighted LayerNorm?
@@ -1074,13 +1086,25 @@ pub fn uses_weighted_layer_norm(arch: &str) -> bool {
 /// same with a partial rotary) and `jais2` (`jais2.cpp:20,30,44`, the
 /// ReLU-squared FFN); `tests/proj_bias_graphs.rs`.
 ///
-/// The three the group still holds, each for something ELSE on top of
-/// this norm (the norm is done for all of them): `starcoder` a learned
-/// `position_embd` with no RoPE; `stablelm` a parallel residual
-/// (`stablelm.cpp`) and its own QK norm order; `phimoe` an
-/// `output.bias` on the LM head and LongRoPE. `tests/attn_bias.rs`
-/// pins all three as refused with the bias named.
-pub const BIASED_LAYER_NORM: &[&str] = &["orion", "nemotron", "starcoder2", "codeshell", "jais2"];
+/// `stablelm` followed (`stablelm.cpp:20-21,27-28,38-39`; the pre-FFN
+/// pair is `TENSOR_NOT_REQUIRED`, and its absence is the parallel
+/// residual `crate::parallel_residual` refuses by name), with its
+/// per-head LayerNorm QK norm refused by name too
+/// (`crate::qk_layer_norm`); `tests/stablelm_graphs.rs`.
+///
+/// The two the group still holds, each for something ELSE on top of
+/// this norm (the norm is done for both): `starcoder` a learned
+/// `position_embd` with no RoPE; `phimoe` an `output.bias` on the LM
+/// head and LongRoPE. `tests/attn_bias.rs` pins both as refused with
+/// the bias named.
+pub const BIASED_LAYER_NORM: &[&str] = &[
+    "orion",
+    "nemotron",
+    "starcoder2",
+    "codeshell",
+    "jais2",
+    "stablelm",
+];
 
 /// See [`BIASED_LAYER_NORM`].
 pub fn uses_biased_layer_norm(arch: &str) -> bool {
@@ -1633,6 +1657,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         v.push(gqa_neox("starcoder2"));
         v.push(gqa_neox("codeshell"));
         v.push(gqa_neox("jais2"));
+        // `stablelm` was DedicatedOnly on its REQUIRED LayerNorm biases;
+        // audited now for the sequential shape, its parallel residual
+        // (`crate::parallel_residual`) and per-head LayerNorm QK norm
+        // (`crate::qk_layer_norm`) refused by name from fixtures libllama
+        // runs (tests/stablelm_graphs.rs). NEOX RoPE: llama-model.cpp:2624.
+        v.push(gqa_neox("stablelm"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -1908,13 +1938,10 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // `nemotron` and `orion` were HERE for their REQUIRED LayerNorm
             // biases alone, and closed together on `NormOp::LayerNormBias`
             // (`BIASED_LAYER_NORM`, tests/biased_layer_norm_graphs.rs).
-            (
-                "stablelm",
-                Neox,
-                "required LayerNorm biases `output_norm.bias` and `attn_norm.bias` \
-                 (src/models/stablelm.cpp:20,28); the generic decoder is \
-                 RMSNorm-only and drops both",
-            ),
+            // `stablelm` was HERE for the same biases and closed on the
+            // same variant once its two OTHER shapes -- the parallel
+            // residual and the per-head LayerNorm QK norm -- had a
+            // refusal by name each (tests/stablelm_graphs.rs).
         ] {
             v.push(prof(
                 n,
@@ -3825,6 +3852,7 @@ mod tests {
             "starcoder2",
             "codeshell",
             "jais2",
+            "stablelm",
         ] {
             assert!(
                 matches!(

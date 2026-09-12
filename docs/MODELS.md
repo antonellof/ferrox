@@ -194,7 +194,7 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **61** do
+   logit comparison against real `libllama`, or a fixture; **62** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
@@ -204,8 +204,8 @@ The error always names the reason. Six things cause it:
    `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35`,
    `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `nanbeige`, `talkie`,
    `arctic`, `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`,
-   `codeshell`, `jais2`, `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`,
-   `dots1`).
+   `codeshell`, `jais2`, `stablelm`, `gemma`, `gemma2`, `gemma3`, `phi3`,
+   `gpt-oss`, `dots1`).
    The other **2** stop with `UnauditedArchitecture`. (`plm` is not in
    the 54 and not in the 2: it runs on the MLA engine, `DedicatedOnly`,
    with its own golden.)
@@ -1174,8 +1174,10 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 |---|---|
 | Per-layer head counts or FFN width | CLOSED (`ferrox_models::layer_shapes`): `deci`, `openelm`, `laguna`, `step35` and `mimo2` run on it |
 | A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | CLOSED: `olmo`, `olmo2`, `exaone4`, `dbrx`, `bitnet` and `talkie` were all here; `bitnet`'s two INNER norms are `ferrox_models::sub_norms`, `talkie`'s weightless RMS is `NormOp::RmsNoParams` and its skip stream `ferrox_models::skip_stream`; the LayerNorm WITH a bias is `NormOp::LayerNormBias`, on which `orion` and `nemotron` closed (`tests/biased_layer_norm_graphs.rs`) |
-| Required `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` with no slot on the dense path | CLOSED (`ferrox_models::proj_bias`): `starcoder2`, `codeshell` and `jais2` run on it, a `llama` file with the optional biases runs where it was refused as unread, and gpt-oss's `o_bias` moved onto the same slot; `starcoder` (learned positions), `stablelm` (parallel residual) and `phimoe` (`output.bias`, LongRoPE) still refuse for the rest |
-| LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`) and weighted (`dbrx`) forms; the bias group below still refuses for more than the norm |
+| Required `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` with no slot on the dense path | CLOSED (`ferrox_models::proj_bias`): `starcoder2`, `codeshell` and `jais2` run on it, a `llama` file with the optional biases runs where it was refused as unread, and gpt-oss's `o_bias` moved onto the same slot; `starcoder` (learned positions) and `phimoe` (`output.bias`, LongRoPE) still refuse for the rest |
+| LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`), weighted (`dbrx`) and biased (`orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`) forms; `starcoder` and `phimoe` still refuse for more than the norm |
+| A parallel residual, `x + attn(norm(x)) + ffn(norm(x))` | REFUSED by name (`ferrox_models::parallel_residual`), from a `stablelm` fixture libllama runs (its logits move by 8.85); eight of 140 graphs build it in two spellings (one shared norm: `stablelm` without `ffn_norm`, `phi2`, `falcon`-7B, `command-r`, `cohere2`, `cohere2moe`; two norms: `gptneox` under `use_parallel_residual`, `falcon`-40B under `attn_norm_2`), recorded in the table for the seam that serves it |
+| A per-head LayerNorm on Q and K with a distinct weight per head (`{n_embd_head_k, n_head}`, `LLM_NORM`) | REFUSED by name (`ferrox_models::qk_layer_norm`), from a `stablelm` fixture libllama runs (8.73); `stablelm` (12B), `command-r` (64 layers), `chameleon` build it |
 | Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all six (`ferrox_models::rope_layers`): `exaone-moe`, `smollm3`, EXAONE-4 32B, `afmoe` and `smallthinker` run on it |
 | A branch fed from the raw layer input rather than the post-attention residual | CLOSED (`ferrox_models::router_input`): `smallthinker`'s router reads it raw (`RawLayerInput`); `arctic`'s router AND experts read it under a second norm (`NormedLayerInput`), and its dense FFN summed with the experts is `ferrox_models::parallel_dense_ffn`, Grok-2's shape too |
 | Hardcoded scales applied even when the GGUF carries no key | none left (`grok` was here and is CLOSED on the MiniCPM defaults hook; `mistral3` was here by mistake -- its scale comes from a key -- and is CLOSED) |

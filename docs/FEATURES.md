@@ -100,6 +100,18 @@ is faster.
   be refused as unread and matches libllama now, 2.7e-13). The ungated
   GELU (`FfnActivation::GeluUngated`) landed with it. Every fused Metal
   dense launch refuses a biased layer.
+- **StableLM (`stablelm`): StableLM-2-1.6B and StableLM-3B-4E1T run**
+  on `NormOp::LayerNormBias` (`capability::BIASED_LAYER_NORM`), the
+  pre-FFN pair OPTIONAL upstream and required as a pair here, Q/K/V
+  biases, a quarter-width NEOX rotary, KL 3.4e-13
+  (`tests/stablelm_graphs.rs`). The graph's two other shapes, both
+  decided by tensor presence and both StableLM-2-12B, are refused by
+  name from fixtures libllama runs: a layer with no `ffn_norm` is the
+  PARALLEL residual (`ferrox_models::parallel_residual`; eight of 140
+  graphs, two spellings, recorded), and a layer with `attn_q_norm` is a
+  per-head LAYERNORM with a distinct weight per head
+  (`ferrox_models::qk_layer_norm`; three graphs). `use_parallel_
+  residual` is dead metadata upstream and ignored here, pinned.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row

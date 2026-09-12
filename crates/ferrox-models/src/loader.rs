@@ -2489,6 +2489,18 @@ impl Decoder {
             .layer_loops
             .map_or(config.n_layers, |loops| loops.n_phys);
         let mut layers = Vec::with_capacity(n_physical);
+        // A parallel-residual layer (`crate::parallel_residual`): the
+        // FFN reads the layer input, which no body here does. Decided
+        // per layer by tensor presence, so it is asked over the whole
+        // trunk before any layer is built.
+        if let Some(reason) =
+            crate::parallel_residual::parallel_residual_refusal(&file, &arch, n_physical)
+        {
+            return Err(LoadError::UnsupportedFeature(
+                config.name.to_string(),
+                reason,
+            ));
+        }
         let mut refined_qk_norm = config.qk_norm_style;
         for l in 0..n_physical {
             // THIS layer's head counts and FFN width. Uniform for every
@@ -2524,6 +2536,19 @@ impl Decoder {
                         load_f32_vec_optional(&file, &format!("blk.{l}.attn_q_norm.weight"))?;
                     let k_norm =
                         load_f32_vec_optional(&file, &format!("blk.{l}.attn_k_norm.weight"))?;
+                    // The per-head LAYERNORM (`crate::qk_layer_norm`), whose
+                    // weight is `n_heads * head_dim` long and would pass
+                    // the length rule below as `WholeVector`.
+                    if let Some(reason) = crate::qk_layer_norm::per_head_layer_norm_refusal(
+                        &arch,
+                        l,
+                        q_norm.is_some() || k_norm.is_some(),
+                    ) {
+                        return Err(LoadError::UnsupportedFeature(
+                            config.name.to_string(),
+                            reason,
+                        ));
+                    }
                     // Refine WholeVector vs PerHead from the first observed norm length.
                     // The per-head SCALAR gain is decided by architecture first
                     // (`capability::PER_HEAD_SCALAR_QK_GAIN`): its length is

@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **61** architectures run with
+Honest position, re-audited 2026-09-12. **62** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -701,6 +701,34 @@ need (`attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` for
 LongRoPE for `phimoe`). Nemotron's OPTIONAL projection biases were
 refused as unread from a fixture whose libllama logits differ by 8.07
 from the plain file's -- for one PR.
+
+`stablelm` closed the same day on that norm and nothing new, and what
+it took was reading `stablelm.cpp` for what it decides by TENSOR
+PRESENCE: three shapes behind one architecture string and no key
+among them. A layer WITH `ffn_norm` is the sequential layer
+(StableLM-2-1.6B, StableLM-3B-4E1T) and runs, KL 3.4e-13
+(`tests/stablelm_graphs.rs`). A layer WITHOUT it is the PARALLEL
+residual (`:135-137`, `cur = inpSA`: the FFN reads the normed input
+attention read and the layer sums three terms), and
+`ferrox-models/src/parallel_residual.rs` refuses it by name from a
+fixture libllama runs (its logits move by 8.85). A layer with
+`attn_q_norm` applies a per-head LAYERNORM with a DISTINCT weight per
+head (`:34-35,84-97`, `{n_embd_head_k, n_head}`, `LLM_NORM`), which
+the loader's length rule would have read as one RMS over the whole
+projection and the fused Metal attention infers the same way from the
+same length -- two wrongs that agree -- so
+`ferrox-models/src/qk_layer_norm.rs` refuses it by name too (8.73).
+StableLM-2-12B has both. `use_parallel_residual`, which every export
+writes, is read by NOTHING in the graph: libllama's logits with the
+key `true` are byte-identical to the file with it `false`, and a
+fixture pins that ferrox ignores it the same way. Both refusals carry
+their reach: the parallel residual is EIGHT of 140 graphs in two
+spellings (one shared norm: `stablelm`, `phi2`, `falcon`-7B,
+`command-r`, `cohere2`, `cohere2moe`; two norms: `gptneox` under the
+key, `falcon`-40B under `attn_norm_2`), and the per-head QK LayerNorm
+is three (`stablelm`, `command-r` at 64 layers, `chameleon`), each
+recorded in its table with the line that decides it, so the seam that
+serves either is sized from the table and not from one graph.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what
