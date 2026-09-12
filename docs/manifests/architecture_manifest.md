@@ -52,6 +52,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `bitnet` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mimo2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `talkie` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `glm4moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `grovemoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `gpt2` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `mpt` | TextGeneration | StandardGqa | KvGqa | dedicated |
@@ -96,7 +97,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `yi` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `glm-dsa` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `glm4` | TextGeneration | Dedicated | KvGqa | dedicated |
-| `glm4moe` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `deepseek4` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `kimi-linear` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `kimi_k3` | TextGeneration | Dedicated | KvGqa | dedicated |

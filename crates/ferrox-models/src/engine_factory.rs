@@ -167,8 +167,11 @@ pub fn load_mla_engine_from_path(path: &std::path::Path) -> Result<ServedEngine,
     Ok(ServedEngine::Mla(mla_gguf_loader::load_mla_engine(&file)?))
 }
 
+/// `glm4moe` is NOT here: GLM-4.5 / 4.5-Air / 4.6 are plain GQA with
+/// a DeepSeek-V3-shaped MoE and run on the generic decoder
+/// (`tests/glm4moe_graphs.rs`).
 fn is_glm52_arch(arch: &str) -> bool {
-    matches!(arch, "glm-dsa" | "glm4" | "glm4moe")
+    matches!(arch, "glm-dsa" | "glm4")
 }
 
 fn is_gemma4_arch(arch: &str) -> bool {
@@ -184,7 +187,7 @@ pub fn load_glm52_engine_from_path(path: &std::path::Path) -> Result<ServedEngin
     if !is_glm52_arch(arch) {
         return Err(LoadError::DedicatedArchitectureRequired(
             arch.to_string(),
-            "not a GLM-5.2 / GLM4-family architecture (expected glm-dsa/glm4/glm4moe)",
+            "not a GLM-5.2 / GLM4 architecture (expected glm-dsa/glm4)",
         ));
     }
     match select_engine_kind(arch) {

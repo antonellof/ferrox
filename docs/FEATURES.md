@@ -91,6 +91,16 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **GLM-4.5 / 4.5-Air / 4.6 (`glm4moe`) on the generic path**, audited
+  against libllama on the 355B shape (per-head Q/K norms) and the Air
+  shape, KL 1.5e-15 / 2.4e-15. The pre-FFN norm stored as
+  `post_attention_norm` is one row in
+  `norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM`; the sigmoid MoE with
+  `exp_probs_b`, `expert_weights_norm` and `expert_weights_scale` read
+  from the file, the shared expert and the NextN blocks were already
+  served. A GLM-4.5V text tower's `rope.dimension_sections` rotates NEOX,
+  which is what llama.cpp's M-RoPE computes on text positions (measured
+  byte-identical).
 - **MLA with the absorption optimization, and DeepSeek-2 checked
   against libllama in both tensor forms.** `ferrox_models::mla::MlaKvB`:
   the combined `attn_kv_b` (legacy exports, `plm`) and the split

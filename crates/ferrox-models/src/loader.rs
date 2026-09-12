@@ -158,6 +158,8 @@ const EXPERT_WEIGHTS_SCALE_READERS: &[&str] = &[
     "deepseek",
     "dots1",
     "exaone-moe",
+    // `glm4-moe.cpp:13-14` read both the scale and the norm.
+    "glm4moe",
     "laguna",
     "step35",
 ];
@@ -174,6 +176,7 @@ const EXPERT_WEIGHTS_NORM_READERS: &[&str] = &[
     "bailingmoe2",
     "dots1",
     "exaone-moe",
+    "glm4moe",
     "laguna",
     "step35",
 ];
@@ -190,8 +193,8 @@ const EXPERT_WEIGHTS_NORM_READERS: &[&str] = &[
 /// architecture that never reaches THIS loader cannot fire, and a gate
 /// that cannot fire is worse than no gate because it reads as coverage.
 ///
-/// Both hold. `deepseek2` and `glm4moe` are genuinely sigmoid-gated and
-/// genuinely never arrive here. So the resolution is not to drop a name
+/// Both hold. `deepseek2` is genuinely sigmoid-gated and genuinely
+/// never arrives here. So the resolution is not to drop a name
 /// from either place, it is to say out loud who owns it instead, and to
 /// make an unexplained dead entry still fail.
 ///
@@ -205,10 +208,9 @@ const DEDICATED_OWNS_ITS_BEHAVIOUR: &[(&str, &str)] = &[
     // `mla_gguf_loader` reads `expert_gating_func` and falls back to
     // Sigmoid itself, so deepseek2's gating is decided there.
     ("deepseek2", "mla_gguf_loader"),
-    // glm4moe is refused today (it needs gpt-oss's norm slot, see its
-    // refusal text). The entry stays because the fact about llama.cpp
-    // stays true, and it becomes live the moment the refusal lifts.
-    ("glm4moe", "refused today, see capability::unaudited_triage"),
+    // `glm4moe` was here while it was refused; it is a generic-path
+    // row now (2026-09-12) and the sigmoid default is live in THIS
+    // loader.
 ];
 
 /// Architecture-family names whose real reference implementation skips

@@ -865,6 +865,22 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // model (shared experts on every layer, a non-default router
     // operand).
     "arctic",
+    // tests/glm4moe_graphs.rs: GLM-4.5 / GLM-4.5-Air / GLM-4.6. Plain
+    // GQA with Q/K/V biases (`glm4-moe.cpp:62`), an OPTIONAL per-head
+    // Q/K RMSNorm before RoPE (`:68-71,175-182`, the 355B variant),
+    // NEOX RoPE (llama-model.cpp:2700), and its pre-FFN norm stored as
+    // `blk.N.post_attention_norm` with no `ffn_norm` (`:75,215`;
+    // `norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM`). The FFN is
+    // DeepSeek-V3's: a leading dense block, sigmoid routing with
+    // `exp_probs_b`, `expert_weights_norm` and `expert_weights_scale`
+    // read from the file (`:13-17`), a shared expert `n_ff_exp *
+    // n_expert_shared` wide (`:96-104`), summed with the routed output
+    // (`:252`). NextN blocks inside `block_count` are skipped
+    // (`crate::mtp_blocks`). Two fixtures: the 355B shape with the Q/K
+    // norms and the Air shape without. A file whose
+    // `rope.dimension_sections` declare M-RoPE (a GLM-4.5V text tower)
+    // is refused by name in the loader.
+    "glm4moe",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1655,6 +1671,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // `tests/skip_stream_graphs.rs`). NEOX RoPE:
             // llama-model.cpp:2681.
             "talkie",
+            // Was a `dedicated` refusal on its pre-FFN norm slot; audited
+            // now (`norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM`,
+            // tests/glm4moe_graphs.rs). NEOX RoPE: llama-model.cpp:2700
+            // (M-RoPE only when `rope.dimension_sections` says so, which
+            // the loader refuses).
+            "glm4moe",
         ] {
             v.push(gqa_neox(n));
         }
@@ -2184,39 +2206,16 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "glm4",
             "use ferrox_models::glm52_decoder / glm52_gguf_loader, not the generic GQA Decoder",
         ));
-        // GLM-4.5 / GLM-4.5-Air / GLM-4.6 tag `glm4moe`, and the reason
-        // here used to point at `glm52_gguf_loader` the way `glm-dsa`
-        // does. It cannot load one: `read_glm52_hparams` requires
-        // `{arch}.attention.q_lora_rank`, `.kv_lora_rank`,
-        // `.qk_nope_head_dim` and `.qk_rope_head_dim`, and glm4moe is
-        // NOT an MLA model -- `src/models/glm4-moe.cpp`'s
-        // `load_arch_hparams` never reads any of the four and its
-        // `load_arch_tensors` calls `create_tensor_qkv` (plain Q/K/V)
-        // with no `attn_kv_a_mqa` / `attn_kv_b` / `attn_q_a` /
-        // `attn_q_b` anywhere. So `ferrox run` on a real GLM-4.5-Air
-        // answered "missing hparam glm4moe.attention.q_lora_rank" for a
-        // model that has no MLA at all.
-        //
-        // What it actually is: plain GQA + DeepSeek-V3-shaped sigmoid
-        // MoE (`exp_probs_b`, shared expert, leading dense,
-        // `expert_weights_scale`), all of which the generic decoder
-        // already computes and `dots1` already pins. The one thing that
-        // does not fit is the norm slot, and it is a real divergence
-        // rather than a missing key -- see the reason string. Pinned by
-        // `tests/glm4moe_refusal.rs` against a synthetic checkpoint
-        // llama.cpp itself loads and decodes.
-        v.push(dedicated(
-            "glm4moe",
-            "GLM-4.5-MoE stores its pre-FFN norm as `blk.N.post_attention_norm.weight` and \
-             carries NO `blk.N.ffn_norm.weight` (src/models/glm4-moe.cpp:75, applied to \
-             `ffn_inp` at :215 -- i.e. AFTER the attention residual). The generic decoder \
-             requires `ffn_norm` and puts `post_attention_norm` in Gemma's other slot, on the \
-             attention branch BEFORE the residual add, so it would both fail to find its \
-             tensors and compute a different graph. This is gpt-oss's norm slot exactly, and \
-             `loader.rs` already implements it behind an `is_gpt_oss` flag; widening that flag \
-             is what admits glm4moe. It is NOT MLA -- do not send it to glm52_gguf_loader, \
-             which asks for a `q_lora_rank` no glm4moe checkpoint carries",
-        ));
+        // `glm4moe` -- GLM-4.5 / GLM-4.5-Air / GLM-4.6 -- was HERE as a
+        // `dedicated` refusal, twice over: first pointing at
+        // `glm52_gguf_loader` (which asks for a `q_lora_rank` no glm4moe
+        // file carries; it is not MLA), then naming the ONE thing that
+        // was missing, its pre-FFN norm stored as
+        // `blk.N.post_attention_norm` (`glm4-moe.cpp:75,215`, gpt-oss's
+        // slot). That slot is one row in
+        // `norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM` now and the
+        // row is audited on the generic NEOX path
+        // (`tests/glm4moe_graphs.rs`); see `AUDITED_GENERIC_GQA`.
         v.push(dedicated(
             "deepseek4",
             "DeepSeek V4 needs CSA/HCA + mHC assembly; generic GQA Decoder is not valid",
@@ -3564,10 +3563,15 @@ mod tests {
             resolve_architecture("glm4"),
             Some(ArchPath::DedicatedOnly { .. })
         ));
+        // `glm4moe` was a DedicatedOnly refusal here and is an audited
+        // generic NEOX row now (tests/glm4moe_graphs.rs).
         assert!(matches!(
             resolve_architecture("glm4moe"),
-            Some(ArchPath::DedicatedOnly { .. })
+            Some(ArchPath::GenericGqa {
+                rope: RopeLayout::Neox
+            })
         ));
+        assert!(is_audited_generic("glm4moe"));
     }
 
     #[test]

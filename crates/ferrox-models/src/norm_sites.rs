@@ -56,6 +56,10 @@ use ferrox_gguf::{GgufError, TensorSource};
 /// tensors happen to be present.
 ///
 /// - `gpt-oss`: `openai-moe.cpp` norms `ffn_inp` with `attn_post_norm`.
+/// - `glm4moe`: `src/models/glm4-moe.cpp:75` creates `attn_post_norm`
+///   and no `ffn_norm`, and `:215` norms `ffn_inp` with it -- the slot
+///   its refusal had named for a year, and the one line that admits
+///   GLM-4.5 / 4.5-Air / 4.6.
 /// - `seed_oss`: `src/models/seed-oss.cpp:36-37` creates `attn_norm` and
 ///   `attn_post_norm` and **no** `ffn_norm`, and `:113-115` norms
 ///   `ffn_inp` -- the post-attention residual -- with `attn_post_norm`.
@@ -65,7 +69,7 @@ use ferrox_gguf::{GgufError, TensorSource};
 /// tensors (sinks, biases, the SwiGLU clamp), and widening it would have
 /// handed `seed_oss` attention sinks it does not have. Two facts, two
 /// predicates.
-pub const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] = &["gpt-oss", "seed_oss"];
+pub const PRE_FFN_NORM_IS_POST_ATTENTION_NORM: &[&str] = &["gpt-oss", "seed_oss", "glm4moe"];
 
 /// Architectures that store their **pre-FFN** norm under
 /// `blk.N.attn_output_norm.weight` (`LLM_TENSOR_ATTN_OUT_NORM`) and carry

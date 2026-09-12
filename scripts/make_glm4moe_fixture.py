@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `glm4moe` GGUF used by ferrox's GLM-4.5-MoE
-refusal test.
+"""Generate the tiny synthetic `glm4moe` GGUFs used by ferrox's GLM-4.5-MoE
+coverage test.
 
-`glm4moe` is what GLM-4.5, GLM-4.5-Air and GLM-4.6 tag. ferrox refuses it
-today, which is right, but the refusal used to say "use
+`glm4moe` is what GLM-4.5, GLM-4.5-Air and GLM-4.6 tag. ferrox refused
+it until 2026-09-12, and the refusal had two lives: first "use
 `ferrox_models::glm52_decoder` / `glm52_gguf_loader`" -- and that loader
 cannot read a `glm4moe` file at all: `read_glm52_hparams` requires
 `{arch}.attention.q_lora_rank`, `kv_lora_rank`, `qk_nope_head_dim` and
@@ -21,11 +21,11 @@ decides where it can and cannot run:
   * `blk.N.post_attention_norm.weight` and **no** `blk.N.ffn_norm.weight`
     (glm4-moe.cpp:75). llama.cpp norms `ffn_inp` -- the post-residual
     sum -- with it (:215), i.e. it is the *pre-FFN* norm, gpt-oss's slot
-    and not Gemma's. ferrox's generic decoder puts
-    `post_attention_norm` in Gemma's slot (on the attention branch,
-    before the residual add) and separately requires `ffn_norm`, so the
-    generic path is a different graph AND cannot even find its tensors.
-  * per-head Q/K RMSNorm of length `head_dim` (:69,71, optional there).
+    and not Gemma's. That was the second life of the refusal, and it is
+    one row in `norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM` now.
+  * per-head Q/K RMSNorm of length `head_dim` (:69,71, optional there:
+    the 355B variant has them, GLM-4.5-Air does not). `--no-qk-norm`
+    writes the Air shape.
   * required Q/K/V biases via `create_tensor_qkv`, and no output bias.
   * a leading dense block, a shared expert, `exp_probs_b.bias`, sigmoid
     gating and `expert_weights_scale` -- the DeepSeek-V3-shaped routing
@@ -33,21 +33,25 @@ decides where it can and cannot run:
   * partial RoPE: `rope.dimension_count` is half `head_dim`, GLM's
     `partial_rotary_factor = 0.5`.
 
+`--mrope` writes `rope.dimension_sections = [2, 1, 1, 0]`, what a
+GLM-4.5V text tower carries (`conversion/glm.py` writes the sections for
+the multimodal exports); `glm4-moe.cpp:6,145,188` then rotate with
+`ggml_rope_multi` in `LLAMA_ROPE_TYPE_MROPE` (llama-model.cpp:2700),
+which ferrox does not implement and REFUSES by name. libllama runs the
+file with text positions (measured), so the variant pins a refusal, not
+a golden.
+
 Weights are pseudo-random from a fixed seed so the file is byte-stable.
 
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
-        python3 scripts/make_glm4moe_fixture.py OUT.gguf
+        python3 scripts/make_glm4moe_fixture.py OUT.gguf [--no-qk-norm] [--mrope]
 
-That the file is a *valid* glm4moe checkpoint was checked by running
-llama.cpp's own loader over it (`scripts/gptoss_reference_logits.cpp`
-against a real `libllama`): it loads, prints `n_expert = 6` /
-`rope type = 2`, and decodes. No golden logits are checked in, because
-ferrox has no glm4moe graph to compare against yet -- see
-`crates/ferrox-models/tests/glm4moe_refusal.rs`.
+The golden values that go with it are produced by llama.cpp itself
+(see `scripts/gptoss_reference_logits.cpp`), not by this script.
 """
 
-import sys
+import argparse
 
 import numpy as np
 
@@ -76,7 +80,7 @@ RMS_EPS = 1e-5
 EXPERT_WEIGHTS_SCALE = 2.5
 
 
-def main(out_path: str) -> None:
+def main(out_path: str, qk_norm: bool, mrope: bool) -> None:
     rng = np.random.default_rng(0x64114)
 
     def rnd(*shape: int) -> np.ndarray:
@@ -95,6 +99,10 @@ def main(out_path: str) -> None:
     w.add_layer_norm_rms_eps(RMS_EPS)
     w.add_rope_freq_base(ROPE_BASE)
     w.add_rope_dimension_count(ROPE_DIM)
+    if mrope:
+        # A GLM-4.5V text tower: three sections over the ROPE_DIM/2
+        # bands (2 + 1 + 1 = 4 = ROPE_DIM / 2), the fourth unused.
+        w.add_rope_dimension_sections([2, 1, 1, 0])
     w.add_expert_count(N_EXPERT)
     w.add_expert_used_count(N_EXPERT_USED)
     w.add_expert_shared_count(N_EXPERT_SHARED)
@@ -135,8 +143,9 @@ def main(out_path: str) -> None:
         w.add_tensor(p + "attn_q.bias", rnd(n_embd_q))
         w.add_tensor(p + "attn_k.bias", rnd(n_embd_kv))
         w.add_tensor(p + "attn_v.bias", rnd(n_embd_kv))
-        w.add_tensor(p + "attn_q_norm.weight", rnd(HEAD_DIM))
-        w.add_tensor(p + "attn_k_norm.weight", rnd(HEAD_DIM))
+        if qk_norm:
+            w.add_tensor(p + "attn_q_norm.weight", rnd(HEAD_DIM))
+            w.add_tensor(p + "attn_k_norm.weight", rnd(HEAD_DIM))
 
         w.add_tensor(p + "attn_output.weight", rnd(N_EMBD, n_embd_q))
 
@@ -176,4 +185,9 @@ def main(out_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "glm4moe-fixture.gguf")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out", nargs="?", default="glm4moe-fixture.gguf")
+    ap.add_argument("--no-qk-norm", action="store_true")
+    ap.add_argument("--mrope", action="store_true")
+    args = ap.parse_args()
+    main(args.out, not args.no_qk_norm, args.mrope)
