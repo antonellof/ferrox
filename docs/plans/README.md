@@ -61,7 +61,7 @@ rather than by whether the architecture name is known:
 | Outcome | Count |
 |---|---|
 | Runs, **with evidence** | **54** (`capability::AUDITED_GENERIC_GQA`) |
-| Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`), the other three none |
+| Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |

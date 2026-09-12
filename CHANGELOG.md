@@ -28,7 +28,11 @@ are the ones worth reading twice.
   from its own f32: the verdict is the reference's 8-bit activation
   quantization on the MLA latent, not ferrox (gap inventory §10.1). The
   reference dumper gained `LLAMA_LOGITS_FLASH_ATTN=0`, because llama.cpp
-  aborts on this file with flash attention on.
+  aborts on this file with flash attention on. Twelve greedy tokens from
+  the same prompt are identical between the two engines. The same
+  libllama (1269cb1) has `gemma4.cpp` now, so the real Gemma-4-E2B went
+  through parity too: tokenizer MATCH, logits MATCH at KL 5.1e-4 on
+  Q4_K_M, the `Gemma4Engine`'s first cross-engine evidence.
 - **YaRN on the MLA engine, as every real DeepSeek-V2 / V3 export
   declares it.** `ferrox_models::mla_yarn` resolves the three pieces
   llama.cpp computes across `deepseek2.cpp:34-37` (the key divided by
