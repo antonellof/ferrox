@@ -457,6 +457,9 @@ pub(crate) fn load_non_gqa_attention(
         post_ffn_norm: NormSites::load_post_norm(norm_sites.post_ffn, file, layer)?,
         output_gate: None,
         sinks: None,
+        // No attention, no attention output to norm; the table row
+        // that has these (`bitnet`) has a uniform GQA shape.
+        attn_sub_norm: None,
     })
 }
 
@@ -753,6 +756,7 @@ mod tests {
             post_ffn_norm: None,
             output_gate: None,
             sinks: None,
+            attn_sub_norm: None,
         };
         assert!(check_gqa_projection_widths(0, shape, head_dim, hidden, &build(24, 12)).is_ok());
         // K sized for 3 KV heads on a 2-KV-head layer.

@@ -85,6 +85,7 @@ pub mod sampler_order;
 pub mod sampling;
 pub mod scalar_multipliers;
 pub mod speculative;
+pub mod sub_norms;
 pub mod swa_geometry;
 pub mod swa_layers;
 pub mod t5_engine;
@@ -93,6 +94,7 @@ pub mod tokenizer;
 pub mod unread_tensors;
 pub mod vision;
 pub mod vl_engine;
+pub mod weight_scales;
 pub mod yarn_magnitude;
 
 pub use bert_encoder::{BertEncoder, BertHparams, BertLayer};

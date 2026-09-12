@@ -951,17 +951,12 @@ pub use glu_act::{relu_sqr, GluAct, Ungated, XieluParams};
 ///
 /// `act` is not optional on purpose -- see [`GluAct`].
 pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f32> {
-    // Ungated: `gate` is an alias of `up`, so one projection is the
-    // whole FFN input. `apply` is the full matvec dispatcher (int-dot,
-    // GPU when placed), so nothing is given up by skipping the pair.
-    if let Some(f) = act.ungated() {
-        let up = expert.up.apply(hidden);
-        return expert.down.apply(&f.apply(&up));
-    }
     #[cfg(any(feature = "cuda", feature = "metal"))]
     if act.is_swiglu() {
         // Full SwiGLU on-device (1× upload + 1× download) when dense GPU
         // is on. SwiGLU-only kernel: a GeGLU expert must not take it.
+        // The ONE path that does not go through `expert_activated`,
+        // which is why `run_expert_sub_normed` cannot reach it.
         if let Some(out) = ferrox_core::WeightMatrix::apply_gpu_dense_ffn_swiglu(
             &expert.gate,
             &expert.up,
@@ -970,6 +965,46 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f3
         ) {
             return out;
         }
+    }
+    expert.down.apply(&expert_activated(hidden, expert, act))
+}
+
+/// [`run_expert`] with BitNet's `ffn_sub_norm` between the activation
+/// and the down projection: `down(rms_norm(act(gate(x), up(x)), w))`
+/// (`bitnet.cpp:127-141`; `ferrox_models::sub_norms`).
+///
+/// Shares [`expert_activated`] with `run_expert` rather than copying
+/// its four arms, and CANNOT take the fused on-device SwiGLU, because
+/// that kernel runs the down projection itself with no site for a
+/// norm in between: the norm is applied to the vector the kernel
+/// never hands back.
+pub fn run_expert_sub_normed(
+    hidden: &[f32],
+    expert: &ExpertWeights,
+    act: GluAct,
+    sub_norm: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let activated = expert_activated(hidden, expert, act);
+    debug_assert_eq!(activated.len(), sub_norm.len());
+    expert
+        .down
+        .apply(&ferrox_core::matmul::rms_norm(&activated, sub_norm, eps))
+}
+
+/// The gate/up half of one expert: `act(gate(x), up(x))`, the vector
+/// the down projection reads, on the fastest path the weights and the
+/// backend admit.
+///
+/// The one body behind [`run_expert`] and [`run_expert_sub_normed`]; a
+/// fifth arm added here reaches both.
+fn expert_activated(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f32> {
+    // Ungated: `gate` is an alias of `up`, so one projection is the
+    // whole FFN input. `apply` is the full matvec dispatcher (int-dot,
+    // GPU when placed), so nothing is given up by skipping the pair.
+    if let Some(f) = act.ungated() {
+        let up = expert.up.apply(hidden);
+        return f.apply(&up);
     }
     #[cfg(any(feature = "cuda", feature = "metal"))]
     {
@@ -980,8 +1015,7 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f3
         {
             let up = outs.pop().unwrap();
             let gate = outs.pop().unwrap();
-            let activated = act.apply(&gate, &up);
-            return expert.down.apply(&activated);
+            return act.apply(&gate, &up);
         }
     }
     // Share one Q8 activation quant across gate+up when INT_DOT is on
@@ -999,14 +1033,12 @@ pub fn run_expert(hidden: &[f32], expert: &ExpertWeights, act: GluAct) -> Vec<f3
             || expert.up.apply_cpu_q8(&act_q8),
         );
         if let (Some(gate), Some(up)) = (g, u) {
-            let activated = act.apply(&gate, &up);
-            return expert.down.apply(&activated);
+            return act.apply(&gate, &up);
         }
     }
     let (gate, up) =
         ferrox_core::par::join2(|| expert.gate.apply(hidden), || expert.up.apply(hidden));
-    let activated = act.apply(&gate, &up);
-    expert.down.apply(&activated)
+    act.apply(&gate, &up)
 }
 
 /// `run_expert`, but actually consulting `placement` instead of always

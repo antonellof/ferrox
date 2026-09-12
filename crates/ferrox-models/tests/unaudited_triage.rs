@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 8,
+        n, 7,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -133,7 +133,13 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          than the normed FFN input; its gated ReLU experts split `GluAct::ReluSqr` from \
          `GluAct::Reglu`, because the one variant that had served `arcee` by aliasing \
          answered `relu(up)^2` for a real gate, and its `n_swa = 4096` pin is a third \
-         answer on the one table `swa_disabled_by_arch` is derived from \
+         answer on the one table `swa_disabled_by_arch` is derived from, and 8 until \
+         `bitnet` closed on the two norms INSIDE the blocks (`ferrox_models::sub_norms`, \
+         tests/sub_norm_graphs.rs) -- one graph of 140 creates either tensor, measured, \
+         so the seam is a `bool` on `ModelConfig` and the row closed alone; its optional \
+         per-projection `.scale` tensors are a refusal by name now \
+         (`ferrox_models::weight_scales`) from a fixture whose libllama logits differ \
+         from the unscaled file's \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -385,7 +391,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 8);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 7);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -462,7 +468,10 @@ fn batch_two_verdicts_are_pinned_to_what_was_read() {
         // is audited now (tests/router_input_graphs.rs); its absence is
         // asserted by `smallthinker_is_audited_and_carries_no_stale_verdict`
         // below.
-        ("bitnet", TriageClass::NewCode, "attn_sub_norm"),
+        // `bitnet` was HERE, NEW CODE on `attn_sub_norm` / `ffn_sub_norm`,
+        // and is audited now (tests/sub_norm_graphs.rs); its absence is
+        // asserted by `bitnet_is_audited_and_carries_no_stale_verdict`
+        // below.
         // `minicpm3` was HERE, and the triage that produced this list
         // is what removed it: reading `minicpm3.cpp:5-6,41-46` showed an
         // MLA tensor set on a row the catalog called `StandardGqa`, so
@@ -521,6 +530,23 @@ fn smallthinker_is_audited_and_carries_no_stale_verdict() {
         "{}",
         arctic.blocker
     );
+}
+
+/// `bitnet`'s verdict named four things: the two inner norms, the
+/// per-projection `.scale` tensors, and the missing `output` tensor.
+/// The norms landed (`ferrox_models::sub_norms`), the scales are a
+/// refusal by name (`ferrox_models::weight_scales`), the tied lm_head
+/// was already served, and the row is audited on a libllama-golden
+/// fixture (tests/sub_norm_graphs.rs), so it carries no verdict.
+#[test]
+fn bitnet_is_audited_and_carries_no_stale_verdict() {
+    assert!(is_audited_generic("bitnet"));
+    assert!(unaudited_triage("bitnet").is_none());
+    // The seam's own census agrees about which row it serves.
+    assert!(ferrox_models::sub_norms::block_sub_norms("bitnet"));
+    assert!(ferrox_models::sub_norms::SUB_NORM_ARCHS
+        .iter()
+        .all(|(name, _)| is_audited_generic(name)));
 }
 
 /// `grok` and `dbrx` are audited, and neither carries a verdict any
@@ -1070,7 +1096,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 7, 1),
+        (0, 0, 6, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1125,7 +1151,11 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          (it routes on the normed FFN input; its blocker is a second expert bank), so \
          this closed alone and the column says why. Its gated ReLU experts found the \
          one `GluAct` variant that had served `arcee` by aliasing answering \
-         `relu(up)^2` for a REAL gate; it is two variants now. \
+         `relu(up)^2` for a REAL gate; it is two variants now. And 7 to 6 when `bitnet` \
+         closed on the two norms INSIDE the blocks (`ferrox_models::sub_norms`): the \
+         reach came back with one graph of 140, so the fact is a `bool` read by the \
+         loader and by the Metal predicate, and the arithmetic landed in the one \
+         attention tail and the one dense FFN row body that already existed. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1134,7 +1164,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 8);
+    assert_eq!(fixture + arm + new_code + unknown, 7);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

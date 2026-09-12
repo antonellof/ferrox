@@ -165,6 +165,22 @@ impl Decoder {
         if let Some(gate) = &layer.attn.output_gate {
             gate.apply_rows(normed, attn_out, rows, self.config.head_dim);
         }
+        // bitnet.cpp:101-106: RMS over the concatenated heads, BEFORE
+        // `wo`. After the gate only by convention -- no graph has both
+        // (`crate::sub_norms`, `crate::attn_gate`) -- and per row,
+        // because the norm is over one token's heads.
+        let sub_normed;
+        let attn_out: &[f32] = match &layer.attn.attn_sub_norm {
+            None => attn_out,
+            Some(w) => {
+                let width = w.len();
+                sub_normed = attn_out
+                    .chunks(width)
+                    .flat_map(|row| rms_norm(row, w, self.config.rms_norm_eps))
+                    .collect::<Vec<f32>>();
+                &sub_normed
+            }
+        };
         let mut projected = if rows == 1 {
             layer.attn.o_proj.apply(attn_out)
         } else {

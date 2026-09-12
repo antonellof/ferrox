@@ -735,6 +735,28 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // `rope.freq_base_swa` that pins the SWA period reading the key
     // while the NoPE step stays the literal 4.
     "smallthinker",
+    // tests/sub_norm_graphs.rs: `bitnet`, NEW CODE on the two norms
+    // INSIDE the blocks. `bitnet.cpp:24,36` require `attn_sub_norm`
+    // `{n_embd}` and `ffn_sub_norm` `{n_ff}`; `:101-106` RMS-norm the
+    // attention output BEFORE `wo` (the other side of that matmul from
+    // Gemma's `post_attention_norm`), and `:127-141` call `build_ffn`
+    // with a NULL down projection, norm the `silu(gate) * up` product,
+    // and apply `ffn_down` by hand. One graph of 140 has either tensor
+    // (measured, `crate::sub_norms`). `ModelConfig::block_sub_norms` is
+    // the one fact: the loader REQUIRES the pair on it, every fused
+    // Metal launch refuses on it, and the arithmetic sits in the one
+    // attention tail (`attn_out_to_residual_rows`) and the one dense
+    // FFN row body (`ferrox_moe::run_expert_sub_normed`, which shares
+    // its gate/up half with `run_expert` and cannot reach the fused
+    // on-device SwiGLU). No `output` tensor (`:14-17,164`: the LM head
+    // is `tok_embd`), `rope.scaling.type = linear` at factor 1
+    // (`conversion/bitnet.py:19-20`), NEOX RoPE (llama-model.cpp:2625),
+    // plain SwiGLU, `1/sqrt(head_dim)`. Its optional per-projection
+    // `.scale` tensors (`:27-43`), which llama.cpp multiplies in and the
+    // current converter no longer writes, are REFUSED by name
+    // (`crate::weight_scales`) from a fixture that carries them and
+    // whose libllama logits differ from the unscaled file's (measured).
+    "bitnet",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1222,7 +1244,21 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          expert bank with its own routing is the larger half and ferrox's MoE layer holds \
          one bank. Both n_group_experts and expert_group_scale are REQUIRED keys (:6-7). \
          QK-norm is before RoPE (:100-109), which is the one thing that would otherwise have \
-         been a blocker",
+         been a blocker. READ ON 2026-09-12 AGAINST THE REFERENCE MODEL, and not closed \
+         for a reason the count cannot show: llama.cpp's graph disagrees with \
+         `modeling_grove_moe.py` in two places. (1) grovemoe.cpp:148-149 sets `cur = \
+         moe_out` and :152 feeds THAT -- the routed experts' OUTPUT -- into the chunk \
+         experts, where the reference (`GroveMoeSparseMoeBlock.forward`:369) feeds them \
+         the same `hidden_states` the routed experts read; upstream PR #15510's own debug \
+         dump shows `MUL_MAT_ID(ffn_gate_chexps, ffn_moe_out)`. (2) llama-graph.cpp: \
+         2035-2039 divides the selected expert ids by `n_group_experts` and then gathers \
+         the weights from the softmax probs AT THE CHUNK INDEX, where the reference (:324, \
+         :370) gathers them at the ORIGINAL expert index; the two agree only when the \
+         selected expert's index equals its chunk's. Both are shipped upstream (master \
+         2026-09) and neither was discussed in the PR. So there is no single graph to \
+         match: reproducing llama.cpp reproduces a divergence from the model, and matching \
+         the model has no libllama golden. Refused by name until upstream settles it; the \
+         reach of the mechanism (a precomputed `probs`) is `crate::router_input`'s census",
     ),
     // `hunyuan-dense` was HERE, ONE MATCH ARM on the NTK-alpha RoPE
     // base rescale. The arm landed (`crate::rope_ntk_alpha`), the
@@ -1293,20 +1329,13 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // precomputed `probs` but routes on the normed FFN input, and the
     // two graphs whose operand really differs (`gemma4`, `nemotron-h`)
     // are on other engines. See `AUDITED_GENERIC_GQA`.
-    (
-        "bitnet",
-        TriageClass::NewCode,
-        "two norms INSIDE the blocks, in slots ferrox does not have. \
-         src/models/bitnet.cpp:24,36 require `attn_sub_norm` and `ffn_sub_norm`, and the \
-         graph applies attn_sub_norm to the attention output BEFORE the output projection \
-         (:101-106 -- not after it, where ferrox's post_attn_norm sits) and ffn_sub_norm \
-         between the gate*up product and `ffn_down` (:135-140), inside the FFN. It also \
-         carries a per-tensor `scale` for every projection (:27-43, applied via \
-         build_lora_mm) and creates no `output` tensor at all, taking the LM head from \
-         `tok_embd` unconditionally (:164). ferrox refuses it by name today via the \
-         unread-tensor gate (`blk.N.attn_sub_norm`, llama-arch.cpp:510-511), which is the \
-         right outcome and not a small fix",
-    ),
+    // `bitnet` was HERE, NEW CODE on the two norms INSIDE the blocks
+    // (`bitnet.cpp:24,36`), and is audited now: `crate::sub_norms` is
+    // the seam and `tests/sub_norm_graphs.rs` carries the fixture. Its
+    // verdict's third sentence, the per-projection `.scale` tensors, is
+    // a refusal by name now (`crate::weight_scales`) rather than an
+    // unread-tensor error, and its fourth (no `output` tensor) was
+    // already served by the tied lm_head. See `AUDITED_GENERIC_GQA`.
     // `openelm` was HERE, NEW CODE on PER-LAYER SHAPES, and is audited
     // now with `deci` (`crate::layer_shapes`,
     // `tests/per_layer_shape_graphs.rs`). The misleading missing-hparam
@@ -1525,6 +1554,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // the `LLAMA_ROPE_TYPE_NEOX` group, which
             // `tests/rope_layout.rs` pins.
             "smallthinker",
+            // Was NEW CODE in `NEOX_ROPE_TRIAGED` on the two norms
+            // INSIDE the blocks (`bitnet.cpp:24,36`), audited now on
+            // `crate::sub_norms` (`tests/sub_norm_graphs.rs`). NEOX
+            // RoPE: llama-model.cpp:2625.
+            "bitnet",
         ] {
             v.push(gqa_neox(n));
         }
@@ -3064,7 +3098,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 8,
+            seen == 7,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -3136,17 +3170,20 @@ mod audit_tests {
              precomputed `probs_in`, and it is the only one on the generic path whose \
              operand is not the normed FFN input; its gated ReLU experts split \
              `GluAct::ReluSqr` from `GluAct::Reglu`, because the one variant that had \
-             served `arcee` by aliasing would have skipped a real gate. \
-             What is left is 7 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             served `arcee` by aliasing would have skipped a real gate, and 8 until \
+             `bitnet` closed on the two norms INSIDE the blocks (`crate::sub_norms`, \
+             tests/sub_norm_graphs.rs) -- the reach measured first: one graph of 140 \
+             creates either tensor, so the seam is a `bool` and it closed alone. \
+             What is left is 6 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
              closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
              `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
-             `step35`, `mistral3` and `smallthinker`, and each closure but `olmo`'s, \
-             `arcee`'s, `mellum`'s, `mistral3`'s and `smallthinker`'s took more than one row \
-             at a time because each found ONE cause behind several refusals; `mellum`'s \
-             cause IS shared and moved three verdicts, but only one of them was closable \
-             by it, `mistral3`'s is shared with two rows on other engines, and \
-             `smallthinker`'s mechanism (a precomputed `probs`) is shared with three rows \
-             whose CAUSE it is not"
+             `step35`, `mistral3`, `smallthinker` and `bitnet`, and each closure but \
+             `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, `smallthinker`'s and `bitnet`'s \
+             took more than one row at a time because each found ONE cause behind several \
+             refusals; `mellum`'s cause IS shared and moved three verdicts, but only one of \
+             them was closable by it, `mistral3`'s is shared with two rows on other \
+             engines, `smallthinker`'s mechanism (a precomputed `probs`) is shared with \
+             three rows whose CAUSE it is not, and `bitnet`'s is shared with nothing"
         );
     }
 
@@ -3163,15 +3200,16 @@ mod audit_tests {
         // `headline()` below, because a class with no rows still has to
         // render distinctly the day something lands in it again.
         //
-        // `bitnet`, which used to be `smallthinker`, which used to be
-        // `dbrx`, which used to be `olmo`: the sample keeps moving
-        // because the rows keep closing. `olmo`'s non-parametric
-        // LayerNorm, then `dbrx`'s weighted one plus its clamp and its
-        // `attn_output_norm` slot, then `smallthinker`'s router operand
-        // and gated ReLU experts, are all implemented now. `bitnet`
-        // needs two norm slots INSIDE the blocks, and nothing landed so
-        // far reaches either.
-        let new_code = unaudited_refusal_detail("bitnet");
+        // `talkie`, which used to be `bitnet`, which used to be
+        // `smallthinker`, which used to be `dbrx`, which used to be
+        // `olmo`: the sample keeps moving because the rows keep closing.
+        // `olmo`'s non-parametric LayerNorm, then `dbrx`'s weighted one
+        // plus its clamp and its `attn_output_norm` slot, then
+        // `smallthinker`'s router operand and gated ReLU experts, then
+        // `bitnet`'s two inner norms, are all implemented now. `talkie`
+        // has NO norm weights, a per-head scalar Q norm and a learned
+        // skip connection, and nothing landed so far reaches any of them.
+        let new_code = unaudited_refusal_detail("talkie");
         // `phi4` is the only UNKNOWN row left: `mistral`, `mixtral` and
         // `yi` used to be the other three and are refused as strings
         // now (see `NO_UPSTREAM_ARCH`).
@@ -3198,7 +3236,7 @@ mod audit_tests {
         // The blocker itself, not only the class label, has to be in the
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
-        assert!(new_code.contains("bitnet.cpp:24,36"), "{new_code}");
+        assert!(new_code.contains("talkie.cpp"), "{new_code}");
         assert!(unknown.contains("LLM_ARCH_NAMES"), "{unknown}");
         // The two empty classes still have to be distinguishable.
         let labels = [
@@ -3219,8 +3257,8 @@ mod audit_tests {
     /// whole point of the inversion.
     #[test]
     fn an_unchecked_architecture_is_not_audited() {
-        assert!(!is_audited_generic("bitnet"));
         assert!(!is_audited_generic("talkie"));
+        assert!(!is_audited_generic("arctic"));
         assert!(!is_audited_generic("an-arch-that-does-not-exist"));
     }
 }

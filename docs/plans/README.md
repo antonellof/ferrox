@@ -60,15 +60,15 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **49** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **50** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 8 |
+| Refuses as **unaudited**, now triaged | 7 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (49 of
+regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (50 of
 them audited), 58 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
@@ -78,8 +78,8 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 8 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-7 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 7 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+6 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
 refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
@@ -106,7 +106,12 @@ router operand (`ferrox_models::router_input`: fifty-nine
 `probs_in`, one on this engine routes on something other than the
 normed FFN input; its "one match arm" ReLU experts turned out to need
 a variant, because the one that existed served `arcee` by aliasing a
-gate SmallThinker really has). Each with a libllama-golden fixture. `minicpm` closed on
+gate SmallThinker really has), and `bitnet` on the two norms INSIDE
+the blocks (`ferrox_models::sub_norms`: one graph of 140 creates
+either tensor, so the seam is a `bool`; its optional per-projection
+`.scale` tensors, which llama.cpp applies for every architecture, are
+refused by name in `ferrox_models::weight_scales`). Each with a
+libllama-golden fixture. `minicpm` closed on
 2026-09-10 and is not in that arithmetic: it was refused BY NAME rather
 than as unaudited, so it raises the audited count without lowering the
 refusing one; `smollm3` and EXAONE-4 32B closed with `exaone-moe` on

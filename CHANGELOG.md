@@ -17,6 +17,41 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`bitnet` runs, on the two norms INSIDE the blocks.**
+  `src/models/bitnet.cpp:24,36` require `attn_sub_norm` (on the
+  attention output BEFORE `wo`, `:101-106`) and `ffn_sub_norm` (on
+  `silu(gate) * up` BEFORE `down`, `:127-141`), two sites the generic
+  decoder's four norm slots did not have; a file carrying them died on
+  the unread-tensor gate. One graph of 140 creates either tensor
+  (measured), so `ferrox_models::sub_norms` is one `bool` on
+  `ModelConfig` read by the loader (the pair is REQUIRED; refused on a
+  routed layer, where `build_moe_ffn` has no such site) and by the
+  Metal predicate (every fused launch refuses; the per-layer fused
+  attention loses its view of the layer through the exhaustive
+  destructure), and two tensors on the layer applied in the one
+  attention tail and the one dense FFN row body --
+  `ferrox_moe::run_expert_sub_normed`, which shares its gate/up half
+  with `run_expert` and cannot reach the fused on-device SwiGLU. One
+  libllama-golden fixture, KL 1.88e-14, with the norm weights drawn
+  away from one so that skipping either norm, applying either with
+  unit weights, or reading the attention one as Gemma's post-norm each
+  diverges by orders of magnitude (measured). The tied lm_head
+  (`:164`, no `output` tensor) and `rope.scaling.type = linear` at 1.0
+  (`conversion/bitnet.py:19-20`) were already served. A real
+  BitNet-b1.58-2B-4T still needs `TQ1_0` / `TQ2_0` kernels; a Q8_0 or
+  F16 re-export runs. 50 audited, 7 refusing.
+- **Per-tensor weight scales are refused by name.** `build_lora_mm`
+  multiplies a projection's output by an optional `<tensor>.scale`
+  companion (`llama-graph.cpp:1492-1494`), and since
+  `llama-model.cpp:1355-1440` a generic pass creates `.scale` and
+  `.input_scale` beside EVERY architecture's projections; the NVFP4
+  converter writes them, and older BitNet exports carry the seven
+  `bitnet.cpp:27-43` created. ferrox does not apply them, and such a
+  file used to die on the unread-tensor gate -- the right outcome with
+  a message `FERROX_ALLOW_UNKNOWN_TENSORS=1` could talk past into every
+  projection running at the wrong magnitude. `ferrox_models::
+  weight_scales` refuses either suffix before that gate, from a fixture
+  whose libllama logits differ from the unscaled file's (measured).
 - **`smallthinker` (every SmallThinker export) runs, on the MoE
   router-operand seam.** `src/models/smallthinker.cpp:111` computes
   the router logits from `inpL` -- the residual stream as it ENTERS

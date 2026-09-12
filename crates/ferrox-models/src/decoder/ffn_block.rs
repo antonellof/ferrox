@@ -73,6 +73,28 @@ pub(crate) enum BatchedFfnKernels {
 }
 
 impl Decoder {
+    /// A dense layer's single expert on ONE row: `run_expert`, or its
+    /// sub-normed twin when the layer carries BitNet's `ffn_sub_norm`
+    /// (`bitnet.cpp:135-140`, `crate::sub_norms`).
+    ///
+    /// The one place the dense row body decides between the two, so
+    /// that a fused kernel reachable from `run_expert` (the on-device
+    /// SwiGLU, which has no norm between the activation and `down`)
+    /// cannot be reached for a layer that needs the norm.
+    pub(crate) fn run_dense_expert(
+        layer: &LayerWeights,
+        normed2: &[f32],
+        act: ferrox_moe::GluAct,
+        eps: f32,
+    ) -> Vec<f32> {
+        layer
+            .moe
+            .with_expert(0, |ex| match &layer.moe.ffn_sub_norm {
+                None => ferrox_moe::run_expert(normed2, ex, act),
+                Some(w) => ferrox_moe::run_expert_sub_normed(normed2, ex, act, w, eps),
+            })
+    }
+
     /// THE constructor for [`RouterOperand`]. `hidden_before_attn` is
     /// `[batch_size, hidden_dim]`, the residual stream as it enters the
     /// layer.
