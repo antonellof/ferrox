@@ -961,14 +961,6 @@ impl ModelConfig {
         )
         .map_err(|e| LoadError::UnsupportedFeature(arch.clone(), e.message(&arch)))?;
 
-        // Grok-2 runs a dense GELU FFN in parallel with its experts and
-        // scales the sum (`grok.cpp:171-184`); ferrox has no slot for
-        // that and stops rather than reading the dense FFN into the
-        // nearest one. See `crate::parallel_dense_ffn`.
-        if let Some(reason) = crate::parallel_dense_ffn::parallel_dense_refusal(&arch, file) {
-            return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
-        }
-
         // SWA-layer RoPE base. `llama_hparams` defaults it to 10000 and
         // the Gemma-3 lineage relies on that default; the architectures
         // in `swa_rope_base_follows_model` instead seed it from the
@@ -2755,7 +2747,7 @@ impl Decoder {
                 stored_layouts.push(None);
             }
 
-            let shared_experts: Vec<ExpertWeights> =
+            let mut shared_experts: Vec<ExpertWeights> =
                 if config.moe.n_shared_experts > 0 && !is_dense_layer {
                     vec![ExpertWeights {
                         gate: load_weight_matrix(&file, &format!("blk.{l}.ffn_gate_shexp.weight"))?,
@@ -2765,6 +2757,36 @@ impl Decoder {
                 } else {
                     Vec::new()
                 };
+            // A dense FFN SUMMED with the experts (Grok-2, Arctic) is the
+            // shared-expert slot under the dense names, plus the row's
+            // scale on the sum (`crate::parallel_dense_ffn`). Decided per
+            // layer: Grok-1's layers have no triple and take neither.
+            let parallel_sum_scale = if is_dense_layer {
+                None
+            } else {
+                match crate::parallel_dense_ffn::parallel_dense_for_layer(&arch, &file, l)? {
+                    Some(row) => {
+                        shared_experts.push(ExpertWeights {
+                            gate: load_weight_matrix(&file, &format!("blk.{l}.ffn_gate.weight"))?,
+                            up: load_weight_matrix(&file, &format!("blk.{l}.ffn_up.weight"))?,
+                            down: load_weight_matrix(&file, &format!("blk.{l}.ffn_down.weight"))?,
+                        });
+                        row.sum_scale
+                    }
+                    None => None,
+                }
+            };
+            // Arctic's second per-layer norm, the routed branch's operand
+            // (`crate::router_input::RouterInput::NormedLayerInput`):
+            // REQUIRED on its routed layers, unread everywhere else.
+            let exps_norm = if config.router_input.needs_exps_norm() && !is_dense_layer {
+                Some(load_f32_vec(
+                    &file,
+                    &format!("blk.{l}.ffn_norm_exps.weight"),
+                )?)
+            } else {
+                None
+            };
 
             let router = if !is_dense_layer {
                 load_weight_matrix(&file, &format!("blk.{l}.ffn_gate_inp.weight"))?
@@ -2847,6 +2869,8 @@ impl Decoder {
                 shared_experts,
                 shared_expert_gate,
                 exp_probs_bias,
+                exps_norm,
+                parallel_sum_scale,
                 ffn_sub_norm: sub_norms.map(|n| n.ffn),
                 down_scale: {
                     let gain =
@@ -3776,24 +3800,25 @@ mod tests {
     /// `AUDITED_GENERIC_GQA` would have gone unnoticed.
     #[test]
     fn an_unaudited_generic_architecture_refuses_rather_than_guessing() {
-        // `arctic` is on the generic path and is not in the audited
-        // list. It is the fifth name to hold this slot: `starcoder` was
+        // `grovemoe` is on the generic path and is not in the audited
+        // list. It is the sixth name to hold this slot: `starcoder` was
         // first, until an audit found it REQUIRES a fused
         // `attn_qkv.bias` and a learned `position_embd` the generic
         // decoder has no slot for, so it refuses for a stronger reason;
         // then `xverse`, until it was admitted with a libllama-golden
         // fixture (`tests/fixture_away_graphs.rs`); then `nanbeige`,
         // until the layer loop became `crate::layer_loops`; then
-        // `talkie`, until `crate::skip_stream`. `arctic` runs a dense FFN
-        // and an MoE bank in parallel from the layer input
-        // (`src/models/arctic.cpp:124-154`), and its blocker is
+        // `talkie`, until `crate::skip_stream`; then `arctic`, until
+        // `crate::parallel_dense_ffn`. `grovemoe` runs a SECOND expert
+        // bank (`src/models/grovemoe.cpp:57-59,137-164`) whose upstream
+        // graph diverges from the reference, and its blocker is
         // invisible in metadata, so nothing but this gate stops it.
         assert!(
-            !crate::capability::is_audited_generic("arctic"),
+            !crate::capability::is_audited_generic("grovemoe"),
             "this test needs an arch that is generic AND unaudited"
         );
-        match config_for_arch("arctic") {
-            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "arctic"),
+        match config_for_arch("grovemoe") {
+            Err(LoadError::UnauditedArchitecture(name, ..)) => assert_eq!(name, "grovemoe"),
             other => panic!("expected an unaudited refusal, got {other:?}"),
         }
     }

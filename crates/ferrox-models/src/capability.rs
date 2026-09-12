@@ -851,6 +851,20 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // fixtures: the converter's shape with the gains, and the same file
     // without them, whose golden differs.
     "talkie",
+    // tests/parallel_dense_ffn_graphs.rs: a dense SiLU FFN sized
+    // `{n_embd, n_embd}` on EVERY layer (`arctic.cpp:38-42`) summed with
+    // the routed experts (`:154`), and the routed branch -- router and
+    // experts -- reading `ffn_norm_exps(inpSA)`, the layer INPUT under
+    // a second norm (`:45,135-152`), while the dense half reads
+    // `ffn_norm(ffn_inp)` (`:118-132`). `crate::parallel_dense_ffn`
+    // (two rows, `grok` the other) and `RouterInput::NormedLayerInput`
+    // (one row). `norm_w = true` literal, softmax,
+    // `expert_weights_scale` read by nothing (`:3-14`; a second fixture
+    // declares it and libllama's logits are byte-identical). NORM RoPE
+    // (llama-model.cpp:2588). Every fused Metal MoE launch refuses the
+    // model (shared experts on every layer, a non-default router
+    // operand).
+    "arctic",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1147,20 +1161,17 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // `llama-graph.cpp:1611-1652` really does clamp Q, K and V and
     // `conversion/olmo.py:23-25` really does write the key. See
     // `crate::clamp_kqv`.
-    (
-        "arctic",
-        TriageClass::NewCode,
-        "a PARALLEL dense+MoE layer whose MoE branch reads the pre-attention residual. \
-         src/models/arctic.cpp:124-132 runs a dense SiLU FFN on `ffn_norm(ffn_inp)` and adds \
-         it back to ffn_inp, then :136-141 norms `inpSA` -- the layer INPUT, before \
-         attention -- through a second per-layer norm `ffn_norm_exps` (:45) and runs the MoE \
-         on that, and :154 sums the two. The generic decoder computes one FFN on the \
-         post-attention residual, so this is a different graph, not a wider one. The dense \
-         half is also sized `{n_embd, n_embd}` (:40-42) rather than n_ff. The same operand \
-         `smallthinker`'s ROUTER reads (`crate::router_input`, `RawLayerInput`), but here \
-         it feeds a whole second norm and a whole expert bank, not a `[n_expert]` logit \
-         vector, so that seam does not reach it",
-    ),
+    // `arctic` was HERE, NEW CODE on a PARALLEL dense + MoE layer whose
+    // MoE branch reads the pre-attention residual, and is audited now
+    // on two seams (`tests/parallel_dense_ffn_graphs.rs`): the dense FFN
+    // summed with the experts is `crate::parallel_dense_ffn` -- the
+    // shared-expert slot under the dense names plus the row's scale on
+    // the sum, whose second row is Grok-2, refused by name until then --
+    // and the branch operand `ffn_norm_exps(inpSA)` is
+    // `RouterInput::NormedLayerInput`, one graph of 140. The verdict had
+    // said `router_input` "does not reach it" because the operand feeds
+    // a whole expert bank; it reaches it as a third variant carrying
+    // that fact (`experts_read_router_operand`).
     // `mistral3` was HERE, NEW CODE on the PER-POSITION ATTENTION
     // TEMPERATURE, and is audited now: `crate::attn_temperature` is the
     // seam and `tests/attn_temperature_graphs.rs` carries five
@@ -1501,6 +1512,11 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // LLM_ARCH_MISTRAL3 is in the consecutive-pairs group
         // (llama-model.cpp:2604), which `tests/rope_layout.rs` pins.
         v.push(gqa_norm("mistral3"));
+        // `arctic` was NEW CODE in `NORM_ROPE_TRIAGED` on the parallel
+        // dense + MoE layer, audited now (`crate::parallel_dense_ffn`,
+        // `RouterInput::NormedLayerInput`, tests/parallel_dense_ffn_graphs.rs).
+        // NORM RoPE: llama-model.cpp:2588.
+        v.push(gqa_norm("arctic"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -3222,7 +3238,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 3,
+            seen == 2,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -3312,21 +3328,28 @@ mod audit_tests {
              -- the reach measured first: six graphs of 140 create `attn_kv_a_mqa`, three \
              have a direct `attn_q` beside it, and on this engine that is `plm` and every \
              lite `deepseek2`, which the loader had refused for a key llama.cpp does not \
-             read; the fixture is the engine's FIRST libllama golden. \
-             What is left is 2 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
-             closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
-             `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
-             `step35`, `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `nanbeige`, `talkie` and \
-             `plm`, and each closure but `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, \
-             `smallthinker`'s, `bitnet`'s, `mimo2`'s, `nanbeige`'s, `talkie`'s and `plm`'s took \
-             more than one row at a time because each found ONE cause \
+             read; the fixture is the engine's FIRST libllama golden, and 3 until `arctic` \
+             closed on the parallel dense + MoE layer (`crate::parallel_dense_ffn`, \
+             `RouterInput::NormedLayerInput`, tests/parallel_dense_ffn_graphs.rs) -- the reach \
+             measured first: two graphs of 140 sum a dense FFN with their routed output, and \
+             the other, Grok-2, had been refused by name from a fixture that now has a golden; \
+             the branch operand is one graph of 140 and a third variant of the seam \
+             `smallthinker` opened. \
+             What is left is 1 NEW CODE (`grovemoe`) and one UNKNOWN (`phi4`). The NEW CODE rows \
+             that have closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, \
+             `grok`, `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
+             `step35`, `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `nanbeige`, `talkie`, \
+             `plm` and `arctic`, and each closure but `olmo`'s, `arcee`'s, `mellum`'s, \
+             `mistral3`'s, `smallthinker`'s, `bitnet`'s, `mimo2`'s, `nanbeige`'s, `talkie`'s \
+             and `plm`'s took more than one row at a time because each found ONE cause \
              behind several refusals; `mellum`'s cause IS shared and moved three verdicts, \
              but only one of them was closable by it, `mistral3`'s is shared with two rows \
              on other engines, `smallthinker`'s mechanism (a precomputed `probs`) is shared \
              with three rows whose CAUSE it is not, `bitnet`'s is shared with nothing, and \
              `mimo2`'s is shared with the MLA engine, which has carried the two widths \
-             since it existed, `nanbeige`'s and `talkie`'s with nothing, and `plm`'s with \
-             the lite DeepSeek-V2 checkpoints on the same engine"
+             since it existed, `nanbeige`'s and `talkie`'s with nothing, `plm`'s with \
+             the lite DeepSeek-V2 checkpoints on the same engine, and `arctic`'s with \
+             Grok-2, whose refusal by name lifted with it"
         );
     }
 
@@ -3343,16 +3366,17 @@ mod audit_tests {
         // `headline()` below, because a class with no rows still has to
         // render distinctly the day something lands in it again.
         //
-        // `arctic`, which used to be `talkie`, `bitnet`, `smallthinker`,
-        // `dbrx`, `olmo`: the sample keeps moving because the rows keep
-        // closing. `olmo`'s non-parametric LayerNorm, `dbrx`'s weighted
-        // one plus its clamp and its `attn_output_norm` slot,
-        // `smallthinker`'s router operand and gated ReLU experts,
-        // `bitnet`'s two inner norms, and `talkie`'s weightless norms,
-        // per-head scalar gain, skip stream and projection gains are all
-        // implemented now. `arctic` runs a dense FFN and an MoE bank in
-        // PARALLEL from the layer input, and nothing landed reaches that.
-        let new_code = unaudited_refusal_detail("arctic");
+        // `grovemoe`, which used to be `arctic`, `talkie`, `bitnet`,
+        // `smallthinker`, `dbrx`, `olmo`: the sample keeps moving because
+        // the rows keep closing. `olmo`'s non-parametric LayerNorm,
+        // `dbrx`'s weighted one plus its clamp and its `attn_output_norm`
+        // slot, `smallthinker`'s router operand and gated ReLU experts,
+        // `bitnet`'s two inner norms, `talkie`'s weightless norms,
+        // per-head scalar gain, skip stream and projection gains, and
+        // `arctic`'s parallel dense + MoE layer are all implemented now.
+        // `grovemoe`'s second expert bank has no single graph to match
+        // (its verdict says why).
+        let new_code = unaudited_refusal_detail("grovemoe");
         // `phi4` is the only UNKNOWN row left: `mistral`, `mixtral` and
         // `yi` used to be the other three and are refused as strings
         // now (see `NO_UPSTREAM_ARCH`).
@@ -3379,7 +3403,7 @@ mod audit_tests {
         // The blocker itself, not only the class label, has to be in the
         // message -- a class with no specifics is the old refusal with a
         // new adjective.
-        assert!(new_code.contains("arctic.cpp"), "{new_code}");
+        assert!(new_code.contains("grovemoe.cpp"), "{new_code}");
         assert!(unknown.contains("LLM_ARCH_NAMES"), "{unknown}");
         // The two empty classes still have to be distinguishable.
         let labels = [
@@ -3400,8 +3424,8 @@ mod audit_tests {
     /// whole point of the inversion.
     #[test]
     fn an_unchecked_architecture_is_not_audited() {
-        assert!(!is_audited_generic("arctic"));
         assert!(!is_audited_generic("grovemoe"));
+        assert!(!is_audited_generic("phi4"));
         assert!(!is_audited_generic("an-arch-that-does-not-exist"));
     }
 }

@@ -17,6 +17,27 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`arctic` runs, and Grok-2's refusal by name lifts with it.**
+  `src/models/arctic.cpp:118-154` runs a dense SiLU FFN sized
+  `{n_embd, n_embd}` on the post-attention residual and its router AND
+  experts on `ffn_norm_exps(inpSA)`, the layer input under a second
+  norm, and sums the two. Reach measured over every `build_moe_ffn`
+  graph that also reads a dense `ffn_up`: two of 140 SUM the dense FFN
+  with the routed output, `grok.cpp:171-184` (Grok-2, `sqrt(2)/2` on
+  the sum) and `arctic.cpp`, so `ferrox_models::parallel_dense_ffn` is
+  a two-row table (`DensePresence`, `sum_scale`) served through the
+  shared-expert slot, and `MoeWeights::parallel_sum_scale` is applied
+  beside `down_scale` at every site. `grep -l FFN_NORM_EXPS` is
+  `arctic.cpp` alone: `RouterInput::NormedLayerInput`, the third
+  variant, carries that the experts read the operand too, and the
+  combine bodies take the routed and the dense operand as two
+  arguments. KL 6.23e-14 (arctic; the same golden for a file declaring
+  `expert_weights_scale`, which `arctic.cpp` never reads, libllama
+  byte-identical), 3.28e-10 (Grok-2, GELU table)
+  (`tests/parallel_dense_ffn_graphs.rs`). Measured rather than
+  sabotaged: Grok-2's `sqrt(2)/2` sits before an RMSNorm and moves
+  llama.cpp's own logits by 2.5e-4. 54 audited, 2 refusing (1 NEW CODE,
+  1 UNKNOWN).
 - **`plm` runs, on the MLA engine, which has its first libllama golden
   with it.** `src/models/plm.cpp:84-166` is `deepseek2.cpp`'s naive MLA
   branch on a dense model, and the three ways it differs are one table,

@@ -33,13 +33,32 @@
 //! overload and route on `cur`.
 //!
 //! So `smallthinker` is the ONLY generic-path graph whose router
-//! operand is not what the experts read, and [`RouterInput`] has two
+//! operand is not what the experts read, and [`RouterInput`] had two
 //! variants rather than four: `gemma4`'s and `nemotron-h`'s shapes
 //! live on engines that do not read this field, and a variant with no
 //! caller is the OLMo lesson (`capability::WEIGHTED_LAYER_NORM`).
 //! `grovemoe` shares the mechanism (a precomputed `probs`) and NOT the
 //! cause; that is why the table is keyed by what the router reads and
 //! not by whether `probs_in` is non-null.
+//!
+//! # The third variant: a different `cur` -- `arctic`
+//!
+//! `arctic.cpp:135-152` passes NO `probs_in`; its router reads `cur`,
+//! the default mechanism. What differs is `cur` itself:
+//! `build_norm(inpSA, ffn_norm_exps)` at `:136-139` -- the residual
+//! stream as it ENTERS the layer (`inpSA = inpL`, `:69`), before
+//! attention, normed by a SECOND per-layer weight -- and the routed
+//! experts read that same vector, while the layer's dense FFN
+//! (`:118-132`, `crate::parallel_dense_ffn`) reads the ordinary
+//! `ffn_norm(ffn_inp)`. `grep -l FFN_NORM_EXPS src/models/*.cpp` over
+//! all 140 graphs is `arctic.cpp` (2026-09-12), so
+//! [`RouterInput::NormedLayerInput`] has one row and carries the fact
+//! that distinguishes it from `smallthinker`'s: the EXPERTS read it
+//! too ([`RouterInput::experts_read_router_operand`]). The bodies
+//! capture it at the same point as `smallthinker`'s logits -- where
+//! `attn_norm` is applied, before attention -- through
+//! `Decoder::router_operand`, and every fused Metal MoE launch refuses
+//! it through the predicate that already refused `RawLayerInput`.
 //!
 //! # What `inpL` is, exactly
 //!
@@ -84,17 +103,45 @@ pub enum RouterInput {
     /// layer, unnormed, before attention (`smallthinker.cpp:111`). The
     /// experts still read the normed FFN input.
     RawLayerInput,
+    /// `gate_inp · ffn_norm_exps(inpSA)` -- the residual stream as it
+    /// enters the layer, normed by `blk.N.ffn_norm_exps` (REQUIRED,
+    /// `arctic.cpp:45,136-139`). The routed experts read the SAME
+    /// vector; the layer's dense FFN reads `ffn_norm(ffn_inp)`.
+    NormedLayerInput,
+}
+
+impl RouterInput {
+    /// Whether the routed experts read the router's operand rather
+    /// than the normed FFN input: true for [`Self::NormedLayerInput`]
+    /// alone. `RawLayerInput`'s experts read `ffn_norm(ffn_inp)`
+    /// (`smallthinker.cpp:151`), as the default's do.
+    pub fn experts_read_router_operand(self) -> bool {
+        matches!(self, RouterInput::NormedLayerInput)
+    }
+
+    /// Whether the layer carries a `ffn_norm_exps` weight for the
+    /// operand.
+    pub fn needs_exps_norm(self) -> bool {
+        matches!(self, RouterInput::NormedLayerInput)
+    }
 }
 
 /// Which operand each architecture's router reads. The table behind
 /// the census above, restricted to the generic path; the two rows on
 /// other engines are documented there and not here, because nothing
 /// on those engines asks this question.
-pub const ROUTER_INPUT_TABLE: &[(&str, RouterInput, &str)] = &[(
-    "smallthinker",
-    RouterInput::RawLayerInput,
-    "src/models/smallthinker.cpp:111,151-161",
-)];
+pub const ROUTER_INPUT_TABLE: &[(&str, RouterInput, &str)] = &[
+    (
+        "smallthinker",
+        RouterInput::RawLayerInput,
+        "src/models/smallthinker.cpp:111,151-161",
+    ),
+    (
+        "arctic",
+        RouterInput::NormedLayerInput,
+        "src/models/arctic.cpp:45,135-152",
+    ),
+];
 
 /// The router operand for an architecture: the table's entry, or the
 /// default for every architecture the table does not name.
@@ -117,6 +164,10 @@ mod tests {
     #[test]
     fn only_smallthinker_routes_on_the_raw_layer_input() {
         assert_eq!(router_input("smallthinker"), RouterInput::RawLayerInput);
+        assert_eq!(router_input("arctic"), RouterInput::NormedLayerInput);
+        assert!(!RouterInput::RawLayerInput.experts_read_router_operand());
+        assert!(RouterInput::NormedLayerInput.experts_read_router_operand());
+        assert!(!RouterInput::NormedFfnInput.needs_exps_norm());
         for arch in [
             "llama",
             "qwen3moe",

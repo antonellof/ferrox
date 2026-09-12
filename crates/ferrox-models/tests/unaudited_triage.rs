@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 3,
+        n, 2,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -160,7 +160,14 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          beside it, and on that engine the direct form is `plm` and every LITE \
          `deepseek2` (`deepseek2.cpp:8`, decided from the layer count), which the loader \
          had refused for a `q_lora_rank` llama.cpp never reads there; the fixture is the \
-         MLA engine's FIRST libllama golden \
+         MLA engine's FIRST libllama golden, and 3 until `arctic` closed on the parallel \
+         dense + MoE layer (`ferrox_models::parallel_dense_ffn`, \
+         `RouterInput::NormedLayerInput`, tests/parallel_dense_ffn_graphs.rs) -- the reach \
+         measured first: two graphs of 140 SUM a dense FFN with their routed output, and \
+         the other is Grok-2, refused by name until then from a fixture that has a golden \
+         now; the branch operand is one graph of 140, a third variant of the seam \
+         `smallthinker` opened, and the verdict that said the seam did not reach it \
+         was read before it was believed \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -412,7 +419,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 3);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 2);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -560,15 +567,16 @@ fn smallthinker_is_audited_and_carries_no_stale_verdict() {
         .iter()
         .any(|(name, input, _)| *name == "smallthinker"
             && *input == ferrox_models::router_input::RouterInput::RawLayerInput));
-    // `arctic`'s verdict used to say it shares `smallthinker`'s shape;
-    // it must now point at the seam and say why the seam does not
-    // reach it (a whole expert bank, not a logit vector).
-    let arctic = unaudited_triage("arctic").expect("arctic still refuses");
-    assert!(
-        arctic.blocker.contains("router_input") && arctic.blocker.contains("does not reach it"),
-        "{}",
-        arctic.blocker
-    );
+    // `arctic`'s verdict used to say it shares `smallthinker`'s shape,
+    // then that the seam "does not reach it"; it reaches it now as a
+    // third variant, `NormedLayerInput`, and the row is audited
+    // (tests/parallel_dense_ffn_graphs.rs).
+    assert!(is_audited_generic("arctic"));
+    assert!(unaudited_triage("arctic").is_none());
+    assert!(ferrox_models::router_input::ROUTER_INPUT_TABLE
+        .iter()
+        .any(|(name, input, _)| *name == "arctic"
+            && *input == ferrox_models::router_input::RouterInput::NormedLayerInput));
 }
 
 /// `bitnet`'s verdict named four things: the two inner norms, the
@@ -943,7 +951,10 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
     let cases: &[(&str, TriageClass, &str)] = &[
         // Batch 4. `maincoder` and `bailingmoe` were here and are now
         // audited; see `tests/one_match_arm_graphs.rs`.
-        ("arctic", TriageClass::NewCode, "PARALLEL dense+MoE"),
+        // `arctic` was HERE, NEW CODE on its PARALLEL dense + MoE
+        // layer, and is audited (tests/parallel_dense_ffn_graphs.rs):
+        // `ferrox_models::parallel_dense_ffn` and
+        // `RouterInput::NormedLayerInput`.
         // `mistral3` was here on "attention temperature tuning" and is
         // audited; see `tests/attn_temperature_graphs.rs`.
         // `nanbeige` was HERE, NEW CODE on RUNNING THE SAME PHYSICAL
@@ -1181,7 +1192,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 2, 1),
+        (0, 0, 1, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1253,7 +1264,13 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          (`ferrox_models::mla_arch`): its attention had been there since the engine \
          existed, and what the row needed was the direct Q form, the ungated dense FFN \
          and the tied lm_head as one table -- plus the engine's first libllama golden, \
-         which is the evidence every other row in this file was held to. \
+         which is the evidence every other row in this file was held to. And 2 to 1 when \
+         `arctic` closed on `ferrox_models::parallel_dense_ffn` (the dense FFN summed with \
+         the experts: the shared-expert slot under the dense names plus the row's scale, \
+         two graphs of 140, Grok-2's refusal by name lifted with it) and \
+         `RouterInput::NormedLayerInput` (the routed branch reading the layer input under \
+         a second norm, one graph of 140). What is left is `grovemoe`, whose upstream graph \
+         diverges from its reference, and `phi4`. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1262,7 +1279,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 3);
+    assert_eq!(fixture + arm + new_code + unknown, 2);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose
