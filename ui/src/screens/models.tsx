@@ -29,8 +29,17 @@
 // only present in builds that have it; a 404 renders as a plain
 // explanation rather than as a broken table.
 
-import { useCallback, useEffect, useState } from "react";
-import { Boxes, CloudDownload, Loader2, RefreshCw, Search } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  Boxes,
+  CloudDownload,
+  Loader2,
+  RefreshCw,
+  Search,
+} from "lucide-react";
 import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -64,6 +73,7 @@ import {
   isNum,
 } from "@/lib/format";
 import { parseHfSource } from "@/lib/hf-source";
+import { cn } from "@/lib/utils";
 
 /** Poll fast while something is moving, slowly when nothing is. */
 const BUSY_POLL_MS = 1000;
@@ -157,12 +167,75 @@ function TaskCard({
   );
 }
 
+type SortKey =
+  | "id"
+  | "quant"
+  | "arch"
+  | "context_length"
+  | "param_count"
+  | "size_bytes"
+  | "state";
+
+/** Column order for one key; nulls sort last either way. */
+function compareBy(key: SortKey, a: ModelEntry, b: ModelEntry): number {
+  const av = a[key];
+  const bv = b[key];
+  if (av == null && bv == null) return 0;
+  if (av == null) return 1;
+  if (bv == null) return -1;
+  if (typeof av === "number" && typeof bv === "number") return av - bv;
+  return String(av).localeCompare(String(bv), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+/** A column header that orders the table; click again to flip. */
+function SortTh({
+  label,
+  column,
+  sort,
+  onSort,
+  numeric,
+}: {
+  label: string;
+  column: SortKey;
+  sort: { key: SortKey; dir: "asc" | "desc" };
+  onSort: (key: SortKey) => void;
+  numeric?: boolean;
+}) {
+  const active = sort.key === column;
+  const Icon = !active ? ArrowUpDown : sort.dir === "asc" ? ArrowUp : ArrowDown;
+  return (
+    <Th numeric={numeric} aria-sort={active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+      <button
+        type="button"
+        onClick={() => onSort(column)}
+        className={cn(
+          "inline-flex items-center gap-1 uppercase hover:text-fg",
+          numeric && "flex-row-reverse",
+          active && "text-fg",
+        )}
+      >
+        {label}
+        <Icon className={cn("size-3", active ? "opacity-100" : "opacity-40")} />
+      </button>
+    </Th>
+  );
+}
+
 export function ModelsScreen() {
   const [inventory, setInventory] = useState<Inventory | null>(null);
   const [tasks, setTasks] = useState<TaskView[]>([]);
   const [unsupported, setUnsupported] = useState(false);
   const [banner, setBanner] = useState<Banner>(null);
   const [filter, setFilter] = useState("");
+  const [quantFilter, setQuantFilter] = useState("");
+  const [archFilter, setArchFilter] = useState("");
+  const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({
+    key: "id",
+    dir: "asc",
+  });
   const [source, setSource] = useState("");
   const [file, setFile] = useState("*Q4_K_M.gguf");
   const [queueing, setQueueing] = useState(false);
@@ -265,6 +338,17 @@ export function ModelsScreen() {
     }
   };
 
+  const quants = useMemo(
+    () =>
+      [...new Set((inventory?.models ?? []).map((m) => m.quant).filter(Boolean))].sort() as string[],
+    [inventory],
+  );
+  const archs = useMemo(
+    () =>
+      [...new Set((inventory?.models ?? []).map((m) => m.arch).filter(Boolean))].sort() as string[],
+    [inventory],
+  );
+
   if (unsupported) {
     return (
       <Page>
@@ -295,13 +379,24 @@ export function ModelsScreen() {
   );
   const lastFailed = tasks.find((t) => t.status === "error") ?? null;
   const needle = filter.trim().toLowerCase();
-  const visible = (inventory?.models ?? []).filter(
-    (m) =>
-      !needle ||
-      m.id.toLowerCase().includes(needle) ||
-      (m.quant ?? "").toLowerCase().includes(needle) ||
-      (m.arch ?? "").toLowerCase().includes(needle),
-  );
+  const visible = (inventory?.models ?? [])
+    .filter(
+      (m) =>
+        (!needle ||
+          m.id.toLowerCase().includes(needle) ||
+          (m.quant ?? "").toLowerCase().includes(needle) ||
+          (m.arch ?? "").toLowerCase().includes(needle)) &&
+        (!quantFilter || m.quant === quantFilter) &&
+        (!archFilter || m.arch === archFilter),
+    )
+    .sort((a, b) => {
+      const c = compareBy(sort.key, a, b);
+      return sort.dir === "asc" ? c : -c;
+    });
+  const onSort = (key: SortKey) =>
+    setSort((s) =>
+      s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" },
+    );
 
   return (
     <Page>
@@ -321,144 +416,6 @@ export function ModelsScreen() {
       />
 
       {banner ? <Notice tone={banner.tone}>{banner.text}</Notice> : null}
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Inventory</CardTitle>
-          {/* The `state` column and the row's own button say which
-              checkpoint is loaded; only the empty case needs a badge. */}
-          {active ? null : <Badge tone="neutral">nothing loaded</Badge>}
-          <span className="flex-1" />
-          <div className="relative">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-faint" />
-            <Input
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="Search by id, quant or arch"
-              aria-label="Search models"
-              className="h-8 w-64 pl-8 text-xs"
-            />
-          </div>
-        </CardHeader>
-
-        {!inventory ? (
-          <CardBody className="space-y-2">
-            {[0, 1, 2].map((i) => (
-              <Skeleton key={i} className="h-9 w-full" />
-            ))}
-          </CardBody>
-        ) : !inventory.models.length ? (
-          <EmptyState
-            icon={Boxes}
-            title={
-              inventory.model_dir
-                ? "No .gguf checkpoints in the scanned directory"
-                : "No model directory is configured"
-            }
-          >
-            {inventory.model_dir ? (
-              <>Download one below, or drop a file into that directory.</>
-            ) : (
-              <>
-                Set <code className="font-mono">FERROX_MODEL_PATH</code> or{" "}
-                <code className="font-mono">FERROX_MODEL_DIR</code> and restart
-                the server.
-              </>
-            )}
-          </EmptyState>
-        ) : !visible.length ? (
-          <EmptyState icon={Search} title={`Nothing matches “${filter}”`} />
-        ) : (
-          <TableScroll>
-            <Table>
-              <thead>
-                <Tr className="hover:bg-transparent">
-                  <Th>id</Th>
-                  <Th>quant</Th>
-                  <Th>arch</Th>
-                  <Th numeric>context</Th>
-                  <Th numeric>params</Th>
-                  <Th numeric>on disk</Th>
-                  <Th numeric>resident</Th>
-                  <Th>state</Th>
-                  <Th>
-                    <span className="sr-only">actions</span>
-                  </Th>
-                </Tr>
-              </thead>
-              <tbody>
-                {visible.map((entry) => {
-                  return (
-                    <Tr key={entry.id}>
-                      <Td mono className="max-w-[22rem]">
-                        <span className="block truncate" title={entry.path}>
-                          {entry.id}
-                        </span>
-                      </Td>
-                      <Td>{entry.quant || "—"}</Td>
-                      <Td>{entry.arch || "—"}</Td>
-                      <Td numeric>
-                        {isNum(entry.context_length)
-                          ? fmtInt(entry.context_length)
-                          : "—"}
-                      </Td>
-                      <Td numeric>{fmtParams(entry.param_count)}</Td>
-                      <Td numeric>{fmtBytes(entry.size_bytes)}</Td>
-                      {/* `resident_bytes` is null for anything the server
-                          cannot measure; that is reported as unknown rather
-                          than as the file size, which would be a guess
-                          dressed as a measurement. */}
-                      <Td numeric>
-                        {isNum(entry.resident_bytes)
-                          ? fmtBytes(entry.resident_bytes)
-                          : "—"}
-                      </Td>
-                      <Td>
-                        <StateBadge entry={entry} activeId={active} />
-                      </Td>
-                      <Td className="text-right">
-                        {entry.id === active ? (
-                          <Button
-                            variant="default"
-                            size="sm"
-                            onClick={unloadModel}
-                            title="Give the memory back without loading another"
-                          >
-                            Unload
-                          </Button>
-                        ) : (
-                          <Button
-                            variant="default"
-                            size="sm"
-                            disabled={busy || loadingId !== null}
-                            onClick={() => void loadModel(entry.id)}
-                            title="Load this checkpoint for every client of this server"
-                          >
-                            {loadingId === entry.id || entry.state === "loading" ? (
-                              <Loader2 className="animate-spin" />
-                            ) : null}
-                            Load
-                          </Button>
-                        )}
-                      </Td>
-                    </Tr>
-                  );
-                })}
-              </tbody>
-            </Table>
-          </TableScroll>
-        )}
-
-        <CardFooter>
-          Load swaps the checkpoint for every client of this server; an
-          in-flight request finishes on the weights it started on. The
-          same switch is in the model menu at the top of{" "}
-          <Link to="/ui/chat" className="link">
-            Chat
-          </Link>
-          .
-        </CardFooter>
-      </Card>
 
       <Card>
         <CardHeader>
@@ -530,6 +487,177 @@ export function ModelsScreen() {
           .
         </CardFooter>
       </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Inventory</CardTitle>
+          {/* The `state` column and the row's own button say which
+              checkpoint is loaded; only the empty case needs a badge. */}
+          {active ? null : <Badge tone="neutral">nothing loaded</Badge>}
+          <span className="flex-1" />
+          <select
+            value={quantFilter}
+            onChange={(e) => setQuantFilter(e.target.value)}
+            aria-label="Filter by quant"
+            className="h-8 rounded-lg border border-line bg-raised px-2 text-xs text-fg focus:border-fg/30 focus:outline-none"
+          >
+            <option value="">any quant</option>
+            {quants.map((q) => (
+              <option key={q} value={q}>
+                {q}
+              </option>
+            ))}
+          </select>
+          <select
+            value={archFilter}
+            onChange={(e) => setArchFilter(e.target.value)}
+            aria-label="Filter by architecture"
+            className="h-8 rounded-lg border border-line bg-raised px-2 text-xs text-fg focus:border-fg/30 focus:outline-none"
+          >
+            <option value="">any arch</option>
+            {archs.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </select>
+          <div className="relative">
+            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-faint" />
+            <Input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Search by id, quant or arch"
+              aria-label="Search models"
+              className="h-8 w-56 pl-8 text-xs"
+            />
+          </div>
+        </CardHeader>
+
+        {!inventory ? (
+          <CardBody className="space-y-2">
+            {[0, 1, 2].map((i) => (
+              <Skeleton key={i} className="h-9 w-full" />
+            ))}
+          </CardBody>
+        ) : !inventory.models.length ? (
+          <EmptyState
+            icon={Boxes}
+            title={
+              inventory.model_dir
+                ? "No .gguf checkpoints in the scanned directory"
+                : "No model directory is configured"
+            }
+          >
+            {inventory.model_dir ? (
+              <>Download one below, or drop a file into that directory.</>
+            ) : (
+              <>
+                Set <code className="font-mono">FERROX_MODEL_PATH</code> or{" "}
+                <code className="font-mono">FERROX_MODEL_DIR</code> and restart
+                the server.
+              </>
+            )}
+          </EmptyState>
+        ) : !visible.length ? (
+          <EmptyState
+            icon={Search}
+            title={
+              filter
+                ? `Nothing matches “${filter}”`
+                : "Nothing matches these filters"
+            }
+          />
+        ) : (
+          <TableScroll>
+            <Table>
+              <thead>
+                <Tr className="hover:bg-transparent">
+                  <SortTh label="id" column="id" sort={sort} onSort={onSort} />
+                  <SortTh label="quant" column="quant" sort={sort} onSort={onSort} />
+                  <SortTh label="arch" column="arch" sort={sort} onSort={onSort} />
+                  <SortTh label="context" column="context_length" sort={sort} onSort={onSort} numeric />
+                  <SortTh label="params" column="param_count" sort={sort} onSort={onSort} numeric />
+                  <SortTh label="on disk" column="size_bytes" sort={sort} onSort={onSort} numeric />
+                  <Th numeric>resident</Th>
+                  <SortTh label="state" column="state" sort={sort} onSort={onSort} />
+                  <Th>
+                    <span className="sr-only">actions</span>
+                  </Th>
+                </Tr>
+              </thead>
+              <tbody>
+                {visible.map((entry) => {
+                  return (
+                    <Tr key={entry.id}>
+                      <Td mono className="max-w-[22rem]">
+                        <span className="block truncate" title={entry.path}>
+                          {entry.id}
+                        </span>
+                      </Td>
+                      <Td>{entry.quant || "—"}</Td>
+                      <Td>{entry.arch || "—"}</Td>
+                      <Td numeric>
+                        {isNum(entry.context_length)
+                          ? fmtInt(entry.context_length)
+                          : "—"}
+                      </Td>
+                      <Td numeric>{fmtParams(entry.param_count)}</Td>
+                      <Td numeric>{fmtBytes(entry.size_bytes)}</Td>
+                      {/* `resident_bytes` is null for anything the server
+                          cannot measure; that is reported as unknown rather
+                          than as the file size, which would be a guess
+                          dressed as a measurement. */}
+                      <Td numeric>
+                        {isNum(entry.resident_bytes)
+                          ? fmtBytes(entry.resident_bytes)
+                          : "—"}
+                      </Td>
+                      <Td>
+                        <StateBadge entry={entry} activeId={active} />
+                      </Td>
+                      <Td className="text-right">
+                        {entry.id === active ? (
+                          <Button
+                            variant="default"
+                            size="sm"
+                            onClick={unloadModel}
+                            title="Give the memory back without loading another"
+                          >
+                            Unload
+                          </Button>
+                        ) : (
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            disabled={busy || loadingId !== null}
+                            onClick={() => void loadModel(entry.id)}
+                            title="Load this checkpoint for every client of this server"
+                          >
+                            {loadingId === entry.id || entry.state === "loading" ? (
+                              <Loader2 className="animate-spin" />
+                            ) : null}
+                            Load
+                          </Button>
+                        )}
+                      </Td>
+                    </Tr>
+                  );
+                })}
+              </tbody>
+            </Table>
+          </TableScroll>
+        )}
+
+        <CardFooter>
+          Load swaps the checkpoint for every client of this server; an
+          in-flight request finishes on the weights it started on. The
+          same switch is in the model menu at the top of{" "}
+          <Link to="/ui/chat" className="link">
+            Chat
+          </Link>
+          .
+        </CardFooter>
+      </Card>
+
     </Page>
   );
 }
