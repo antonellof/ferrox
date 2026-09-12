@@ -173,10 +173,16 @@ pub struct MlaMoeRuntime {
     pub expert_weights_scale: f32,
 }
 
+/// One dense layer's FFN: the gate / up / down triple and the
+/// activation that combines the first two, carried TOGETHER so the
+/// forward pass cannot run a `plm` layer's ungated ReLU-squared
+/// weights through SwiGLU. `act` is the architecture's
+/// (`crate::mla_arch::MlaArch::dense_act`); for an ungated one the
+/// loader aliases `gate` to `ffn_up`, as the generic loader does for
+/// `arcee`, and `ferrox_moe::run_expert` skips the aliased matmul.
 pub struct MlaDenseFfn {
-    pub gate: WeightMatrix,
-    pub up: WeightMatrix,
-    pub down: WeightMatrix,
+    pub weights: ferrox_moe::ExpertWeights,
+    pub act: ferrox_moe::GluAct,
 }
 
 pub struct MlaMoeFfn {
@@ -273,7 +279,7 @@ impl Engine for MlaEngine {
         _pos: usize,
         state: &mut Self::State,
     ) -> Vec<f32> {
-        use ferrox_core::matmul::{rms_norm, swiglu};
+        use ferrox_core::matmul::rms_norm;
         let mut hidden = self.embedding.dequant_row(token_id);
         for (layer, (k_cache, v_cache)) in self.layers.iter().zip(state.layers.iter_mut()) {
             let normed = rms_norm(&hidden, &layer.attn_norm, self.rms_norm_eps);
@@ -290,11 +296,7 @@ impl Engine for MlaEngine {
             }
             let ffn_in = rms_norm(&hidden, &layer.ffn_norm, self.rms_norm_eps);
             let down = match &layer.ffn {
-                MlaLayerFfn::Dense(d) => {
-                    let gate = d.gate.apply(&ffn_in);
-                    let up = d.up.apply(&ffn_in);
-                    d.down.apply(&swiglu(&gate, &up))
-                }
+                MlaLayerFfn::Dense(d) => ferrox_moe::run_expert(&ffn_in, &d.weights, d.act),
                 MlaLayerFfn::Moe(m) => self.moe_ffn_forward(m, &ffn_in),
             };
             for (h, d) in hidden.iter_mut().zip(down.iter()) {

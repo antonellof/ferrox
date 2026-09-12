@@ -603,7 +603,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // optional `output.weight` with a tied fallback (:20-25),
     // `n_embd_head == n_rot` asserted (:51-52). The same FFN is in
     // `plm`, `nemotron`, `jais2` and `nemotron-h`, each of which refuses
-    // for something else; see `UNGATED_RELU_SQR`.
+    // for something else; see `uses_relu_sqr`.
     "arcee",
     // tests/per_layer_shape_graphs.rs: the PER-LAYER-SHAPE pair, two
     // rows on one seam (`crate::layer_shapes`). llama.cpp reads
@@ -1184,7 +1184,13 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // `arcee` was HERE, NEW CODE on `UNGATED_RELU_SQR`, and is audited
     // now: the FFN is `FfnActivation::ReluSqr` and
     // `tests/ungated_ffn_graphs.rs` carries the fixture.
-    ("plm", TriageClass::NewCode, UNGATED_RELU_SQR),
+    // `plm` was HERE, NEW CODE on `UNGATED_RELU_SQR`'s second half,
+    // DeepSeek-2 MLA attention on a dense model, and it is on the MLA
+    // engine now (`DecoderFamily::Mla`, below): the engine gained the
+    // direct-Q form (`crate::mla_q_proj`), the per-architecture table
+    // (`crate::mla_arch`) and its FIRST libllama-golden fixture
+    // (tests/plm_graphs.rs) with it. That row is not in
+    // AUDITED_GENERIC_GQA because it never ran on the generic path.
 ];
 
 /// Shared by the three ferrox-only alias rows `mistral`, `mixtral` and
@@ -1228,36 +1234,15 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
 const NO_UPSTREAM_ARCH: &str =
     "this is not a GGUF architecture. `mistral`, `mixtral` and `yi` appear in neither      LLM_ARCH_NAMES (src/llama-arch.cpp lists `mistral3` and `mistral4` and nothing else      under that prefix) nor gguf-py's MODEL_ARCH_NAMES, and libllama REFUSES a file      declaring one of them: `unknown model architecture: 'mistral'` -- measured, on a      synthetic llama-shaped file written under each of the three strings. Every real      Mistral, Mixtral and Yi checkpoint converts to `llama` instead, which ferrox audits      and runs: the two in this repo's own models/ directory      (Mistral-7B-Instruct-v0.2-Q4_K_M.gguf, Yi-1.5-6B-Chat-Q4_K_M.gguf) both declare      `general.architecture = llama`. IF YOUR FILE REALLY SPELLS THIS, it came from a      converter neither engine has read, so its RoPE variant, its norm placement and its      FFN shape are all undetermined and ferrox will not guess -- re-convert it with      llama.cpp's convert_hf_to_gguf.py and it will load as `llama`. These rows used to sit      on the generic path with NEOX RoPE, while `llama` is in llama_model_rope_type's NORM      group, so such a file would have been rotated on the wrong pairs of every Q/K head";
 
-/// Was shared by `arcee` and `plm`: an ungated ReLU-squared MLP. `arcee`
-/// closed on it (2026-09-11, `FfnActivation::ReluSqr`,
-/// `tests/ungated_ffn_graphs.rs`); `plm` did not, and this is the
-/// verdict that says why.
-///
-/// The original verdict called the two "one cause" from the FFN alone,
-/// and it was wrong by an attention block: reading `plm.cpp` against
-/// `arcee.cpp` before assuming they were identical (the `diff` is 150
-/// lines) shows `plm.cpp:16-19,32-36` creating `attn_kv_a_mqa`,
-/// `attn_kv_a_norm` and `attn_kv_b` sized by `kv_lora_rank` and
-/// `n_rot`, and `:84-166` running DeepSeek-2's MLA attention -- Q split
-/// into `q_nope`/`q_pe`, a compressed KV normed and re-expanded, a
-/// shared roped key concatenated onto every head. ferrox has that
-/// attention only in the dedicated `MlaEngine`. Five graphs use the
-/// FFN (`arcee`, `plm`, `nemotron`, `jais2`, `nemotron-h`, measured by
-/// grepping `LLM_FFN_RELU_SQR` over `src/models/`); only `arcee` needed
-/// nothing else.
-const UNGATED_RELU_SQR: &str =
-    "DeepSeek-2 MLA attention on a dense model, and NOT the ungated ReLU-squared FFN the \
-     verdict used to name -- that half is IMPLEMENTED (`FfnActivation::ReluSqr`, audited on \
-     `arcee`, whose `arcee.cpp:123-128` is the same `build_ffn(up, NULL gate, down, \
-     LLM_FFN_RELU_SQR, LLM_FFN_SEQ)` call as plm.cpp:181-187). What remains is the \
-     attention: src/models/plm.cpp:16-19 sizes `attn_kv_a_mqa` {n_embd, kv_lora_rank + \
-     n_rot}, `attn_kv_a_norm` {kv_lora_rank} and `attn_kv_b` {kv_lora_rank, n_head * \
-     (qk_nope + v)} from `attention.kv_lora_rank` (:5), and :84-166 splits Q into nope/pe \
-     views, RMS-norms the compressed KV, re-expands it, ropes ONE shared key and repeats it \
-     across the heads -- `deepseek2.cpp`'s graph with no q_lora and no MoE. ferrox runs \
-     that attention only inside the dedicated `MlaEngine` (`mla_gguf_loader.rs`, arch-gated \
-     to `deepseek2` / `mistral4`), which has no dense ReLU-squared FFN and no libllama-golden \
-     evidence of its own; the generic decoder has no MLA at all";
+// `UNGATED_RELU_SQR` was here: the verdict `arcee` and `plm` shared,
+// and after `arcee` closed (2026-09-11) the one that said why `plm` had
+// not -- DeepSeek-2 MLA attention on a dense model, `plm.cpp:16-19,
+// 32-36,84-166`, which ferrox had only inside the dedicated `MlaEngine`,
+// arch-gated to `deepseek2` / `mistral4`, with no dense ReLU-squared FFN
+// and no libllama-golden evidence of its own. `plm` closed on that
+// engine on 2026-09-12 (`crate::mla_arch`, `crate::mla_q_proj`,
+// tests/plm_graphs.rs), and the same fixture is the engine's first
+// golden. The FFN half is `uses_relu_sqr` below.
 
 /// Triaged rows of the generic **NEOX**-RoPE group. Same rules as
 /// [`NORM_ROPE_TRIAGED`].
@@ -2126,6 +2111,23 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             },
             WholeVector,
         ));
+        // PLM-1.8B: `deepseek2.cpp`'s naive MLA branch on a dense
+        // ReLU-squared model with a direct `attn_q` and a tied lm_head
+        // (`plm.cpp`); the three differences are `crate::mla_arch`'s
+        // row. Checked against libllama in tests/plm_graphs.rs, NORM
+        // RoPE (llama-model.cpp:2592).
+        v.push(prof(
+            "plm",
+            TextGeneration,
+            Mla,
+            KvMla,
+            Norm,
+            ArchPath::DedicatedOnly {
+                reason: "PLM is DeepSeek-2 MLA attention on a dense model and runs on the MLA \
+                         engine (`mla_gguf_loader`), not generic GQA",
+            },
+            WholeVector,
+        ));
         v.push(prof(
             "deepseek32",
             TextGeneration,
@@ -2589,14 +2591,41 @@ pub fn uses_geglu(arch: &str) -> bool {
 /// Five graphs pass `LLM_FFN_RELU_SQR` upstream -- measured, by
 /// grepping `src/models/*.cpp`: `arcee`, `plm`, `nemotron`, `jais2`,
 /// `nemotron-h`. Only `arcee` reaches the generic path with nothing
-/// else in the way: `plm` is MLA attention (`UNGATED_RELU_SQR`),
+/// else in the way: `plm` is MLA attention and runs on the MLA engine
+/// (`crate::mla_arch` reads the same fact from its own table, and
+/// `mla_arch_and_this_table_agree_about_plm` pins that they agree),
 /// `nemotron` and `jais2` are in the biased-LayerNorm group
 /// (`WEIGHTED_LAYER_NORM`), `nemotron-h` is a hybrid recurrent model.
 /// They are listed so that closing one of them finds its FFN already
-/// implemented and named here, and so that `plm`'s verdict can point at
-/// the half that is done.
+/// implemented and named here.
 pub fn uses_relu_sqr(arch: &str) -> bool {
     matches!(arch, "arcee" | "plm" | "nemotron" | "jais2" | "nemotron-h")
+}
+
+#[cfg(test)]
+mod relu_sqr_tests {
+    use super::*;
+
+    /// Two tables say what `plm`'s dense FFN is -- this one, read by
+    /// the generic loader, and `crate::mla_arch`'s row, read by the MLA
+    /// loader. They must agree, and the MLA table must say ReluSqr for
+    /// exactly the rows this one names.
+    #[test]
+    fn mla_arch_and_this_table_agree_about_plm() {
+        for row in crate::mla_arch::MLA_ENGINE_ARCHS {
+            let ungated = row.dense_act.ungated().is_some();
+            assert_eq!(
+                ungated,
+                uses_relu_sqr(row.name),
+                "`{}`: mla_arch says ungated={ungated}, uses_relu_sqr disagrees",
+                row.name
+            );
+        }
+        assert!(matches!(
+            crate::mla_arch::mla_arch("plm").unwrap().dense_act,
+            ferrox_moe::GluAct::ReluSqr
+        ));
+    }
 }
 
 /// Architectures whose experts are the GATED ReLU MLP:
@@ -3193,7 +3222,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 4,
+            seen == 3,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -3278,20 +3307,26 @@ mod audit_tests {
              physical layer rather than a copy of the weights, and 5 until `talkie` closed \
              on four things at once (`crate::skip_stream`, `NormOp::RmsNoParams`, \
              `QkNormStyle::PerHeadScalar`, the two served `.scale` companions; \
-             tests/skip_stream_graphs.rs), each one graph of 140. \
-             What is left is 3 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
+             tests/skip_stream_graphs.rs), each one graph of 140, and 4 until `plm` closed \
+             on the MLA engine (`crate::mla_arch`, `crate::mla_q_proj`, tests/plm_graphs.rs) \
+             -- the reach measured first: six graphs of 140 create `attn_kv_a_mqa`, three \
+             have a direct `attn_q` beside it, and on this engine that is `plm` and every \
+             lite `deepseek2`, which the loader had refused for a key llama.cpp does not \
+             read; the fixture is the engine's FIRST libllama golden. \
+             What is left is 2 NEW CODE and one UNKNOWN (`phi4`). The NEW CODE rows that have \
              closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, `grok`, \
              `dbrx`, `arcee`, `deci`, `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, \
-             `step35`, `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `nanbeige` and `talkie`, \
-             and each closure but `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, \
-             `smallthinker`'s, `bitnet`'s, `mimo2`'s, `nanbeige`'s and `talkie`'s took more \
-             than one row at a time because each found ONE cause \
+             `step35`, `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `nanbeige`, `talkie` and \
+             `plm`, and each closure but `olmo`'s, `arcee`'s, `mellum`'s, `mistral3`'s, \
+             `smallthinker`'s, `bitnet`'s, `mimo2`'s, `nanbeige`'s, `talkie`'s and `plm`'s took \
+             more than one row at a time because each found ONE cause \
              behind several refusals; `mellum`'s cause IS shared and moved three verdicts, \
              but only one of them was closable by it, `mistral3`'s is shared with two rows \
              on other engines, `smallthinker`'s mechanism (a precomputed `probs`) is shared \
              with three rows whose CAUSE it is not, `bitnet`'s is shared with nothing, and \
              `mimo2`'s is shared with the MLA engine, which has carried the two widths \
-             since it existed, and `nanbeige`'s and `talkie`'s with nothing"
+             since it existed, `nanbeige`'s and `talkie`'s with nothing, and `plm`'s with \
+             the lite DeepSeek-V2 checkpoints on the same engine"
         );
     }
 
@@ -3366,7 +3401,7 @@ mod audit_tests {
     #[test]
     fn an_unchecked_architecture_is_not_audited() {
         assert!(!is_audited_generic("arctic"));
-        assert!(!is_audited_generic("plm"));
+        assert!(!is_audited_generic("grovemoe"));
         assert!(!is_audited_generic("an-arch-that-does-not-exist"));
     }
 }

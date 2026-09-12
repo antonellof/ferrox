@@ -18,21 +18,24 @@ engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 4 unaudited refusals are now TRIAGED, and the refusal says which of
+The 3 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 3 need new code, 1 is unknown with the question stated. Five
+away**, 2 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
 `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35` and
 `mistral3` on 2026-09-11, and `smallthinker`, `bitnet`, `mimo2`,
-`nanbeige` and `talkie` on 2026-09-12, each with a libllama-golden
+`nanbeige`, `talkie` and `plm` on 2026-09-12, each with a libllama-golden
 fixture, which is what moved 46 to 41 to 34 to 31 to 29 to 28 to 25 to
 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10 to 9 to 8 to 7 to 6 to 5 to
-4; the step from 28 to 25
+4 to 3; the step from 28 to 25
 was moving the three alias rows off
-the generic path rather than a closure. `minicpm` moved too and is not in that count: it
+the generic path rather than a closure, and the step from 4 to 3 moved
+`plm` onto the MLA ENGINE rather than the generic path, so it lowers
+the refusing number without raising `AUDITED_GENERIC_GQA` -- the
+engine it joined now has a libllama golden, which it never had. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
 without lowering the refusing one. `smollm3` and EXAONE-4 32B closed
 with `exaone-moe` and are the same case, one a DedicatedOnly refusal and
@@ -45,8 +48,8 @@ needs a different graph.
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
 times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times
 more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9
-to 8, and on 2026-09-12 five times more, 8 to 7, 7 to 6, 6 to 5, 5 to
-4 and 4 to 3. The first two took several rows
+to 8, and on 2026-09-12 six times more, 8 to 7, 7 to 6, 6 to 5, 5 to
+4, 4 to 3 and 3 to 2. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -105,7 +108,40 @@ pair since it existed. The fourteenth, `nanbeige`, 5 to 4, is the
 verdict's last sentence taken literally: "it is the copy that has no
 home" closed as a mapping, not a copy. The fifteenth, `talkie`, 4 to
 3, is four seams for one row, each one graph of 140, so none could be
-built for anything else and all four landed together.
+built for anything else and all four landed together. The sixteenth,
+`plm`, 3 to 2, closed on an engine that already had its attention: the
+work was a table of the three ways it differs from DeepSeek-2 and the
+engine's FIRST golden, and the table's direct-Q column had a second
+caller waiting -- every lite DeepSeek-V2, which the loader had refused
+for a key llama.cpp does not read on those files.
+
+`plm` closed on `ferrox-models/src/mla_arch.rs` and `mla_q_proj.rs`, on
+the MLA engine. `plm.cpp:84-166` is `deepseek2.cpp`'s naive MLA branch
+line for line (`grep -l ATTN_KV_A_MQA` over all 140 graphs is six
+files, `plm` the only one on no engine), and what differs is three
+things, one table: a DIRECT `attn_q` (`plm.cpp:32`; `deepseek2.cpp:
+104-115` creates the same when `q_lora_rank == 0`, and `:8,11-13`
+decide that from the LAYER COUNT -- 27, 26, or 48 with a 128256
+vocabulary -- BEFORE reading the key, so a lite file's `q_lora_rank`
+is dead metadata and `MlaQProj` is an enum the forward pass cannot
+reach without the answer), an ungated `LLM_FFN_RELU_SQR` dense FFN
+(`:181-187`, `GluAct::ReluSqr` with the gate aliased as for `arcee`,
+carried ON `MlaDenseFfn` so the body cannot run it through SwiGLU), and
+a tied lm_head the graph never reads an `output.weight` for (`:23-24`;
+libllama REFUSES a file carrying one, `done_getting_tensors: wrong
+number of tensors; expected 30, got 29`, measured, so ferrox refuses it
+too rather than prefer the decoy). The head widths come from
+`attention.key_length` / `value_length` because `llama-hparams.cpp:
+259-265` fall back to them when the `_mla` keys are absent, which is
+what `conversion/plm.py:16-17` writes. KL 1.87e-13 on the MLA engine's
+first libllama golden; the loader's lite rule has a 27-layer synthetic
+test that carries the key and is direct anyway. Two things it found:
+the engine had REQUIRED `attention.q_lora_rank`, so every
+DeepSeek-V2-Lite / GigaChat3 / Kanana-2 export failed on a key upstream
+never reads for them; and it read no `rope.scaling.*` at all, so every
+real DeepSeek-V2 / V3 export (all YaRN) would have run at factor 1 with
+`kq_scale` missing `deepseek2.cpp:312-319`'s mscale -- REFUSED by name
+now, with the lines.
 
 `talkie` closed on four seams. `NormOp::RmsNoParams` (`talkie.cpp:50,
 68,90,110,137` are all `build_norm(x, nullptr, nullptr, LLM_NORM_RMS)`;

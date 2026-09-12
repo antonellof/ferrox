@@ -61,15 +61,15 @@ rather than by whether the architecture name is known:
 | Outcome | Count |
 |---|---|
 | Runs, **with evidence** | **53** (`capability::AUDITED_GENERIC_GQA`) |
-| Loads on a dedicated engine, no cross-engine evidence | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`) |
-| Refuses as **unaudited**, now triaged | 4 |
+| Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`), the other three none |
+| Refuses as **unaudited**, now triaged | 3 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 57 generic-gqa (53 of
-them audited), 58 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 56 generic-gqa (53 of
+them audited), 59 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -78,8 +78,8 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 4 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-3 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 3 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+2 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
 refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
@@ -122,8 +122,14 @@ are shared and the KV is not, so the seam is a logical-to-physical
 mapping and a loop norm, not a copy of the weights), and `talkie` on
 four seams at once (`NormOp::RmsNoParams`, `QkNormStyle::PerHeadScalar`,
 `ferrox_models::skip_stream`, and the two `.scale` companions
-`ferrox_models::weight_scales` now serves), each one graph of 140.
-Each with a libllama-golden fixture. `minicpm` closed on
+`ferrox_models::weight_scales` now serves), each one graph of 140,
+and `plm` on the MLA engine (`ferrox_models::mla_arch`,
+`ferrox_models::mla_q_proj`: its attention was already there, and the
+three ways it differs from DeepSeek-2 -- a direct `attn_q`, an ungated
+ReLU-squared dense FFN, a tied lm_head -- are one table; the direct-Q
+column also lifts the refusal of every lite DeepSeek-V2 export, and
+the fixture is that engine's FIRST libllama golden). Each with a
+libllama-golden fixture. `minicpm` closed on
 2026-09-10 and is not in that arithmetic: it was refused BY NAME rather
 than as unaudited, so it raises the audited count without lowering the
 refusing one; `smollm3` and EXAONE-4 32B closed with `exaone-moe` on

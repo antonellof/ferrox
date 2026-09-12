@@ -25,7 +25,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `deci` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `mistral3` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `arctic` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
-| `plm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -89,6 +88,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `minimax-m3` | TextGeneration | Dedicated | KvGqa | dedicated |
 | `minicpm3` | TextGeneration | Mla | KvMla | dedicated |
 | `deepseek2` | TextGeneration | Mla | KvMla | dedicated |
+| `plm` | TextGeneration | Mla | KvMla | dedicated |
 | `deepseek32` | TextGeneration | Mla | KvDsa | dedicated |
 | `mistral4` | TextGeneration | Mla | KvMla | dedicated |
 | `mistral` | TextGeneration | Dedicated | KvGqa | dedicated |

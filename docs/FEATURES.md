@@ -91,6 +91,18 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **PLM on the MLA engine, and the engine's first cross-engine
+  evidence.** `plm` (PLM-1.8B) is DeepSeek-2's MLA attention on a dense
+  model; `ferrox_models::mla_arch` is the table of the three ways it
+  differs (a direct `attn_q` -- `ferrox_models::mla_q_proj`, which the
+  lite DeepSeek-V2 layer counts take too, where the loader had refused
+  them for a key llama.cpp never reads; an ungated ReLU-squared dense
+  FFN carried on `MlaDenseFfn`; a tied lm_head whose decoy
+  `output.weight` is refused as libllama refuses it). Checked against
+  libllama, KL 1.87e-13. The same pass made the engine REFUSE any
+  `rope.scaling.type` but `none`, because it has neither the frequency
+  rewrite nor the YaRN mscale in `kq_scale` that every real DeepSeek-V2
+  / V3 export needs.
 - **Weightless RMS norms, a per-head scalar Q gain, an embedding skip
   stream and two projection gains**, and with them Talkie (`talkie`).
   `NormOp::RmsNoParams` for a file with no norm tensor at all;

@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 4,
+        n, 3,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -153,7 +153,14 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          logical, and one mapping serves the three bodies, and 5 until `talkie` closed \
          on its four things at once (`ferrox_models::skip_stream`, `NormOp::RmsNoParams`, \
          `QkNormStyle::PerHeadScalar`, and the two `.scale` companions \
-         `ferrox_models::weight_scales` now serves; tests/skip_stream_graphs.rs) \
+         `ferrox_models::weight_scales` now serves; tests/skip_stream_graphs.rs), and 4 \
+         until `plm` closed on the MLA engine (`ferrox_models::mla_arch`, \
+         `ferrox_models::mla_q_proj`, tests/plm_graphs.rs) -- the reach measured first: \
+         six graphs of 140 create `attn_kv_a_mqa` and three have a direct `attn_q` \
+         beside it, and on that engine the direct form is `plm` and every LITE \
+         `deepseek2` (`deepseek2.cpp:8`, decided from the layer count), which the loader \
+         had refused for a `q_lora_rank` llama.cpp never reads there; the fixture is the \
+         MLA engine's FIRST libllama golden \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -405,7 +412,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 4);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 3);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -500,13 +507,11 @@ fn batch_two_verdicts_are_pinned_to_what_was_read() {
         // its verdict constant with `plm`, and that constant was WRONG
         // about `plm` by an attention block: `plm.cpp:84-166` is
         // DeepSeek-2's MLA attention, which the FFN-only reading had
-        // not seen. `plm` stays, with the verdict now naming the half
-        // that is done and the half that is not.
-        (
-            "plm",
-            TriageClass::NewCode,
-            "MLA attention on a dense model",
-        ),
+        // not seen. `plm` was HERE with that corrected verdict, and
+        // closed on 2026-09-12 on the MLA engine (`DecoderFamily::Mla`,
+        // tests/plm_graphs.rs), where its `ArchPath::DedicatedOnly`
+        // profile carries no verdict; `plm_is_served_by_the_mla_engine`
+        // below asserts the move.
     ];
     for (arch, class, evidence) in cases {
         let t = unaudited_triage(arch).unwrap_or_else(|| panic!("`{arch}` carries no verdict"));
@@ -517,6 +522,26 @@ fn batch_two_verdicts_are_pinned_to_what_was_read() {
             t.blocker
         );
     }
+}
+
+/// `plm` left the triage table for the MLA engine: no verdict, the
+/// `Mla` family, a `DedicatedOnly` path that names the engine, and the
+/// generic loader still refusing it by that path rather than as
+/// unaudited.
+#[test]
+fn plm_is_served_by_the_mla_engine() {
+    use ferrox_models::capability::{resolve_profile, ArchPath, DecoderFamily};
+    assert!(
+        unaudited_triage("plm").is_none(),
+        "an MLA-engine row carries no triage verdict"
+    );
+    let p = resolve_profile("plm").expect("registered");
+    assert_eq!(p.family, DecoderFamily::Mla);
+    match p.path {
+        ArchPath::DedicatedOnly { reason } => assert!(reason.contains("MLA"), "{reason}"),
+        other => panic!("plm is DedicatedOnly, not {other:?}"),
+    }
+    assert!(ferrox_models::mla_arch::mla_arch("plm").is_some());
 }
 
 /// `smallthinker`'s verdict led with the routing input, then the
@@ -1156,7 +1181,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 3, 1),
+        (0, 0, 2, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1224,7 +1249,11 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          logical-to-physical mapping and a loop norm at the end of both FFN bodies. And \
          4 to 3 when `talkie` closed on four seams at once, each one graph of 140: a \
          weightless RMSNorm variant, a per-head scalar QK gain, the embedding skip stream \
-         and the two projection gains. \
+         and the two projection gains. And 3 to 2 when `plm` moved to the MLA engine \
+         (`ferrox_models::mla_arch`): its attention had been there since the engine \
+         existed, and what the row needed was the direct Q form, the ungated dense FFN \
+         and the tied lm_head as one table -- plus the engine's first libllama golden, \
+         which is the evidence every other row in this file was held to. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1233,7 +1262,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 4);
+    assert_eq!(fixture + arm + new_code + unknown, 3);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

@@ -17,6 +17,25 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`plm` runs, on the MLA engine, which has its first libllama golden
+  with it.** `src/models/plm.cpp:84-166` is `deepseek2.cpp`'s naive MLA
+  branch on a dense model, and the three ways it differs are one table,
+  `ferrox_models::mla_arch`: a DIRECT `attn_q` (`ferrox_models::
+  mla_q_proj`, an enum the forward pass cannot reach without the file
+  having answered low-rank or direct; `deepseek2.cpp:8,11-13` decide
+  the same for the LITE layer counts before reading `q_lora_rank`, so
+  every DeepSeek-V2-Lite / GigaChat3 / Kanana-2 export, which the loader
+  had refused for that key, loads direct now), an ungated ReLU-squared
+  dense FFN (`GluAct::ReluSqr` carried ON `MlaDenseFfn`, gate aliased as
+  for `arcee`), and a tied lm_head (a decoy `output.weight` is refused
+  as libllama refuses it, `wrong number of tensors`, measured). Head
+  widths from `attention.key_length` / `value_length` when the `_mla`
+  keys are absent, as `llama-hparams.cpp:259-265`. KL 1.87e-13
+  (`tests/plm_graphs.rs`). The engine now REFUSES any `rope.scaling.type`
+  but `none`, naming `deepseek2.cpp:312-328`: it has neither the
+  frequency rewrite nor YaRN's mscale in `kq_scale`, and every real
+  DeepSeek-V2 / V3 export declares YaRN. 53 audited on the generic path,
+  3 refusing.
 - **`talkie` runs, on four seams at once.** `src/models/talkie.cpp`
   norms without a weight at every site (`NormOp::RmsNoParams`, the RMS
   twin of OLMo-1's parameterless LayerNorm, through the same

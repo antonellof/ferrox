@@ -64,11 +64,12 @@ use ferrox_core::matmul::rms_norm;
 use ferrox_core::weight_matrix::WeightMatrix;
 
 use crate::config::MlaConfig;
+pub use crate::mla_q_proj::MlaQProj;
 
 pub struct MlaAttnWeights {
-    pub q_a_proj: WeightMatrix,           // [q_lora_rank, hidden_dim]
-    pub q_a_layernorm: Vec<f32>,          // [q_lora_rank]
-    pub q_b_proj: WeightMatrix,           // [n_heads*q_head_dim, q_lora_rank]
+    /// Low-rank (`attn_q_a` / `attn_q_a_norm` / `attn_q_b`) or direct
+    /// (`attn_q`): `crate::mla_q_proj`.
+    pub q: MlaQProj,
     pub kv_a_proj_with_mqa: WeightMatrix, // [kv_lora_rank+qk_rope_head_dim, hidden_dim]
     pub kv_a_layernorm: Vec<f32>,         // [kv_lora_rank]
     pub kv_b_proj: WeightMatrix,          // [n_heads*(qk_nope_head_dim+v_head_dim), kv_lora_rank]
@@ -100,13 +101,12 @@ pub fn mla_forward_token(
     // this layer has processed so far").
     let pos = k_cache.len() / (cfg.num_heads * q_head_dim);
 
-    let q_a = weights.q_a_proj.apply(hidden);
-    let q_a_normed = rms_norm(&q_a, &weights.q_a_layernorm, rms_norm_eps);
-    // Without rope: `query_states` == raw `q_b_proj` output; see module
-    // doc comment for why the reference's split+re-concat round-trip is
-    // skipped in that case. With rope (GLM-5.2): the split is no longer
-    // a no-op, so `q_rot` is rotated in place per head before use.
-    let mut query = weights.q_b_proj.apply(&q_a_normed); // [n_heads*q_head_dim]
+    // Without rope: `query_states` == the raw projection output; see
+    // module doc comment for why the reference's split+re-concat
+    // round-trip is skipped in that case. With rope (GLM-5.2, PLM): the
+    // split is no longer a no-op, so `q_rot` is rotated in place per
+    // head before use.
+    let mut query = weights.q.apply(hidden, rms_norm_eps); // [n_heads*q_head_dim]
     if let Some(rope) = &cfg.rope {
         for h in 0..cfg.num_heads {
             let q_rot_h = &mut query[h * q_head_dim + cfg.qk_nope_head_dim..(h + 1) * q_head_dim];
@@ -375,13 +375,15 @@ mod tests {
 
     fn make_weights() -> MlaAttnWeights {
         MlaAttnWeights {
-            q_a_proj: wm(&MLA_Q_A_PROJ, Q_LORA_RANK, HIDDEN_SIZE),
-            q_a_layernorm: MLA_Q_A_LAYERNORM_W.to_vec(),
-            q_b_proj: wm(
-                &MLA_Q_B_PROJ,
-                NUM_HEADS * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM),
-                Q_LORA_RANK,
-            ),
+            q: MlaQProj::LowRank {
+                a: wm(&MLA_Q_A_PROJ, Q_LORA_RANK, HIDDEN_SIZE),
+                norm: MLA_Q_A_LAYERNORM_W.to_vec(),
+                b: wm(
+                    &MLA_Q_B_PROJ,
+                    NUM_HEADS * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM),
+                    Q_LORA_RANK,
+                ),
+            },
             kv_a_proj_with_mqa: wm(&MLA_KV_A_PROJ, KV_LORA_RANK + QK_ROPE_HEAD_DIM, HIDDEN_SIZE),
             kv_a_layernorm: MLA_KV_A_LAYERNORM_W.to_vec(),
             kv_b_proj: wm(
@@ -738,13 +740,15 @@ mod tests {
 
     fn make_rope_weights() -> MlaAttnWeights {
         MlaAttnWeights {
-            q_a_proj: wm(&MLA_ROPE_Q_A_PROJ, ROPE_Q_LORA_RANK, ROPE_HIDDEN_SIZE),
-            q_a_layernorm: MLA_ROPE_Q_A_LAYERNORM_W.to_vec(),
-            q_b_proj: wm(
-                &MLA_ROPE_Q_B_PROJ,
-                ROPE_NUM_HEADS * (ROPE_QK_NOPE_HEAD_DIM + ROPE_QK_ROPE_HEAD_DIM),
-                ROPE_Q_LORA_RANK,
-            ),
+            q: MlaQProj::LowRank {
+                a: wm(&MLA_ROPE_Q_A_PROJ, ROPE_Q_LORA_RANK, ROPE_HIDDEN_SIZE),
+                norm: MLA_ROPE_Q_A_LAYERNORM_W.to_vec(),
+                b: wm(
+                    &MLA_ROPE_Q_B_PROJ,
+                    ROPE_NUM_HEADS * (ROPE_QK_NOPE_HEAD_DIM + ROPE_QK_ROPE_HEAD_DIM),
+                    ROPE_Q_LORA_RANK,
+                ),
+            },
             kv_a_proj_with_mqa: wm(
                 &MLA_ROPE_KV_A_PROJ,
                 ROPE_KV_LORA_RANK + ROPE_QK_ROPE_HEAD_DIM,
