@@ -156,6 +156,10 @@ function ModelSwitcher({
   /** The id a load was accepted for, until the server reports a verdict. */
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Controlled, so that picking an entry closes the menu: the header
+  // trigger carries the spinner from there on, and an error re-opens
+  // nothing -- it is shown the next time the menu is opened.
+  const [open, setOpen] = useState(false);
 
   const refresh = useCallback(() => {
     return getJson<Inventory>(routes.adminModels)
@@ -203,13 +207,20 @@ function ModelSwitcher({
     try {
       await postJson(routes.adminModelsLoad, { id });
       setLoading(id);
+      setOpen(false);
     } catch (e) {
       setError((e as Error).message);
     }
   };
 
   return (
-    <Popover.Root onOpenChange={(open) => open && void refresh()}>
+    <Popover.Root
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) void refresh();
+      }}
+    >
       <Popover.Trigger asChild>
         <Button
           variant="default"
