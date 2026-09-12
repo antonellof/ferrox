@@ -975,6 +975,7 @@ mod tests {
             block_sub_norms: false,
             attn_value_scale: None,
             layer_loops: None,
+            skip_stream: false,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

@@ -364,6 +364,7 @@ mod tests {
     fn a_non_rms_final_norm_cannot_fold_however_greedy_the_caller_is() {
         for norm in [
             crate::norm::NormOp::LayerNormNoParams,
+            crate::norm::NormOp::RmsNoParams,
             crate::norm::NormOp::None,
         ] {
             assert!(

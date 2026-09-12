@@ -38,6 +38,7 @@ use rayon::prelude::*;
 use super::{Decoder, GptOssLayer, LayerWeights};
 use crate::router_input::RouterInput;
 use crate::scalar_multipliers::residual_add;
+use crate::skip_stream::SkipStream;
 
 /// What the MoE router multiplies, for one layer of one forward pass.
 ///
@@ -158,6 +159,7 @@ impl Decoder {
     ///
     /// `hidden` is the post-attention residual; on return it is the
     /// layer's output.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ffn_block_row(
         &self,
         layer_idx: usize,
@@ -166,6 +168,7 @@ impl Decoder {
         oai: Option<&GptOssLayer>,
         plan: Option<&ferrox_moe::PlacementPlan>,
         operand: RouterOperand,
+        skip: Option<SkipStream<'_>>,
     ) {
         if self.config.layer_shape(layer_idx).ffn_dim == 0 {
             return;
@@ -187,11 +190,54 @@ impl Decoder {
                 operand,
             ),
         };
+        Self::apply_down_scale(layer, &mut ffn_out);
         if let Some(post) = &layer.attn.post_ffn_norm {
             ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
         }
         residual_add(hidden, &ffn_out, self.config.residual_scale);
+        Self::apply_skip_stream(layer, hidden, skip, 1, hidden_dim);
         self.apply_loop_norm(layer_idx, hidden, 1);
+    }
+
+    /// `build_ffn(..., down, down_b, down_s, ...)`: the `{1}` companion
+    /// multiplied onto the FFN output right after `down`, before any
+    /// post-norm (`crate::weight_scales`). Elementwise, so one row and a
+    /// batch of rows are the same call.
+    fn apply_down_scale(layer: &LayerWeights, ffn_out: &mut [f32]) {
+        if let Some(scale) = layer.moe.down_scale {
+            for x in ffn_out.iter_mut() {
+                *x *= scale;
+            }
+        }
+    }
+
+    /// Talkie's second residual (`talkie.cpp:123-126`,
+    /// `crate::skip_stream`): `hidden += skip * out_scale`, row by row,
+    /// after the FFN residual add. A model without the stream passes
+    /// `None` and carries no `out_scale`; the two agree because both
+    /// come from one `ModelConfig::skip_stream`, and the assert says so.
+    fn apply_skip_stream(
+        layer: &LayerWeights,
+        hidden: &mut [f32],
+        skip: Option<SkipStream<'_>>,
+        rows: usize,
+        hidden_dim: usize,
+    ) {
+        match (skip, layer.out_scale) {
+            (Some(skip), Some(scale)) => {
+                debug_assert_eq!(skip.rows.len(), rows * hidden_dim);
+                debug_assert_eq!(hidden.len(), rows * hidden_dim);
+                for (h, s) in hidden.iter_mut().zip(skip.rows.iter()) {
+                    *h += s * scale;
+                }
+            }
+            (None, None) => {}
+            (skip, scale) => unreachable!(
+                "the skip stream and the layer's out_scale come from one config fact; \
+                 got skip={} out_scale={scale:?}",
+                skip.is_some()
+            ),
+        }
     }
 
     /// Nanbeige's loop norm (`nanbeige.cpp:167-175`): after the last
@@ -238,6 +284,7 @@ impl Decoder {
         plan: Option<&ferrox_moe::PlacementPlan>,
         operand: RouterOperand,
         kernels: BatchedFfnKernels,
+        skip: Option<SkipStream<'_>>,
     ) {
         if self.config.layer_shape(layer_idx).ffn_dim == 0 {
             return;
@@ -257,6 +304,7 @@ impl Decoder {
                 let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
                 residual_add(hidden_row, &ffn_out, config.residual_scale);
             }
+            Self::apply_skip_stream(layer, hidden_batch, skip, batch_size, hidden_dim);
             self.apply_loop_norm(layer_idx, hidden_batch, batch_size);
             return;
         }
@@ -315,6 +363,7 @@ impl Decoder {
         };
 
         if let Some(mut ffn_batch) = batched {
+            Self::apply_down_scale(layer, &mut ffn_batch);
             if let Some(post) = &layer.attn.post_ffn_norm {
                 ffn_batch = ffn_batch
                     .chunks(hidden_dim)
@@ -322,6 +371,7 @@ impl Decoder {
                     .collect();
             }
             residual_add(hidden_batch, &ffn_batch, config.residual_scale);
+            Self::apply_skip_stream(layer, hidden_batch, skip, batch_size, hidden_dim);
             self.apply_loop_norm(layer_idx, hidden_batch, batch_size);
             return;
         }
@@ -351,12 +401,14 @@ impl Decoder {
                     plan,
                 )
             };
+            Self::apply_down_scale(layer, &mut ffn_out);
             if let Some(post) = &layer.attn.post_ffn_norm {
                 ffn_out = rms_norm(&ffn_out, post, config.rms_norm_eps);
             }
             let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
             residual_add(hidden_row, &ffn_out, config.residual_scale);
         }
+        Self::apply_skip_stream(layer, hidden_batch, skip, batch_size, hidden_dim);
         self.apply_loop_norm(layer_idx, hidden_batch, batch_size);
     }
 }

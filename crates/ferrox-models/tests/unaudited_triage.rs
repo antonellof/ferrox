@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 5,
+        n, 4,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -150,7 +150,10 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          closed on the layer loop (`ferrox_models::layer_loops`, \
          tests/layer_loop_graphs.rs) -- one graph of 140 reads `num_loops`; the weights \
          are shared and the KV is not, so `Decoder::layers` stays physical, `n_layers` is \
-         logical, and one mapping serves the three bodies \
+         logical, and one mapping serves the three bodies, and 5 until `talkie` closed \
+         on its four things at once (`ferrox_models::skip_stream`, `NormOp::RmsNoParams`, \
+         `QkNormStyle::PerHeadScalar`, and the two `.scale` companions \
+         `ferrox_models::weight_scales` now serves; tests/skip_stream_graphs.rs) \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
          or one was added (check it was triaged)"
@@ -402,7 +405,7 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 5);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 4);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -573,6 +576,30 @@ fn nanbeige_is_audited_and_carries_no_stale_verdict() {
     assert!(ferrox_models::layer_loops::LOOP_READERS
         .iter()
         .all(|(name, _)| is_audited_generic(name)));
+}
+
+/// `talkie`'s verdict named four things and all four landed: the
+/// weightless norms (`NormOp::RmsNoParams`), the per-head scalar Q gain
+/// with the weightless K norm (`QkNormStyle::PerHeadScalar`), the
+/// embedding skip stream (`ferrox_models::skip_stream`), and the two
+/// projection gains its converter writes (`ferrox_models::weight_scales`
+/// serves exactly those two). Audited on two libllama-golden fixtures
+/// (tests/skip_stream_graphs.rs), so it carries no verdict.
+#[test]
+fn talkie_is_audited_and_carries_no_stale_verdict() {
+    assert!(is_audited_generic("talkie"));
+    assert!(unaudited_triage("talkie").is_none());
+    assert!(ferrox_models::skip_stream::has_skip_stream("talkie"));
+    assert!(ferrox_models::capability::uses_non_parametric_rms_norm(
+        "talkie"
+    ));
+    assert!(ferrox_models::capability::uses_per_head_scalar_qk_gain(
+        "talkie"
+    ));
+    assert_eq!(
+        ferrox_models::weight_scales::SERVED_SCALE_TENSORS,
+        ["attn_output.scale", "ffn_down.scale"]
+    );
 }
 
 /// `grok` and `dbrx` are audited, and neither carries a verdict any
@@ -906,7 +933,11 @@ fn batches_four_and_five_verdicts_are_pinned_to_what_was_read() {
         // period (`tests/window_array_graphs.rs`); the RoPE half is a
         // refusal by name (`swa_geometry`) for a file with both a window
         // and a scaling, which every real Mellum2 is.
-        ("talkie", TriageClass::NewCode, "NO norm weights"),
+        // `talkie` was HERE, NEW CODE on NO norm weights (and three
+        // more things), and is audited now (`ferrox_models::skip_stream`,
+        // `NormOp::RmsNoParams`, `QkNormStyle::PerHeadScalar`,
+        // tests/skip_stream_graphs.rs); its absence is asserted by
+        // `talkie_is_audited_and_carries_no_stale_verdict` below.
         // `mimo2` was HERE. Its leading blocker WAS "attention sinks",
         // then "NEXTN blocks and a window array", then "a V head width
         // that differs from the K head width", and each landed in turn:
@@ -1125,7 +1156,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 4, 1),
+        (0, 0, 3, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
          the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
@@ -1190,7 +1221,10 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          the pair since it existed; the seam is one `Option<usize>` on `ModelConfig` and \
          a V width beside every K width in the cache, the kernels and the checks. And 5 \
          to 4 when `nanbeige` closed on the layer loop (`ferrox_models::layer_loops`): a \
-         logical-to-physical mapping and a loop norm at the end of both FFN bodies. \
+         logical-to-physical mapping and a loop norm at the end of both FFN bodies. And \
+         4 to 3 when `talkie` closed on four seams at once, each one graph of 140: a \
+         weightless RMSNorm variant, a per-head scalar QK gain, the embedding skip stream \
+         and the two projection gains. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
          recorded rather than hoped over -- every `build_norm` call in llama.cpp's 140 \
@@ -1199,7 +1233,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 5);
+    assert_eq!(fixture + arm + new_code + unknown, 4);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

@@ -36,7 +36,33 @@ impl Decoder {
             QkNormStyle::PerHead => {
                 rms_norm_per_head(x, weight, self.config.head_dim, self.config.rms_norm_eps)
             }
+            // `talkie.cpp:82-84`: RMS over each head, then that head's one
+            // scalar. `weight` is `[n_heads]`.
+            QkNormStyle::PerHeadScalar => Self::rms_norm_per_head_scalar_gain(
+                x,
+                Some(weight),
+                self.config.head_dim,
+                self.config.rms_norm_eps,
+            ),
         }
+    }
+
+    /// Per-head RMSNorm with one gain per head (`Some`) or none (`None`,
+    /// talkie's K at `:90`).
+    fn rms_norm_per_head_scalar_gain(
+        x: &[f32],
+        gains: Option<&[f32]>,
+        head_dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        debug_assert_eq!(x.len() % head_dim, 0);
+        let mut out = Vec::with_capacity(x.len());
+        for (h, head) in x.chunks_exact(head_dim).enumerate() {
+            let normed = crate::norm::rms_norm_no_params(head, eps);
+            let gain = gains.map_or(1.0, |g| g[h]);
+            out.extend(normed.iter().map(|v| v * gain));
+        }
+        out
     }
 
     /// Applies this layer's Q/K RMSNorm in place, row by row, to a whole
@@ -59,6 +85,19 @@ impl Decoder {
         if let Some(k_norm) = &layer.attn.k_norm {
             for row in k_batch.chunks_mut(kv_width) {
                 let normed = self.apply_qk_norm(row, k_norm);
+                row.copy_from_slice(&normed);
+            }
+        } else if self.config.qk_norm_style == crate::capability::QkNormStyle::PerHeadScalar {
+            // The weightless K norm (`talkie.cpp:90`): no tensor, and the
+            // norm still runs. The style decides, not the tensor's
+            // presence, because for this architecture there is none.
+            for row in k_batch.chunks_mut(kv_width) {
+                let normed = Self::rms_norm_per_head_scalar_gain(
+                    row,
+                    None,
+                    self.config.head_dim,
+                    self.config.rms_norm_eps,
+                );
                 row.copy_from_slice(&normed);
             }
         }

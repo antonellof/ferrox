@@ -143,6 +143,11 @@ pub enum NormOp {
     /// is [`NormOp::LayerNorm`], which arrived only when `dbrx` gave it
     /// a caller; the biased form still has none.
     LayerNormNoParams,
+    /// `build_norm(x, nullptr, nullptr, LLM_NORM_RMS, il)`: `x /
+    /// sqrt(mean(x^2) + eps)` with no weight. `talkie`'s every norm
+    /// site (`capability::NON_PARAMETRIC_RMS_NORM`); the RMS twin of
+    /// [`Self::LayerNormNoParams`].
+    RmsNoParams,
     /// LayerNorm with a learned weight and no bias:
     /// `(x - mean) / sqrt(var + eps) * w`.
     ///
@@ -173,6 +178,7 @@ impl NormOp {
     pub fn apply(&self, x: &[f32], eps: f32) -> Vec<f32> {
         match self {
             Self::Rms(w) => rms_norm(x, w, eps),
+            Self::RmsNoParams => rms_norm_no_params(x, eps),
             Self::LayerNormNoParams => layer_norm_no_params(x, eps),
             Self::LayerNorm(w) => {
                 // `build_norm` (llama-graph.cpp): `ggml_norm`, then
@@ -198,7 +204,7 @@ impl NormOp {
     pub fn rms_weights(&self) -> Option<&[f32]> {
         match self {
             Self::Rms(w) => Some(w),
-            Self::LayerNormNoParams | Self::LayerNorm(_) | Self::None => None,
+            Self::RmsNoParams | Self::LayerNormNoParams | Self::LayerNorm(_) | Self::None => None,
         }
     }
 }
@@ -222,6 +228,9 @@ pub enum NormFunction {
     /// `LLM_NORM` with neither: `olmo`
     /// (`capability::NON_PARAMETRIC_LAYER_NORM`).
     LayerNormNoParams,
+    /// `LLM_NORM_RMS` with a null weight: `talkie`
+    /// (`capability::NON_PARAMETRIC_RMS_NORM`), [`NormOp::RmsNoParams`].
+    RmsNoParams,
 }
 
 impl NormFunction {
@@ -237,6 +246,7 @@ impl NormFunction {
             Self::Rms => NormOp::Rms(load()?),
             Self::LayerNorm => NormOp::LayerNorm(load()?),
             Self::LayerNormNoParams => NormOp::LayerNormNoParams,
+            Self::RmsNoParams => NormOp::RmsNoParams,
         })
     }
 }
@@ -252,6 +262,8 @@ impl NormFunction {
 pub fn norm_function(arch: &str) -> NormFunction {
     if crate::capability::uses_non_parametric_layer_norm(arch) {
         NormFunction::LayerNormNoParams
+    } else if crate::capability::uses_non_parametric_rms_norm(arch) {
+        NormFunction::RmsNoParams
     } else if crate::capability::uses_weighted_layer_norm(arch) {
         NormFunction::LayerNorm
     } else {
@@ -266,6 +278,15 @@ pub fn norm_function(arch: &str) -> NormFunction {
 /// Bessel's correction on a 4096-wide hidden state is a factor of
 /// 1.00012, which is far too small to fail a smoke test and far too
 /// large to be right.
+/// `ggml_rms_norm` with no multiply after it: `x * rsqrt(mean(x^2) + eps)`.
+pub fn rms_norm_no_params(x: &[f32], eps: f32) -> Vec<f32> {
+    let n = x.len() as f32;
+    debug_assert!(n > 0.0, "a norm site with no elements");
+    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n;
+    let scale = 1.0 / (mean_sq + eps).sqrt();
+    x.iter().map(|v| v * scale).collect()
+}
+
 fn layer_norm_no_params(x: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len() as f32;
     debug_assert!(n > 0.0, "a norm site with no elements");

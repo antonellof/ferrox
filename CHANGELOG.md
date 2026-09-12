@@ -17,6 +17,25 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`talkie` runs, on four seams at once.** `src/models/talkie.cpp`
+  norms without a weight at every site (`NormOp::RmsNoParams`, the RMS
+  twin of OLMo-1's parameterless LayerNorm, through the same
+  `NormFunction` table), applies one learned scalar per head after a
+  per-head RMS on Q and a weightless per-head RMS on K, after RoPE
+  (`QkNormStyle::PerHeadScalar`, decided by architecture because the
+  weight's length is ambiguous with `head_dim`), adds the normed
+  embedding into every layer's output times `layer_output_scale`
+  (`ferrox_models::skip_stream`: the norm at the one embedding site,
+  the add at the end of both FFN bodies), and its converter writes
+  `attn_output.scale` / `ffn_down.scale`, which `build_lora_mm`
+  multiplies in -- `ferrox_models::weight_scales` now serves exactly
+  those two companions for any architecture (`AttnWeights::o_scale`,
+  `MoeWeights::down_scale`) and still refuses the rest by name.
+  `logit_scale` is required and multiplied (`MultiplierSupport::TALKIE`).
+  Each was one graph of 140, measured. Two libllama-golden fixtures,
+  KL 6.43e-14 (the converter's shape) and 1.47e-14 (without the gains;
+  dropping them from the first file lands on the second's golden). The
+  fused Metal launches refuse the model. 53 audited, 4 refusing.
 - **`nanbeige` runs, on the layer-loop seam.** `src/models/nanbeige.cpp:
   6-31` read `num_loops` and make the logical layer count `n_phys *
   n_loops`, every logical layer with its own KV cache over shared
