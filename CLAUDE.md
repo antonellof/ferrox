@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **55** architectures run with
+Honest position, re-audited 2026-09-12. **56** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -43,7 +43,18 @@ slot that turned out to be ONE row in `norm_sites::
 PRE_FFN_NORM_IS_POST_ATTENTION_NORM` -- the refusal had named the slot
 for a year and nobody had tried the row on the table that already
 served gpt-oss's identical slot; KL 1.5e-15 on the first run
-(`tests/glm4moe_graphs.rs`). `smollm3` and EXAONE-4 32B closed
+(`tests/glm4moe_graphs.rs`). `glm4` (GLM-4-0414) followed the same
+day with NO code change at all -- its profile moved from `dedicated`
+to `gqa_norm` and the fixture matched at 9.7e-15 -- because the row
+had been sent to the GLM-5.2 MLA loader for keys `glm4.cpp` never
+reads, exactly the `glm4moe` defect on the family's dense members.
+The one thing either needs beyond the generic path is
+`ferrox-models/src/mrope.rs`: a vision export's text tower declares
+`rope.dimension_sections`, and llama.cpp's M-RoPE on text positions
+is NEOX band for band, which is `glm4moe`'s layout already (served,
+libllama byte-identical) and is NOT `glm4`'s NORM -- the converter
+permutes those weights to NEOX order, libllama's logits move by 0.72,
+and ferrox refuses the file by name. `smollm3` and EXAONE-4 32B closed
 with `exaone-moe` and are the same case, one a DedicatedOnly refusal and
 the other a refusal by name; the clamped OLMo-1 checkpoints closed with
 `dbrx` the same way.

@@ -4,7 +4,7 @@
 //! `.gguf` **file** through either the generic `Decoder` path or
 //! [`ferrox_models::load_mla_engine_from_path`] for MLA architectures
 //! (deepseek2 / mistral4 dense-lead), or [`ferrox_models::load_glm52_engine_from_path`]
-//! for GLM-5.2 / GLM4 GGUFs (`glm-dsa`, `glm4`) when
+//! for GLM-5.2 GGUFs (`glm-dsa`) when
 //! the file itself names via `tokenizer.ggml.model`
 //! (`gpt2` -> `GgufBpeTokenizer`, `llama` -> `GgufSpmTokenizer`, `t5` ->
 //! `GgufUnigramTokenizer`); or a Kimi K3 checkpoint **directory** (real
@@ -379,9 +379,10 @@ fn load_encoder_checkpoint(path: &str) -> anyhow::Result<Arc<ferrox_models::Embe
 /// true, and about a key the architecture is not supposed to have.
 /// Refusing on the generic path names the norm slot that is genuinely
 /// missing instead, and runs it there since 2026-09-12
-/// (`ferrox-models/tests/glm4moe_graphs.rs`).
+/// (`ferrox-models/tests/glm4moe_graphs.rs`). `glm4` (GLM-4-0414) left
+/// the same day for the same reason (`tests/glm4_graphs.rs`).
 fn is_glm52_arch(arch: &str) -> bool {
-    matches!(arch, "glm-dsa" | "glm4")
+    arch == "glm-dsa"
 }
 
 pub fn load() -> anyhow::Result<LoadedModel> {
@@ -852,7 +853,7 @@ mod glm_dispatch_tests {
     #[test]
     fn glm4moe_does_not_go_to_the_mla_loader() {
         assert!(!super::is_glm52_arch("glm4moe"));
+        assert!(!super::is_glm52_arch("glm4"));
         assert!(super::is_glm52_arch("glm-dsa"));
-        assert!(super::is_glm52_arch("glm4"));
     }
 }

@@ -267,7 +267,13 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
     //    answer in both cases: `tests/glm4moe_graphs.rs` pins that
     //    libllama's logits under MROPE with text positions are byte
     //    for byte the NEOX ones.
-    const DECLARED: &[&str] = &["phi4", "granite-moe", "glm4moe"];
+    //  * `glm4` -- the same per-checkpoint arm one line up
+    //    (`llama-model.cpp:2699`: `MROPE` with sections, `NORM`
+    //    without). ferrox rotates NORM and REFUSES a sectioned file
+    //    (`ferrox_models::mrope`), because for this one the converter
+    //    permuted the weights and the two rotations differ (measured,
+    //    `tests/glm4_graphs.rs`).
+    const DECLARED: &[&str] = &["phi4", "granite-moe", "glm4moe", "glm4"];
     let mut undeclared = Vec::new();
     for p in architecture_catalog() {
         let ArchPath::GenericGqa { rope } = p.path else {

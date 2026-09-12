@@ -72,7 +72,7 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | Qwen2-MoE / Qwen1.5-MoE | Loads. Not in the current suite (OLMoE is the MoE entry) |
 | Mixtral | In the suite, skipped on 32 GiB Host B (`--fit-host`) |
 | MLA (`deepseek2` / `mistral4` / `plm`) | Dense-lead + MoE-after-dense via `MlaEngine`, checked against libllama. **Real checkpoint: PLM-1.8B-Instruct Q8_0** (`ferrox parity`, through the new MLA arm): tokenizer MATCH, graph 4.5e-5 from llama.cpp on the dequantized f32 file, and the Q8_0 file reads `WRONG` at 3.5e-2 because llama.cpp's own 8-bit activation quantization costs it 3.7e-2 on this graph where ferrox loses 2.8e-9 (`docs/plans/llama-cpp-gap-inventory.md` §10.1). Fixtures: `deepseek2` in BOTH tensor forms -- the split `attn_k_b` / `attn_v_b` every real export carries (the absorbed attention over a latent cache, `ferrox_core::mla_absorbed`; refused until 2026-09-12) and the legacy combined `attn_kv_b` -- KL 2.35e-15 and 3.57e-15 (`tests/deepseek2_graphs.rs`), and `plm` (PLM-1.8B) KL 1.87e-13 (`tests/plm_graphs.rs`). The lite DeepSeek-V2 layer counts take the direct-Q form. YaRN as every real DeepSeek-V2 / V3 export declares it is `ferrox_models::mla_yarn` (the `pe` frequency rewrite, the magnitude, `mscale^2` in `kq_scale`, with `deepseek2.cpp:34-37`'s `/ 0.1` on `yarn_log_multiplier` and `llama-context.cpp:210-213`'s DeepSeek-V2 rule), checked in both generations' shapes and both tensor forms, KL 2.98e-15 / 4.42e-15 / 2.94e-15. Any other scaling type, or `yarn` without `original_context_length`, is refused by name |
-| GLM4 (`glm4`) | Loads via the GLM-5.2 path when the tensors are there. Never measured in the suite |
+| GLM-4-0414 / GLM-Z1 / GLM-OCR (`glm4`) | **Generic path, audited 2026-09-12** (`tests/glm4_graphs.rs`, KL 9.67e-15). It had been sent to the GLM-5.2 MLA loader for four keys `glm4.cpp` never reads, so a real GLM-4-9B-0414 failed on `q_lora_rank`; the graph is plain GQA with Gemma-2's two post norms in Gemma-2's slots and a fused SwiGLU, all of which the generic decoder already served. A GLM-4.1V text tower's `rope.dimension_sections` is refused by name (`ferrox_models::mrope`): llama.cpp rotates it M-RoPE over converter-permuted weights and its logits differ from the plain file's by 0.72 (measured) |
 | GLM-4.5 / 4.5-Air / 4.6 (`glm4moe`) | **Generic path, audited 2026-09-12** (`tests/glm4moe_graphs.rs`, KL 1.51e-15 and 2.41e-15 on the 355B and Air shapes). Its refusal had two lives -- sent to the MLA loader for a `q_lora_rank` it never carries, then named for its pre-FFN norm stored as `post_attention_norm` -- and the second was one row in `norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM`. A GLM-4.5V text tower's `rope.dimension_sections` rotates NEOX here, and libllama's M-RoPE logits on text positions are byte-identical (measured). No real checkpoint run yet: the smallest export is 106B |
 | Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. **Cross-engine evidence since 2026-09-12**: against a libllama built from `.scratch/llama.cpp` (1269cb1, which has `gemma4.cpp`), `ferrox parity` reads tokenizer MATCH (21 cases x 2) and logits MATCH, KL 5.1e-4 on Q4_K_M with top-10 overlap 10/10 -- the K-quant band, so the graph agrees and the file is not one a WRONG line can be drawn on. |
 | gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal stops with an error, because no Metal kernel implements attention sinks. The paged-KV decode path runs it: all three attention arms are bit-identical to their contiguous twins |
@@ -194,7 +194,7 @@ The error always names the reason. Six things cause it:
    because nothing said otherwise, and that guess was already wrong for
    the five architectures in cause 5. So the generic path is opt-in.
    An architecture reaches it only if there is a benchmark row, a pinned
-   logit comparison against real `libllama`, or a fixture; **55** do
+   logit comparison against real `libllama`, or a fixture; **56** do
    today (`llama`, `qwen`, `qwen2`, `qwen2moe`, `qwen3`, `qwen3moe`,
    `olmoe`, `olmo2`, `chatglm`, `deepseek`, `bailingmoe`, `bailingmoe2`,
    `seed_oss`, `maincoder`, `hunyuan-moe`, `hunyuan-dense`, `ernie4_5`,
@@ -203,8 +203,8 @@ The error always names the reason. Six things cause it:
    `granite-moe`, `minicpm`, `olmo`, `dbrx`, `grok`, `arcee`, `deci`,
    `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35`,
    `mistral3`, `smallthinker`, `bitnet`, `mimo2`, `nanbeige`, `talkie`,
-   `arctic`, `glm4moe`, `gemma`, `gemma2`, `gemma3`, `phi3`, `gpt-oss`,
-   `dots1`).
+   `arctic`, `glm4moe`, `glm4`, `gemma`, `gemma2`, `gemma3`, `phi3`,
+   `gpt-oss`, `dots1`).
    The other **2** stop with `UnauditedArchitecture`. (`plm` is not in
    the 54 and not in the 2: it runs on the MLA engine, `DedicatedOnly`,
    with its own golden.)

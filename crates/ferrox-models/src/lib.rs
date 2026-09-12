@@ -68,6 +68,7 @@ pub mod mla_q_proj;
 pub mod mla_yarn;
 pub mod mmproj;
 pub mod moe_interleave;
+pub mod mrope;
 pub mod mtp_blocks;
 pub mod norm;
 pub mod norm_sites;

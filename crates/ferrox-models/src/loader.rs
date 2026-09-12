@@ -366,6 +366,11 @@ impl ModelConfig {
             }
         };
         let qk_norm_style = arch_profile.qk_norm;
+        // A vision export's text tower declaring M-RoPE sections on an
+        // architecture whose text rotation is NORM (`crate::mrope`).
+        if let Some(reason) = crate::mrope::mrope_refusal(file, &arch) {
+            return Err(LoadError::UnsupportedFeature(arch.clone(), reason));
+        }
         for (meta_key, feature) in crate::capability::unsupported_feature_keys(&arch) {
             if let Some(v) = metadata_f32_any(file, std::slice::from_ref(&meta_key)) {
                 if v > 0.0 {
