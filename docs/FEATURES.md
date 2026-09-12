@@ -91,6 +91,16 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **A dense FFN summed with the routed experts, and a routed branch
+  fed from the layer input**, and with them Arctic (`arctic`) and
+  Grok-2. `ferrox_models::parallel_dense_ffn` is the table of the two
+  graphs that sum a dense FFN with their experts (presence, scale on
+  the sum), served through the shared-expert slot under the dense
+  names; `RouterInput::NormedLayerInput` is Arctic's router and experts
+  reading `ffn_norm_exps` of the layer INPUT while the dense half
+  reads the post-attention residual. Checked against libllama, KL
+  6.23e-14 (arctic) and 3.28e-10 (Grok-2, GELU table). Every fused
+  Metal MoE launch refuses both.
 - **PLM on the MLA engine, and the engine's first cross-engine
   evidence.** `plm` (PLM-1.8B) is DeepSeek-2's MLA attention on a dense
   model; `ferrox_models::mla_arch` is the table of the three ways it

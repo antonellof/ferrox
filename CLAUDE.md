@@ -12,25 +12,25 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **53** architectures run with
+Honest position, re-audited 2026-09-12. **54** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 3 unaudited refusals are now TRIAGED, and the refusal says which of
+The 2 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 2 need new code, 1 is unknown with the question stated. Five
+away**, 1 needs new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
 `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35` and
 `mistral3` on 2026-09-11, and `smallthinker`, `bitnet`, `mimo2`,
-`nanbeige`, `talkie` and `plm` on 2026-09-12, each with a libllama-golden
-fixture, which is what moved 46 to 41 to 34 to 31 to 29 to 28 to 25 to
-22 to 21 to 20 to 18 to 15 to 13 to 12 to 10 to 9 to 8 to 7 to 6 to 5 to
-4 to 3; the step from 28 to 25
+`nanbeige`, `talkie`, `plm` and `arctic` on 2026-09-12, each with a
+libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
+to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10 to 9 to 8
+to 7 to 6 to 5 to 4 to 3 to 2; the step from 28 to 25
 was moving the three alias rows off
 the generic path rather than a closure, and the step from 4 to 3 moved
 `plm` onto the MLA ENGINE rather than the generic path, so it lowers
@@ -48,8 +48,8 @@ needs a different graph.
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
 times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times
 more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9
-to 8, and on 2026-09-12 six times more, 8 to 7, 7 to 6, 6 to 5, 5 to
-4, 4 to 3 and 3 to 2. The first two took several rows
+to 8, and on 2026-09-12 seven times more, 8 to 7, 7 to 6, 6 to 5, 5 to
+4, 4 to 3, 3 to 2 and 2 to 1. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -113,7 +113,48 @@ built for anything else and all four landed together. The sixteenth,
 work was a table of the three ways it differs from DeepSeek-2 and the
 engine's FIRST golden, and the table's direct-Q column had a second
 caller waiting -- every lite DeepSeek-V2, which the loader had refused
-for a key llama.cpp does not read on those files.
+for a key llama.cpp does not read on those files. The seventeenth,
+`arctic`, 2 to 1, is the reach measurement coming back with TWO where
+the verdict had implied one: the dense FFN summed with the experts is
+Grok-2's shape as well, refused by name for a day and a half from a
+fixture that now has a golden, and the two rows are one table with
+two columns (presence, scale on the sum); the operand its verdict said
+the router seam "does not reach" is a third variant of that seam.
+
+`arctic` closed on `ferrox-models/src/parallel_dense_ffn.rs` and a
+third `RouterInput` variant. `arctic.cpp:118-154` runs a dense SiLU
+FFN sized `{n_embd, n_embd}` (`:38-42`) on `ffn_norm(ffn_inp)`, the
+router AND the experts on `ffn_norm_exps(inpSA)` -- the layer INPUT
+under a SECOND per-layer weight (`:45,135-152`) -- and sums the two
+(`:154`). Reach, measured over every `build_moe_ffn` graph that also
+reads a dense `ffn_up`: all but two use the triple on their leading
+dense layers or as `_shexp`; `grok.cpp:171-184` (Grok-2: same `cur`,
+GELU, the sum scaled by `sqrt(2)/2`) and `arctic.cpp` SUM it with the
+routed output. So `PARALLEL_DENSE_FFN_ARCHITECTURES` is two rows and
+two columns -- `DensePresence::{Required, Optional}` and `sum_scale`
+-- served through the shared-expert slot, which was already "a dense
+FFN on every token added to the routed sum, with the architecture's
+dense activation", under the dense names, plus
+`MoeWeights::parallel_sum_scale` applied to the whole branch beside
+`apply_down_scale` at every site. `grep -l FFN_NORM_EXPS` is
+`arctic.cpp` alone, so the operand is `RouterInput::NormedLayerInput`
+carrying the one fact that distinguishes it from `smallthinker`'s
+(`experts_read_router_operand`), captured by the ONE constructor
+`Decoder::router_operand` at the point `attn_norm` is applied, and
+`combine_ffn_outputs_for_position` / `moe_ffn_batch` take the routed
+operand and the dense operand as TWO arguments so a caller cannot hand
+the experts the wrong vector without saying so. Every fused Metal MoE
+launch refuses the model through the predicate that refused
+`RawLayerInput`, and through the shared-expert check. KL 6.23e-14
+(arctic), the same golden for a file declaring
+`expert_weights_scale = 2.5` (libllama byte-identical: `arctic.cpp:
+3-14` never read it), 3.28e-10 for Grok-2 at the GELU-table tolerance.
+One measurement rather than a sabotage: `grok.cpp:180` scales the sum
+and `:186` RMS-norms it, and an RMSNorm is invariant under a positive
+scalar up to eps, so the `sqrt(2)/2` moves libllama's own logits by
+2.5e-4 and no more; the test pins that. Sabotaging the routed operand
+at the row site and at the batch site each turns the golden red
+(confirmed).
 
 `plm` closed on `ferrox-models/src/mla_arch.rs` and `mla_q_proj.rs`, on
 the MLA engine. `plm.cpp:84-166` is `deepseek2.cpp`'s naive MLA branch
@@ -665,8 +706,9 @@ shaped in their evidence: DBRX KL 3.4e-12; Grok KL 4.7e-10 and 1.6e-10
 on the no-key and all-keys fixtures, at the GeGLU tolerance because
 llama.cpp's f16 GELU table is the approximate side -- measured by
 making ferrox's GELU emulate the table, at which point both files agree
-to 1e-7. Grok-2's parallel dense FFN (`grok.cpp:171-184`) stays refused
-by name from a fixture that has it, so the row is admitted for Grok-1.
+to 1e-7. Grok-2's parallel dense FFN (`grok.cpp:171-184`) was refused
+by name from a fixture that has it until `arctic` closed on the same
+seam (`parallel_dense_ffn.rs`, above); the fixture has a golden now.
 
 `exaone-moe`, `smollm3` and EXAONE-4 32B closed together on 2026-09-11
 on the PER-LAYER RoPE gate, and the claim that they are one cause was

@@ -37,8 +37,9 @@
 //! `attention.temperature_length` (`:23`; no other reference to either
 //! field under `src/`, measured) -- are neither applied nor refused, and
 //! the declared file carries both to prove it. Grok-2's parallel dense
-//! FFN (`:171-184`) is refused by name (`crate::parallel_dense_ffn`),
-//! and `grok_dense_ffn_tiny.gguf` drives that refusal.
+//! FFN (`:171-184`) is `crate::parallel_dense_ffn`, served since
+//! `arctic` closed on the same seam, and `grok_dense_ffn_tiny.gguf` is
+//! checked in `tests/parallel_dense_ffn_graphs.rs`.
 //!
 //! **Tolerance.** This is a GeGLU row (`:165`, `LLM_FFN_GELU`), so it
 //! is compared at [`GELU_TABLE_TOL`]: llama.cpp's CPU GELU is a 65536
@@ -379,22 +380,6 @@ fn grok_ropes_neox_and_the_fixture_can_see_the_other_variant() {
     );
 }
 
-/// The Grok-2 shape is refused, from a file that has it.
-///
-/// `grok_dense_ffn_tiny.gguf` is the default fixture plus dense
-/// `ffn_gate/up/down` on every layer, which `grok.cpp:171-184` would sum
-/// with the experts at `sqrt(2)/2`. ferrox has no slot for that and
-/// stops.
-#[test]
-fn a_grok_file_with_a_parallel_dense_ffn_is_refused() {
-    let file =
-        ferrox_gguf::GgufFile::open(graph_fixture_path("grok_dense_ffn")).expect("fixture opens");
-    assert!(
-        file.find_tensor("blk.0.ffn_up.weight").is_some(),
-        "the fixture must carry the dense FFN for this to prove anything"
-    );
-    let err = ModelConfig::from_gguf(&file).expect_err("the Grok-2 shape must stop");
-    let msg = format!("{err}");
-    assert!(msg.contains("grok.cpp:171-184"), "{msg}");
-    assert!(msg.contains("sqrt(2)/2"), "{msg}");
-}
+// The Grok-2 shape, `grok_dense_ffn_tiny.gguf`, was refused from here
+// until 2026-09-12; it is served now and checked against its own
+// libllama golden in `tests/parallel_dense_ffn_graphs.rs`.

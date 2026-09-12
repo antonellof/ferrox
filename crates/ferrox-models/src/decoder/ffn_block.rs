@@ -26,11 +26,23 @@
 //! [`Decoder::router_operand`] is the ONE constructor: it takes the
 //! hidden state AS IT ENTERS THE LAYER, so the caller has to build it
 //! where `attn_norm` is applied, before attention -- the point
-//! `smallthinker.cpp:111` reads `inpL`. For every architecture but that
-//! one it answers [`RouterOperand::FfnInput`] without reading its
-//! argument, and the FFN body computes `router · normed2` as it always
-//! did. There is no `Default` and no second constructor, so a body
-//! cannot be reached with the operand unstated.
+//! `smallthinker.cpp:111` reads `inpL` and `arctic.cpp:136` norms
+//! `inpSA`. For every architecture but those two it answers
+//! [`RouterOperand::FfnInput`] without reading its argument, and the
+//! FFN body computes `router · normed2` as it always did. There is no
+//! `Default` and no second constructor, so a body cannot be reached
+//! with the operand unstated.
+//!
+//! # The parallel dense FFN
+//!
+//! A layer whose dense FFN is summed with its experts
+//! (`crate::parallel_dense_ffn`: Grok-2, Arctic) has that FFN in the
+//! shared-expert slot and, when the row scales the sum, a
+//! `parallel_sum_scale` on the layer; [`Decoder::apply_parallel_sum_scale`]
+//! multiplies the WHOLE branch output by it right after the combine and
+//! before `down_scale` and the post-FFN norm, where `grok.cpp:180-186`
+//! put it. Beside `apply_down_scale` at every site, so the two cannot
+//! drift.
 
 use ferrox_core::matmul::rms_norm;
 use rayon::prelude::*;
@@ -55,6 +67,12 @@ pub(crate) enum RouterOperand {
     FfnInput,
     /// `router · inpL`, already computed: `[batch, n_experts]`.
     Precomputed(Vec<f32>),
+    /// Arctic: the routed branch's INPUT, `ffn_norm_exps(inpSA)`,
+    /// `[batch, hidden_dim]`. The body computes `router · x` from it
+    /// and runs the routed experts on it; the dense half still reads
+    /// `ffn_norm(ffn_inp)` (`crate::router_input::RouterInput::
+    /// NormedLayerInput`).
+    BranchInput(Vec<f32>),
 }
 
 /// Whether the batched FFN body may take its batched kernels
@@ -132,6 +150,29 @@ impl Decoder {
     ) -> RouterOperand {
         match self.config.router_input {
             RouterInput::NormedFfnInput => RouterOperand::FfnInput,
+            RouterInput::NormedLayerInput => {
+                if Self::is_dense_layer(layer) {
+                    return RouterOperand::FfnInput;
+                }
+                debug_assert_eq!(
+                    hidden_before_attn.len(),
+                    batch_size * self.config.hidden_dim
+                );
+                // REQUIRED at load for this operand (`arctic.cpp:45`);
+                // a layer without it is a loader defect, not a file's.
+                let w = layer
+                    .moe
+                    .exps_norm
+                    .as_deref()
+                    .expect("NormedLayerInput layer loaded without ffn_norm_exps");
+                let eps = self.config.rms_norm_eps;
+                RouterOperand::BranchInput(
+                    hidden_before_attn
+                        .chunks(self.config.hidden_dim)
+                        .flat_map(|row| rms_norm(row, w, eps))
+                        .collect(),
+                )
+            }
             RouterInput::RawLayerInput => {
                 debug_assert!(
                     self.gpt_oss.is_none(),
@@ -190,6 +231,7 @@ impl Decoder {
                 operand,
             ),
         };
+        Self::apply_parallel_sum_scale(layer, &mut ffn_out);
         Self::apply_down_scale(layer, &mut ffn_out);
         if let Some(post) = &layer.attn.post_ffn_norm {
             ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
@@ -197,6 +239,19 @@ impl Decoder {
         residual_add(hidden, &ffn_out, self.config.residual_scale);
         Self::apply_skip_stream(layer, hidden, skip, 1, hidden_dim);
         self.apply_loop_norm(layer_idx, hidden, 1);
+    }
+
+    /// `ggml_scale(ffn_out + moe_out, s)` (`grok.cpp:180`): the factor
+    /// on the whole branch of a layer whose dense FFN is summed with
+    /// its experts (`crate::parallel_dense_ffn`). Elementwise, so one
+    /// row and a batch of rows are the same call; a no-op for every
+    /// layer without the row's scale.
+    fn apply_parallel_sum_scale(layer: &LayerWeights, ffn_out: &mut [f32]) {
+        if let Some(scale) = layer.moe.parallel_sum_scale {
+            for x in ffn_out.iter_mut() {
+                *x *= scale;
+            }
+        }
     }
 
     /// `build_ffn(..., down, down_b, down_s, ...)`: the `{1}` companion
@@ -314,10 +369,16 @@ impl Decoder {
         // there is nothing to route (see `is_dense_layer`'s doc
         // comment), so computing it here just to ignore it below would
         // waste the one matmul this fast path exists to avoid.
-        let router_logits_batch: Vec<f32> = match operand {
-            _ if dense => Vec::new(),
-            RouterOperand::FfnInput => layer.moe.router.apply_batch(&normed2_batch, batch_size),
-            RouterOperand::Precomputed(logits) => logits,
+        let (router_logits_batch, routed_batch): (Vec<f32>, &[f32]) = match &operand {
+            _ if dense => (Vec::new(), normed2_batch.as_slice()),
+            RouterOperand::FfnInput => (
+                layer.moe.router.apply_batch(&normed2_batch, batch_size),
+                normed2_batch.as_slice(),
+            ),
+            RouterOperand::Precomputed(logits) => (logits.clone(), normed2_batch.as_slice()),
+            RouterOperand::BranchInput(x) => {
+                (layer.moe.router.apply_batch(x, batch_size), x.as_slice())
+            }
         };
 
         let batched: Option<Vec<f32>> = match kernels {
@@ -353,6 +414,7 @@ impl Decoder {
                             layer_idx,
                             layer,
                             &normed2_batch,
+                            routed_batch,
                             &router_logits_batch,
                             batch_size,
                             config,
@@ -363,6 +425,7 @@ impl Decoder {
         };
 
         if let Some(mut ffn_batch) = batched {
+            Self::apply_parallel_sum_scale(layer, &mut ffn_batch);
             Self::apply_down_scale(layer, &mut ffn_batch);
             if let Some(post) = &layer.attn.post_ffn_norm {
                 ffn_batch = ffn_batch
@@ -395,12 +458,14 @@ impl Decoder {
                     layer_idx,
                     layer,
                     normed2,
+                    &routed_batch[b * hidden_dim..(b + 1) * hidden_dim],
                     router_logits,
                     config,
                     hidden_dim,
                     plan,
                 )
             };
+            Self::apply_parallel_sum_scale(layer, &mut ffn_out);
             Self::apply_down_scale(layer, &mut ffn_out);
             if let Some(post) = &layer.attn.post_ffn_norm {
                 ffn_out = rms_norm(&ffn_out, post, config.rms_norm_eps);

@@ -1,5 +1,8 @@
-//! MoE layers that ALSO run a dense FFN and sum the two: the Grok-2
-//! shape, refused by name.
+//! **A DENSE FFN SUMMED WITH THE ROUTED EXPERTS** -- the Grok-2 and
+//! Arctic layer shape, served through the shared-expert slot, with the
+//! two things that differ between the two graphs as one table.
+//!
+//! # What it is
 //!
 //! `src/models/grok.cpp:66-68` creates `ffn_gate` / `ffn_up` /
 //! `ffn_down` as `TENSOR_NOT_REQUIRED` beside the routed experts, and
@@ -14,52 +17,138 @@
 //! }
 //! ```
 //!
-//! A dense GELU FFN over the SAME normed input as the router, added to
-//! the routed output, and the sum scaled by `sqrt(2)/2` before the
-//! post-FFN norm. That is Grok-2 (`conversion/grok.py` maps its
-//! `model.layers.N.mlp.*` onto the dense names); Grok-1 has no dense
-//! FFN and takes the `else` branch.
+//! `src/models/arctic.cpp:38-42` creates the same three REQUIRED, sized
+//! `{n_embd, n_embd}`, and `:118-154` runs `ffn_out = build_ffn(
+//! ffn_norm(ffn_inp), ...SILU, PAR)`, `moe_out = build_moe_ffn(
+//! ffn_norm_exps(inpSA), ...)` and sums them with no scale.
 //!
-//! ferrox has no slot for it. The nearest thing is the shared expert
-//! (`MoeWeights::shared_experts`), which is also always-on and added to
-//! the routed sum -- but a shared expert loads from the `*_shexp`
-//! names, is SiLU on every architecture that has one, and nothing
-//! scales the sum afterwards. Reading Grok-2's dense FFN into that slot
-//! would drop the `sqrt(2)/2` and swap the activation, and answer
-//! fluently. So a `grok` file carrying a dense `ffn_up` on a routed
-//! layer STOPS here, and the row is admitted for Grok-1.
+//! # Reach -- MEASURED
 //!
-//! The gate is reachable: `scripts/make_grok_fixture.py --dense-ffn`
-//! writes exactly this file, and `tests/grok_graphs.rs` drives the
-//! refusal from it.
+//! Over all 140 `src/models/*.cpp` (2026-09-12): every graph that calls
+//! `build_moe_ffn` AND reads a dense `layers[il].ffn_up` was listed;
+//! all but two use the dense triple on their LEADING dense layers
+//! (`if (il < n_layer_dense_lead)` or `if (ffn_gate_inp == nullptr)`)
+//! or as `_shexp`. The two that SUM a dense FFN with the routed output
+//! on one layer are `grok.cpp:171-184` and `arctic.cpp:118-154`. So
+//! [`PARALLEL_DENSE_FFN_ARCHITECTURES`] has two rows, and the two free
+//! parameters are the columns: whether the triple is required
+//! (`arctic`) or optional (`grok`: Grok-1 has none and takes the
+//! `else`), and the scale on the sum (`sqrt(2)/2` for `grok`, none for
+//! `arctic`). What does NOT differ and so is not a column: the dense
+//! branch reads the normed FFN input `cur` in both, and its activation
+//! is the architecture's dense activation (GELU for `grok`, SiLU for
+//! `arctic`), which is what `ModelConfig::layer_ffn_acts(il).dense`
+//! already answers for the shared-expert slot. Arctic's OTHER
+//! difference -- the routed branch reading `ffn_norm_exps(inpSA)` --
+//! is `crate::router_input::RouterInput::NormedLayerInput`, one graph
+//! of 140, and not this module's business.
+//!
+//! # Why the shared-expert slot
+//!
+//! `MoeWeights::shared_experts` is already "a dense FFN that fires on
+//! every token and is added to the routed sum", computed with the
+//! architecture's dense activation on the normed FFN input, in the
+//! row body and the batched body alike; every fused Metal MoE launch
+//! refuses a layer that has one. What the slot lacked was the tensor
+//! NAMES (it loads `_shexp`) and the scale on the sum, which is why
+//! this module used to be a refusal: reading Grok-2's triple into it
+//! would have dropped the `sqrt(2)/2`. The loader fills the slot from
+//! the dense names for these two architectures and records the row's
+//! scale on the layer (`MoeWeights::parallel_sum_scale`), which the
+//! FFN bodies apply to the WHOLE branch output -- `ffn_out + moe_out`
+//! -- before the post-FFN norm, where `grok.cpp:180` applies it. A
+//! Grok-1 layer has no triple, loads no shared expert and carries no
+//! scale, which is the `else` branch.
+
+use std::f32::consts::FRAC_1_SQRT_2;
 
 use ferrox_gguf::TensorSource;
 
-/// Architectures whose graph sums a dense FFN with the routed experts
-/// when the dense tensors are present.
-pub const PARALLEL_DENSE_FFN_ARCHITECTURES: &[&str] = &["grok"];
+use crate::LoadError;
 
-/// The refusal reason when `arch` would run a parallel dense FFN on
-/// its routed layers and the file carries one, or `None` when the file
-/// may be run.
+/// Whether the dense triple must be present on a routed layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DensePresence {
+    /// `create_tensor(..., 0)`: absent is a load error upstream.
+    Required,
+    /// `TENSOR_NOT_REQUIRED`: absent means "no dense branch, no scale".
+    Optional,
+}
+
+/// One architecture whose routed layers sum a dense FFN with the
+/// experts.
+#[derive(Debug, Clone, Copy)]
+pub struct ParallelDenseFfn {
+    pub arch: &'static str,
+    pub presence: DensePresence,
+    /// The factor on `ffn_out + moe_out`, or `None` for a plain sum.
+    pub sum_scale: Option<f32>,
+    pub lines: &'static str,
+}
+
+/// The two graphs, with the lines.
+pub const PARALLEL_DENSE_FFN_ARCHITECTURES: &[ParallelDenseFfn] = &[
+    ParallelDenseFfn {
+        arch: "grok",
+        presence: DensePresence::Optional,
+        sum_scale: Some(FRAC_1_SQRT_2),
+        lines: "src/models/grok.cpp:66-68,171-184",
+    },
+    ParallelDenseFfn {
+        arch: "arctic",
+        presence: DensePresence::Required,
+        sum_scale: None,
+        lines: "src/models/arctic.cpp:38-42,118-154",
+    },
+];
+
+/// The row for an architecture, or `None` for one whose routed layers
+/// have no dense branch.
+pub fn parallel_dense_ffn(arch: &str) -> Option<&'static ParallelDenseFfn> {
+    PARALLEL_DENSE_FFN_ARCHITECTURES
+        .iter()
+        .find(|row| row.arch == arch)
+}
+
+/// Whether routed layer `l` of `arch` carries the dense triple, by the
+/// row's presence rule: `Some(row)` when it does and the loader should
+/// fill the shared-expert slot from `ffn_{gate,up,down}` and record the
+/// scale, `None` when the layer runs the experts alone.
 ///
-/// Checks layer 0 only: `grok.cpp:54-79` creates the same optional set
-/// for every layer, and a file with a dense FFN on some layers and not
-/// others is not one any converter writes.
-pub fn parallel_dense_refusal(arch: &str, file: &impl TensorSource) -> Option<String> {
-    if !PARALLEL_DENSE_FFN_ARCHITECTURES.contains(&arch) {
-        return None;
+/// Refuses a REQUIRED triple that is missing (llama.cpp's loader would
+/// fail on the same tensor), and an incomplete triple in either case,
+/// because a graph with `ffn_up` and no `ffn_down` exists nowhere.
+pub fn parallel_dense_for_layer(
+    arch: &str,
+    file: &impl TensorSource,
+    l: usize,
+) -> Result<Option<&'static ParallelDenseFfn>, LoadError> {
+    let Some(row) = parallel_dense_ffn(arch) else {
+        return Ok(None);
+    };
+    let names = ["ffn_gate", "ffn_up", "ffn_down"].map(|t| format!("blk.{l}.{t}.weight"));
+    let present = names
+        .iter()
+        .filter(|n| file.find_tensor(n).is_some())
+        .count();
+    match (present, row.presence) {
+        (3, _) => Ok(Some(row)),
+        (0, DensePresence::Optional) => Ok(None),
+        (0, DensePresence::Required) => Err(LoadError::Gguf(
+            ferrox_gguf::GgufError::TensorNotFound(format!(
+                "{} (the dense half of `{arch}`'s parallel dense + MoE layer, REQUIRED by {})",
+                names[1], row.lines
+            )),
+        )),
+        _ => Err(LoadError::UnsupportedFeature(
+            arch.to_string(),
+            format!(
+                "layer {l} carries {present} of the dense `ffn_gate` / `ffn_up` / `ffn_down` \
+                 triple; {} reads all three or none",
+                row.lines
+            ),
+        )),
     }
-    file.find_tensor("blk.0.ffn_up.weight")?;
-    Some(format!(
-        "`blk.N.ffn_up.weight` beside routed experts: src/models/grok.cpp:171-184 runs a \
-         dense GELU FFN in parallel with the MoE on every layer and scales their sum by \
-         sqrt(2)/2, which is the Grok-2 shape. ferrox has no slot for a dense FFN that is \
-         summed with the experts -- the shared-expert slot has the wrong activation, the \
-         wrong tensor names and no scale on the sum -- so it stops rather than loading the \
-         file into the nearest thing. Grok-1, which has no dense FFN, is unaffected; \
-         `{arch}` is admitted for it"
-    ))
 }
 
 #[cfg(test)]
@@ -112,25 +201,74 @@ mod tests {
         }
     }
 
-    /// The gate fires on the Grok-2 tensor set and not on Grok-1's.
-    #[test]
-    fn a_dense_ffn_up_beside_experts_refuses_grok_and_its_absence_does_not() {
-        let grok2 = Names::of(&["blk.0.ffn_up_exps.weight", "blk.0.ffn_up.weight"]);
-        let msg = parallel_dense_refusal("grok", &grok2).expect("refused");
-        assert!(msg.contains("grok.cpp:171-184"), "{msg}");
-        assert!(msg.contains("sqrt(2)/2"), "{msg}");
+    const TRIPLE: [&str; 3] = [
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_down.weight",
+    ];
 
-        let grok1 = Names::of(&["blk.0.ffn_up_exps.weight"]);
-        assert_eq!(parallel_dense_refusal("grok", &grok1), None);
+    /// Grok-2's triple is served with the scale; Grok-1's absence is
+    /// the `else` branch; Arctic's absence is a missing REQUIRED tensor.
+    #[test]
+    fn presence_follows_each_rows_rule() {
+        let grok2 = parallel_dense_for_layer("grok", &Names::of(&TRIPLE), 0)
+            .unwrap()
+            .expect("Grok-2 has the branch");
+        assert_eq!(grok2.sum_scale, Some(FRAC_1_SQRT_2));
+        assert!(parallel_dense_for_layer("grok", &Names::of(&[]), 0)
+            .unwrap()
+            .is_none());
+
+        let arctic = parallel_dense_for_layer("arctic", &Names::of(&TRIPLE), 0)
+            .unwrap()
+            .expect("Arctic always has the branch");
+        assert_eq!(arctic.sum_scale, None);
+        let err = parallel_dense_for_layer("arctic", &Names::of(&[]), 0).expect_err("REQUIRED");
+        assert!(err.to_string().contains("arctic.cpp:38-42"), "{err}");
+
+        // An incomplete triple is refused on both rows.
+        for arch in ["grok", "arctic"] {
+            let err = parallel_dense_for_layer(arch, &Names::of(&TRIPLE[..2]), 0)
+                .err()
+                .unwrap_or_else(|| panic!("{arch}: 2 of 3 refused"));
+            assert!(err.to_string().contains("2 of the dense"), "{err}");
+        }
     }
 
     /// Every other architecture with a dense `ffn_up` is a dense model
-    /// or a leading-dense MoE, and neither is this gate's business.
+    /// or a leading-dense MoE, and neither is this table's business.
     #[test]
-    fn a_dense_ffn_on_any_other_architecture_is_not_this_gates_business() {
-        let dense = Names::of(&["blk.0.ffn_up.weight"]);
-        for arch in ["llama", "deepseek", "dbrx", "qwen3moe"] {
-            assert_eq!(parallel_dense_refusal(arch, &dense), None, "{arch}");
+    fn a_dense_ffn_on_any_other_architecture_is_not_this_tables_business() {
+        for arch in ["llama", "deepseek", "dbrx", "qwen3moe", "smallthinker"] {
+            assert!(
+                parallel_dense_for_layer(arch, &Names::of(&TRIPLE), 0)
+                    .unwrap()
+                    .is_none(),
+                "{arch}"
+            );
+        }
+    }
+
+    /// Every row is an audited generic-path architecture, or the seam
+    /// is unevidenced.
+    #[test]
+    fn every_row_is_an_audited_generic_row() {
+        for row in PARALLEL_DENSE_FFN_ARCHITECTURES {
+            let profile = crate::capability::resolve_profile(row.arch).unwrap_or_else(|| {
+                panic!(
+                    "`{}` ({}) is not a registered architecture",
+                    row.arch, row.lines
+                )
+            });
+            assert!(matches!(
+                profile.path,
+                crate::capability::ArchPath::GenericGqa { .. }
+            ));
+            assert!(
+                crate::capability::AUDITED_GENERIC_GQA.contains(&row.arch),
+                "{}",
+                row.arch
+            );
         }
     }
 }

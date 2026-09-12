@@ -60,15 +60,15 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **53** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **54** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`), the other three none |
-| Refuses as **unaudited**, now triaged | 3 |
+| Refuses as **unaudited**, now triaged | 2 |
 | Off the generic path: refuses by name, or reaches one of those 4 engines | 90 (58 `dedicated` + 32 `deferred` in the manifest) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 56 generic-gqa (53 of
+regenerated with `ferrox archs --write`: 150 rows, 56 generic-gqa (54 of
 them audited), 59 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
@@ -78,8 +78,8 @@ position embeddings as though they were NEOX RoPE (`gpt2`, `mpt`,
 `refact`, `bloom`, `jais`) are `DedicatedOnly` refusals, pinned by a
 test that they can never be re-listed as audited.
 
-The 3 unaudited refusals split 0 fixture-away / 0 one-match-arm /
-2 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
+The 2 unaudited refusals split 0 fixture-away / 0 one-match-arm /
+1 new-code / 1 unknown, each naming the `llama.cpp/src/models/*.cpp`
 line that decides it. **Both cheap classes are empty**: nothing still
 refusing is one fixture or one arm away, so every row left needs a
 different graph. Five one-match-arm rows closed on 2026-09-02
@@ -128,8 +128,13 @@ and `plm` on the MLA engine (`ferrox_models::mla_arch`,
 three ways it differs from DeepSeek-2 -- a direct `attn_q`, an ungated
 ReLU-squared dense FFN, a tied lm_head -- are one table; the direct-Q
 column also lifts the refusal of every lite DeepSeek-V2 export, and
-the fixture is that engine's FIRST libllama golden). Each with a
-libllama-golden fixture. `minicpm` closed on
+the fixture is that engine's FIRST libllama golden), and `arctic` on
+the parallel dense + MoE layer (`ferrox_models::parallel_dense_ffn`:
+the dense FFN summed with the experts is the shared-expert slot under
+the dense names plus a scale on the sum, two graphs of 140, and Grok-2's
+refusal by name lifted with it; the routed branch reading the layer
+input under a second norm is `RouterInput::NormedLayerInput`, one graph
+of 140). Each with a libllama-golden fixture. `minicpm` closed on
 2026-09-10 and is not in that arithmetic: it was refused BY NAME rather
 than as unaudited, so it raises the audited count without lowering the
 refusing one; `smollm3` and EXAONE-4 32B closed with `exaone-moe` on

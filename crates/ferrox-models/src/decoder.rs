@@ -224,6 +224,20 @@ pub struct MoeWeights {
     /// dense FFN's output right after `down` (`crate::weight_scales`);
     /// refused on a routed layer, whose experts carry their own.
     pub down_scale: Option<f32>,
+    /// Arctic's `blk.N.ffn_norm_exps.weight`, `[hidden_dim]`: the SECOND
+    /// per-layer norm, applied to the layer INPUT to make the routed
+    /// branch's operand (`arctic.cpp:45,136-139`;
+    /// `RouterInput::NormedLayerInput`). REQUIRED on a routed layer of
+    /// such a model, `None` everywhere else. Read by
+    /// `Decoder::router_operand`, the one constructor of the operand.
+    pub exps_norm: Option<Vec<f32>>,
+    /// The factor on `ffn_out + moe_out` for a layer whose dense FFN is
+    /// summed with its experts (`crate::parallel_dense_ffn`): `Some`
+    /// only when the loader filled `shared_experts` from the dense
+    /// names AND the row scales the sum (`grok.cpp:180`, `sqrt(2)/2`).
+    /// Applied by the FFN bodies to the whole branch output before the
+    /// post-FFN norm.
+    pub parallel_sum_scale: Option<f32>,
     /// How many times each routed expert (index into `experts`) has been
     /// selected by `route_top_k` across every `forward_token`/
     /// `forward_batch` call so far. Real observed hotness, not a
@@ -742,6 +756,8 @@ impl Decoder {
                 exp_probs_bias: None,
                 ffn_sub_norm: None,
                 down_scale: None,
+                exps_norm: None,
+                parallel_sum_scale: None,
                 router: wm(rng.vec(n_experts * hidden), vec![n_experts, hidden]),
                 experts: ExpertBacking::Resident(experts),
                 shared_experts,
@@ -2855,6 +2871,7 @@ impl Decoder {
                                                                 l,
                                                                 layer,
                                                                 &normed2,
+                                                                &normed2,
                                                                 &logits,
                                                                 &self.config,
                                                                 hidden_dim,
@@ -3389,10 +3406,18 @@ impl Decoder {
         }
     }
 
+    /// `normed2` is what the DENSE half (the shared experts) reads;
+    /// `routed_input` is what the routed experts read -- the same slice
+    /// for every architecture but Arctic, whose routed branch reads
+    /// `ffn_norm_exps(inpSA)` (`crate::router_input`). Two arguments
+    /// rather than one so a caller cannot hand the experts the wrong
+    /// vector without saying so.
+    #[allow(clippy::too_many_arguments)]
     fn combine_ffn_outputs_for_position(
         layer_idx: usize,
         layer: &LayerWeights,
         normed2: &[f32],
+        routed_input: &[f32],
         router_logits: &[f32],
         config: &ModelConfig,
         hidden_dim: usize,
@@ -3433,7 +3458,7 @@ impl Decoder {
             && act.is_swiglu()
             && layer.moe.shared_experts.is_empty()
         {
-            if let Some(fused) = Self::try_metal_moe_topk(layer, normed2, &decision) {
+            if let Some(fused) = Self::try_metal_moe_topk(layer, routed_input, &decision) {
                 return fused;
             }
         }
@@ -3451,15 +3476,19 @@ impl Decoder {
                 })
                 .unwrap_or(true);
             if let (true, ExpertBacking::Resident(experts)) = (all_cpu, &layer.moe.experts) {
-                if let Some(outs) =
-                    Self::cpu_moe_topk_parallel_slots(experts, normed2, &decision, hidden_dim, act)
-                {
+                if let Some(outs) = Self::cpu_moe_topk_parallel_slots(
+                    experts,
+                    routed_input,
+                    &decision,
+                    hidden_dim,
+                    act,
+                ) {
                     outs
                 } else {
-                    Self::cpu_moe_serial_experts(layer, normed2, &decision, plan, act)
+                    Self::cpu_moe_serial_experts(layer, routed_input, &decision, plan, act)
                 }
             } else {
-                Self::cpu_moe_serial_experts(layer, normed2, &decision, plan, act)
+                Self::cpu_moe_serial_experts(layer, routed_input, &decision, plan, act)
             }
         };
         // Shared experts fire on every token regardless of routing, so
@@ -3614,10 +3643,15 @@ impl Decoder {
     /// GPU-placed expert). Both gated activations are served here --
     /// the combine goes through [`GluAct`], so GeGLU no longer falls out
     /// to the per-position path.
+    /// `routed_batch` is what the experts read, `normed2_batch` what the
+    /// shared experts read: the same rows for every architecture but
+    /// Arctic (see `combine_ffn_outputs_for_position`).
+    #[allow(clippy::too_many_arguments)]
     fn moe_ffn_batch(
         layer_idx: usize,
         layer: &LayerWeights,
         normed2_batch: &[f32],
+        routed_batch: &[f32],
         router_logits_batch: &[f32],
         batch_size: usize,
         config: &ModelConfig,
@@ -3665,7 +3699,7 @@ impl Decoder {
             let mut gathered = vec![0f32; n * hidden_dim];
             for (i, &(tok, _)) in toks.iter().enumerate() {
                 gathered[i * hidden_dim..(i + 1) * hidden_dim]
-                    .copy_from_slice(&normed2_batch[tok * hidden_dim..(tok + 1) * hidden_dim]);
+                    .copy_from_slice(&routed_batch[tok * hidden_dim..(tok + 1) * hidden_dim]);
             }
             let ex = &experts[eid];
             let ffn_acts = ex.gate.quantize_batch_acts(&gathered, n);
@@ -3768,15 +3802,18 @@ impl Decoder {
             return Self::run_dense_expert(layer, normed2, act, config.rms_norm_eps);
         }
         // What the router reads is the caller's fact (`crate::router_input`):
-        // the normed FFN input here, or logits computed before attention.
-        let router_logits = match operand {
-            ffn_block::RouterOperand::FfnInput => layer.moe.router.apply(normed2),
-            ffn_block::RouterOperand::Precomputed(logits) => logits,
+        // the normed FFN input here, logits computed before attention, or
+        // Arctic's normed layer input, which its experts read too.
+        let (router_logits, routed_input): (Vec<f32>, &[f32]) = match &operand {
+            ffn_block::RouterOperand::FfnInput => (layer.moe.router.apply(normed2), normed2),
+            ffn_block::RouterOperand::Precomputed(logits) => (logits.clone(), normed2),
+            ffn_block::RouterOperand::BranchInput(x) => (layer.moe.router.apply(x), x.as_slice()),
         };
         Self::combine_ffn_outputs_for_position(
             layer_idx,
             layer,
             normed2,
+            routed_input,
             &router_logits,
             config,
             hidden_dim,
@@ -4972,6 +5009,7 @@ mod tests {
             1,
             &decoder.layers[1],
             &normed2,
+            &normed2,
             &router_logits,
             &decoder.config,
             hidden_dim,
@@ -4981,6 +5019,7 @@ mod tests {
         let gated_total = Decoder::combine_ffn_outputs_for_position(
             1,
             &decoder.layers[1],
+            &normed2,
             &normed2,
             &router_logits,
             &decoder.config,
@@ -6284,11 +6323,21 @@ mod tests {
         // the same way are still the wrong experts. `agrees` cannot see
         // this one -- it compares two routers over one logit vector --
         // which is exactly why the predicate has to.
-        let mut raw = base;
+        let mut raw = base.clone();
         raw.router_input = crate::router_input::RouterInput::RawLayerInput;
         assert!(
             !Decoder::gpu_router_matches_host_routing(plain_layer, &raw),
             "a raw-layer-input router must make the layer ineligible for the GPU router"
+        );
+
+        // A router (and experts) reading the normed layer input
+        // (`arctic`): the same predicate, for the same reason, and the
+        // experts would read the wrong tensor too.
+        let mut branch = base;
+        branch.router_input = crate::router_input::RouterInput::NormedLayerInput;
+        assert!(
+            !Decoder::gpu_router_matches_host_routing(plain_layer, &branch),
+            "a normed-layer-input branch must make the layer ineligible for the GPU router"
         );
     }
 
