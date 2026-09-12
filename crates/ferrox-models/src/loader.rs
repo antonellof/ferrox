@@ -1287,6 +1287,7 @@ impl ModelConfig {
             // two must not be able to disagree.
             rope_layers: crate::rope_layers::rope_layers(&arch, n_layers, sliding_window.is_some()),
             router_input: crate::router_input::router_input(&arch),
+            block_sub_norms: crate::sub_norms::block_sub_norms(&arch),
             layer_shapes,
             moe: MoeLayerConfig {
                 n_experts: n_experts.max(1),
@@ -2355,6 +2356,14 @@ impl Decoder {
             .unwrap_or_default()
             .to_string();
         let is_gpt_oss = arch == "gpt-oss";
+        // A `<projection>.scale` companion is a multiply llama.cpp
+        // applies and ferrox does not; refused by name here, before
+        // the unread-tensor gate can be talked past
+        // (`crate::weight_scales`).
+        crate::weight_scales::refuse_weight_scale_tensors(
+            &arch,
+            file.tensors().map(|(_, t)| t.name.as_str()),
+        )?;
         // Which tensor each of the five norm sites is stored under and
         // which FUNCTION norms it, resolved ONCE. Four shapes reach this
         // loader -- the plain pre-norm layer, the post-norm-only
@@ -2388,6 +2397,16 @@ impl Decoder {
             // and the loader reads the shape rather than the scalars so
             // that a deci / openelm layer is sized by its own header.
             let shape = config.layer_shape(l);
+            // BitNet's two inner norms, REQUIRED when the architecture
+            // has them and untouched otherwise (`crate::sub_norms`).
+            let sub_norms = crate::sub_norms::load_sub_norms(
+                &file,
+                &arch,
+                config.block_sub_norms,
+                l,
+                config.hidden_dim,
+                shape.ffn_dim,
+            )?;
             let attn = match shape.attention {
                 crate::layer_shapes::AttnShape::Gqa { n_heads, .. } => {
                     // Q/K/V and their biases come out of ONE decision about
@@ -2471,6 +2490,7 @@ impl Decoder {
                         // architecture string. gpt-oss's requirement is
                         // checked where its side table loads.
                         sinks: load_attn_sinks(&file, l, n_heads)?,
+                        attn_sub_norm: sub_norms.as_ref().map(|n| n.attn.clone()),
                     };
                     crate::layer_shapes::check_gqa_projection_widths(
                         l,
@@ -2498,6 +2518,20 @@ impl Decoder {
             // globally (the dense test fixture) is dense on every
             // layer either way.
             let is_dense_layer = config.layer_is_dense(l) || config.moe.n_experts <= 1;
+            // The inner FFN norm has a site in the dense body only
+            // (`build_ffn` with a NULL down, `bitnet.cpp:127-141`);
+            // `build_moe_ffn` has none, so a routed layer that carried
+            // one would have nowhere to apply it.
+            if sub_norms.is_some() && !is_dense_layer {
+                return Err(LoadError::UnsupportedFeature(
+                    arch.clone(),
+                    format!(
+                        "blk.{l}.ffn_sub_norm on a MoE layer: llama.cpp applies the inner FFN \
+                         norm in the dense `build_ffn` body only (bitnet.cpp:127-141), and no \
+                         routed-expert graph has that site"
+                    ),
+                ));
+            }
             let n_experts = if is_dense_layer {
                 1
             } else {
@@ -2687,6 +2721,7 @@ impl Decoder {
                 shared_experts,
                 shared_expert_gate,
                 exp_probs_bias,
+                ffn_sub_norm: sub_norms.map(|n| n.ffn),
                 // The same table as the attention slot, so the two
                 // pre-norms cannot disagree about the function, and the
                 // pre-FFN tensor's NAME comes from the same row that

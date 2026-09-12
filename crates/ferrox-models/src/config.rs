@@ -404,6 +404,15 @@ pub struct ModelConfig {
     /// refuse a model whose operand they cannot read
     /// (`Decoder::gpu_router_matches_host_routing`).
     pub router_input: crate::router_input::RouterInput,
+    /// Whether this model's blocks norm INSIDE the two sublayers:
+    /// BitNet's `attn_sub_norm` (on the attention output, BEFORE `wo`)
+    /// and `ffn_sub_norm` (on `silu(gate) * up`, BEFORE `down`),
+    /// `bitnet.cpp:24,36,101-106,135-140`. See [`crate::sub_norms`] for
+    /// the census (one graph of 140) and the two readers: the loader,
+    /// which REQUIRES the pair when this is set, and
+    /// `Decoder::metal_can_serve_model`, which refuses every fused
+    /// launch, since none has a norm at either site.
+    pub block_sub_norms: bool,
     /// RoPE base used on SWA layers (Gemma 3: defaults to `10000` when
     /// the GGUF omits `rope.freq_base_swa`; full-attn layers keep
     /// [`Self::rope_theta`]).
@@ -889,6 +898,7 @@ pub fn glm_5_2() -> ModelConfig {
         clamp_kqv: None,
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -976,6 +986,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         clamp_kqv: None,
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1095,6 +1106,7 @@ pub fn kimi_k3() -> ModelConfig {
         clamp_kqv: None,
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1160,6 +1172,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         clamp_kqv: None,
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1220,6 +1233,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         clamp_kqv: None,
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,
@@ -1283,6 +1297,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         clamp_kqv: None,
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
+        block_sub_norms: false,
         logit_multiplier: None,
         attention_scale: None,
         rope_theta_swa: None,

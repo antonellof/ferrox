@@ -971,6 +971,7 @@ mod tests {
             clamp_kqv: None,
             attn_temperature: None,
             router_input: crate::router_input::RouterInput::NormedFfnInput,
+            block_sub_norms: false,
             logit_multiplier: None,
             attention_scale: None,
             rope_theta_swa: None,

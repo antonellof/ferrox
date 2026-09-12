@@ -12,23 +12,24 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **49** architectures run with
+Honest position, re-audited 2026-09-12. **50** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
 instead of guessing.
 
-The 8 unaudited refusals are now TRIAGED, and the refusal says which of
+The 7 unaudited refusals are now TRIAGED, and the refusal says which of
 three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 7 need new code, 1 is unknown with the question stated. Five
+away**, 6 need new code, 1 is unknown with the question stated. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
 `olmo` on 2026-09-10, and `exaone-moe`, `grok`, `dbrx`, `arcee`, `deci`,
 `openelm`, `afmoe`, `laguna`, `mellum`, `apertus`, `step35` and
-`mistral3` on 2026-09-11, and `smallthinker` on 2026-09-12, each with a
-libllama-golden fixture, which is what moved 46 to 41 to 34 to 31 to 29
-to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10 to 9 to 8; the step from 28 to 25
+`mistral3` on 2026-09-11, and `smallthinker` and `bitnet` on 2026-09-12,
+each with a libllama-golden fixture, which is what moved 46 to 41 to 34
+to 31 to 29 to 28 to 25 to 22 to 21 to 20 to 18 to 15 to 13 to 12 to 10
+to 9 to 8 to 7; the step from 28 to 25
 was moving the three alias rows off
 the generic path rather than a closure. `minicpm` moved too and is not in that count: it
 was refused BY NAME, never as unaudited, so it raises the audited number
@@ -43,7 +44,7 @@ needs a different graph.
 **On 2026-09-10 the NEW CODE column moved for the first time**, three
 times: 26 to 24, 24 to 21, then 21 to 20, and on 2026-09-11 seven times
 more, 20 to 19, 19 to 17, 17 to 14, 14 to 12, 12 to 11, 11 to 9 and 9
-to 8, and on 2026-09-12 once more, 8 to 7. The first two took several rows
+to 8, and on 2026-09-12 twice more, 8 to 7 and 7 to 6. The first two took several rows
 at once for the same reason, and it is the lesson: each found ONE cause
 behind several refusals. The fourth did too and the column hides it:
 the per-layer RoPE gate closed THREE refusals and only `exaone-moe` was
@@ -86,7 +87,50 @@ a defect in every YaRN checkpoint on the generic path. The eleventh
 is the same measurement answering ONE for a different reason:
 `smallthinker`'s router MECHANISM (a precomputed `probs_in`) is shared
 with three graphs and its CAUSE (routing on the raw layer input) with
-none on this engine.
+none on this engine. The twelfth is the smallest reach there is:
+`bitnet` closed ALONE, 7 to 6, on two norm slots one graph of 140
+creates, and the seam is a `bool` because there is no second shape to
+name. The same day's OTHER reading did not close a row and is worth
+as much: `grovemoe`'s graph, read against `modeling_grove_moe.py`,
+feeds its chunk experts the routed experts' OUTPUT (`grovemoe.cpp:
+148-152`) and gathers their weights at the CHUNK index
+(`llama-graph.cpp:2035-2039`) where the reference does neither, so
+there is no single graph to match and its verdict says so.
+
+`bitnet` closed on `ferrox-models/src/sub_norms.rs`. `bitnet.cpp:24,36`
+require `attn_sub_norm` `{n_embd}` and `ffn_sub_norm` `{n_ff}`, two
+RMSNorms INSIDE the sublayers where the decoder's four sites are all
+outside them: `:101-106` norm the attention output BEFORE `wo` (the
+other side of that matmul from Gemma's `post_attention_norm`) and
+`:127-141` call `build_ffn` with a NULL down, norm `silu(gate) * up`,
+and apply `ffn_down` by hand. `grep -l` for either tensor over all 140
+graphs is `bitnet.cpp`, so `ModelConfig::block_sub_norms` is a `bool`
+with two readers: the loader REQUIRES the pair on it (and refuses the
+FFN one on a routed layer, where `build_moe_ffn` has no such site), and
+`metal_can_serve_model` refuses every fused launch on it; the
+exhaustive destructure in `metal_attn_view` refuses the layer as well.
+The arithmetic landed where the tails already were -- `attn_out_to_
+residual_rows`, the one attention tail, and `ferrox_moe::
+run_expert_sub_normed`, which shares its gate/up half with `run_expert`
+(a new `expert_activated`) and cannot reach the fused on-device SwiGLU
+because that kernel runs `down` itself; `dense_ffn_batch` applies it
+per row and skips its fused batch kernel for the same reason. KL
+1.88e-14, norm weights drawn AWAY from one so skipping either, applying
+either with unit weights, or reading the attention one as the
+post-norm each diverges by orders of magnitude, measured. Building it
+found the per-tensor `.scale` companions: `bitnet.cpp:27-43` create
+them optionally, `build_lora_mm` multiplies each projection's output
+by them, and since `llama-model.cpp:1355-1440` a GENERIC pass creates
+`.scale` / `.input_scale` beside every architecture's projections (the
+NVFP4 converter writes them; the current BitNet converter folds them
+in). libllama's logits for a fixture with seven `2.0` scales differ
+from the unscaled file's, measured, so `ferrox-models/src/
+weight_scales.rs` refuses either suffix by name BEFORE the
+unread-tensor gate, which `FERROX_ALLOW_UNKNOWN_TENSORS=1` could have
+talked past into every projection at the wrong magnitude. A real
+BitNet-b1.58-2B-4T still needs `TQ1_0` / `TQ2_0` (or `i2_s`) kernels,
+which `ferrox-gguf` inspects and refuses at execution; the row is
+evidenced on F32 and runs a Q8_0 / F16 re-export.
 
 `smallthinker` closed on `ferrox-models/src/router_input.rs`. Every
 `build_moe_ffn(` call in all 140 graphs was parsed for its `probs_in`
@@ -674,7 +718,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 49
+Those files are why llama.cpp has 140 architectures and ferrox has 50
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

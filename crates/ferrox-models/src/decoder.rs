@@ -28,9 +28,6 @@ use ferrox_core::attention::{
     causal_gqa_attention_prefill_shared_kv_windowed, causal_gqa_attention_softcap,
 };
 use ferrox_core::cache::{KvCache, PagedKvCache, PagedStoreExhausted, SharedPagedKv};
-// The host FFN tails moved into `ffn_block`; the one remaining caller is
-// the Metal prefill arm's post-attention norm.
-#[cfg(feature = "metal")]
 use ferrox_core::matmul::rms_norm;
 pub use kv_window::{KvWindowPolicy, KV_WINDOW_ENV};
 #[cfg(feature = "metal")]
@@ -127,6 +124,14 @@ pub struct AttnWeights {
     /// Metal launches refuse any layer that has one, by the exhaustive
     /// destructure in `Decoder::metal_attn_view`.
     pub sinks: Option<Vec<f32>>,
+    /// BitNet's `blk.N.attn_sub_norm.weight`, `[hidden_dim]`: an RMSNorm
+    /// on the attention output BEFORE `o_proj` (`bitnet.cpp:101-106`),
+    /// the other side of that matmul from `post_attn_norm`. Loaded
+    /// only for a model whose `ModelConfig::block_sub_norms` says so
+    /// (`crate::sub_norms`); the fused Metal launches refuse the model
+    /// through `metal_can_serve_model` and the layer through the
+    /// exhaustive destructure in `Decoder::metal_attn_view`.
+    pub attn_sub_norm: Option<Vec<f32>>,
 }
 
 /// How a layer's routed experts are held. `Resident` is the original
@@ -198,6 +203,15 @@ pub struct MoeWeights {
     /// *is* present, the GPU MoE fast paths refuse the layer rather than
     /// route without it -- their kernels have no bias input.
     pub exp_probs_bias: Option<Vec<f32>>,
+    /// BitNet's `blk.N.ffn_sub_norm.weight`, `[ffn_dim]`: an RMSNorm on
+    /// `silu(gate) * up` BEFORE `down` (`bitnet.cpp:135-140`), inside
+    /// the dense FFN. `Some` only for a model whose
+    /// `ModelConfig::block_sub_norms` says so (`crate::sub_norms`), and
+    /// only on a dense layer: no MoE graph has this site. Read by
+    /// `Decoder::run_dense_expert` and `Decoder::dense_ffn_batch`, the
+    /// two dense FFN bodies; the fused kernels never see it because
+    /// `metal_can_serve_model` refuses the model.
+    pub ffn_sub_norm: Option<Vec<f32>>,
     /// How many times each routed expert (index into `experts`) has been
     /// selected by `route_top_k` across every `forward_token`/
     /// `forward_batch` call so far. Real observed hotness, not a
@@ -667,6 +681,7 @@ impl Decoder {
                 post_ffn_norm: None,
                 output_gate: None,
                 sinks: None,
+                attn_sub_norm: None,
             };
 
             // Leading dense layers (see ModelConfig::layer_is_dense's
@@ -707,6 +722,7 @@ impl Decoder {
 
             let moe = MoeWeights {
                 exp_probs_bias: None,
+                ffn_sub_norm: None,
                 router: wm(rng.vec(n_experts * hidden), vec![n_experts, hidden]),
                 experts: ExpertBacking::Resident(experts),
                 shared_experts,
@@ -864,6 +880,10 @@ impl Decoder {
             && config.residual_scale.is_none()
             && config.clamp_kqv.is_none()
             && config.attn_temperature.is_none()
+            // BitNet's two inner norms (`crate::sub_norms`): no fused
+            // kernel norms between attention and `wo`, or between the
+            // activation and `down`.
+            && !config.block_sub_norms
             // `model_ffn_act` is `None` for an activation that varies
             // by layer (xIELU's parameters), which no fused kernel
             // takes; `fused_kernel_gelu_flag` is `None` for one no
@@ -1068,8 +1088,11 @@ impl Decoder {
             post_ffn_norm: _,
             output_gate,
             sinks,
+            attn_sub_norm,
         } = &layer.attn;
-        if output_gate.is_some() || sinks.is_some() {
+        // No Metal attention kernel gates, sinks, or norms between the
+        // V sum and `wo`; a layer with any of the three runs on the host.
+        if output_gate.is_some() || sinks.is_some() || attn_sub_norm.is_some() {
             return None;
         }
         Some(ferrox_metal::attn::AttnExtras {
@@ -3461,11 +3484,14 @@ impl Decoder {
         // simdgroup GEMM: gate and up feed the activation and the down
         // projection without the intermediates ever touching the host.
         // Three separate launches cost three round trips per layer plus
-        // four copies of a `batch x ffn_dim` tensor.
+        // four copies of a `batch x ffn_dim` tensor. Not for a layer
+        // with a norm between the activation and `down`
+        // (`ffn_sub_norm`): the kernel has no such site.
         #[cfg(feature = "metal")]
-        if let (true, Some(gelu)) = (
+        if let (true, Some(gelu), None) = (
             ferrox_core::weight_matrix::metal_dense_enabled(),
             act.fused_kernel_gelu_flag(),
+            layer.moe.ffn_sub_norm.as_ref(),
         ) {
             let fused = layer.moe.with_expert(0, |ex| {
                 let (g, u, d) = (
@@ -3495,7 +3521,16 @@ impl Decoder {
             let up = ex
                 .up
                 .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-            let activated = act.apply(&gate, &up);
+            let mut activated = act.apply(&gate, &up);
+            // bitnet.cpp:135-140, per row, on the same vector the row
+            // body norms in `ferrox_moe::run_expert_sub_normed`.
+            if let Some(w) = &layer.moe.ffn_sub_norm {
+                let width = w.len();
+                activated = activated
+                    .chunks(width)
+                    .flat_map(|row| rms_norm(row, w, config.rms_norm_eps))
+                    .collect();
+            }
             ex.down.apply_batch(&activated, batch_size)
         }))
     }
@@ -3659,7 +3694,7 @@ impl Decoder {
             // arm used to be spelled out here and nowhere else, which is
             // precisely how the routed paths ended up SwiGLU-only.
             let act = config.layer_ffn_acts(layer_idx).dense;
-            return layer.moe.with_expert(0, |ex| run_expert(normed2, ex, act));
+            return Self::run_dense_expert(layer, normed2, act, config.rms_norm_eps);
         }
         // What the router reads is the caller's fact (`crate::router_input`):
         // the normed FFN input here, or logits computed before attention.
@@ -6745,6 +6780,55 @@ mod metal_rope_tests {
             "...and the prefill dense stack"
         );
         assert!(!Decoder::metal_can_serve_model(&tempered, false));
+    }
+
+    /// BitNet's two inner norms keep the model off every fused Metal
+    /// path, through the same predicate, and a layer that carries the
+    /// attention one off the per-layer fused attention through the
+    /// exhaustive destructure in `metal_attn_view`.
+    ///
+    /// No fused kernel norms between the V sum and `wo` or between the
+    /// activation and `down`; a BitNet layer served by one would skip
+    /// both norms at full speed (`crate::sub_norms`). Only reachable in
+    /// a `--features metal` build.
+    #[test]
+    fn the_inner_norms_keep_the_model_off_every_fused_metal_path() {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        let d = Decoder::new_random_small(plain.clone(), 1, 32);
+        assert!(
+            d.layer_supports_metal_attn(&d.layers[0]),
+            "the fixture must be Metal-eligible to start, or this proves nothing"
+        );
+
+        let mut sub_normed = plain;
+        sub_normed.block_sub_norms = true;
+        let d = Decoder::new_random_small(sub_normed.clone(), 1, 32);
+        assert!(
+            !d.layer_supports_metal_attn(&d.layers[0]),
+            "a norm between attention and `wo` that no Metal kernel applies must refuse the \
+             fused attention"
+        );
+        assert!(
+            !Decoder::metal_prefill_dense_layer_eligible(&d.layers[0], &sub_normed, false),
+            "...and the prefill dense stack"
+        );
+        assert!(!Decoder::metal_can_serve_model(&sub_normed, false));
+
+        // Independently of the config: the tensor on the layer is enough
+        // to lose the per-layer fused attention's view of it.
+        let mut d = Decoder::new_random_small(plain_config_with_metal_view(), 1, 32);
+        assert!(d.metal_attn_view(&d.layers[0]).is_some());
+        d.layers[0].attn.attn_sub_norm = Some(vec![1.0; d.config.hidden_dim]);
+        assert!(d.metal_attn_view(&d.layers[0]).is_none());
+    }
+
+    fn plain_config_with_metal_view() -> ModelConfig {
+        let mut plain = phi_like_config();
+        plain.rope_dim = None;
+        plain.rope_attn_factor = 1.0;
+        plain
     }
 
     /// An FFN activation no fused kernel spells keeps the model off

@@ -91,6 +91,20 @@ is faster.
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
+- **The two norms inside the blocks**, and with it BitNet (`bitnet`).
+  `bitnet.cpp:24,36` require `attn_sub_norm` on the attention output
+  BEFORE `wo` and `ffn_sub_norm` on `silu(gate) * up` BEFORE `down`,
+  two sites the generic decoder's four norm slots did not have; one
+  graph of 140 creates either tensor (measured), so
+  `ModelConfig::block_sub_norms` is a `bool` the loader and the Metal
+  predicate both read (`ferrox_models::sub_norms`). Applied in the one
+  attention tail and the one dense FFN row body; every fused Metal
+  launch refuses the model. Per-projection `.scale` / `.input_scale`
+  companions, which llama.cpp multiplies in for every architecture and
+  the NVFP4 and older BitNet converters write, are refused by name
+  (`ferrox_models::weight_scales`) rather than run at the wrong
+  magnitude. A real BitNet-b1.58 still needs `TQ1_0` / `TQ2_0`
+  kernels; a Q8_0 or F16 re-export runs.
 - **The MoE router operand**, and with it every SmallThinker
   (`smallthinker`). `smallthinker.cpp:111` routes on `inpL`, the
   residual stream as it enters the layer, before `attn_norm` and before
