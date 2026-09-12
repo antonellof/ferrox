@@ -724,7 +724,7 @@ key `true` are byte-identical to the file with it `false`, and a
 fixture pins that ferrox ignores it the same way. Both refusals carry
 their reach: the parallel residual is EIGHT of 140 graphs in two
 spellings (one shared norm: `stablelm`, `phi2`, `falcon`-7B,
-`command-r`, `cohere2`, `cohere2moe`; two norms: `gptneox` under the
+`command-r`, `cohere2`, `cohere2moe`, `plamo`; two norms: `gptneox` under the
 key, `falcon`-40B under `attn_norm_2`), and the per-head QK LayerNorm
 is three (`stablelm`, `command-r` at 64 layers, `chameleon`), each
 recorded in its table with the line that decides it, so the seam that

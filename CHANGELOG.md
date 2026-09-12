@@ -27,8 +27,9 @@ are the ones worth reading twice.
   (`x + attn(norm(x)) + ffn(norm(x))`, `:135-137`):
   `ferrox_models::parallel_residual` refuses it from a fixture whose
   libllama logits move by 8.85, and its table records the eight graphs
-  that build the shape in two spellings (one shared norm; two norms
-  under `gptneox`'s key or `falcon`'s `attn_norm_2`). A layer with
+  that build the shape in two spellings (one shared norm: `stablelm`,
+  `phi2`, `falcon`-7B, `command-r`, `cohere2`, `cohere2moe`, `plamo`;
+  two norms under `gptneox`'s key or `falcon`'s `attn_norm_2`). A layer with
   `attn_q_norm` (`{n_embd_head_k, n_head}`, `LLM_NORM` per head, a
   distinct weight per head) is refused by `ferrox_models::qk_layer_norm`
   from a fixture whose logits move by 8.73, because the loader's length
