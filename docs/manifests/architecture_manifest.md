@@ -34,6 +34,7 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `stablelm` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `gptneox` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `plamo` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
+| `command-r` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `olmoe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
 | `qwen2moe` | TextGeneration | StandardGqa | KvGqa | generic-gqa |
@@ -77,7 +78,6 @@ Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 | `gemma3` | TextGeneration | GemmaFamily | KvIswa | generic-gqa |
 | `gemma4` | TextGeneration | GemmaFamily | KvIswa | dedicated |
 | `gemma4-assistant` | TextGeneration | GemmaFamily | KvIswa | dedicated |
-| `command-r` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `cohere2` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `cohere2moe` | TextGeneration | StandardGqa | KvGqa | dedicated |
 | `falcon` | TextGeneration | StandardGqa | KvGqa | dedicated |

@@ -946,6 +946,18 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // 64,97-98,111-112`), one RMSNorm per layer, GQA 8:1, NEOX.
     "gptneox",
     "plamo",
+    // tests/command_r_graphs.rs: `command-r` (Command-R 35B, Aya-23).
+    // `command-r.cpp:68` is `build_norm(inpL, attn_norm, NULL, LLM_NORM)`,
+    // the weighted LayerNorm without a bias `dbrx` gave its caller
+    // (`WEIGHTED_LAYER_NORM`); `:106-119` the shared-norm parallel
+    // residual (`crate::parallel_residual`); `:137-138` a `logit_scale`
+    // MULTIPLY on the logits (`crate::scalar_multipliers`, the `grok`
+    // use, optional); a tied lm_head (`:21`, `TENSOR_DUPLICATED`), NORM
+    // RoPE, `rope.scaling.type = none` written by its converter.
+    // Command-R+ (64 layers) carries the per-head LayerNorm QK norm
+    // `:28-31` REQUIRE at that depth and is refused by name from a
+    // 64-layer fixture libllama runs (`crate::qk_layer_norm`).
+    "command-r",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1062,7 +1074,13 @@ pub fn uses_non_parametric_rms_norm(arch: &str) -> bool {
 /// [`BIASED_LAYER_NORM`], which arrived on 2026-09-12 when `orion` and
 /// `nemotron` turned out to need nothing else; six of the group are on
 /// it now and `starcoder` / `phimoe` still refuse for something on top.
-pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx"];
+///
+/// The second caller of THIS variant is `command-r` (Command-R 35B):
+/// `command-r.cpp:68,127` pass `attn_norm` / `output_norm` with a NULL
+/// bias to `LLM_NORM`, over the shared-norm parallel residual
+/// (`crate::parallel_residual`) with a `logit_scale` MULTIPLY
+/// (`crate::scalar_multipliers`); `tests/command_r_graphs.rs`.
+pub const WEIGHTED_LAYER_NORM: &[&str] = &["dbrx", "command-r"];
 
 /// Does this architecture normalise with a weighted LayerNorm?
 /// See [`WEIGHTED_LAYER_NORM`].
@@ -1685,6 +1703,12 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // NEOX RoPE: llama-model.cpp:2651 (gptneox), :2639 (plamo).
         v.push(gqa_neox("gptneox"));
         v.push(gqa_neox("plamo"));
+        // `command-r` (Command-R 35B, Aya-23): the shared-norm parallel
+        // residual over the weighted LayerNorm WITHOUT a bias
+        // (`WEIGHTED_LAYER_NORM`'s second caller) and a `logit_scale`
+        // multiply (tests/command_r_graphs.rs). NORM RoPE:
+        // llama-model.cpp:2582.
+        v.push(gqa_norm("command-r"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -2050,20 +2074,10 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // the reason names it. `unsupported_scaling_keys` is the
         // metadata-visible half of the same class.
         for (n, rope, fam, reason) in [
-            // src/models/command-r.cpp:68 (`LLM_NORM`, no bias: the
-            // weighted LayerNorm `WEIGHTED_LAYER_NORM` lists only dbrx
-            // for), :28-31 (per-head LayerNorm QK norm at 64 layers,
-            // `crate::qk_layer_norm`), :137-138 (`logit_scale` multiply).
-            (
-                "command-r",
-                Norm,
-                StandardGqa,
-                "parallel residual over a weighted LayerNorm WITHOUT a bias \
-                 (src/models/command-r.cpp:68; `NormOp::LayerNorm` has one caller, `dbrx`) \
-                 and a `logit_scale` multiply on the logits (:137-138) the generic decoder \
-                 applies for no architecture; Command-R+ (64 layers, :28-31) adds the \
-                 per-head LayerNorm QK norm `crate::qk_layer_norm` refuses",
-            ),
+            // `command-r` was HERE (a weighted LayerNorm without a bias,
+            // `logit_scale`); audited now (tests/command_r_graphs.rs),
+            // with Command-R+'s per-head LayerNorm QK norm refused by
+            // `crate::qk_layer_norm`.
             // src/models/cohere2.cpp:120-134 plus a window whose sliding
             // layers alone are rotated (:72,90-99).
             (
@@ -3875,7 +3889,7 @@ mod tests {
     /// applies them now and `tests/minicpm_graphs.rs` is the evidence.
     #[test]
     fn architectures_with_a_different_residual_topology_are_refused() {
-        for arch in ["command-r", "cohere2", "cohere2moe", "falcon", "phi2"] {
+        for arch in ["cohere2", "cohere2moe", "falcon", "phi2"] {
             match resolve_architecture(arch) {
                 Some(ArchPath::DedicatedOnly { reason }) => {
                     assert!(
@@ -3913,6 +3927,7 @@ mod tests {
             "stablelm",
             "gptneox",
             "plamo",
+            "command-r",
         ] {
             assert!(
                 matches!(

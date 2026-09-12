@@ -17,6 +17,19 @@ are the ones worth reading twice.
 
 ### Added
 
+- **`command-r` runs: Command-R 35B and Aya-23.** The shared-norm
+  parallel residual (`ferrox_models::parallel_residual`) over the
+  weighted LayerNorm WITHOUT a bias (`command-r.cpp:68,127`,
+  `capability::WEIGHTED_LAYER_NORM`'s second caller after `dbrx`), a
+  `logit_scale` MULTIPLY read `required = false` and skipped at zero
+  (`:4,137-138`; `LogitScaleUse::AsIsOptional`, a new variant beside
+  the REQUIRED `AsIs` Grok and Talkie use, with a negative value
+  refused), a tied lm_head, NORM RoPE. `tests/command_r_graphs.rs`: KL
+  1.02e-15 with the key, 2.26e-13 without it (libllama's two goldens
+  are in the ratio 0.0625, the key's value). Command-R+ (64 layers)
+  carries the per-head LayerNorm QK norm `:28-31` REQUIRE at that depth
+  and is refused by name (`ferrox_models::qk_layer_norm`) from a
+  64-layer fixture libllama runs. 65 audited.
 - **The parallel residual; `gptneox` (Pythia, GPT-NeoX-20B) and
   `plamo` (PLaMo-13B) run.** `x + attn(norm(x)) + ffn(norm(x))`,
   refused by name the PR before, is served by

@@ -115,15 +115,16 @@
 //! `residual_scale` stays refused for `grok`: the graph has no residual
 //! multiplier, and the derived list keeps saying so.
 //!
-//! One row is deliberately NOT here, and it is not one table entry away:
-//!
-//! * **Command-R / Cohere2** apply `f_logit_scale` as a MULTIPLY rather
-//!   than a divide (`command-r.cpp:136-138`), which is
-//!   [`LogitScaleUse::AsIs`] now that `grok` needed it. But their
-//!   blocker is not the multiplier: `command-r.cpp:66-119` feeds both
-//!   branches the same normed input and sums `inpL + attn_out + ffn_out`
-//!   once, over LayerNorm rather than RMSNorm. The multiplier work does
-//!   not bring them closer.
+//! * **Command-R** applies `f_logit_scale` as a MULTIPLY
+//!   (`command-r.cpp:4,137-138`, optional, skipped at zero), which is
+//!   [`LogitScaleUse::AsIs`], the `grok` / `talkie` use; it is a row
+//!   since its other blocker, the shared-norm parallel residual over a
+//!   weighted LayerNorm, landed (`crate::parallel_residual`,
+//!   `capability::WEIGHTED_LAYER_NORM`). **Cohere2** reads the same key
+//!   the same way (`cohere2.cpp:14,153-154`, REQUIRED there) and is not
+//!   a row yet: its window rotates the sliding layers only, which no
+//!   seam here serves, and a row for an architecture that cannot load
+//!   is a gate that cannot fire.
 //!
 //! **Neither attention key lives in this module's output.** Both
 //! `{arch}.attention.scale` and `{arch}.attention.output_scale` resolve
@@ -153,14 +154,21 @@ pub enum LogitScaleUse {
     /// than a `required` flag beside the table that could come to
     /// disagree with it.
     Reciprocal,
-    /// Grok / Command-R: `ggml_scale(cur, f_logit_scale)` (`grok.cpp:211`,
-    /// `command-r.cpp:136-138`). The value IS the multiplier.
+    /// Grok / Talkie: `ggml_scale(cur, f_logit_scale)` (`grok.cpp:211`,
+    /// `talkie.cpp:141`). The value IS the multiplier, and the key is
+    /// REQUIRED (or seeded, for Grok).
     ///
     /// The same positivity rule as [`Self::Reciprocal`], for the same
     /// reason: a Metal decode stack may fold the lm_head into an argmax
     /// only while every post-head transform is monotone increasing, and
     /// a zero would blank the whole vocabulary rather than divide by it.
     AsIs,
+    /// Command-R: the same multiply behind `if (f_logit_scale)`
+    /// (`command-r.cpp:4,137-138`; `get_key(..., false)` leaves the
+    /// `llama-hparams.h` zero when the file has no key). Absent or zero
+    /// is "no scale"; a negative value is refused, because the graph
+    /// would apply it and the argmax fold could not.
+    AsIsOptional,
 }
 
 /// Which GGUF key, if any, an architecture reads its attention scale
@@ -437,6 +445,19 @@ impl MultiplierSupport {
         attention: AttentionScaleKey::NotRead,
         defaults: MultiplierDefaults::FromFileOnly,
     };
+
+    /// `command-r`. `{arch}.logit_scale` OPTIONAL (`command-r.cpp:4`,
+    /// `required = false`) and MULTIPLIED onto the logits when nonzero
+    /// (`:137-138`); every real export writes it (`conversion/
+    /// command_r.py:19`, `0.0625` for the 35B). None of the other three
+    /// keys is read.
+    pub const COMMAND_R: Self = Self {
+        embedding: false,
+        residual: false,
+        logit: LogitScaleUse::AsIsOptional,
+        attention: AttentionScaleKey::NotRead,
+        defaults: MultiplierDefaults::FromFileOnly,
+    };
 }
 
 /// The GGUF architectures whose graph applies one or more of the four
@@ -455,6 +476,7 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     ("minicpm", MultiplierSupport::MINICPM),
     ("grok", MultiplierSupport::GROK),
     ("talkie", MultiplierSupport::TALKIE),
+    ("command-r", MultiplierSupport::COMMAND_R),
 ];
 
 /// Which multipliers ferrox applies for `arch`.
@@ -612,6 +634,11 @@ pub fn resolve(
             }
             scale_or_none(Some(v))
         }
+        LogitScaleUse::AsIsOptional => match logit {
+            None | Some(0.0) => None,
+            Some(v) if v < 0.0 => return Err(MultiplierError::NonPositiveLogitScale(v)),
+            Some(v) => scale_or_none(Some(v)),
+        },
     };
 
     // An override that restates the kernels' own `1/sqrt(head_dim)`
@@ -976,6 +1003,44 @@ mod tests {
         assert_eq!(MultiplierDefaults::Grok.yarn_beta_fast(), Some(8.0));
         assert_eq!(MultiplierDefaults::MiniCpm.attn_logit_softcap(), None);
         assert_eq!(MultiplierDefaults::FromFileOnly.yarn_beta_fast(), None);
+    }
+
+    /// Command-R's `logit_scale` is a multiply that the graph skips at
+    /// zero and when the key is absent (`command-r.cpp:4,137`), where
+    /// Talkie's same multiply is REQUIRED (`talkie.cpp:5`): one variant
+    /// each, so the two cannot be confused, and a negative value is
+    /// refused on both.
+    #[test]
+    fn command_rs_logit_scale_is_optional_and_talkies_is_not() {
+        let with = |logit: Option<f32>| DeclaredMultipliers {
+            logit,
+            ..Default::default()
+        };
+        let cr = |logit| resolve(MultiplierSupport::COMMAND_R, with(logit), dims(6));
+        assert_eq!(cr(None).expect("absent is no scale").logit_multiplier, None);
+        assert_eq!(
+            cr(Some(0.0)).expect("zero is no scale").logit_multiplier,
+            None
+        );
+        assert_eq!(
+            cr(Some(0.0625)).expect("resolves").logit_multiplier,
+            Some(0.0625)
+        );
+        assert!(matches!(
+            cr(Some(-1.0)),
+            Err(MultiplierError::NonPositiveLogitScale(_))
+        ));
+        assert!(matches!(
+            resolve(MultiplierSupport::TALKIE, with(None), dims(6)),
+            Err(MultiplierError::MissingRequiredLogitScale)
+        ));
+        // Neither reads the other three keys, so a Command-R file
+        // declaring `residual_scale` is refused as it always was.
+        let cr_keys = crate::capability::unsupported_scaling_keys("command-r");
+        assert!(cr_keys
+            .iter()
+            .any(|(k, _, _)| k == "command-r.residual_scale"));
+        assert!(!cr_keys.iter().any(|(k, _, _)| k == "command-r.logit_scale"));
     }
 
     /// The file wins over the Grok defaults, key by key.
