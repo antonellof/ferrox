@@ -251,7 +251,15 @@ fn matches_independent_python_reference_across_three_decode_steps() {
     ];
 
     for (pos, (hidden, golden)) in hiddens.iter().zip(goldens.iter()).enumerate() {
-        let out = mla_forward_token(&weights, &cfg, hidden, EPS, &mut k_cache, &mut v_cache);
+        let out = mla_forward_token(
+            &weights,
+            &cfg,
+            None,
+            hidden,
+            EPS,
+            &mut k_cache,
+            &mut v_cache,
+        );
         assert_eq!(out.len(), golden.len());
         for (i, (a, b)) in out.iter().zip(golden.iter()).enumerate() {
             assert!(
@@ -274,6 +282,7 @@ fn without_output_gate_skips_the_sigmoid_multiply() {
     let out = mla_forward_token(
         &weights,
         &cfg,
+        None,
         &MLA_HIDDEN_0,
         EPS,
         &mut k_cache,
@@ -617,7 +626,15 @@ fn rope_enabled_matches_independent_python_reference_across_three_decode_steps()
     ];
 
     for (pos, (hidden, golden)) in hiddens.iter().zip(goldens.iter()).enumerate() {
-        let out = mla_forward_token(&weights, &cfg, hidden, EPS, &mut k_cache, &mut v_cache);
+        let out = mla_forward_token(
+            &weights,
+            &cfg,
+            None,
+            hidden,
+            EPS,
+            &mut k_cache,
+            &mut v_cache,
+        );
         assert_eq!(out.len(), golden.len());
         for (i, (a, b)) in out.iter().zip(golden.iter()).enumerate() {
             assert!(
@@ -645,6 +662,7 @@ fn rope_enabled_output_changes_with_position() {
     let out_pos0 = mla_forward_token(
         &weights,
         &cfg,
+        None,
         &MLA_ROPE_HIDDEN_0,
         EPS,
         &mut k_cache_pos0,
@@ -659,6 +677,7 @@ fn rope_enabled_output_changes_with_position() {
     mla_forward_token(
         &weights,
         &cfg,
+        None,
         &MLA_ROPE_HIDDEN_1,
         EPS,
         &mut k_cache_pos1,
@@ -667,6 +686,7 @@ fn rope_enabled_output_changes_with_position() {
     let out_pos1 = mla_forward_token(
         &weights,
         &cfg,
+        None,
         &MLA_ROPE_HIDDEN_0,
         EPS,
         &mut k_cache_pos1,
@@ -703,6 +723,7 @@ fn rope_disabled_config_is_unaffected_by_position_change() {
     let out_a = mla_forward_token(
         &weights,
         &cfg,
+        None,
         &MLA_HIDDEN_0,
         EPS,
         &mut k_cache_a,
@@ -714,6 +735,7 @@ fn rope_disabled_config_is_unaffected_by_position_change() {
     let out_b = mla_forward_token(
         &weights,
         &cfg,
+        None,
         &MLA_HIDDEN_0,
         EPS,
         &mut k_cache_b,

@@ -162,6 +162,9 @@ pub struct MlaEngine {
     pub hidden_dim: usize,
     /// Present when any layer uses [`MlaLayerFfn::Moe`].
     pub moe: Option<MlaMoeRuntime>,
+    /// YaRN, when the file declares it (`crate::mla_yarn`): the `pe`
+    /// frequency rewrite, its magnitude and the softmax scale.
+    pub yarn: Option<crate::mla_yarn::MlaYarn>,
 }
 
 /// MoE routing knobs shared by every MoE layer (DeepSeek-2 / Mistral-4).
@@ -286,6 +289,7 @@ impl Engine for MlaEngine {
             let attn_out = crate::mla::mla_forward_token(
                 &layer.attn,
                 &self.mla_cfg,
+                self.yarn.as_ref(),
                 &normed,
                 self.rms_norm_eps,
                 k_cache,

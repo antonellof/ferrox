@@ -59,13 +59,16 @@
 //! transcriptions of the same real reference algorithms for both
 //! rope-disabled and rope-enabled paths.
 
-use ferrox_core::attention::{apply_rope_interleaved, causal_mla_attention};
+use ferrox_core::attention::{
+    apply_rope_interleaved, apply_rope_interleaved_with_freq_factors, causal_mla_attention_scaled,
+};
 use ferrox_core::matmul::rms_norm;
 use ferrox_core::mla_absorbed::causal_mla_absorbed_attention;
 use ferrox_core::weight_matrix::WeightMatrix;
 
 use crate::config::MlaConfig;
 pub use crate::mla_q_proj::MlaQProj;
+use crate::mla_yarn::{kq_scale, MlaYarn};
 
 pub struct MlaAttnWeights {
     /// Low-rank (`attn_q_a` / `attn_q_a_norm` / `attn_q_b`) or direct
@@ -135,10 +138,18 @@ impl MlaKvB {
 /// (see module doc comment). This function appends the current
 /// position before running attention over every position pushed so
 /// far.
+///
+/// `yarn` is the file's YaRN (`crate::mla_yarn`), an argument rather
+/// than a field of `cfg` so no caller reaches the rotation or the
+/// softmax scale without having answered it: the `pe` bands are
+/// divided by its factors, `q_pe` / `k_pe` multiplied by its magnitude
+/// after rotation, and the scale is its `kq_scale`. `None` is a plain
+/// file.
 #[allow(clippy::too_many_arguments)]
 pub fn mla_forward_token(
     weights: &MlaAttnWeights,
     cfg: &MlaConfig,
+    yarn: Option<&MlaYarn>,
     hidden: &[f32],
     rms_norm_eps: f32,
     k_cache: &mut Vec<f32>,
@@ -161,7 +172,7 @@ pub fn mla_forward_token(
     if let Some(rope) = &cfg.rope {
         for h in 0..cfg.num_heads {
             let q_rot_h = &mut query[h * q_head_dim + cfg.qk_nope_head_dim..(h + 1) * q_head_dim];
-            apply_rope_interleaved(q_rot_h, pos, rope.theta);
+            rotate_pe(q_rot_h, pos, rope.theta, yarn);
         }
     }
 
@@ -175,14 +186,22 @@ pub fn mla_forward_token(
     // rotating each head's copy separately).
     let mut k_rot = k_rot_raw.to_vec();
     if let Some(rope) = &cfg.rope {
-        apply_rope_interleaved(&mut k_rot, pos, rope.theta);
+        rotate_pe(&mut k_rot, pos, rope.theta, yarn);
     }
     let k_pass_c_normed = rms_norm(k_pass_c, &weights.kv_a_layernorm, rms_norm_eps);
+    let scale = kq_scale(yarn, q_head_dim);
 
     let attn_out = match &weights.kv_b {
-        MlaKvB::Split { k_b, v_b } => {
-            absorbed_attention(cfg, k_b, v_b, &query, &k_pass_c_normed, &k_rot, k_cache)
-        }
+        MlaKvB::Split { k_b, v_b } => absorbed_attention(
+            cfg,
+            k_b,
+            v_b,
+            &query,
+            &k_pass_c_normed,
+            &k_rot,
+            k_cache,
+            scale,
+        ),
         MlaKvB::Combined(kv_b_proj) => naive_attention(
             cfg,
             kv_b_proj,
@@ -191,6 +210,7 @@ pub fn mla_forward_token(
             &k_rot,
             k_cache,
             v_cache,
+            scale,
         ),
     };
 
@@ -209,10 +229,31 @@ pub fn mla_forward_token(
     weights.o_proj.apply(&gated)
 }
 
+/// `ggml_rope_ext` on one `pe` slice (`deepseek2.cpp:320-328`): the
+/// NORM-layout rotation with YaRN's per-band divisors when the file
+/// declares it, then ggml's `rope_yarn` magnitude on the rotated
+/// channels -- which is every channel of this slice, since `n_rot ==
+/// qk_rope`.
+fn rotate_pe(slice: &mut [f32], pos: usize, theta: f32, yarn: Option<&MlaYarn>) {
+    match yarn {
+        None => apply_rope_interleaved(slice, pos, theta),
+        Some(y) => {
+            apply_rope_interleaved_with_freq_factors(slice, pos, theta, &y.freq_factors);
+            if y.pe_magnitude != 1.0 {
+                for v in slice.iter_mut() {
+                    *v *= y.pe_magnitude;
+                }
+            }
+        }
+    }
+}
+
 /// `deepseek2.cpp:563-598`: absorb `q_nope` through `wk_b`, attend as
 /// MQA over the latent `concat(c, k_pe)`, pull the weighted latent
-/// through `wv_b`. `kq_scale` is the UNabsorbed head width's
-/// (`ferrox_core::mla_absorbed`). Returns `[n_heads * v_head_dim]`.
+/// through `wv_b`. `scale` is `kq_scale`, the UNabsorbed head width's
+/// with YaRN's `mscale^2` folded in (`ferrox_core::mla_absorbed`,
+/// `crate::mla_yarn`). Returns `[n_heads * v_head_dim]`.
+#[allow(clippy::too_many_arguments)]
 fn absorbed_attention(
     cfg: &MlaConfig,
     k_b: &[WeightMatrix],
@@ -221,6 +262,7 @@ fn absorbed_attention(
     k_pass_c_normed: &[f32],
     k_rot: &[f32],
     k_cache: &mut Vec<f32>,
+    scale: f32,
 ) -> Vec<f32> {
     let q_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
     let width = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
@@ -242,7 +284,7 @@ fn absorbed_attention(
         cfg.kv_lora_rank,
         cfg.qk_rope_head_dim,
         seq_len,
-        1.0 / (q_head_dim as f32).sqrt(),
+        scale,
     );
     let mut out = vec![0f32; cfg.num_heads * cfg.v_head_dim];
     for h in 0..cfg.num_heads {
@@ -266,6 +308,7 @@ fn naive_attention(
     k_rot: &[f32],
     k_cache: &mut Vec<f32>,
     v_cache: &mut Vec<f32>,
+    scale: f32,
 ) -> Vec<f32> {
     let q_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
     let k_pass_full = kv_b_proj.apply(k_pass_c_normed); // [n_heads*(qk_nope_head_dim+v_head_dim)]
@@ -288,7 +331,7 @@ fn naive_attention(
     v_cache.extend_from_slice(&value_step);
     let seq_len = k_cache.len() / (cfg.num_heads * q_head_dim);
 
-    causal_mla_attention(
+    causal_mla_attention_scaled(
         query,
         k_cache,
         v_cache,
@@ -296,6 +339,7 @@ fn naive_attention(
         q_head_dim,
         cfg.v_head_dim,
         seq_len,
+        scale,
     )
 }
 

@@ -50,10 +50,21 @@ files hold the same model and llama.cpp's absorbed and naive branches
 should agree on them to float noise; that agreement is one of the things
 the golden test measures.
 
-No RoPE scaling is declared, which keeps llama.cpp's YaRN `mscale`
-correction at 1.0 (`attn_factor_org * ...` with `freq_scale = 1` makes
-every `logf(1/freq_scale)` term vanish, deepseek2.cpp:444-448). A fixture
-that exercises `rope_yarn_log_mul` is a separate, larger job.
+No RoPE scaling is declared by default, which keeps llama.cpp's YaRN
+`mscale` correction at 1.0 (`attn_factor_org * ...` with `freq_scale =
+1` makes every `logf(1/freq_scale)` term vanish, deepseek2.cpp:444-448).
+
+`--yarn MSCALE_ALL_DIM` writes what `conversion/base.py:1231-1235` and
+`conversion/deepseek.py:363-368` write for a real DeepSeek: `rope.
+scaling.type = yarn`, `factor = 4`, `original_context_length = 16` (the
+served context is 64), and `yarn_log_multiplier = 0.1 * MSCALE_ALL_DIM`
+-- `0.707` is DeepSeek-V2 / V2-Lite (`config.json`: `mscale ==
+mscale_all_dim == 0.707`), `1.0` is DeepSeek-V3 / R1. No beta keys, as
+the converters write none for these configs. What llama.cpp does with
+them is `crates/ferrox-models/src/mla_yarn.rs`; this fixture is how it
+is checked, because `deepseek2.cpp:34-37` divide the key by 0.1 and
+`llama-context.cpp:202-215` special-case `LLM_ARCH_DEEPSEEK2`, and a
+reading of either can be wrong in a way only libllama's logits show.
 
 `--temperature` writes the same file with `attention.temperature_scale
 = 0.5` and `attention.temperature_length = 2`, the two keys
@@ -66,7 +77,7 @@ used to load and drop the key, so no golden is checked in for it.
 
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
-        python3 scripts/make_deepseek2_fixture.py OUT.gguf [--temperature] [--legacy-kv-b]
+        python3 scripts/make_deepseek2_fixture.py OUT.gguf [--temperature] [--legacy-kv-b] [--yarn MSCALE_ALL_DIM]
 
 The golden values that go with the default and `--legacy-kv-b` files
 are produced by llama.cpp itself (`scripts/gptoss_reference_logits.cpp`
@@ -110,9 +121,16 @@ K_MLA = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 # of 2 steps twice inside llama.cpp's six-token reference prompt.
 TEMP_SCALE = 0.5
 TEMP_LENGTH = 2
+YARN_FACTOR = 4.0
+YARN_ORIG_CTX = 16
 
 
-def main(out_path: str, temperature: bool = False, legacy_kv_b: bool = False) -> None:
+def main(
+    out_path: str,
+    temperature: bool = False,
+    legacy_kv_b: bool = False,
+    yarn_mscale_all_dim: float | None = None,
+) -> None:
     rng = np.random.default_rng(0xD5002)
 
     def rnd(*shape: int) -> np.ndarray:
@@ -130,6 +148,12 @@ def main(out_path: str, temperature: bool = False, legacy_kv_b: bool = False) ->
     w.add_head_count_kv(N_HEAD if legacy_kv_b else 1)
     w.add_layer_norm_rms_eps(RMS_EPS)
     w.add_rope_freq_base(ROPE_BASE)
+    if yarn_mscale_all_dim is not None:
+        # conversion/base.py:1231-1235 and deepseek.py:363-368.
+        w.add_rope_scaling_type(gguf.RopeScalingType.YARN)
+        w.add_rope_scaling_factor(YARN_FACTOR)
+        w.add_rope_scaling_orig_ctx_len(YARN_ORIG_CTX)
+        w.add_rope_scaling_yarn_log_mul(0.1 * yarn_mscale_all_dim)
     # deepseek.py:356 -- the ROPE half of the head, not the whole head.
     w.add_rope_dimension_count(QK_ROPE_HEAD_DIM)
     w.add_vocab_size(N_VOCAB)
@@ -242,8 +266,13 @@ def main(out_path: str, temperature: bool = False, legacy_kv_b: bool = False) ->
 
 
 if __name__ == "__main__":
+    args = sys.argv[1:]
+    yarn = None
+    if "--yarn" in args:
+        yarn = float(args[args.index("--yarn") + 1])
     main(
-        sys.argv[1] if len(sys.argv) > 1 else "deepseek2-fixture.gguf",
-        temperature="--temperature" in sys.argv[2:],
-        legacy_kv_b="--legacy-kv-b" in sys.argv[2:],
+        args[0] if args and not args[0].startswith("--") else "deepseek2-fixture.gguf",
+        temperature="--temperature" in args,
+        legacy_kv_b="--legacy-kv-b" in args,
+        yarn_mscale_all_dim=yarn,
     )

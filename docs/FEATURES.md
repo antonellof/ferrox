@@ -97,8 +97,8 @@ is faster.
   `attn_k_b` / `attn_v_b` (every DeepSeek export since the `_mla` keys),
   the latter attending over a latent cache `kv_lora_rank + qk_rope` wide
   (`ferrox_core::mla_absorbed`). KL 2.35e-15 and 3.57e-15
-  (`tests/deepseek2_graphs.rs`). YaRN on this engine is still refused by
-  name, which is what a real DeepSeek-V2 / V3 file hits next.
+  (`tests/deepseek2_graphs.rs`). YaRN as DeepSeek-V2 and V3 declare it
+  is `ferrox_models::mla_yarn`, three more goldens at 1e-15.
 - **A dense FFN summed with the routed experts, and a routed branch
   fed from the layer input**, and with them Arctic (`arctic`) and
   Grok-2. `ferrox_models::parallel_dense_ffn` is the table of the two

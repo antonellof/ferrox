@@ -2281,6 +2281,7 @@ pub fn causal_mla_attention(
         seq_len,
         None,
         None,
+        1.0 / (qk_head_dim as f32).sqrt(),
     )
 }
 
@@ -2316,6 +2317,7 @@ fn mla_attention_inner(
     seq_len: usize,
     visible: Option<&[usize]>,
     sinks: Option<&[f32]>,
+    scale: f32,
 ) -> Vec<f32> {
     assert_eq!(q.len(), n_heads * qk_head_dim);
     assert_eq!(k_cache.len(), seq_len * n_heads * qk_head_dim);
@@ -2341,7 +2343,6 @@ fn mla_attention_inner(
     let n_positions = visible.map_or(seq_len, |v| v.len());
     let position_at = |i: usize| visible.map_or(i, |v| v[i]);
 
-    let scale = 1.0 / (qk_head_dim as f32).sqrt();
     let mut out = vec![0f32; n_heads * v_head_dim];
 
     for h in 0..n_heads {
@@ -2394,6 +2395,34 @@ fn mla_attention_inner(
     out
 }
 
+/// [`causal_mla_attention`] with the caller's softmax scale instead of
+/// `1/sqrt(qk_head_dim)`: DeepSeek-2 under YaRN folds `mscale^2` into
+/// it (`src/models/deepseek2.cpp:446-448`, `ferrox_models::mla_yarn`).
+#[allow(clippy::too_many_arguments)]
+pub fn causal_mla_attention_scaled(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads: usize,
+    qk_head_dim: usize,
+    v_head_dim: usize,
+    seq_len: usize,
+    scale: f32,
+) -> Vec<f32> {
+    mla_attention_inner(
+        q,
+        k_cache,
+        v_cache,
+        n_heads,
+        qk_head_dim,
+        v_head_dim,
+        seq_len,
+        None,
+        None,
+        scale,
+    )
+}
+
 /// [`causal_mla_attention`] with DeepSeek V4's per-head attention sinks.
 ///
 /// `sinks` is one learned logit per query head. See
@@ -2420,6 +2449,7 @@ pub fn causal_mla_attention_sinks(
         seq_len,
         None,
         sinks,
+        1.0 / (qk_head_dim as f32).sqrt(),
     )
 }
 
@@ -2451,6 +2481,7 @@ pub fn causal_mla_attention_sparse_sinks(
         seq_len,
         Some(visible),
         sinks,
+        1.0 / (qk_head_dim as f32).sqrt(),
     )
 }
 
@@ -2533,6 +2564,7 @@ pub fn causal_mla_attention_sparse(
         seq_len,
         Some(visible),
         None,
+        1.0 / (qk_head_dim as f32).sqrt(),
     )
 }
 
