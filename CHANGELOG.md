@@ -17,6 +17,31 @@ are the ones worth reading twice.
 
 ### Added
 
+- **The parallel residual; `gptneox` (Pythia, GPT-NeoX-20B) and
+  `plamo` (PLaMo-13B) run.** `x + attn(norm(x)) + ffn(norm(x))`,
+  refused by name the PR before, is served by
+  `ferrox_models::parallel_residual`: the FFN input on a parallel layer
+  is a norm of the LAYER INPUT (`gptneox.cpp:149` its own `ffn_norm`;
+  `plamo.cpp:97` and `stablelm.cpp:137` the vector attention read), so
+  it is captured before attention beside the router's operand as
+  `decoder::ffn_block::BranchInputs`, from one constructor
+  (`Decoder::branch_inputs`) every host body calls at the top of every
+  layer; `MoeWeights::parallel` is the per-layer fact, a shared-norm
+  layer's pre-FFN slot is `NormOp::None`, and
+  `ModelConfig::parallel_residual` fences every fused Metal launch.
+  The table has all eight graphs that build the shape (a two-adds scan
+  over the 140; `plamo` had been missed by a grep for `attn_out`), with
+  the rule that decides each (`use_parallel_residual`, `ffn_norm`
+  absent, `attn_norm_2` present, always). `gptneox` also needed the
+  biased LayerNorm, the fused `attn_qkv` bias and the REQUIRED
+  projection biases with the ungated GELU, all seams from the two days
+  before. `tests/parallel_residual_graphs.rs`: `gptneox` under the key
+  `true` and `false` (libllama's logits differ by 3.73; both matched
+  at the f16 GELU-table line, 1.9e-3 / 2.1e-3, KL 5e-7 / 3e-7), `plamo`
+  KL 1.64e-13; the `stablelm` parallel fixture matches, KL 1.95e-12
+  (`tests/stablelm_graphs.rs`). Refusals for `command-r`, `cohere2`,
+  `cohere2moe`, `falcon` and `phi2` now name what each needs on top of
+  the residual. 64 audited.
 - **`stablelm` runs: StableLM-2-1.6B and StableLM-3B-4E1T on the
   biased LayerNorm, with the graph's two other shapes refused by name.**
   `stablelm.cpp` decides three shapes by TENSOR PRESENCE and none by a

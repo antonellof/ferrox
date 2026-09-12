@@ -107,11 +107,26 @@ is faster.
   (`tests/stablelm_graphs.rs`). The graph's two other shapes, both
   decided by tensor presence and both StableLM-2-12B, are refused by
   name from fixtures libllama runs: a layer with no `ffn_norm` is the
-  PARALLEL residual (`ferrox_models::parallel_residual`; eight of 140
-  graphs, two spellings, recorded), and a layer with `attn_q_norm` is a
+  PARALLEL residual (`ferrox_models::parallel_residual`, served since
+  the next PR, below), and a layer with `attn_q_norm` is a
   per-head LAYERNORM with a distinct weight per head
   (`ferrox_models::qk_layer_norm`; three graphs). `use_parallel_
   residual` is dead metadata upstream and ignored here, pinned.
+- **The parallel residual, and with it GPT-NeoX / Pythia (`gptneox`)
+  and PLaMo (`plamo`).** `x + attn(norm(x)) + ffn(norm(x))`:
+  `ferrox_models::parallel_residual` is one table for the eight graphs
+  that build it (measured over all 140), in its two spellings -- the FFN
+  reading its own norm of the layer input (`gptneox` under
+  `use_parallel_residual`, Falcon-40B under `attn_norm_2`) or the vector
+  attention read (`plamo`, `stablelm` without `ffn_norm`, `phi2`,
+  `falcon`-7B, `command-r`, `cohere2`, `cohere2moe`). The FFN input is
+  captured before attention beside the router's operand, as one value
+  from one constructor, so no host body can take one and forget the
+  other; every fused Metal launch refuses a model with a parallel layer.
+  `tests/parallel_residual_graphs.rs`: `gptneox` with the key `true` and
+  `false` (libllama differs by 3.73 between them; both matched, at the
+  f16 GELU-table line), `plamo` KL 1.6e-13; the `stablelm` parallel
+  fixture, refused the PR before, matches.
 - **The LayerNorm with a bias, and with it Orion-14B (`orion`) and
   Nemotron-4 / Minitron (`nemotron`).** `NormOp::LayerNormBias` is
   `build_norm(x, w, b, LLM_NORM)`, the variant the eight-row
@@ -307,11 +322,10 @@ is faster.
   `rope.scaling.finetuned = false` stops too, because llama.cpp then
   runs it with no rotation at all and there is no way to express that
   here.
-- **Parallel-residual architectures do not load either**: `command-r`,
-  `cohere2`, `cohere2moe`, `falcon`, `gptneox`, `phi2`, `plamo`. They
-  sum `inpL + attn_out + ffn_out` once instead of taking two sequential
-  residuals. That is a different graph, and the tensor list looks
-  identical either way, so these are listed by name.
+- **Five parallel-residual architectures still do not load**:
+  `command-r`, `cohere2`, `cohere2moe`, `falcon`, `phi2`. The residual
+  itself is served (`ferrox_models::parallel_residual`, below); each of
+  these names what it needs on top of it.
 
 Full matrix: [`MODELS.md`](MODELS.md) ·
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) ·

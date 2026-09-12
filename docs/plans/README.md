@@ -60,16 +60,16 @@ rather than by whether the architecture name is known:
 
 | Outcome | Count |
 |---|---|
-| Runs, **with evidence** | **62** (`capability::AUDITED_GENERIC_GQA`) |
+| Runs, **with evidence** | **64** (`capability::AUDITED_GENERIC_GQA`) |
 | Loads on a dedicated engine | 4 engines (`Mla`, `Glm52`, `Kimi`, `Gemma4`); `Mla` has cross-engine evidence since 2026-09-12 (`plm`, `tests/plm_graphs.rs`; `deepseek2` in both tensor forms, `tests/deepseek2_graphs.rs`; the real PLM-1.8B through `ferrox parity`), `Gemma4` has it on the real Gemma-4-E2B (parity MATCH, KL 5.1e-4 on Q4_K_M, against a libllama that has `gemma4.cpp`), `Glm52` and `Kimi` none |
 | Refuses as **unaudited**, now triaged | 2 |
-| Off the generic path: refuses by name, or reaches one of those 4 engines | 83 (51 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2` and `stablelm` left the dedicated column for the generic path on 2026-09-12 and `plm` went the other way) |
+| Off the generic path: refuses by name, or reaches one of those 4 engines | 81 (49 `dedicated` + 32 `deferred` in the manifest; `glm4moe`, `glm4`, `orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox` and `plamo` left the dedicated column for the generic path on 2026-09-12 and `plm` went the other way) |
 | **Loads and is WRONG** | **closed** |
 
 Counts reproduce from
 [`../manifests/architecture_manifest.md`](../manifests/architecture_manifest.md),
-regenerated with `ferrox archs --write`: 150 rows, 64 generic-gqa (62 of
-them audited), 51 dedicated, 32 deferred, 3 test fixtures.
+regenerated with `ferrox archs --write`: 150 rows, 66 generic-gqa (64 of
+them audited), 49 dedicated, 32 deferred, 3 test fixtures.
 
 The "loads and is WRONG" class is closed because the generic path is
 opt-in: an architecture not on the audited list stops rather than
@@ -198,9 +198,18 @@ and the per-head LayerNorm QK norm a layer with `attn_q_norm` builds
 -- had a refusal by name each, with the reach of both measured
 (`ferrox_models::parallel_residual`: eight graphs in two spellings;
 `ferrox_models::qk_layer_norm`: three); the two left say what else.
-The parallel residual is the next seam on this list: its table
-already names `phi2`, `falcon`, `command-r`, `cohere2`, `cohere2moe`,
-`plamo` and `gptneox` beside `stablelm`.
+The parallel residual landed the same day as the seam the table had
+sized: `gptneox` (Pythia) and `plamo` closed on it, one per arm, and
+the `stablelm` parallel fixture matches where it was refused
+(`tests/parallel_residual_graphs.rs`). What it cost the bodies is one
+value captured before attention beside the router's operand
+(`decoder::ffn_block::BranchInputs`) and one match on it where each
+body computed `ffn_norm(h)`; what it cost the fused Metal launches is
+one predicate clause. `command-r`, `cohere2`, `cohere2moe`, `falcon`
+and `phi2` stay refused, each naming what it needs on top: the
+weighted LayerNorm without a bias plus `logit_scale`, a rotation on the
+sliding layers only, experts and an MTP block, `attn_norm_2`,
+`output.bias`.
 
 `olmo2` and `exaone4` closed TOGETHER, because they are one residual
 topology and not two. Neither has an `attn_norm` or an `ffn_norm`

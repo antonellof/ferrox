@@ -20,18 +20,24 @@
 //! is the one body; the multi-sequence caller passes
 //! `BatchedFfnKernels::PerRow` to keep exactly the behaviour it had.
 //!
-//! # The router operand
+//! # What is captured before attention
 //!
-//! [`RouterOperand`] is how a caller says what the router reads, and
-//! [`Decoder::router_operand`] is the ONE constructor: it takes the
-//! hidden state AS IT ENTERS THE LAYER, so the caller has to build it
-//! where `attn_norm` is applied, before attention -- the point
-//! `smallthinker.cpp:111` reads `inpL` and `arctic.cpp:136` norms
-//! `inpSA`. For every architecture but those two it answers
-//! [`RouterOperand::FfnInput`] without reading its argument, and the
-//! FFN body computes `router · normed2` as it always did. There is no
-//! `Default` and no second constructor, so a body cannot be reached
-//! with the operand unstated.
+//! Two things the FFN body needs are facts about the hidden state AS
+//! IT ENTERS THE LAYER, which attention has mutated in place by the
+//! time the body runs: what the router reads ([`RouterOperand`];
+//! `smallthinker.cpp:111` reads `inpL`, `arctic.cpp:136` norms `inpSA`)
+//! and, on a PARALLEL-residual layer, what the FFN itself reads
+//! ([`FfnInput`]; `gptneox.cpp:149` norms `inpL` with `ffn_norm`,
+//! `plamo.cpp:97` and `stablelm.cpp:137` hand the FFN the vector
+//! attention read, `crate::parallel_residual`). They travel together
+//! as [`BranchInputs`], and [`Decoder::branch_inputs`] is the ONE
+//! constructor, called where `attn_norm` is applied, before attention.
+//! For every sequential architecture with a router on the FFN input it
+//! answers the two defaults without reading its argument, and the body
+//! computes `ffn_norm(h)` and `router · normed2` as it always did.
+//! There is no `Default` and no second constructor, so a body cannot
+//! be reached with either fact unstated, and a body that took one and
+//! forgot the other cannot be written.
 //!
 //! # The parallel dense FFN
 //!
@@ -48,6 +54,7 @@ use ferrox_core::matmul::rms_norm;
 use rayon::prelude::*;
 
 use super::{Decoder, GptOssLayer, LayerWeights};
+use crate::norm::NormOp;
 use crate::router_input::RouterInput;
 use crate::scalar_multipliers::residual_add;
 use crate::skip_stream::SkipStream;
@@ -73,6 +80,24 @@ pub(crate) enum RouterOperand {
     /// `ffn_norm(ffn_inp)` (`crate::router_input::RouterInput::
     /// NormedLayerInput`).
     BranchInput(Vec<f32>),
+}
+
+/// What the FFN reads: the ordinary pre-FFN norm of the post-attention
+/// residual, computed inside the body, or -- on a parallel-residual
+/// layer -- a norm of the LAYER INPUT, captured before attention
+/// (`crate::parallel_residual`). `[batch, hidden_dim]`, already normed.
+#[derive(Debug)]
+pub(crate) enum FfnInput {
+    PostAttnResidual,
+    LayerInput(Vec<f32>),
+}
+
+/// The two pre-attention facts a layer's FFN body needs, built by
+/// [`Decoder::branch_inputs`] and nothing else.
+#[derive(Debug)]
+pub(crate) struct BranchInputs {
+    pub(crate) router: RouterOperand,
+    pub(crate) ffn: FfnInput,
 }
 
 /// Whether the batched FFN body may take its batched kernels
@@ -143,16 +168,64 @@ impl Decoder {
         })
     }
 
-    /// THE constructor for [`RouterOperand`]. `hidden_before_attn` is
+    /// THE constructor for [`BranchInputs`]. `hidden_before_attn` is
     /// `[batch_size, hidden_dim]`, the residual stream as it enters the
     /// layer.
+    pub(crate) fn branch_inputs(
+        &self,
+        layer: &LayerWeights,
+        hidden_before_attn: &[f32],
+        batch_size: usize,
+    ) -> BranchInputs {
+        BranchInputs {
+            router: self.router_operand(layer, hidden_before_attn, batch_size),
+            ffn: self.ffn_input(layer, hidden_before_attn, batch_size),
+        }
+    }
+
+    /// What the FFN reads on a parallel layer: `attn_norm(x)` -- the
+    /// same function on the same vector attention took, so the two
+    /// cannot disagree -- or `ffn_norm(x)`; and the body's own
+    /// `ffn_norm(h)` on a sequential one.
+    fn ffn_input(
+        &self,
+        layer: &LayerWeights,
+        hidden_before_attn: &[f32],
+        batch_size: usize,
+    ) -> FfnInput {
+        use crate::parallel_residual::ParallelNorm;
+        let norm = match layer.moe.parallel {
+            None => return FfnInput::PostAttnResidual,
+            Some(ParallelNorm::SharedNorm) => {
+                debug_assert!(
+                    matches!(layer.moe.norm_weight, NormOp::None),
+                    "a shared-norm parallel layer has no pre-FFN tensor"
+                );
+                &layer.attn.norm_weight
+            }
+            Some(ParallelNorm::TwoNorms) => &layer.moe.norm_weight,
+        };
+        debug_assert_eq!(
+            hidden_before_attn.len(),
+            batch_size * self.config.hidden_dim
+        );
+        let eps = self.config.rms_norm_eps;
+        FfnInput::LayerInput(
+            hidden_before_attn
+                .chunks(self.config.hidden_dim)
+                .flat_map(|row| norm.apply(row, eps))
+                .collect(),
+        )
+    }
+
+    /// The router half of [`Self::branch_inputs`].
     ///
     /// Answers `FfnInput` for a dense layer (nothing to route) and for
     /// gpt-oss (`gpt_oss_ffn` computes its own biased logits from the
     /// normed input and is the only reader of `router_bias`; no
     /// gpt-oss graph routes on the layer input, and the debug assert
     /// pins that the table agrees).
-    pub(crate) fn router_operand(
+    fn router_operand(
         &self,
         layer: &LayerWeights,
         hidden_before_attn: &[f32],
@@ -218,17 +291,24 @@ impl Decoder {
         hidden: &mut [f32],
         oai: Option<&GptOssLayer>,
         plan: Option<&ferrox_moe::PlacementPlan>,
-        operand: RouterOperand,
+        inputs: BranchInputs,
         skip: Option<SkipStream<'_>>,
     ) {
         if self.config.layer_shape(layer_idx).ffn_dim == 0 {
             return;
         }
         let hidden_dim = self.config.hidden_dim;
-        let normed2 = layer
-            .moe
-            .norm_weight
-            .apply(hidden, self.config.rms_norm_eps);
+        let BranchInputs {
+            router: operand,
+            ffn,
+        } = inputs;
+        let normed2 = match ffn {
+            FfnInput::PostAttnResidual => layer
+                .moe
+                .norm_weight
+                .apply(hidden, self.config.rms_norm_eps),
+            FfnInput::LayerInput(x) => x,
+        };
         let mut ffn_out = match oai {
             Some(oai) => Self::gpt_oss_ffn(layer, oai, &normed2, &self.config, hidden_dim),
             None => Self::run_ffn_block(
@@ -347,7 +427,7 @@ impl Decoder {
         batch_size: usize,
         oai: Option<&GptOssLayer>,
         plan: Option<&ferrox_moe::PlacementPlan>,
-        operand: RouterOperand,
+        inputs: BranchInputs,
         kernels: BatchedFfnKernels,
         skip: Option<SkipStream<'_>>,
     ) {
@@ -356,11 +436,21 @@ impl Decoder {
         }
         let hidden_dim = self.config.hidden_dim;
         let config = &self.config;
-        let normed2_batch: Vec<f32> = hidden_batch
-            .par_chunks(hidden_dim)
-            .map(|h| layer.moe.norm_weight.apply(h, config.rms_norm_eps))
-            .flatten()
-            .collect();
+        let BranchInputs {
+            router: operand,
+            ffn,
+        } = inputs;
+        let normed2_batch: Vec<f32> = match ffn {
+            FfnInput::PostAttnResidual => hidden_batch
+                .par_chunks(hidden_dim)
+                .map(|h| layer.moe.norm_weight.apply(h, config.rms_norm_eps))
+                .flatten()
+                .collect(),
+            FfnInput::LayerInput(x) => {
+                debug_assert_eq!(x.len(), batch_size * hidden_dim);
+                x
+            }
+        };
 
         if let Some(oai) = oai {
             for b in 0..batch_size {

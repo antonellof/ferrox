@@ -934,6 +934,18 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // StableLM-2-12B has both. `use_parallel_residual` is read by
     // nothing in the graph and ignored here as there (measured).
     "stablelm",
+    // tests/parallel_residual_graphs.rs: the PARALLEL residual
+    // (`crate::parallel_residual`). `gptneox` (Pythia, GPT-NeoX-20B):
+    // `x + attn(ln1(x)) + ffn(ln2(x))` under `use_parallel_residual`
+    // (`gptneox.cpp:5,143-166`) and the sequential form under `false`
+    // (`:167-195`), both matched; the biased LayerNorm, a fused
+    // `attn_qkv` with its bias, REQUIRED `attn_output.bias` and FFN
+    // biases (`crate::proj_bias`), the ungated GELU FFN, a partial NEOX
+    // rotary, no `head_count_kv` in the file. `plamo` (PLaMo-13B): a
+    // Llama whose FFN reads the vector attention read (`plamo.cpp:
+    // 64,97-98,111-112`), one RMSNorm per layer, GQA 8:1, NEOX.
+    "gptneox",
+    "plamo",
 ];
 
 /// Is this architecture's use of the shared generic path backed by
@@ -1087,10 +1099,12 @@ pub fn uses_weighted_layer_norm(arch: &str) -> bool {
 /// ReLU-squared FFN); `tests/proj_bias_graphs.rs`.
 ///
 /// `stablelm` followed (`stablelm.cpp:20-21,27-28,38-39`; the pre-FFN
-/// pair is `TENSOR_NOT_REQUIRED`, and its absence is the parallel
-/// residual `crate::parallel_residual` refuses by name), with its
-/// per-head LayerNorm QK norm refused by name too
-/// (`crate::qk_layer_norm`); `tests/stablelm_graphs.rs`.
+/// pair is `TENSOR_NOT_REQUIRED`, and its absence is the shared-norm
+/// parallel residual `crate::parallel_residual` serves), with its
+/// per-head LayerNorm QK norm refused by name
+/// (`crate::qk_layer_norm`); `tests/stablelm_graphs.rs`. `gptneox`
+/// (`gptneox.cpp:57-58,63-64,72-73`, all six REQUIRED) followed on the
+/// parallel residual's other arm; `tests/parallel_residual_graphs.rs`.
 ///
 /// The two the group still holds, each for something ELSE on top of
 /// this norm (the norm is done for both): `starcoder` a learned
@@ -1104,6 +1118,7 @@ pub const BIASED_LAYER_NORM: &[&str] = &[
     "codeshell",
     "jais2",
     "stablelm",
+    "gptneox",
 ];
 
 /// See [`BIASED_LAYER_NORM`].
@@ -1663,6 +1678,13 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // (`crate::qk_layer_norm`) refused by name from fixtures libllama
         // runs (tests/stablelm_graphs.rs). NEOX RoPE: llama-model.cpp:2624.
         v.push(gqa_neox("stablelm"));
+        // The parallel residual's two arms, each on a real graph
+        // (`crate::parallel_residual`, tests/parallel_residual_graphs.rs):
+        // `gptneox` (Pythia, GPT-NeoX-20B) under `use_parallel_residual`
+        // with two norms, `plamo` (PLaMo-13B) with the one shared norm.
+        // NEOX RoPE: llama-model.cpp:2651 (gptneox), :2639 (plamo).
+        v.push(gqa_neox("gptneox"));
+        v.push(gqa_neox("plamo"));
         // Same generic Norm-RoPE path, but READ against llama.cpp's own
         // graph -- see [`TriageClass`]. Each row below refuses with its
         // class and its blocker instead of the generic
@@ -2021,33 +2043,69 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 PerHead,
             ));
         }
-        // Refused, not implemented: the generic decoder computes
-        // `x + attn(norm(x))` then `y + ffn(norm(y))`, and every arch
-        // here computes something else that no tensor and (for MiniCPM)
-        // no metadata key makes visible. See
-        // `unsupported_scaling_keys` for the metadata-visible half of
-        // the same class.
-        const PARALLEL_RESIDUAL: &str =
-            "parallel attention+FFN residual -- llama.cpp feeds both branches the *same* \
-             normed input and sums `inpL + attn_out + ffn_out` once; the generic decoder \
-             computes the sequential form, which is a different graph";
-        for (n, rope, fam) in [
-            // src/models/cohere2.cpp:120-134, cohere2moe.cpp:222-266,
-            // command-r.cpp:106-119. All three also carry a
-            // `logit_scale` the generic decoder does not apply.
-            ("command-r", Norm, StandardGqa),
-            ("cohere2", Norm, StandardGqa),
-            ("cohere2moe", Norm, StandardGqa),
-            // src/models/falcon.cpp:121-135 (and an `attn_norm_2` the
-            // generic decoder has no slot for).
-            ("falcon", Neox, StandardGqa),
-            // src/models/gptneox.cpp:147-195 -- parallel or sequential
-            // per `use_par_res`, and the generic decoder implements
-            // neither branch of that choice.
-            ("gptneox", Neox, StandardGqa),
-            // src/models/phi2.cpp:116-117, plamo.cpp:97-112.
-            ("phi2", Neox, PhiFamily),
-            ("plamo", Neox, StandardGqa),
+        // The parallel residual `x + attn(norm(x)) + ffn(norm(x))` is
+        // SERVED (`crate::parallel_residual`; `gptneox` and `plamo`
+        // are audited on it, tests/parallel_residual_graphs.rs). The
+        // rows still here each need something ELSE on top of it, and
+        // the reason names it. `unsupported_scaling_keys` is the
+        // metadata-visible half of the same class.
+        for (n, rope, fam, reason) in [
+            // src/models/command-r.cpp:68 (`LLM_NORM`, no bias: the
+            // weighted LayerNorm `WEIGHTED_LAYER_NORM` lists only dbrx
+            // for), :28-31 (per-head LayerNorm QK norm at 64 layers,
+            // `crate::qk_layer_norm`), :137-138 (`logit_scale` multiply).
+            (
+                "command-r",
+                Norm,
+                StandardGqa,
+                "parallel residual over a weighted LayerNorm WITHOUT a bias \
+                 (src/models/command-r.cpp:68; `NormOp::LayerNorm` has one caller, `dbrx`) \
+                 and a `logit_scale` multiply on the logits (:137-138) the generic decoder \
+                 applies for no architecture; Command-R+ (64 layers, :28-31) adds the \
+                 per-head LayerNorm QK norm `crate::qk_layer_norm` refuses",
+            ),
+            // src/models/cohere2.cpp:120-134 plus a window whose sliding
+            // layers alone are rotated (:72,90-99).
+            (
+                "cohere2",
+                Norm,
+                StandardGqa,
+                "parallel residual over a weighted LayerNorm without a bias \
+                 (src/models/cohere2.cpp:78) with a `logit_scale` multiply (:153-154) and a \
+                 sliding window whose SLIDING layers alone are rotated (:72,90-99), the \
+                 inverse of the per-layer RoPE gate `crate::rope_layers` serves",
+            ),
+            (
+                "cohere2moe",
+                Norm,
+                StandardGqa,
+                "the `cohere2` graph with routed experts whose router reads the parallel \
+                 branch's one normed input (src/models/cohere2moe.cpp:234) and an MTP block \
+                 (:51-53,380-420); nothing here has run it",
+            ),
+            // src/models/falcon.cpp:121-135, with the FUSED `attn_qkv`
+            // of a multi-query head count and, for Falcon-40B, the
+            // second pre-norm `attn_norm_2` (:35-36,79-85).
+            (
+                "falcon",
+                Neox,
+                StandardGqa,
+                "the shared-norm parallel residual over the biased LayerNorm \
+                 (src/models/falcon.cpp:71-74,124-135) with the ungated GELU FFN and a fused \
+                 `attn_qkv`; Falcon-40B's `attn_norm_2` (:35-36,79-85) is a second pre-norm \
+                 slot no layer here has. Not yet audited against libllama",
+            ),
+            // src/models/phi2.cpp:116-117: the shared-norm parallel
+            // residual plus an `output.bias` on the LM head (:22,136).
+            (
+                "phi2",
+                Neox,
+                PhiFamily,
+                "the shared-norm parallel residual (src/models/phi2.cpp:67,108,116-117) plus \
+                 an `output.bias` on the LM head (:22,136) the generic decoder has no slot \
+                 for, with the Q/K/V biases through `create_tensor_qkv` (:30), \
+                 `attn_output.bias` (:33) and the FFN biases (:36,39)",
+            ),
         ] {
             v.push(prof(
                 n,
@@ -2055,9 +2113,7 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 fam,
                 KvGqa,
                 rope,
-                ArchPath::DedicatedOnly {
-                    reason: PARALLEL_RESIDUAL,
-                },
+                ArchPath::DedicatedOnly { reason },
                 WholeVector,
             ));
         }
@@ -2723,10 +2779,12 @@ pub fn uses_relu_sqr(arch: &str) -> bool {
 /// listed reach the generic path with nothing else in the way once the
 /// projection biases are served (`crate::proj_bias`); `bert` and
 /// `wavtokenizer-dec` are not decoders, `bloom` / `gpt2` / `mpt` /
-/// `starcoder` have no RoPE, `falcon` / `gptneox` / `phi2` a parallel
-/// residual. The two here map to `FfnActivation::GeluUngated`.
+/// `starcoder` have no RoPE, `falcon` / `phi2` a parallel residual
+/// with something else on top; `gptneox` joined once the parallel
+/// residual was served (`crate::parallel_residual`). The three here
+/// map to `FfnActivation::GeluUngated`.
 pub fn uses_gelu_ungated(arch: &str) -> bool {
-    matches!(arch, "starcoder2" | "codeshell")
+    matches!(arch, "starcoder2" | "codeshell" | "gptneox")
 }
 
 #[cfg(test)]
@@ -3802,10 +3860,11 @@ mod tests {
         assert_eq!(llama.len(), 5, "{llama:?}");
     }
 
-    /// Parallel attention+FFN residual is not a tensor and not a
-    /// metadata key either, so neither the tensor-consumption gate nor
-    /// `unsupported_scaling_keys` can see the difference: these
-    /// architectures must not be admitted to the generic decoder at all.
+    /// The parallel residual is served now (`crate::parallel_residual`),
+    /// and what this test pins is that each row still off the generic
+    /// path for something ON TOP of it says so, and that no row is
+    /// refused for the residual alone any more: a reason that names
+    /// only the residual would be a refusal nobody can act on.
     ///
     /// `minicpm` used to be on this list and is NOT a residual-topology
     /// row -- it runs Granite's graph verbatim
@@ -3816,18 +3875,17 @@ mod tests {
     /// applies them now and `tests/minicpm_graphs.rs` is the evidence.
     #[test]
     fn architectures_with_a_different_residual_topology_are_refused() {
-        for arch in [
-            "command-r",
-            "cohere2",
-            "cohere2moe",
-            "falcon",
-            "gptneox",
-            "phi2",
-            "plamo",
-        ] {
+        for arch in ["command-r", "cohere2", "cohere2moe", "falcon", "phi2"] {
             match resolve_architecture(arch) {
                 Some(ArchPath::DedicatedOnly { reason }) => {
-                    assert!(!reason.is_empty(), "{arch} must say why");
+                    assert!(
+                        reason.contains("parallel residual") || reason.contains("cohere2"),
+                        "{arch}: the residual is the shared cause and the reason names it"
+                    );
+                    assert!(
+                        reason.contains("src/models/"),
+                        "{arch}: what else it needs, with the line"
+                    );
                 }
                 other => panic!("{arch} must be refused, got {other:?}"),
             }
@@ -3853,6 +3911,8 @@ mod tests {
             "codeshell",
             "jais2",
             "stablelm",
+            "gptneox",
+            "plamo",
         ] {
             assert!(
                 matches!(

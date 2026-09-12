@@ -426,6 +426,14 @@ pub struct ModelConfig {
     /// `Decoder::metal_can_serve_model`, which refuses every fused
     /// launch, since none has a norm at either site.
     pub block_sub_norms: bool,
+    /// Whether any layer of this model is a PARALLEL residual,
+    /// `x + attn(norm(x)) + ffn(norm(x))` (`crate::parallel_residual`;
+    /// `gptneox` under its key, `plamo` always, `stablelm` per layer by
+    /// tensor presence). The per-layer fact is `MoeWeights::parallel`;
+    /// this is the model-level one `Decoder::metal_can_serve_model`
+    /// reads, because every fused Metal launch bakes the pre-FFN norm
+    /// over the post-attention residual into its kernel.
+    pub parallel_residual: bool,
     /// `{arch}.attention.value_scale`: MiMo-V2 multiplies the attention
     /// branch by it AFTER `wo` (`mimo2.cpp:180-183`; every real export
     /// carries `0.707`). `None` for no scale; see
@@ -961,6 +969,7 @@ pub fn glm_5_2() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        parallel_residual: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1053,6 +1062,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        parallel_residual: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1177,6 +1187,7 @@ pub fn kimi_k3() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        parallel_residual: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1247,6 +1258,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        parallel_residual: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1312,6 +1324,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        parallel_residual: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,
@@ -1380,6 +1393,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         attn_temperature: None,
         router_input: crate::router_input::RouterInput::NormedFfnInput,
         block_sub_norms: false,
+        parallel_residual: false,
         attn_value_scale: None,
         layer_loops: None,
         skip_stream: false,

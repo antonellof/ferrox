@@ -12,8 +12,9 @@
 //!   SERVED, matched below.
 //! - `ffn_norm` absent: the PARALLEL residual, `cur = inpSA` (`:135-137`)
 //!   -- the FFN reads the normed input attention read and `:124,147`
-//!   sum `inpL + attn + ffn`. StableLM-2-12B. REFUSED by name
-//!   (`ferrox_models::parallel_residual`).
+//!   sum `inpL + attn + ffn`. StableLM-2-12B. SERVED
+//!   (`ferrox_models::parallel_residual`, the `SharedNorm` arm; refused
+//!   by name for one PR, matched below).
 //! - `attn_q_norm` / `attn_k_norm` present (`:34-35`, `{n_embd_head_k,
 //!   n_head}`, applied as `LLM_NORM` per head, `:84-97`): a per-head
 //!   LAYERNORM with a distinct weight per head. StableLM-2-12B again.
@@ -29,7 +30,7 @@
 //! |---|---|
 //! | `stablelm` | the served shape: six LayerNorm tensors per layer plus two on the output, Q/K/V biases, a quarter-width NEOX rotary (`rope.dimension_count = 2` of `head_dim = 8`), SwiGLU |
 //! | `stablelm_parkey` | the same file with `use_parallel_residual = true`; libllama byte-identical |
-//! | `stablelm_parallel` | no `ffn_norm` tensors; libllama's logits move by 8.85; refused by name |
+//! | `stablelm_parallel` | no `ffn_norm` tensors; libllama's logits move by 8.85; matched on the parallel residual |
 //! | `stablelm_qknorm` | `attn_q_norm` `{8, 4}` / `attn_k_norm` `{8, 2}`; libllama's logits move by 8.73; refused by name |
 //!
 //! # Where the numbers come from
@@ -42,6 +43,7 @@
 //! |---|---|---|
 //! | `stablelm` | 3.39e-13 | 5.96e-06 |
 //! | `stablelm_parkey` | 3.39e-13 | 5.96e-06 (the same golden) |
+//! | `stablelm_parallel` | 1.95e-12 | 3.93e-06 |
 //!
 //! ```text
 //! PYTHONPATH=$LLAMA/gguf-py python3 scripts/make_stablelm_fixture.py \
@@ -62,7 +64,7 @@ use ferrox_models::capability::{resolve_architecture, ArchPath, BIASED_LAYER_NOR
 use ferrox_models::config::{ModelConfig, RopeLayout};
 use ferrox_models::loader::LoadError;
 use ferrox_models::norm::NormOp;
-use ferrox_models::parallel_residual::{layer_is_parallel, parallel_residual_refusal};
+use ferrox_models::parallel_residual::{layer_is_parallel, layer_parallel_norm, ParallelNorm};
 use ferrox_models::qk_layer_norm::uses_per_head_layer_norm_qk;
 use ferrox_models::{Decoder, FfnActivation};
 
@@ -122,6 +124,57 @@ const STABLELM_GOLDEN: [f32; 48] = [
     0.417924,
 ];
 
+const STABLELM_PARALLEL_GOLDEN: [f32; 48] = [
+    1.2758179,
+    0.37484562,
+    2.213649,
+    0.28281808,
+    0.8447058,
+    3.1614578,
+    -1.8220228,
+    2.9400084,
+    0.13048437,
+    2.2828484,
+    -1.9335421,
+    2.9557915,
+    4.284463,
+    2.8044024,
+    -0.35587215,
+    -0.8806735,
+    -1.1278548,
+    -1.6981783,
+    -1.9637629,
+    -1.2375301,
+    3.1581702,
+    1.0493554,
+    -2.962418,
+    -1.4916241,
+    -1.3107321,
+    4.6415944,
+    -2.3528848,
+    1.5127593,
+    -2.0867608,
+    -2.9950027,
+    1.716147,
+    -4.8329277,
+    -3.0630543,
+    -1.9723964,
+    -3.2645502,
+    1.7738416,
+    -2.23112,
+    -1.6054454,
+    -3.2711077,
+    -1.8463326,
+    3.3980062,
+    0.16393054,
+    3.3589559,
+    -1.5282092,
+    2.4592724,
+    -0.2873793,
+    1.568964,
+    1.0649867,
+];
+
 fn decode(decoder: &Decoder) -> Vec<f32> {
     let mut kv = graph_caches(decoder);
     let mut out = Vec::new();
@@ -138,12 +191,17 @@ fn stablelm_matches_llama_cpp_on_all_three_paths() {
 
 #[test]
 fn report_kl_against_llama_cpp() {
-    let out = decode(&load_graph_fixture(STABLELM));
-    println!(
-        "{STABLELM}: KL(llama.cpp || ferrox) = {:.3e}, max |delta| = {:.3e}",
-        kl_vs_golden(&out, &STABLELM_GOLDEN),
-        worst_vs(&out, &STABLELM_GOLDEN)
-    );
+    for (name, golden) in [
+        (STABLELM, &STABLELM_GOLDEN),
+        (PARALLEL, &STABLELM_PARALLEL_GOLDEN),
+    ] {
+        let out = decode(&load_graph_fixture(name));
+        println!(
+            "{name}: KL(llama.cpp || ferrox) = {:.3e}, max |delta| = {:.3e}",
+            kl_vs_golden(&out, golden),
+            worst_vs(&out, golden)
+        );
+    }
 }
 
 /// What the loader built: the biased LayerNorm at all three sites with
@@ -211,35 +269,33 @@ fn use_parallel_residual_is_ignored_as_llama_cpp_ignores_it() {
     );
     // The rule is the tensor, not the key.
     assert!(!layer_is_parallel(&file, STABLELM, 0));
-    assert!(parallel_residual_refusal(&file, STABLELM, 3).is_none());
+    assert!(!ModelConfig::from_gguf(&file).unwrap().parallel_residual);
     assert_all_three_paths_match(PARKEY, &STABLELM_GOLDEN);
 }
 
-/// A layer with no `ffn_norm` is the parallel residual: refused by name
-/// from a file libllama runs, whose logits differ from the sequential
-/// file's by 8.85 (measured, so the refusal is of a shape that matters
-/// and not of a no-op).
+/// A layer with no `ffn_norm` is the parallel residual, and it is
+/// SERVED (`ferrox_models::parallel_residual`, `SharedNorm`): the
+/// fixture that evidenced its refusal for one PR matches libllama,
+/// whose logits differ from the sequential file's by 8.85.
 #[test]
-fn the_parallel_residual_is_refused_by_name() {
+fn the_parallel_residual_matches_llama_cpp() {
     let file = ferrox_gguf::GgufFile::open(graph_fixture_path(PARALLEL)).expect("fixture opens");
     assert!(file.find_tensor("blk.0.ffn_norm.weight").is_none());
-    assert!(layer_is_parallel(&file, STABLELM, 0));
-    let reason = parallel_residual_refusal(&file, STABLELM, 3).expect("refused");
-    assert!(
-        reason.contains("layer 0 is a PARALLEL residual"),
-        "{reason}"
+    assert_eq!(
+        layer_parallel_norm(&file, STABLELM, 0),
+        Some(ParallelNorm::SharedNorm)
     );
-    // The config parses -- nothing in the header says parallel -- and
-    // the decoder refuses before any layer is built.
-    let config = ModelConfig::from_gguf(&file).expect("the header is the served shape's");
-    match Decoder::from_gguf(graph_fixture_path(PARALLEL), config) {
-        Err(LoadError::UnsupportedFeature(_, msg)) => {
-            assert!(msg.contains("PARALLEL residual"), "{msg}");
-            assert!(msg.contains("stablelm.cpp:38-39,129-138,147"), "{msg}");
-            assert!(msg.contains("`blk.0.ffn_norm.weight` is absent"), "{msg}");
-        }
-        Err(other) => panic!("expected the parallel shape refused by name, got {other:?}"),
-        Ok(_) => panic!("the parallel shape loaded"),
+    assert!(worst_vs(&STABLELM_GOLDEN, &STABLELM_PARALLEL_GOLDEN) > 1.0);
+    assert_all_three_paths_match(PARALLEL, &STABLELM_PARALLEL_GOLDEN);
+    let d = load_graph_fixture(PARALLEL);
+    assert!(d.config.parallel_residual);
+    for layer in &d.layers {
+        assert_eq!(layer.moe.parallel, Some(ParallelNorm::SharedNorm));
+        assert!(matches!(layer.moe.norm_weight, NormOp::None));
+        assert!(matches!(
+            layer.attn.norm_weight,
+            NormOp::LayerNormBias { .. }
+        ));
     }
 }
 

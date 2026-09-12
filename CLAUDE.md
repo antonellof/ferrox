@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-12. **62** architectures run with
+Honest position, re-audited 2026-09-12. **64** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -730,6 +730,37 @@ is three (`stablelm`, `command-r` at 64 layers, `chameleon`), each
 recorded in its table with the line that decides it, so the seam that
 serves either is sized from the table and not from one graph.
 
+The parallel residual was served the same day, and the table did the
+sizing: `gptneox` (Pythia, GPT-NeoX-20B) and `plamo` (PLaMo-13B)
+closed on it, ONE PER ARM, and the `stablelm` parallel fixture matches
+where it had been refused (`tests/parallel_residual_graphs.rs`; the
+GELU rows at the f16-table line, `plamo` KL 1.6e-13). The seam is
+smaller than the refusal made it sound, and reading the bodies is
+what showed that: the sequential bodies compute `h = x + attn` and
+then `h + ffn(normed2)`, which IS the three-term sum, so the only
+difference is what `normed2` is -- a norm of the LAYER INPUT, which
+attention has already been added on top of by the time the FFN body
+runs. So it is captured before attention at the point
+`crate::router_input` already captured the router's operand, and the
+two travel as ONE value from ONE constructor
+(`decoder::ffn_block::BranchInputs`, `Decoder::branch_inputs`), so a
+body cannot take one and forget the other; `MoeWeights::parallel` is
+the per-layer fact (the `stablelm` row is per layer), and a shared-norm
+layer's pre-FFN slot is `NormOp::None` because there is no tensor;
+`ModelConfig::parallel_residual` is the model-level fact
+`metal_can_serve_model` refuses on, because every fused launch bakes
+`ffn_norm` over the post-attention residual into its kernel. The
+gptneox fixture pair is the sabotage that matters: the same weights
+under the key `true` and `false` are 3.73 apart in libllama, and both
+match, so a seam that ignored the field would be caught by the golden
+and not only by a test that flips it. `gptneox` also drew on three
+seams from the two days before -- the biased LayerNorm, the fused
+`attn_qkv` bias, the required projection biases with the ungated GELU
+-- which is what "one row per PR" buys: the next row finds its other
+blockers already named. `command-r`, `cohere2`, `cohere2moe`, `falcon`
+and `phi2` stay refused with what each needs ON TOP of the residual
+written into the reason.
+
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what
 the seam is: `grep -l 'ATTN_OUT, "bias"'` over the 140 graphs is 33
@@ -817,9 +848,9 @@ expressible, and the fixture that evidences it declares NO key at all --
 the only fixture shape that can tell the hook from its absence. A second
 one declares all three and pins that the file still wins, because a hook
 merged the wrong way round would agree with llama.cpp on exactly the
-files that prove it exists. Command-R is still not close, because its
-blocker is a parallel residual over LayerNorm rather than the
-multiplier.
+files that prove it exists. Command-R's parallel residual is served
+since 2026-09-12 (below); what keeps it off the generic path is the
+weighted LayerNorm without a bias and the `logit_scale` multiply.
 
 `grok` closed on 2026-09-11 on that same hook, one day after it landed,
 and the verdict had predicted it: `grok.cpp:5-12` seeds SEVEN

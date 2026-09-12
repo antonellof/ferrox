@@ -8704,6 +8704,7 @@ pub(crate) mod tests {
             attn_temperature: None,
             router_input: ferrox_models::router_input::RouterInput::NormedFfnInput,
             block_sub_norms: false,
+            parallel_residual: false,
             attn_value_scale: None,
             layer_loops: None,
             skip_stream: false,
