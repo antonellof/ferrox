@@ -7,10 +7,9 @@ import {
   ChevronDown,
   History,
   Loader2,
-  MessagesSquare,
+  Search,
   SlidersHorizontal,
   SquarePen,
-  Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Field, Input, Textarea } from "@/components/ui/field";
@@ -163,9 +162,18 @@ function ModelSwitcher({
   // trigger carries the spinner from there on, and an error re-opens
   // nothing -- it is shown the next time the menu is opened.
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
   // The parent disables the composer for the same window; one state,
   // reported outward, so the two cannot disagree about when it ends.
   useEffect(() => onLoadingChange(loading), [loading, onLoadingChange]);
+  const needle = query.trim().toLowerCase();
+  const visible = (inventory?.models ?? []).filter(
+    (m) =>
+      !needle ||
+      m.id.toLowerCase().includes(needle) ||
+      (m.quant ?? "").toLowerCase().includes(needle) ||
+      (m.arch ?? "").toLowerCase().includes(needle),
+  );
 
   const refresh = useCallback(() => {
     return getJson<Inventory>(routes.adminModels)
@@ -266,8 +274,23 @@ function ModelSwitcher({
               .
             </p>
           ) : (
+            <>
+              <div className="relative mb-1">
+                <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-faint" />
+                <input
+                  autoFocus
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search models"
+                  aria-label="Search models"
+                  className="h-8 w-full rounded-lg border border-line bg-inset pr-2 pl-8 text-xs text-fg placeholder:text-faint focus:border-fg/30 focus:outline-none"
+                />
+              </div>
+              {!visible.length ? (
+                <p className="p-2 text-xs text-faint">Nothing matches “{query}”.</p>
+              ) : null}
             <ul className="max-h-72 space-y-0.5 overflow-y-auto">
-              {inventory.models.map((entry) => {
+              {visible.map((entry) => {
                 const isActive = entry.id === inventory.active;
                 // The server's own view, so a load started by another
                 // client shows here too, not only one this menu began.
@@ -310,6 +333,7 @@ function ModelSwitcher({
                 );
               })}
             </ul>
+            </>
           )}
           {error ? (
             <p className="mt-1 rounded-lg bg-err-soft px-2 py-1.5 text-2xs text-err">
@@ -433,95 +457,6 @@ function SamplingPanel({
   );
 }
 
-/**
- * The saved conversations, and the switch between them.
- *
- * Only rendered when the server actually keeps conversations. In local
- * mode there is exactly one transcript and a list of it would be a
- * menu with one entry pretending to be a library.
- */
-function ConversationPicker({ transcript }: { transcript: Transcript }) {
-  const { summaries, current } = transcript;
-
-  return (
-    <Popover.Root
-      onOpenChange={(open) => {
-        if (open) transcript.refresh();
-      }}
-    >
-      <Popover.Trigger asChild>
-        <Button variant="default" size="sm" className="max-w-[14rem]">
-          <MessagesSquare className="text-faint" />
-          <span className="truncate text-2xs">
-            {current ? conversationLabel(current) : "New conversation"}
-          </span>
-          <ChevronDown className="text-faint" />
-        </Button>
-      </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content
-          align="end"
-          sideOffset={6}
-          collisionPadding={12}
-          className="z-50 w-[min(26rem,calc(100vw-1.5rem))] rounded-xl border border-line bg-raised p-1.5 shadow-pop data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
-        >
-          {!summaries.length ? (
-            <p className="p-2 text-xs text-faint">
-              Nothing saved yet. A conversation is created on this server the
-              first time you send a message.
-            </p>
-          ) : (
-            <ul className="max-h-80 space-y-0.5 overflow-y-auto">
-              {summaries.map((entry) => {
-                const isActive = entry.id === current?.id;
-                return (
-                  <li key={entry.id} className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={() => transcript.open(entry.id)}
-                      className={cn(
-                        "min-w-0 flex-1 rounded-lg px-2 py-1.5 text-left transition-colors",
-                        isActive
-                          ? "bg-inset font-medium text-fg"
-                          : "hover:bg-inset",
-                      )}
-                    >
-                      <span className="block truncate text-xs">
-                        {conversationLabel(entry)}
-                      </span>
-                      <span className="block truncate text-2xs text-faint">
-                        {[
-                          `${entry.message_count} message${entry.message_count === 1 ? "" : "s"}`,
-                          entry.model,
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}
-                      </span>
-                    </button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      title="Delete this conversation from the server"
-                      onClick={() => transcript.remove(entry.id)}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-          <p className="mt-1 border-t border-line px-2 pt-1.5 text-2xs text-faint">
-            Stored on the server, not in this browser. Deleting one deletes it
-            for every client of this server, and nothing is ever deleted to
-            make room.
-          </p>
-        </Popover.Content>
-      </Popover.Portal>
-    </Popover.Root>
-  );
-}
-
 function ChatInner({
   sampling,
   setSampling,
@@ -554,7 +489,11 @@ function ChatInner({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-raised/70 px-4 py-2.5 backdrop-blur">
-        <h1 className="text-sm font-semibold tracking-tight">Chat</h1>
+        {/* The conversation's own title, as the sidebar names it; the
+            library itself is the sidebar, not a menu up here. */}
+        <h1 className="min-w-0 max-w-[40%] truncate text-sm font-semibold tracking-tight">
+          {transcript.current ? conversationLabel(transcript.current) : "New chat"}
+        </h1>
         {serving.synthetic ? (
           <Badge tone="err">synthetic weights</Badge>
         ) : null}
@@ -562,18 +501,20 @@ function ChatInner({
           <span className="text-2xs text-faint">saving…</span>
         ) : null}
         <span className="flex-1" />
-        {transcript.mode === "server" ? (
-          <ConversationPicker transcript={transcript} />
-        ) : null}
         <ModelSwitcher
           active={serving.modelId}
           onSwitched={refreshServing}
           onLoadingChange={setLoadingModel}
         />
         <SamplingPanel value={sampling} onChange={setSampling} />
-        <Button variant="ghost" size="sm" onClick={transcript.newChat}>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={transcript.newChat}
+          className="md:hidden"
+          title="New chat"
+        >
           <SquarePen />
-          <span className="hidden sm:inline">New chat</span>
         </Button>
       </header>
 

@@ -109,8 +109,23 @@ export async function listConversations(): Promise<ConversationSummary[]> {
   return body?.data ?? [];
 }
 
+/**
+ * Fired on `window` after any write to the conversation store succeeds,
+ * so a listing kept somewhere other than the chat (the sidebar) can
+ * re-read without polling the store on a timer. Every write goes
+ * through the three functions below; there is no other writer.
+ */
+export const CONVERSATIONS_CHANGED = "ferrox:conversations-changed";
+
+function notifyChanged<T>(value: T): T {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(CONVERSATIONS_CHANGED));
+  }
+  return value;
+}
+
 export function createConversation(body: CreateBody): Promise<Conversation> {
-  return postJson<Conversation>(routes.conversations, body);
+  return postJson<Conversation>(routes.conversations, body).then(notifyChanged);
 }
 
 export function getConversation(id: string): Promise<Conversation> {
@@ -121,11 +136,13 @@ export function updateConversation(
   id: string,
   body: UpdateBody,
 ): Promise<Conversation> {
-  return postJson<Conversation>(routes.conversation(id), body);
+  return postJson<Conversation>(routes.conversation(id), body).then(
+    notifyChanged,
+  );
 }
 
 export function deleteConversation(id: string): Promise<unknown> {
-  return postJson(routes.conversationDelete(id), {});
+  return postJson(routes.conversationDelete(id), {}).then(notifyChanged);
 }
 
 // ---------------------------------------------------------------------
