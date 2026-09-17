@@ -1177,6 +1177,37 @@ impl WeightMatrix {
         })
     }
 
+    /// This matrix as the CUDA batched GEMM takes it, or `None` for an
+    /// adapted matrix (a LoRA delta lives in `WeightMatrix::Adapted` and
+    /// no raw-bytes launch serves it) or a kind with no `mul_mm` row.
+    /// The CUDA twin of [`Self::mul_mm_sg_launch`], and the ONE
+    /// constructor of [`ferrox_cuda::prefill::MulMmWeights`]: the row
+    /// byte count comes from the same `block_bytes_per_row` the matvec
+    /// seam is held to, so a kind added there is a kind added here.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_mul_mm_view(&self) -> Option<ferrox_cuda::prefill::MulMmWeights<'_>> {
+        let WeightMatrix::Quantized {
+            data,
+            rows,
+            cols,
+            kind,
+        } = self
+        else {
+            return None;
+        };
+        if !cuda_mul_mm_kind_supported(*kind) {
+            return None;
+        }
+        let mm_kind = ferrox_cuda::mul_mm::kind_by_name(kind.name())?;
+        Some(ferrox_cuda::prefill::MulMmWeights {
+            kind: mm_kind,
+            data: data.as_slice(),
+            rows: *rows,
+            cols: *cols,
+            row_bytes: self.block_bytes_per_row(*kind, *cols),
+        })
+    }
+
     #[cfg(any(feature = "metal", feature = "cuda"))]
     pub fn prefers_gpu_batch(&self) -> bool {
         !matches!(

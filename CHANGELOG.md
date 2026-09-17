@@ -17,6 +17,23 @@ are the ones worth reading twice.
 
 ### Added
 
+- **CUDA prefill keeps the dense layer on the device.**
+  `ferrox_cuda::prefill` runs a run of dense layers resident: the
+  hidden batch goes up once, the norms, QKV biases, QK norms, RoPE, the
+  causal GQA, SwiGLU and the residual adds are kernels between GEMMs
+  that take device pointers, and what comes back is the hidden batch
+  after the last layer plus each layer's K/V rows for the host cache.
+  Before, every one of a layer's seven matmuls was a synchronous round
+  trip with everything else on the host: 111 MB over PCIe per
+  Llama-3.2-3B layer at pp512, 3.1 GB and 196 syncs per step, measured
+  with `nsys` as two thirds of the step (#259). On an RTX 3090, pp512
+  on Llama-3.2-3B Q4_K_M went 305 to 912 tok/s, `ferrox verify` is
+  token-identical on Llama-3.2-3B, Llama-3.2-1B and Qwen3-0.6B, and
+  every kernel has a hardware test against a host twin. Which layers
+  the stack may take is decided once for Metal and CUDA in
+  `decoder/fused_view.rs` (the exhaustive `AttnWeights` destructure,
+  the model-wide fence, the dense-layer rule), so the two backends
+  cannot admit different sets.
 - **IQ4_XS on the CPU dots against Q8_K activations.**
   `ferrox_quant::iq4_xs_q8` is llama.cpp's `ggml_vec_dot_iq4_xs_q8_K`
   (a scalar twin, an SDOT arm, an AVX2 arm), and both the single-vector

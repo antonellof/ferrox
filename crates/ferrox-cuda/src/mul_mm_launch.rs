@@ -1,21 +1,24 @@
 //! The device side of `mul_mm`: NVRTC compile, upload, launch, download.
 //!
-//! # UNRUN ON HARDWARE
-//!
-//! Nothing in this module has executed on a GPU. It is written against
-//! `cudarc` 0.11.9's API the same way `gpu.rs`'s matvec launchers are,
-//! and it reuses their proven plumbing verbatim -- the process-wide
+//! Run on hardware since 2026-09-15 (RTX 3090, CUDA 12.4): every kind
+//! and shape in [`tests::launch_mul_mm_matches_the_scalar_twin`]
+//! passes, and `ferrox verify --backend cuda` is token-identical to
+//! the CPU on Q4_K_M, Q5_K_M, Q6_K, Q8_0 and IQ4_XS checkpoints. It is
+//! written against `cudarc` 0.11.9's API the same way `gpu.rs`'s
+//! matvec launchers are, and reuses their plumbing -- the process-wide
 //! device (`shared_device`), the load-once NVRTC cache
 //! (`ensure_module_loaded_lazy`) and the pointer-keyed resident weight
 //! cache (`resident_cuda_weights`) -- rather than growing a second copy
-//! of any of it. What is new here is one launch configuration and one
-//! output allocation.
+//! of any of it.
 //!
-//! The arithmetic this launches is checked on the host by
-//! [`crate::mul_mm_ref`]. The launch itself is checked by
-//! [`tests::launch_mul_mm_matches_the_scalar_twin`], which is
-//! `#[ignore]`d because it needs a device. Do not un-ignore it here; run
-//! it on real hardware and write down what happened.
+//! Two entry points: [`launch_mul_mm`] takes and returns host slices
+//! (one upload, one synchronous download), and [`enqueue_mul_mm`] is
+//! the launch alone over device slices, which the resident prefill
+//! stack ([`crate::prefill`]) chains seven of per layer. The
+//! arithmetic both launch is checked on the host by
+//! [`crate::mul_mm_ref`]. The hardware test is `#[ignore]`d because it
+//! needs a device; run it on real hardware and write down what
+//! happened.
 
 use crate::gpu::{ensure_module_loaded_lazy, resident_cuda_weights, shared_device, CudaError};
 use crate::mul_mm::{grid_dims, kernel_src, validate_shape, MulMmKind, THREADS};
@@ -43,8 +46,6 @@ pub fn launch_mul_mm(
     batch: usize,
     row_bytes: usize,
 ) -> Result<Vec<f32>, CudaError> {
-    use cudarc::driver::LaunchAsync;
-
     validate_shape(
         kind,
         weights.len(),
@@ -57,7 +58,47 @@ pub fn launch_mul_mm(
     .map_err(|e| CudaError::Unsupported(e.to_string()))?;
 
     let dev = shared_device()?;
-    ensure_module_loaded_lazy(&dev, kind.module_name, kind.fn_name, || kernel_src(kind))?;
+    let d_x = dev
+        .htod_copy(x_batch[..batch * n_cols].to_vec())
+        .map_err(|e| CudaError::Launch(format!("mul_mm activation upload: {e:?}")))?;
+    let (d_out, d_weights) =
+        enqueue_mul_mm(&dev, kind, weights, &d_x, n_rows, n_cols, batch, row_bytes)?;
+    let out = dev
+        .dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("mul_mm output download: {e:?}")))?;
+    drop(d_weights);
+    Ok(out)
+}
+
+/// The launch alone: `d_x` is already on the device and the output
+/// stays there. This is what [`launch_mul_mm`] wraps in an upload and
+/// a download, and what the resident prefill layer
+/// ([`crate::prefill`]) chains seven of without either. The caller
+/// holds the returned weight `Arc` until it synchronises: the kernel
+/// reads that buffer asynchronously.
+///
+/// `validate_shape` is the caller's: this function trusts the shape
+/// it is handed, and both callers check it first.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enqueue_mul_mm(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    kind: &MulMmKind,
+    weights: &[u8],
+    d_x: &cudarc::driver::CudaSlice<f32>,
+    n_rows: usize,
+    n_cols: usize,
+    batch: usize,
+    row_bytes: usize,
+) -> Result<
+    (
+        cudarc::driver::CudaSlice<f32>,
+        std::sync::Arc<crate::gpu::ResidentCudaWeights>,
+    ),
+    CudaError,
+> {
+    use cudarc::driver::LaunchAsync;
+
+    ensure_module_loaded_lazy(dev, kind.module_name, kind.fn_name, || kernel_src(kind))?;
     let func = dev
         .get_func(kind.module_name, kind.fn_name)
         .ok_or_else(|| {
@@ -67,12 +108,9 @@ pub fn launch_mul_mm(
             ))
         })?;
 
-    // `_weights` must outlive the launch: the kernel reads that buffer
-    // asynchronously and only the DtoH below synchronizes.
-    let d_weights = resident_cuda_weights(&dev, weights)?;
-    let d_x = dev
-        .htod_copy(x_batch[..batch * n_cols].to_vec())
-        .map_err(|e| CudaError::Launch(format!("mul_mm activation upload: {e:?}")))?;
+    // `d_weights` must outlive the launch: the kernel reads that buffer
+    // asynchronously and only the caller's DtoH synchronizes.
+    let d_weights = resident_cuda_weights(dev, weights)?;
     let mut d_out = dev
         .alloc_zeros::<f32>(batch * n_rows)
         .map_err(|e| CudaError::Launch(format!("mul_mm output alloc: {e:?}")))?;
@@ -92,18 +130,18 @@ pub fn launch_mul_mm(
     // int, int) and is matched positionally by the tuple below. Each
     // buffer is at least the size the kernel indexes: `validate_shape`
     // has established `weights.len() >= n_rows * row_bytes` and
-    // `x_batch.len() >= batch * n_cols`, `d_out` is allocated at exactly
+    // `d_x.len() >= batch * n_cols`, `d_out` is allocated at exactly
     // `batch * n_rows`, and the kernel bounds-checks every store against
     // `n_rows`/`batch`. The grid covers `ceil(batch/BN) x
     // ceil(n_rows/BM)` tiles, so no thread addresses a row beyond
     // `n_rows - 1` (out-of-range rows are clamped inside the kernel).
-    // `d_weights` is held alive across the launch and the DtoH.
+    // `d_weights` is held alive across the launch by the caller.
     unsafe {
         func.launch(
             cfg,
             (
                 &d_weights.slice,
-                &d_x,
+                d_x,
                 &mut d_out,
                 n_rows as i32,
                 n_cols as i32,
@@ -113,12 +151,7 @@ pub fn launch_mul_mm(
         )
         .map_err(|e| CudaError::Launch(format!("kernel {}: {e:?}", kind.fn_name)))?;
     }
-
-    let out = dev
-        .dtoh_sync_copy(&d_out)
-        .map_err(|e| CudaError::Launch(format!("mul_mm output download: {e:?}")))?;
-    drop(d_weights);
-    Ok(out)
+    Ok((d_out, d_weights))
 }
 
 #[cfg(test)]

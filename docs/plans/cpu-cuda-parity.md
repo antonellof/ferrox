@@ -130,6 +130,88 @@ per-op `cudaStreamSynchronize` shape) before touching any kernel
 body, because at 35% utilization the arithmetic cannot be more than a
 third of the problem.
 
+**Counted, 2026-09-17, from the code.** The batched host body
+(`decoder.rs`, `forward_batch_*`) runs a dense layer as seven
+`WeightMatrix::apply_batch` calls -- `q_proj`, `k_proj`, `v_proj`,
+`o_proj`, `gate`, `up`, `down` -- and on CUDA each one is
+`ferrox_cuda::mul_mm_launch::launch_mul_mm`, which is ONE round trip:
+`x_batch[..].to_vec()` (a host copy), `htod_copy` of it (pageable),
+`alloc_zeros` for the output, one launch, `dtoh_sync_copy`. Nothing
+else in the layer touches the device: the norms, RoPE, the causal
+attention over the whole prompt, the SwiGLU and the residual adds run
+on the host between the matmuls. The shared activation quantization
+that lets the CPU quantize `normed_batch` once for q/k/v
+(`quantize_batch_acts`) returns `None` on CUDA, so q, k and v each
+upload the same 512-row activation. Per Llama-3.2-3B layer at pp512
+(`n_embd 3072`, `n_ff 8192`, `n_kv 8 x 128`), in f32:
+
+| call | up (MB) | down (MB) |
+|---|---|---|
+| q, k, v | 3 x 6.3 | 6.3 + 2.1 + 2.1 |
+| o | 6.3 | 6.3 |
+| gate, up | 2 x 6.3 | 2 x 16.8 |
+| down | 16.8 | 6.3 |
+| **layer** | **54.5** | **56.6** |
+
+**111 MB per layer, 3.1 GB per 512-token prefill over 28 layers, in
+196 synchronous round trips**, against the 6 MB of token embeddings
+llama.cpp uploads once and the logits it downloads once
+(`ggml_backend_cuda_graph_compute` has no sync inside the node loop;
+see step 2). At the 3 to 6 GB/s a pageable `cudaMemcpy` gets on PCIe
+3.0 that is 0.5 to 1.0 s of the 1.58 s a pp512 step takes at 323
+tok/s, and the GPU is idle for all of it, which is the 30% to 39% the
+sampler saw. This is the arithmetic the #136 retraction asked for,
+run BEFORE the code: the round trips alone can account for most of
+the step, so removing them can reach the target for prefill, where
+for decode they could not (a decode round trip carries 12 KB, not 6
+MB, and the decode GPU sits at 86% to 93%).
+
+What reaches it is the layer staying on the device -- embeddings in,
+logits out -- not a cheaper round trip: chaining only the matmuls
+that are adjacent (q/k/v, then gate/up/down) still leaves three round
+trips and 42 MB per layer, a 2.6x cut against a 25x to 43x gap. So
+the CUDA prefill work is the Metal work again, in order: a batched
+RMSNorm, RoPE, a causal prefill attention kernel and the residual add
+on the device, `launch_mul_mm` taking a device pointer for its
+activation, and one download at the end; and it is verified the way
+step 1 was, by the hardware test suite and `ferrox verify --backend
+cuda`, before any receipt. The direct measurement that confirms the
+split (memcpy time against kernel time inside one pp512 step, `nsys`
+or event-timed) is the first thing to take on the next rented box; it
+is cheaper than the first kernel and it is what says whether the
+seven-call shape or the GEMM body is the bigger half once the copies
+are gone.
+
+**Measured the same day, and the count held.** `nsys` on `main`'s
+pp512 (RTX 3090, Llama-3.2-3B Q4_K_M, two steps): 394 `cuMemcpyDtoH`
+and 591 `cuMemcpyHtoD`, 0.88 s of memcpy per step against 0.39 s of
+GEMM kernels (`q4_k_mul_mm` 1.9 ms per call, `q6_k_mul_mm` 2.2 ms).
+The copies were two thirds of the step, as the arithmetic said.
+
+**The resident stack landed (`ferrox_cuda::prefill`, #260).** A run
+of dense layers per launch: the hidden batch up once, five small
+kernels (row RMSNorm, bias add, RoPE, causal GQA, residual add) plus
+the existing SwiGLU between GEMMs that now take device pointers
+(`enqueue_mul_mm`), the hidden batch down once, and each layer's K/V
+rows down for the host cache, which stays authoritative. `ferrox
+verify --backend cuda` token-identical on Llama-3.2-3B / 1B Q4_K_M
+and Qwen3-0.6B Q8_0 (QK norm), all 17 hardware tests green, and
+**pp512 305 to 912 tok/s, 2.9x**, interleaved against `main` three
+times (main 305 / 319 / 305, stack 883 / 900 / 912). Per-step memcpy
+fell from 0.88 s to under 0.1 s, and most of what is left is the
+one-time weight upload the profile's first step carries. The gap on
+that row is 25.5x to about 9x.
+
+What is left on CUDA prefill, from the same profile of the new
+binary, per two steps: `q4_k_mul_mm` 0.63 s, `causal_gqa_prefill_f32`
+0.14 s, `q6_k_mul_mm` 0.12 s, everything else under 0.01 s. So the
+GEMM is now three quarters of the GPU time at about 7 TFLOPS on a
+card whose f32 peak is 35 and whose int8 tensor cores are what
+llama.cpp's `mmq` uses; the attention kernel (one warp per query and
+head, no tiling) is the other sixth. Those are the next two items,
+in that order, and both are kernel bodies now that the copies are
+gone -- which is the order the 2026-09-15 paragraph asked for.
+
 ## Measured state, 2026-09-04
 
 ### CUDA (GTX 1080, CUDA 12.4, llama.cpp built with CUDA on the same box)
@@ -564,11 +646,12 @@ all, which is honest and temporary.
 
 | Step | Issue | State |
 |---|---|---|
-| 1 CUDA K-quant GEMM verified | #131 | **done**: verify token-identical, 325x to 10.9x |
-| 2 CUDA decode | #133 | GQA and graphs ruled out; GPU at 36% util, host-bound |
+| 1 CUDA K-quant GEMM verified | #131 | **done**: verify token-identical on RTX 3090 (2026-09-15), all 13 hardware tests pass |
+| 2 CUDA decode | #133 | GQA and graphs ruled out; GPU at 86% to 93% util, kernel-bound; 2.75x to 9.25x on Ampere |
+| 2b CUDA prefill | #259 | counted and measured 2026-09-17: copies were two thirds of the step; the resident stack (#260) took pp512 306 to 930 tok/s; GEMM body next, then attention tiling |
 | 3 CPU pool rule | #27 | measured, needs the predicate |
-| 4 fixed per-token cost | #128 | not started |
-| 5 x86 decode | #127 | **done**: default was wrong, 6.8x to 1.4x |
-| 5b x86 prefill | | not started, now the largest CPU gap (6x to 10x) |
-| 6 kernel coverage | | Q4_K/Q5_K/Q6_K landed on CUDA, Q5_0 2026-09-05, Q2_K/Q3_K/IQ4_NL/IQ4_XS/MXFP4 2026-09-09 (all unverified on hardware); 10 kinds still host-only |
+| 4 fixed per-token cost | #128 | named: rayon's cold submit |
+| 5 x86 decode | #127 | **done**: default was wrong, 6.8x to 1.4x; 1.04x to 1.17x on Zen 2 (2026-09-15) |
+| 5b x86 prefill | | 1.0x to 1.4x on the K-quants after #159; Q5_K gate (#257) and IQ4_XS (#258) closed 2026-09-15; small Q8_0 models 1.5x to 2.1x remain |
+| 6 kernel coverage | | Q4_K/Q5_K/Q6_K, Q5_0, Q2_K/Q3_K/IQ4_NL/IQ4_XS/MXFP4 on CUDA, verified on hardware 2026-09-15; 10 kinds still host-only |
 | 7 ledger | #126 | **done**: three hosts, and a committed-receipt check |

@@ -583,7 +583,7 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 |---|---|
 | **CPU** | Dense and MoE. int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out), interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot, pool sized to performance cores |
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent with fused groups, `MemRanges`, `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
-| **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`), plus batched GEMMs for `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`, `IQ4_XS` and `MXFP4` that **have never executed on a GPU** |
+| **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`), batched GEMMs for `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`, `IQ4_XS` and `MXFP4` (verified on an RTX 3090, 2026-09-15), and a resident dense prefill stack (norms, QKV bias, QK norm, RoPE, causal GQA, SwiGLU, residuals on the device; K/V rows back to the host cache) |
 | **Vulkan** | `Q8_0` matvec only, no GEMM (`--features vulkan`). A beachhead, not a backend: see below |
 
 **Vulkan is one kernel, and calling it a backend would be generous.**
@@ -597,28 +597,29 @@ Intel have a path at all, and because the seam it needed is the seam a
 real backend needs. `docs/plans/vulkan-beachhead-verdict.md` has the
 sizing: a full Vulkan backend is 15 to 25k lines.
 
-**The CUDA GEMM is unrun, and that is not a formality.** It is wired
-into a wide prefill and it decides nothing about performance here,
-because nobody has put it on a card. What it does have is a
+**The CUDA GEMM has run, and it is now the limit.** Its hardware test
+passes every kind and shape on an RTX 3090 and `ferrox verify
+--backend cuda` is token-identical to the CPU on Q4_K_M, Q5_K_M, Q6_K,
+Q8_0 and IQ4_XS checkpoints (2026-09-15). It also keeps the
 thread-by-thread scalar twin held against `ferrox-quant`'s independent
-dequantize-then-GEMM, and a host harness that compiles and *executes*
-the emitted CUDA C against a barrier shim
-(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`) with zero
-mismatches across **11 kinds, 33 shapes and 75,042 compared positions**.
-Its hardware test is `#[ignore]`d, and NVRTC is not clang, so "it
-compiles here" is not "NVRTC accepts it". Below the width threshold a
-single token stays on the matvec kernels, which are the arm that *has*
-run on a GPU. That harness is worth no more than its own health: it had
-silently stopped compiling once already, which is why it now runs over
-every kind in the table rather than a hand-kept list.
+dequantize-then-GEMM, and the host harness that executes the emitted
+CUDA C against a barrier shim
+(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`), zero mismatches
+across **11 kinds, 33 shapes and 75,042 compared positions**. Below
+the width threshold a single token stays on the matvec kernels.
 
-**CUDA is benchmarked and far behind.** It has receipts now, on an RTX
-3060: prefill 22.6× to 33.8× and decode 2.2× to 5.0× against llama.cpp
-on the same box. So a Windows or Linux install runs, and answers
-correctly, and should not be chosen for speed yet. The newest kernels
-in the table above are a further step back from that: they are verified
-on the host and have never run on a card at all. `/health` reports the same thing per capability,
-with a reason string, instead of quietly greying a control out.
+**CUDA prefill is resident, and still 9x off.** A dense layer used to
+be seven synchronous round trips with everything else on the host:
+3.1 GB over PCIe per Llama-3.2-3B pp512 step, two thirds of the step
+by `nsys`. `ferrox_cuda::prefill` runs a run of dense layers on the
+device with one upload and one download of the hidden batch, and
+pp512 on that model went 305 to 912 tok/s on an RTX 3090 (#259). What
+is left is the GEMM body itself, at about 7 TFLOPS against llama.cpp's
+int8 tensor-core `mmq`, and an untiled attention kernel. Decode is
+2.2x to 5.0x behind on the same cards (#133). So a Windows or Linux
+install runs, answers correctly, and should not be chosen for speed
+yet. `/health` reports the same thing per capability, with a reason
+string, instead of quietly greying a control out.
 
 ## CLI
 
@@ -859,7 +860,7 @@ checked against the code rather than asserted. The gap is the roadmap.
 | NVFP4 / FP8 | **No.** Neither is parsed. |
 | DeepSeek-V4-Flash, GLM-5.2, Kimi K3 | **Loaders and primitives only.** Nothing has run end to end on a real checkpoint. |
 | OpenAI + Anthropic compatible APIs | **Yes**, both, plus Responses. Tool calls parsed in eleven wire formats. |
-| NVIDIA RTX 30/40/50 | **Compiles, never measured.** CUDA has no in-tree benchmark receipt and no GPU in CI. |
+| NVIDIA RTX 30/40/50 | **Runs, measured, behind.** Receipts on a GTX 1080, an RTX 3060 and an RTX 3090; correct by `ferrox verify`; prefill about 9x and decode 2x to 5x off llama.cpp. No GPU in CI. |
 
 Two honest notes. Ferrox runs on Apple Metal, which that description
 does not cover, and Metal is where it is fastest: every `pp512` row is

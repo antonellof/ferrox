@@ -42,5 +42,8 @@ pub mod gpu;
 pub mod graph;
 #[cfg(feature = "cuda")]
 pub mod mul_mm_launch;
+/// One dense prefill layer resident on the device (#259).
+#[cfg(feature = "cuda")]
+pub mod prefill;
 
 pub use capability::{HardwareProfile, SimdCaps};
