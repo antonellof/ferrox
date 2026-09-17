@@ -56,7 +56,10 @@ const _: () = assert!(
     "two threads per token row of the B tile"
 );
 const _: () = assert!(TBK == 32, "the B loader converts sixteen floats per thread");
-const _: () = assert!((LDS * 2).is_multiple_of(16), "shared rows stay 16-byte aligned");
+const _: () = assert!(
+    (LDS * 2).is_multiple_of(16),
+    "shared rows stay 16-byte aligned"
+);
 
 /// The compute capability the body needs: `mma.sync.m16n8k16` with
 /// f16 operands is `sm_80` and up.

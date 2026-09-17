@@ -210,9 +210,9 @@ pub(crate) fn enqueue_causal_gqa_prefill(
         scale,
         softcap,
     } = *args;
-    if head_dim > 256 {
+    if head_dim > 256 || !head_dim.is_multiple_of(4) {
         return Err(CudaError::Unsupported(format!(
-            "causal_gqa_prefill: head_dim {head_dim} > 256"
+            "causal_gqa_prefill: head_dim {head_dim} (the kernel takes a multiple of 4 up to 256)"
         )));
     }
     debug_assert!(q.len() >= n_q * n_heads * head_dim);
@@ -222,16 +222,19 @@ pub(crate) fn enqueue_causal_gqa_prefill(
     let mut out = dev
         .alloc_zeros::<f32>(n_q * n_heads * head_dim)
         .map_err(|e| launch_err("causal_gqa_prefill alloc", e))?;
+    // Four query rows per block, one per warp (`FX_ATTN_WARPS`).
     let cfg = LaunchConfig {
-        grid_dim: (n_q as u32, n_heads as u32, 1),
-        block_dim: (32, 1, 1),
+        grid_dim: ((n_q as u32).div_ceil(4), n_heads as u32, 1),
+        block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     };
     // SAFETY: (const float* x3, float*, int x6, float, float) matched
-    // positionally; the grid is exactly `n_q x n_heads` and the kernel
-    // returns past either, every key index is below `start_pos + n_q`
-    // which the K/V buffers cover, and `out` is allocated at the size
-    // the kernel writes.
+    // positionally; the grid covers `n_q x n_heads` in fours and the
+    // kernel returns past either, every key index is below `start_pos
+    // + n_q` which the K/V buffers cover, the `float4` views need
+    // `head_dim % 4 == 0` (checked above) on buffers cudarc allocates
+    // 256-byte aligned, and `out` is allocated at the size the kernel
+    // writes.
     unsafe {
         func.launch(
             cfg,
