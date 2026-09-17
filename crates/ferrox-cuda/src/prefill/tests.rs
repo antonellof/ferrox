@@ -460,9 +460,14 @@ fn the_dense_layer_matches_a_host_twin_with_prefix_biases_norms_and_rope() {
         start_pos,
     };
     let out = launch_prefill_dense_layer(&hidden_in, &layer, &params, batch).unwrap();
-    assert_close(&out.k_rows, &k, 1e-3, "K rows");
-    assert_close(&out.v_rows, &v, 1e-3, "V rows");
-    assert_close(&out.hidden, &h, 1e-3, "hidden");
+    // 5e-3, not 1e-3: on sm_80+ the seven GEMMs run on the tensor cores
+    // with f16 operands (`mul_mm_tc`), and the twin here is the f32
+    // reference. 2^-11 per operand over 64 to 96 products is a few
+    // 1e-3 of the result on this data; a wrong kernel is off by a whole
+    // term. The GEMM's own exactness is `mul_mm_launch`'s test.
+    assert_close(&out.k_rows, &k, 5e-3, "K rows");
+    assert_close(&out.v_rows, &v, 5e-3, "V rows");
+    assert_close(&out.hidden, &h, 5e-3, "hidden");
 
     // The stack: the same layer twice with the hidden batch resident
     // between them must equal two single launches, K/V rows per layer.
