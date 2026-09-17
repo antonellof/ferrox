@@ -1,21 +1,24 @@
 //! The device side of `mul_mm`: NVRTC compile, upload, launch, download.
 //!
-//! # UNRUN ON HARDWARE
-//!
-//! Nothing in this module has executed on a GPU. It is written against
-//! `cudarc` 0.11.9's API the same way `gpu.rs`'s matvec launchers are,
-//! and it reuses their proven plumbing verbatim -- the process-wide
+//! Run on hardware since 2026-09-15 (RTX 3090, CUDA 12.4): every kind
+//! and shape in [`tests::launch_mul_mm_matches_the_scalar_twin`]
+//! passes, and `ferrox verify --backend cuda` is token-identical to
+//! the CPU on Q4_K_M, Q5_K_M, Q6_K, Q8_0 and IQ4_XS checkpoints. It is
+//! written against `cudarc` 0.11.9's API the same way `gpu.rs`'s
+//! matvec launchers are, and reuses their plumbing -- the process-wide
 //! device (`shared_device`), the load-once NVRTC cache
 //! (`ensure_module_loaded_lazy`) and the pointer-keyed resident weight
 //! cache (`resident_cuda_weights`) -- rather than growing a second copy
-//! of any of it. What is new here is one launch configuration and one
-//! output allocation.
+//! of any of it.
 //!
-//! The arithmetic this launches is checked on the host by
-//! [`crate::mul_mm_ref`]. The launch itself is checked by
-//! [`tests::launch_mul_mm_matches_the_scalar_twin`], which is
-//! `#[ignore]`d because it needs a device. Do not un-ignore it here; run
-//! it on real hardware and write down what happened.
+//! Two entry points: [`launch_mul_mm`] takes and returns host slices
+//! (one upload, one synchronous download), and [`enqueue_mul_mm`] is
+//! the launch alone over device slices, which the resident prefill
+//! stack ([`crate::prefill`]) chains seven of per layer. The
+//! arithmetic both launch is checked on the host by
+//! [`crate::mul_mm_ref`]. The hardware test is `#[ignore]`d because it
+//! needs a device; run it on real hardware and write down what
+//! happened.
 
 use crate::gpu::{ensure_module_loaded_lazy, resident_cuda_weights, shared_device, CudaError};
 use crate::mul_mm::{grid_dims, kernel_src, validate_shape, MulMmKind, THREADS};

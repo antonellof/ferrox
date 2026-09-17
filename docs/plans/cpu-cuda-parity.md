@@ -182,6 +182,36 @@ is cheaper than the first kernel and it is what says whether the
 seven-call shape or the GEMM body is the bigger half once the copies
 are gone.
 
+**Measured the same day, and the count held.** `nsys` on `main`'s
+pp512 (RTX 3090, Llama-3.2-3B Q4_K_M, two steps): 394 `cuMemcpyDtoH`
+and 591 `cuMemcpyHtoD`, 0.88 s of memcpy per step against 0.39 s of
+GEMM kernels (`q4_k_mul_mm` 1.9 ms per call, `q6_k_mul_mm` 2.2 ms).
+The copies were two thirds of the step, as the arithmetic said.
+
+**The resident stack landed (`ferrox_cuda::prefill`, #260).** A run
+of dense layers per launch: the hidden batch up once, five small
+kernels (row RMSNorm, bias add, RoPE, causal GQA, residual add) plus
+the existing SwiGLU between GEMMs that now take device pointers
+(`enqueue_mul_mm`), the hidden batch down once, and each layer's K/V
+rows down for the host cache, which stays authoritative. `ferrox
+verify --backend cuda` token-identical on Llama-3.2-3B / 1B Q4_K_M
+and Qwen3-0.6B Q8_0 (QK norm), all 17 hardware tests green, and
+**pp512 305 to 912 tok/s, 2.9x**, interleaved against `main` three
+times (main 305 / 319 / 305, stack 883 / 900 / 912). Per-step memcpy
+fell from 0.88 s to under 0.1 s, and most of what is left is the
+one-time weight upload the profile's first step carries. The gap on
+that row is 25.5x to about 9x.
+
+What is left on CUDA prefill, from the same profile of the new
+binary, per two steps: `q4_k_mul_mm` 0.63 s, `causal_gqa_prefill_f32`
+0.14 s, `q6_k_mul_mm` 0.12 s, everything else under 0.01 s. So the
+GEMM is now three quarters of the GPU time at about 7 TFLOPS on a
+card whose f32 peak is 35 and whose int8 tensor cores are what
+llama.cpp's `mmq` uses; the attention kernel (one warp per query and
+head, no tiling) is the other sixth. Those are the next two items,
+in that order, and both are kernel bodies now that the copies are
+gone -- which is the order the 2026-09-15 paragraph asked for.
+
 ## Measured state, 2026-09-04
 
 ### CUDA (GTX 1080, CUDA 12.4, llama.cpp built with CUDA on the same box)
@@ -618,7 +648,7 @@ all, which is honest and temporary.
 |---|---|---|
 | 1 CUDA K-quant GEMM verified | #131 | **done**: verify token-identical on RTX 3090 (2026-09-15), all 13 hardware tests pass |
 | 2 CUDA decode | #133 | GQA and graphs ruled out; GPU at 86% to 93% util, kernel-bound; 2.75x to 9.25x on Ampere |
-| 2b CUDA prefill | #259 | 25x to 43x on Ampere at 30% to 39% util; counted 2026-09-17: 196 synchronous round trips and 3.1 GB over PCIe per pp512 step (above); the lever is the device-resident layer |
+| 2b CUDA prefill | #259 | counted and measured 2026-09-17: copies were two thirds of the step; the resident stack (#260) took pp512 306 to 930 tok/s; GEMM body next, then attention tiling |
 | 3 CPU pool rule | #27 | measured, needs the predicate |
 | 4 fixed per-token cost | #128 | named: rayon's cold submit |
 | 5 x86 decode | #127 | **done**: default was wrong, 6.8x to 1.4x; 1.04x to 1.17x on Zen 2 (2026-09-15) |
