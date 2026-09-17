@@ -33,6 +33,9 @@ pub mod mul_mm;
 /// rather than a new section of a file nobody wants to open.
 pub mod mul_mm_kinds;
 pub mod mul_mm_ref;
+/// The tensor-core body for `mul_mm` (text, always compiled; launched
+/// by `mul_mm_launch` on `sm_80` and up).
+pub mod mul_mm_tc;
 
 #[cfg(feature = "cuda")]
 pub mod attn;

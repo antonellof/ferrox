@@ -76,6 +76,51 @@ pub fn mul_mm_reference(
     Ok(dst)
 }
 
+/// `sum_k |W[row][k] * x[token][k]|` for every output element, in the
+/// same `dst[token * n_rows + row]` layout as [`mul_mm_reference`]: the
+/// L1 norm of the products each result sums, which is what bounds the
+/// rounding error of any GEMM that rounds its operands (the tensor-core
+/// body rounds both to f16). Dequantizes with the kind's own twin, so
+/// it is the reference's arithmetic and not a second reading of the
+/// format.
+#[allow(clippy::too_many_arguments)]
+pub fn product_l1(
+    kind: &MulMmKind,
+    weights: &[u8],
+    x_batch: &[f32],
+    n_rows: usize,
+    n_cols: usize,
+    batch: usize,
+    row_bytes: usize,
+) -> Result<Vec<f32>, MulMmUnsupported> {
+    validate_shape(
+        kind,
+        weights.len(),
+        x_batch.len(),
+        n_rows,
+        n_cols,
+        batch,
+        row_bytes,
+    )?;
+    let subs_per_row = n_cols / SUB;
+    let nl = kind.nl();
+    let mut out = vec![0f32; batch * n_rows];
+    let mut reg = [0f32; SUB];
+    for row in 0..n_rows {
+        let rp = &weights[row * row_bytes..(row + 1) * row_bytes];
+        for sub in 0..subs_per_row {
+            let block = &rp[(sub / nl) * kind.block_bytes..(sub / nl + 1) * kind.block_bytes];
+            (kind.dequant_twin)(block, sub % nl, &mut reg);
+            for token in 0..batch {
+                let xs = &x_batch[token * n_cols + sub * SUB..token * n_cols + (sub + 1) * SUB];
+                let acc: f32 = reg.iter().zip(xs).map(|(w, x)| (w * x).abs()).sum();
+                out[token * n_rows + row] += acc;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// One threadblock of the kernel: `blockIdx = (bx, by)`, `THREADS`
 /// threads, `sa`/`sb` standing in for the two `__shared__` tiles.
 #[allow(clippy::too_many_arguments)] // The kernel's own parameter list plus its block index; bundling it would only move the same values behind a name that says less.

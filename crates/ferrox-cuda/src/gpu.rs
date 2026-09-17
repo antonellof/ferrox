@@ -507,6 +507,18 @@ extern "C" __global__ void q4_k_matvec_coalesced(
 static CUDA_DEVICE: std::sync::Mutex<Option<std::sync::Arc<cudarc::driver::CudaDevice>>> =
     std::sync::Mutex::new(None);
 
+/// The shared device's compute capability major, asked once. `0` when
+/// the query fails, which no capability gate treats as "new enough".
+pub(crate) fn compute_capability_major(dev: &std::sync::Arc<cudarc::driver::CudaDevice>) -> i32 {
+    static CC_MAJOR: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *CC_MAJOR.get_or_init(|| {
+        dev.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+        .unwrap_or(0)
+    })
+}
+
 pub(crate) fn shared_device() -> Result<std::sync::Arc<cudarc::driver::CudaDevice>, CudaError> {
     let mut guard = CUDA_DEVICE.lock().unwrap();
     if let Some(dev) = guard.as_ref() {
@@ -546,12 +558,30 @@ pub(crate) fn ensure_module_loaded_lazy(
     fn_name: &'static str,
     src: impl FnOnce() -> String,
 ) -> Result<(), CudaError> {
+    ensure_module_loaded_lazy_for_arch(dev, module_name, fn_name, None, src)
+}
+
+/// [`ensure_module_loaded_lazy`] with an explicit NVRTC target, for a
+/// kernel whose instructions need one (`mma.sync.m16n8k16` is
+/// `compute_80`); `None` is NVRTC's default target, which every other
+/// kernel here compiles for.
+pub(crate) fn ensure_module_loaded_lazy_for_arch(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    module_name: &'static str,
+    fn_name: &'static str,
+    arch: Option<&'static str>,
+    src: impl FnOnce() -> String,
+) -> Result<(), CudaError> {
     let mut guard = LOADED_MODULES.lock().unwrap();
     let set = guard.get_or_insert_with(std::collections::HashSet::new);
     if set.contains(module_name) {
         return Ok(());
     }
-    let ptx = cudarc::nvrtc::compile_ptx(src())
+    let opts = cudarc::nvrtc::CompileOptions {
+        arch,
+        ..Default::default()
+    };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src(), opts)
         .map_err(|e| CudaError::KernelCompile(format!("{e:?}")))?;
     dev.load_ptx(ptx, module_name, &[fn_name])
         .map_err(|e| CudaError::KernelCompile(format!("{e:?}")))?;
