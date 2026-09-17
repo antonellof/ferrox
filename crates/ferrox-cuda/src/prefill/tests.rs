@@ -176,7 +176,7 @@ fn rmsnorm_rows_matches_the_host() {
 fn rope_rows_matches_the_host_in_both_layouts_with_a_partial_width_and_divisors() {
     let dev = shared_device().unwrap();
     let (rows, n_heads, head_dim) = (9, 3, 32);
-    let ff: Vec<f32> = (0..12).map(|i| 1.0 + i as f32 * 0.25).collect();
+    let ff: Vec<f32> = (0..16).map(|i| 1.0 + i as f32 * 0.25).collect();
     for (neox, rot_dim, use_ff, mscale) in [
         (false, 32, false, 1.0),
         (true, 32, false, 1.0),
@@ -274,8 +274,20 @@ fn the_dense_layer_matches_a_host_twin_with_prefix_biases_norms_and_rope() {
     let start_pos = 6;
     let q_w = n_heads * head_dim;
     let kv_w = n_kv_heads * head_dim;
+    // The shared fixtures pin every Q8_0 scale near 0.1, which puts
+    // this layer's `down` input in the thousands and its output in the
+    // tens: an f32 sum that cancels three orders of magnitude, where
+    // the GPU's FMA contraction and the twin's plain accumulate differ
+    // by 4e-3 without either being wrong. Small scales keep every
+    // activation near 1 so the comparison measures the kernels.
     let mk = |rows, cols, seed| {
-        let data = fixtures::weights(&Q8_0, rows, cols, seed);
+        let mut data = fixtures::weights(&Q8_0, rows, cols, seed);
+        for block in data.as_chunks_mut::<34>().0 {
+            let bits = u16::from(block[0]) | (u16::from(block[1]) << 8);
+            let bits = (bits & 0x83FF) | (6 << 10);
+            block[0] = bits as u8;
+            block[1] = (bits >> 8) as u8;
+        }
         (data, rows, cols, cols / 32 * 34)
     };
     let (qd, ..) = mk(q_w, hidden, 1);
@@ -450,5 +462,27 @@ fn the_dense_layer_matches_a_host_twin_with_prefix_biases_norms_and_rope() {
     let out = launch_prefill_dense_layer(&hidden_in, &layer, &params, batch).unwrap();
     assert_close(&out.k_rows, &k, 1e-3, "K rows");
     assert_close(&out.v_rows, &v, 1e-3, "V rows");
-    assert_close(&out.hidden, &h, 2e-3, "hidden");
+    assert_close(&out.hidden, &h, 1e-3, "hidden");
+
+    // The stack: the same layer twice with the hidden batch resident
+    // between them must equal two single launches, K/V rows per layer.
+    let second = launch_prefill_dense_layer(&out.hidden, &layer, &params, batch).unwrap();
+    let stacked =
+        launch_prefill_dense_stack(&hidden_in, &[(&layer, &params), (&layer, &params)], batch)
+            .unwrap();
+    assert_eq!(stacked.kv_rows.len(), 2);
+    assert_close(&stacked.kv_rows[0].0, &out.k_rows, 1e-5, "stack layer 0 K");
+    assert_close(
+        &stacked.kv_rows[1].0,
+        &second.k_rows,
+        1e-5,
+        "stack layer 1 K",
+    );
+    assert_close(
+        &stacked.kv_rows[1].1,
+        &second.v_rows,
+        1e-5,
+        "stack layer 1 V",
+    );
+    assert_close(&stacked.hidden, &second.hidden, 1e-5, "stack hidden");
 }

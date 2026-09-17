@@ -4244,25 +4244,24 @@ impl Decoder {
                 }
             }
 
-            let cache = &mut kv_caches[l];
-
-            // The whole dense layer on the device, one upload and three
-            // downloads instead of seven round trips (#259). Declines
-            // before touching the cache; the host body below then runs
-            // the layer.
+            // A run of dense layers on the device, the hidden batch
+            // resident across them, instead of seven round trips per
+            // layer (#259). Declines before touching any cache; the
+            // host body below then runs the layer.
             #[cfg(feature = "cuda")]
-            if let Some(h_out) = self.try_cuda_prefill_dense_layer(
+            if let Some((h_out, run_len)) = self.try_cuda_prefill_dense_stack(
                 l,
-                layer,
                 &hidden_batch,
                 start_pos,
                 batch_size,
-                cache,
+                kv_caches,
             ) {
                 hidden_batch = h_out;
-                l += 1;
+                l += run_len;
                 continue;
             }
+
+            let cache = &mut kv_caches[l];
 
             // One-CB dense prefill (RMSNorm→QKV GEMM→attn→O→FFN) when every
             // projection has mul_mm_sg and the layer has no QKV bias / QK-norm.

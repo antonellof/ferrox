@@ -181,26 +181,79 @@ pub fn launch_prefill_dense_layer(
     params: &PrefillParams<'_>,
     batch: usize,
 ) -> Result<PrefillLayerOut, CudaError> {
-    let hidden_dim = layer.attn_norm_w.len();
+    let mut out = launch_prefill_dense_stack(hidden, &[(layer, params)], batch)?;
+    let (k_rows, v_rows) = out.kv_rows.pop().expect("one layer in, one layer out");
+    Ok(PrefillLayerOut {
+        hidden: out.hidden,
+        k_rows,
+        v_rows,
+    })
+}
+
+/// What a stack returns: the hidden batch after the last layer, and
+/// each layer's K (post-RoPE) and V rows in the host cache's layout.
+pub struct PrefillStackOut {
+    pub hidden: Vec<f32>,
+    pub kv_rows: Vec<(Vec<f32>, Vec<f32>)>,
+}
+
+/// A run of consecutive dense layers with the hidden batch resident
+/// across them: one upload at the start, one download of it at the
+/// end, and two small downloads (K rows, V rows) per layer. This is
+/// what the decoder calls; [`launch_prefill_dense_layer`] is the
+/// one-layer case of it. Every layer is shape-checked before the first
+/// touches the device, so a refusal leaves no partial state anywhere.
+pub fn launch_prefill_dense_stack(
+    hidden: &[f32],
+    layers: &[(&PrefillDenseLayerCuda<'_>, &PrefillParams<'_>)],
+    batch: usize,
+) -> Result<PrefillStackOut, CudaError> {
+    let Some((first, _)) = layers.first() else {
+        return Err(CudaError::Unsupported(
+            "prefill dense stack: no layers".to_string(),
+        ));
+    };
+    let hidden_dim = first.attn_norm_w.len();
+    if hidden.len() != batch * hidden_dim {
+        return Err(CudaError::Unsupported(
+            "prefill dense stack: hidden batch does not match the first layer's width".to_string(),
+        ));
+    }
+    for (layer, params) in layers {
+        check_layer_shapes(layer, params, batch, hidden_dim)?;
+    }
+    let dev = shared_device()?;
+    let mut h = upload(&dev, "hidden", hidden)?;
+    let mut kv_rows = Vec::with_capacity(layers.len());
+    for (layer, params) in layers {
+        let (k_rows, v_rows) = run_layer_resident(&dev, &mut h, layer, params, batch)?;
+        kv_rows.push((k_rows, v_rows));
+    }
+    let hidden = download(&dev, "hidden", &h)?;
+    Ok(PrefillStackOut { hidden, kv_rows })
+}
+
+/// The host-side shape agreement, before any device work: a mismatch
+/// is a named error and never a kernel reading past a buffer.
+fn check_layer_shapes(
+    layer: &PrefillDenseLayerCuda<'_>,
+    params: &PrefillParams<'_>,
+    batch: usize,
+    hidden_dim: usize,
+) -> Result<(), CudaError> {
     let PrefillParams {
         n_heads,
         n_kv_heads,
         head_dim,
-        rms_eps,
-        attn_scale,
-        attn_softcap,
-        window,
         prefix_k,
         prefix_v,
         start_pos,
+        ..
     } = *params;
     let q_width = n_heads * head_dim;
     let kv_width = n_kv_heads * head_dim;
     let ffn_dim = layer.gate.rows;
-
-    // Shape agreement first, on the host, so a mismatch is a named
-    // error and never a kernel reading past a buffer.
-    if hidden.len() != batch * hidden_dim
+    if layer.attn_norm_w.len() != hidden_dim
         || layer.ffn_norm_w.len() != hidden_dim
         || layer.q.rows != q_width
         || layer.k.rows != kv_width
@@ -221,16 +274,16 @@ pub fn launch_prefill_dense_layer(
                 .to_string(),
         ));
     }
-    for (m, b) in [
-        (&layer.q, batch),
-        (&layer.k, batch),
-        (&layer.v, batch),
-        (&layer.o, batch),
-        (&layer.gate, batch),
-        (&layer.up, batch),
-        (&layer.down, batch),
+    for m in [
+        &layer.q,
+        &layer.k,
+        &layer.v,
+        &layer.o,
+        &layer.gate,
+        &layer.up,
+        &layer.down,
     ] {
-        m.validate(b)?;
+        m.validate(batch)?;
     }
     if let Some(rope) = &layer.rope {
         if rope.rot_dim == 0 || !rope.rot_dim.is_multiple_of(2) || rope.rot_dim > head_dim {
@@ -249,37 +302,80 @@ pub fn launch_prefill_dense_layer(
             }
         }
     }
-    let norm_rows =
-        |w: Option<&[f32]>, width: usize| -> Result<Option<(usize, usize)>, CudaError> {
-            match w {
-                None => Ok(None),
-                Some(w) if w.is_empty() || !width.is_multiple_of(w.len()) => {
-                    Err(CudaError::Unsupported(format!(
-                        "prefill dense layer: a QK norm of {} over a width of {width}",
-                        w.len()
-                    )))
-                }
-                // Per head (`head_dim` long) or whole vector: rows of the
-                // weight's length, `width / len` of them per position.
-                Some(w) => Ok(Some((w.len(), width / w.len()))),
+    norm_rows(layer.extras.q_norm, q_width)?;
+    norm_rows(layer.extras.k_norm, kv_width)?;
+    for (bias, width) in [
+        (layer.extras.q_bias, q_width),
+        (layer.extras.k_bias, kv_width),
+        (layer.extras.v_bias, kv_width),
+    ] {
+        if let Some(bias) = bias {
+            if bias.len() != width {
+                return Err(CudaError::Unsupported(format!(
+                    "prefill dense layer: a bias of {} on a projection of {width}",
+                    bias.len()
+                )));
             }
-        };
+        }
+    }
+    Ok(())
+}
+
+/// A QK norm weight as `(n, rows per position)`: per head (`head_dim`
+/// long) or whole vector, which is how the loader's length rule reads
+/// them.
+fn norm_rows(w: Option<&[f32]>, width: usize) -> Result<Option<(usize, usize)>, CudaError> {
+    match w {
+        None => Ok(None),
+        Some(w) if w.is_empty() || !width.is_multiple_of(w.len()) => {
+            Err(CudaError::Unsupported(format!(
+                "prefill dense layer: a QK norm of {} over a width of {width}",
+                w.len()
+            )))
+        }
+        Some(w) => Ok(Some((w.len(), width / w.len()))),
+    }
+}
+
+/// One layer over the resident hidden batch `h`, in place. Returns
+/// the batch's K/V rows. Shapes were checked by `check_layer_shapes`.
+fn run_layer_resident(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    h: &mut CudaSlice<f32>,
+    layer: &PrefillDenseLayerCuda<'_>,
+    params: &PrefillParams<'_>,
+    batch: usize,
+) -> Result<(Vec<f32>, Vec<f32>), CudaError> {
+    let hidden_dim = layer.attn_norm_w.len();
+    let PrefillParams {
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        rms_eps,
+        attn_scale,
+        attn_softcap,
+        window,
+        prefix_k,
+        prefix_v,
+        start_pos,
+    } = *params;
+    let q_width = n_heads * head_dim;
+    let kv_width = n_kv_heads * head_dim;
+    let ffn_dim = layer.gate.rows;
     let q_norm_shape = norm_rows(layer.extras.q_norm, q_width)?;
     let k_norm_shape = norm_rows(layer.extras.k_norm, kv_width)?;
 
-    let dev = shared_device()?;
     // Every resident-weight Arc the GEMMs hand back is held here until
     // the downloads at the end synchronise the stream.
     let mut held = Vec::with_capacity(7);
 
-    let attn_norm_w = upload(&dev, "attn_norm", layer.attn_norm_w)?;
-    let ffn_norm_w = upload(&dev, "ffn_norm", layer.ffn_norm_w)?;
-    let mut h = upload(&dev, "hidden", hidden)?;
+    let attn_norm_w = upload(dev, "attn_norm", layer.attn_norm_w)?;
+    let ffn_norm_w = upload(dev, "ffn_norm", layer.ffn_norm_w)?;
 
     // --- attention ---
-    let normed = enqueue_rmsnorm_rows(&dev, &h, &attn_norm_w, batch, hidden_dim, rms_eps)?;
+    let normed = enqueue_rmsnorm_rows(dev, h, &attn_norm_w, batch, hidden_dim, rms_eps)?;
     let gemm = |m: &MulMmWeights<'_>, x: &CudaSlice<f32>, held: &mut Vec<_>| {
-        let (out, w) = enqueue_mul_mm(&dev, m.kind, m.data, x, m.rows, m.cols, batch, m.row_bytes)?;
+        let (out, w) = enqueue_mul_mm(dev, m.kind, m.data, x, m.rows, m.cols, batch, m.row_bytes)?;
         held.push(w);
         Ok::<_, CudaError>(out)
     };
@@ -300,21 +396,21 @@ pub fn launch_prefill_dense_layer(
                     bias.len()
                 )));
             }
-            let d_bias = upload(&dev, "qkv bias", bias)?;
-            enqueue_add_bias_rows(&dev, x, &d_bias, batch, width)?;
+            let d_bias = upload(dev, "qkv bias", bias)?;
+            enqueue_add_bias_rows(dev, x, &d_bias, batch, width)?;
         }
     }
     if let (Some(w), Some((n, per))) = (layer.extras.q_norm, q_norm_shape) {
-        let d_w = upload(&dev, "q_norm", w)?;
-        q = enqueue_rmsnorm_rows(&dev, &q, &d_w, batch * per, n, rms_eps)?;
+        let d_w = upload(dev, "q_norm", w)?;
+        q = enqueue_rmsnorm_rows(dev, &q, &d_w, batch * per, n, rms_eps)?;
     }
     if let (Some(w), Some((n, per))) = (layer.extras.k_norm, k_norm_shape) {
-        let d_w = upload(&dev, "k_norm", w)?;
-        k = enqueue_rmsnorm_rows(&dev, &k, &d_w, batch * per, n, rms_eps)?;
+        let d_w = upload(dev, "k_norm", w)?;
+        k = enqueue_rmsnorm_rows(dev, &k, &d_w, batch * per, n, rms_eps)?;
     }
     if let Some(rope) = &layer.rope {
         let d_ff = match rope.freq_factors {
-            Some(ff) => Some(upload(&dev, "freq_factors", ff)?),
+            Some(ff) => Some(upload(dev, "freq_factors", ff)?),
             None => None,
         };
         let args = RopeArgs {
@@ -324,8 +420,8 @@ pub fn launch_prefill_dense_layer(
             neox: rope.layout == RopeLayoutCuda::Neox,
             mscale: rope.mscale,
         };
-        enqueue_rope_rows(&dev, &mut q, batch, n_heads, head_dim, start_pos, &args)?;
-        enqueue_rope_rows(&dev, &mut k, batch, n_kv_heads, head_dim, start_pos, &args)?;
+        enqueue_rope_rows(dev, &mut q, batch, n_heads, head_dim, start_pos, &args)?;
+        enqueue_rope_rows(dev, &mut k, batch, n_kv_heads, head_dim, start_pos, &args)?;
     }
 
     // K/V over prefix + batch, in the cache's `[pos, kv_head, dim]`
@@ -342,8 +438,8 @@ pub fn launch_prefill_dense_layer(
         let mut v_all = dev
             .alloc_zeros::<f32>(total)
             .map_err(|e| CudaError::Launch(format!("v_all alloc: {e:?}")))?;
-        let d_pk = upload(&dev, "prefix K", prefix_k)?;
-        let d_pv = upload(&dev, "prefix V", prefix_v)?;
+        let d_pk = upload(dev, "prefix K", prefix_k)?;
+        let d_pv = upload(dev, "prefix V", prefix_v)?;
         let n_prefix = start_pos * kv_width;
         dev.dtod_copy(&d_pk, &mut k_all.slice_mut(..n_prefix))
             .map_err(|e| CudaError::Launch(format!("prefix K copy: {e:?}")))?;
@@ -357,7 +453,7 @@ pub fn launch_prefill_dense_layer(
     };
 
     let attn = enqueue_causal_gqa_prefill(
-        &dev,
+        dev,
         &q,
         &k_all,
         &v_all,
@@ -376,39 +472,36 @@ pub fn launch_prefill_dense_layer(
     let mut o = gemm(&layer.o, &attn, &mut held)?;
     drop(attn);
     if let Some(post) = layer.post_attn_norm {
-        let d_w = upload(&dev, "post_attn_norm", post)?;
-        o = enqueue_rmsnorm_rows(&dev, &o, &d_w, batch, hidden_dim, rms_eps)?;
+        let d_w = upload(dev, "post_attn_norm", post)?;
+        o = enqueue_rmsnorm_rows(dev, &o, &d_w, batch, hidden_dim, rms_eps)?;
     }
-    enqueue_add_rows(&dev, &mut h, &o, batch * hidden_dim)?;
+    enqueue_add_rows(dev, h, &o, batch * hidden_dim)?;
     drop(o);
 
     // --- FFN ---
-    let normed2 = enqueue_rmsnorm_rows(&dev, &h, &ffn_norm_w, batch, hidden_dim, rms_eps)?;
+    let normed2 = enqueue_rmsnorm_rows(dev, h, &ffn_norm_w, batch, hidden_dim, rms_eps)?;
     let gate = gemm(&layer.gate, &normed2, &mut held)?;
     let up = gemm(&layer.up, &normed2, &mut held)?;
     drop(normed2);
-    let act = silu_mul_device(&dev, &gate, &up, batch * ffn_dim)?;
+    let act = silu_mul_device(dev, &gate, &up, batch * ffn_dim)?;
     drop((gate, up));
     let mut down = gemm(&layer.down, &act, &mut held)?;
     drop(act);
     if let Some(post) = layer.post_ffn_norm {
-        let d_w = upload(&dev, "post_ffn_norm", post)?;
-        down = enqueue_rmsnorm_rows(&dev, &down, &d_w, batch, hidden_dim, rms_eps)?;
+        let d_w = upload(dev, "post_ffn_norm", post)?;
+        down = enqueue_rmsnorm_rows(dev, &down, &d_w, batch, hidden_dim, rms_eps)?;
     }
-    enqueue_add_rows(&dev, &mut h, &down, batch * hidden_dim)?;
+    enqueue_add_rows(dev, h, &down, batch * hidden_dim)?;
     drop(down);
 
-    // The batch's rows of K/V are the tail of `k_all` / `v_all`.
+    // The batch's rows of K/V are the tail of `k_all` / `v_all`. These
+    // two downloads are the layer's only host syncs; the hidden batch
+    // stays on the device for the next layer.
     let n_prefix = start_pos * kv_width;
-    let hidden_out = download(&dev, "hidden", &h)?;
-    let k_rows = download(&dev, "K rows", &k_all.slice(n_prefix..))?;
-    let v_rows = download(&dev, "V rows", &v_all.slice(n_prefix..))?;
+    let k_rows = download(dev, "K rows", &k_all.slice(n_prefix..))?;
+    let v_rows = download(dev, "V rows", &v_all.slice(n_prefix..))?;
     drop(held);
-    Ok(PrefillLayerOut {
-        hidden: hidden_out,
-        k_rows,
-        v_rows,
-    })
+    Ok((k_rows, v_rows))
 }
 
 #[cfg(test)]
