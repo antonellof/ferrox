@@ -13,8 +13,12 @@
 //! checkpoint to be present.
 
 mod attn_block;
+#[cfg(feature = "cuda")]
+mod cuda_prefill;
 mod entry;
 mod ffn_block;
+#[cfg(any(feature = "metal", feature = "cuda"))]
+mod fused_view;
 pub mod kv_window;
 mod lm_head;
 mod qk_norm;
@@ -1020,7 +1024,12 @@ impl Decoder {
     /// for an adapted matrix). Fencing the whole model here, too, is
     /// what keeps a model with an adapter on one layer from being served
     /// half by a stack and half by the host.
-    #[cfg(feature = "metal")]
+    ///
+    /// Named for the backend that had fused stacks first. The CUDA
+    /// resident prefill layer (`decoder/cuda_prefill.rs`, #259) asks the
+    /// same question through `fused_view`, because the facts are
+    /// properties of the model and not of the kernel language.
+    #[cfg(any(feature = "metal", feature = "cuda"))]
     fn metal_can_serve_model(config: &ModelConfig, lora_attached: bool) -> bool {
         !lora_attached
             && config.residual_scale.is_none()
@@ -1087,92 +1096,10 @@ impl Decoder {
     /// via [`ferrox_metal::attn::AttnExtras`]).
     #[cfg(feature = "metal")]
     fn layer_supports_metal_attn(&self, layer: &LayerWeights) -> bool {
-        use crate::config::RopeLayout;
-        if !Self::metal_can_serve_model(&self.config, self.lora_attached()) {
-            return false;
-        }
-        // gpt-oss: no Metal kernel adds the `o_bias` or runs the biased
-        // router, so the fused stacks would compute a *different* graph
-        // than the CPU path for the same weights. Keep this family on
-        // CPU rather than letting the two backends disagree. See
-        // `Decoder::gpt_oss`. Its attention sinks are refused one line
-        // down, by the tensor rather than by the name.
-        if self.gpt_oss.is_some() {
-            return false;
-        }
-        // The output gate and the attention sinks: `metal_attn_view` is
-        // the one place that knows which `AttnWeights` fields the
-        // launches serve, and it answers `None` for a layer they cannot.
-        if self.metal_attn_view(layer).is_none() {
-            return false;
-        }
-        if !matches!(self.config.rope_layout, RopeLayout::Norm | RopeLayout::Neox) {
-            return false;
-        }
-        // QKV bias (Qwen2) and QK-norm — per-head (Qwen3/Gemma-3) or
-        // whole-vector (OLMoE) — run on Metal via AttnExtras.
-        let q_len = self.config.n_heads * self.config.head_dim;
-        let k_len = self.config.n_kv_heads * self.config.head_dim;
-        let qk_norm_ok = |w: Option<&Vec<f32>>, vec_len: usize| -> bool {
-            match w {
-                None => true,
-                Some(w) if w.len() == self.config.head_dim => true,
-                Some(w) if w.len() == vec_len => true,
-                _ => false,
-            }
-        };
-        if !qk_norm_ok(layer.attn.q_norm.as_ref(), q_len)
-            || !qk_norm_ok(layer.attn.k_norm.as_ref(), k_len)
-        {
-            return false;
-        }
-        // NOT the QK-norm ORDER. `AttnExtras` hands the norm weights to
-        // kernels that apply them before their own RoPE, so a
-        // `maincoder` / `hunyuan-moe` layer would be normed on the wrong
-        // side of the rotation by every fused launch while the host
-        // bodies got it right — the same weights answering differently
-        // depending on which backend served the token. Same fence, same
-        // reason, as `attention_scale` below.
-        if self.qk_norm_after_rope {
-            return false;
-        }
-        // Softcaps: final logit softcap is applied on the host after
-        // lm_head (Metal-safe). Attention softcap runs on Metal FA-vec /
-        // legacy GQA (decode + prefill).
-        //
-        // NOT attention_scale, and this is now a refusal rather than a
-        // comment. `AttnExtras` has no field for it and no Metal kernel
-        // applies it, so a checkpoint carrying one would be scaled by
-        // the four host bodies and not by any of the seven fused
-        // launches -- the same weights answering at two different
-        // temperatures depending on which backend served the token.
-        //
-        // LIVE, not latent: `capability::attention_scale_override` sets
-        // it for Gemma-2-27B and Gemma-3-27B, so those two checkpoints
-        // take the host path here and are scaled exactly once. It was
-        // written down as a fence while `loader.rs` still hardcoded
-        // `None`, which is why the day the loader started setting it
-        // cost nothing.
-        if self.config.attention_scale.is_some() {
-            return false;
-        }
-        if self.config.head_dim > 256 {
-            return false;
-        }
-        // Partial rotary (`n_rot < head_dim`) and LongRoPE's `mscale`
-        // now ride the Metal RoPE kernels as the `rot_dim` / `mscale`
-        // uniforms on [`ferrox_metal::attn::MetalRope`], so Phi-3/Phi-4
-        // are admitted here. `n_rot` must still be even — ggml's
-        // `ggml_rope_impl` asserts it, and an odd width would leave one
-        // channel's pairing undefined rather than merely unrotated.
-        if self
-            .config
-            .rope_dim
-            .is_some_and(|rot| rot == 0 || rot % 2 != 0 || rot > self.config.head_dim)
-        {
-            return false;
-        }
-        Self::metal_matvec_launch(&layer.attn.q_proj).is_some()
+        // The backend-neutral questions are `fused_view`'s; what is
+        // left is whether Metal has a launch for every projection.
+        self.layer_supports_fused_attn(layer)
+            && Self::metal_matvec_launch(&layer.attn.q_proj).is_some()
             && Self::metal_matvec_launch(&layer.attn.k_proj).is_some()
             && Self::metal_matvec_launch(&layer.attn.v_proj).is_some()
             && Self::metal_matvec_launch(&layer.attn.o_proj).is_some()
@@ -1231,72 +1158,26 @@ impl Decoder {
         })
     }
 
-    /// What the fused Metal attention launches can take from one
-    /// layer's attention weights, or `None` when the layer carries
-    /// something none of them applies.
-    ///
-    /// An EXHAUSTIVE destructure with no `..`, on purpose: every field
-    /// of [`AttnWeights`] is named here and either handed to
-    /// [`ferrox_metal::attn::AttnExtras`], consumed by the launch some
-    /// other way (the four projections, the pre-norm, the post-norms
-    /// that `layer_needs_metal_stack` routes to the stack), or the
-    /// reason for the `None`. A field added to `AttnWeights` therefore
-    /// fails to compile until this function says which of the three it
-    /// is. The output gate and the attention sinks are the two the
-    /// launches cannot serve: both sit between the softmax and `wo`,
-    /// which the kernels fuse with no host round-trip, so a launch that
-    /// ignored them would answer differently from the host bodies for
-    /// the same weights -- the fifth and sixth things found written into
-    /// the stacks unconditionally, after the final norm, the rotation,
-    /// the residual scale and the activation.
+    /// [`Self::fused_attn_extras`] -- the ONE exhaustive destructure of
+    /// `AttnWeights`, in `fused_view` -- in Metal's spelling.
     #[cfg(feature = "metal")]
     fn metal_attn_view<'a>(
         &self,
         layer: &'a LayerWeights,
     ) -> Option<ferrox_metal::attn::AttnExtras<'a>> {
-        let AttnWeights {
-            q_proj: _,
-            k_proj: _,
-            v_proj: _,
-            o_proj: _,
-            norm_weight: _,
-            q_norm,
-            k_norm,
+        let fused_view::FusedAttnExtras {
             q_bias,
             k_bias,
             v_bias,
-            post_attn_norm: _,
-            post_ffn_norm: _,
-            output_gate,
-            sinks,
-            attn_sub_norm,
-            o_scale,
-            o_bias,
-            shortconv,
-            ssm,
-            q_gate_interleaved,
-        } = &layer.attn;
-        // No Metal attention kernel gates, sinks, norms between the V
-        // sum and `wo`, scales after it, adds a bias to it, or runs a
-        // convolution or a state space in its place; a layer with any
-        // of the seven runs on the host.
-        if output_gate.is_some()
-            || sinks.is_some()
-            || attn_sub_norm.is_some()
-            || o_scale.is_some()
-            || o_bias.is_some()
-            || shortconv.is_some()
-            || ssm.is_some()
-            || *q_gate_interleaved
-        {
-            return None;
-        }
+            q_norm,
+            k_norm,
+        } = Self::fused_attn_extras(layer)?;
         Some(ferrox_metal::attn::AttnExtras {
-            q_bias: q_bias.as_deref(),
-            k_bias: k_bias.as_deref(),
-            v_bias: v_bias.as_deref(),
-            q_norm: q_norm.as_deref(),
-            k_norm: k_norm.as_deref(),
+            q_bias,
+            k_bias,
+            v_bias,
+            q_norm,
+            k_norm,
             attn_logit_softcap: self.config.attn_logit_softcap,
         })
     }
@@ -1379,10 +1260,7 @@ impl Decoder {
         config: &ModelConfig,
         lora_attached: bool,
     ) -> bool {
-        Self::is_dense_layer(layer)
-            && layer.moe.down_scale.is_none()
-            && layer.moe.dense_bias.is_none()
-            && Self::metal_can_serve_model(config, lora_attached)
+        Self::fused_prefill_dense_layer_eligible(layer, config, lora_attached)
     }
 
     #[cfg(feature = "metal")]
@@ -4367,6 +4245,24 @@ impl Decoder {
             }
 
             let cache = &mut kv_caches[l];
+
+            // The whole dense layer on the device, one upload and three
+            // downloads instead of seven round trips (#259). Declines
+            // before touching the cache; the host body below then runs
+            // the layer.
+            #[cfg(feature = "cuda")]
+            if let Some(h_out) = self.try_cuda_prefill_dense_layer(
+                l,
+                layer,
+                &hidden_batch,
+                start_pos,
+                batch_size,
+                cache,
+            ) {
+                hidden_batch = h_out;
+                l += 1;
+                continue;
+            }
 
             // One-CB dense prefill (RMSNorm→QKV GEMM→attn→O→FFN) when every
             // projection has mul_mm_sg and the layer has no QKV bias / QK-norm.

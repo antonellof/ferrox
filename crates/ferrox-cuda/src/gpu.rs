@@ -1081,7 +1081,7 @@ extern "C" __global__ void silu_mul_f32(
 /// slice. `gate`/`up` are device slices of length `n` produced by the
 /// two FFN input matvecs; the result feeds straight into the down
 /// matvec without ever touching host memory.
-fn silu_mul_device(
+pub(crate) fn silu_mul_device(
     dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
     gate: &cudarc::driver::CudaSlice<f32>,
     up: &cudarc::driver::CudaSlice<f32>,
