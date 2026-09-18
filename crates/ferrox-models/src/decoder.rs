@@ -1789,12 +1789,16 @@ impl Decoder {
             #[cfg_attr(not(feature = "metal"), allow(clippy::unnecessary_literal_unwrap))]
             let down = down.unwrap_or_else(|| {
                 let ffn_acts = shex.gate.quantize_batch_acts(normed2_batch, batch_size);
-                let gate =
-                    shex.gate
-                        .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-                let up =
-                    shex.up
-                        .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
+                // One rotation for the pair when they share a fold
+                // (`apply_batch_pair_with_acts`); two independent calls
+                // otherwise, which is every unfolded model.
+                let (gate, up) = WeightMatrix::apply_batch_pair_with_acts(
+                    &shex.gate,
+                    &shex.up,
+                    normed2_batch,
+                    batch_size,
+                    ffn_acts.as_ref(),
+                );
                 let activated = act.apply(&gate, &up);
                 shex.down.apply_batch(&activated, batch_size)
             });
@@ -3667,12 +3671,13 @@ impl Decoder {
         }
         Some(layer.moe.with_expert(0, |ex| {
             let ffn_acts = ex.gate.quantize_batch_acts(normed2_batch, batch_size);
-            let mut gate =
-                ex.gate
-                    .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
-            let mut up = ex
-                .up
-                .apply_batch_with_acts(normed2_batch, batch_size, ffn_acts.as_ref());
+            let (mut gate, mut up) = WeightMatrix::apply_batch_pair_with_acts(
+                &ex.gate,
+                &ex.up,
+                normed2_batch,
+                batch_size,
+                ffn_acts.as_ref(),
+            );
             // `build_ffn`: `up_b` / `gate_b` before the activation
             // (`crate::proj_bias`). On an ungated layer `gate` is an
             // alias of `up` and only `up_b` exists; `act.apply` reads

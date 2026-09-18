@@ -96,18 +96,31 @@ impl HadamardFold {
     /// the head's input takes the forward transform too (no
     /// permutation is ever set on a lookup table).
     pub fn transform_input(&self, x: &[f32]) -> Vec<f32> {
-        self.check(x.len());
-        let mut v = match self.perm {
-            Some(p) => tiled_to_grouped(x, p),
-            None => x.to_vec(),
-        };
+        let mut out = vec![0f32; x.len()];
+        self.transform_into(&mut out, x);
+        out
+    }
+
+    /// [`Self::transform_input`] writing into a caller's buffer.
+    ///
+    /// The allocating form is this plus a `Vec`, and a batch wants the
+    /// buffer it already has: `transform_rows` used to allocate one
+    /// `Vec` PER ROW inside the parallel region and copy out of it,
+    /// which on a 128-token Bonsai prefill is some fifty thousand
+    /// multi-kilobyte allocations for data that already had a home.
+    pub fn transform_into(&self, dst: &mut [f32], src: &[f32]) {
+        self.check(src.len());
+        assert_eq!(dst.len(), src.len(), "the rotation is size-preserving");
+        match self.perm {
+            Some(p) => tiled_to_grouped_into(dst, src, p),
+            None => dst.copy_from_slice(src),
+        }
         if let Some(s) = &self.signs {
-            for (a, b) in v.iter_mut().zip(s.iter()) {
+            for (a, b) in dst.iter_mut().zip(s.iter()) {
                 *a *= b;
             }
         }
-        fwht_normalized(&mut v, self.block);
-        v
+        fwht_normalized(dst, self.block);
     }
 
     /// [`Self::transform_input`] over `n` consecutive rows of `x`.
@@ -115,10 +128,12 @@ impl HadamardFold {
         assert!(n > 0 && x.len().is_multiple_of(n));
         let w = x.len() / n;
         let mut out = vec![0f32; x.len()];
-        // Rows are independent: one parallel region over them. Serial,
-        // this was a quarter of a Bonsai-2-27B prefill step.
+        // Rows are independent: one parallel region over them, each
+        // writing straight into its own slice of the output. Serial and
+        // allocating per row, this was a quarter of a Bonsai-2-27B
+        // prefill step.
         crate::par::chunks_mut(&mut out, w, 1, |r, dst| {
-            dst.copy_from_slice(&self.transform_input(&x[r * w..(r + 1) * w]));
+            self.transform_into(dst, &x[r * w..(r + 1) * w]);
         });
         out
     }
@@ -151,16 +166,23 @@ impl HadamardFold {
 }
 
 /// `[hd, nk, rep]` (ggml `ne` order: `hd` fastest) to `[hd, rep, nk]`.
+#[cfg(test)]
 fn tiled_to_grouped(x: &[f32], p: HeadPerm) -> Vec<f32> {
-    let HeadPerm { hd, nk, rep } = p;
     let mut out = vec![0f32; x.len()];
+    tiled_to_grouped_into(&mut out, x, p);
+    out
+}
+
+/// [`tiled_to_grouped`] into a caller's buffer.
+fn tiled_to_grouped_into(out: &mut [f32], x: &[f32], p: HeadPerm) {
+    let HeadPerm { hd, nk, rep } = p;
+    debug_assert_eq!(out.len(), x.len());
     for r in 0..rep {
         for k in 0..nk {
             let src = &x[hd * (k + nk * r)..hd * (k + nk * r) + hd];
             out[hd * (r + rep * k)..hd * (r + rep * k) + hd].copy_from_slice(src);
         }
     }
-    out
 }
 
 /// The natural-order Walsh-Hadamard transform of every `block`-wide

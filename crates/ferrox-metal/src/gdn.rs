@@ -246,6 +246,36 @@ pub fn encode_delta_step(
     beta: &ProtocolObject<dyn MTLBuffer>,
     out: &ProtocolObject<dyn MTLBuffer>,
 ) -> Result<(), MetalError> {
+    encode_delta_step_at(
+        encoder,
+        device,
+        shape,
+        state,
+        (q, 0),
+        (k, 0),
+        (v, 0),
+        (g, 0),
+        (beta, 0),
+        (out, 0),
+    )
+}
+
+/// [`encode_delta_step`] with each operand at a float OFFSET into its
+/// buffer, so a batch keeps one upload per operand and one state buffer
+/// across its rows. Offsets are in floats, as the caller indexes them.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_delta_step_at(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    shape: DeltaShape,
+    state: &ProtocolObject<dyn MTLBuffer>,
+    q: (&ProtocolObject<dyn MTLBuffer>, usize),
+    k: (&ProtocolObject<dyn MTLBuffer>, usize),
+    v: (&ProtocolObject<dyn MTLBuffer>, usize),
+    g: (&ProtocolObject<dyn MTLBuffer>, usize),
+    beta: (&ProtocolObject<dyn MTLBuffer>, usize),
+    out: (&ProtocolObject<dyn MTLBuffer>, usize),
+) -> Result<(), MetalError> {
     if shape.head_dim == 0
         || shape.head_dim > MAX_HEAD_DIM
         || shape.n_k_heads == 0
@@ -257,8 +287,9 @@ pub fn encode_delta_step(
     let pipe = ensure_pipeline(device, GDN_KERNEL_SRC, "gdn_delta_step")?;
     encoder.setComputePipelineState(&pipe.0);
     unsafe {
-        for (idx, buf) in [state, q, k, v, g, beta, out].into_iter().enumerate() {
-            encoder.setBuffer_offset_atIndex(Some(buf), 0, idx);
+        encoder.setBuffer_offset_atIndex(Some(state), 0, 0);
+        for (idx, (buf, off)) in [q, k, v, g, beta, out].into_iter().enumerate() {
+            encoder.setBuffer_offset_atIndex(Some(buf), off * 4, idx + 1);
         }
         let mut dims: [u32; 4] = [
             shape.n_k_heads as u32,
@@ -348,6 +379,102 @@ pub fn launch_delta_step(
             std::slice::from_raw_parts(state_buf.contents().as_ptr() as *const f32, state.len());
         state.copy_from_slice(st);
         let o = std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const f32, out_len);
+        Ok(o.to_vec())
+    }
+}
+
+/// `rows` consecutive tokens' delta steps in ONE command buffer.
+///
+/// The recurrence is sequential in rows and the dispatches are too: a
+/// serial compute encoder runs them in order against the same state
+/// buffer, which is what makes this one submission rather than `rows`
+/// of them. The state is uploaded once and read back once, so its cost
+/// is amortised over the whole batch instead of paid per token, which
+/// is the difference between this path and a decode token's (see
+/// `docs/plans/gdn-resident-state.md`).
+///
+/// `q`, `k` are `[rows][n_k_heads * head_dim]`, `v` is
+/// `[rows][n_v_heads * head_dim]`, `g` and `beta` are `[rows][n_v_heads]`,
+/// and the returned outputs are `[rows][n_v_heads * head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_delta_step_rows(
+    shape: DeltaShape,
+    rows: usize,
+    state: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+) -> Result<Vec<f32>, MetalError> {
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
+    let key_row = shape.n_k_heads * shape.head_dim;
+    let val_row = shape.n_v_heads * shape.head_dim;
+    if q.len() != rows * key_row
+        || k.len() != rows * key_row
+        || v.len() != rows * val_row
+        || g.len() != rows * shape.n_v_heads
+        || beta.len() != rows * shape.n_v_heads
+    {
+        return Err(MetalError::CommandFailed);
+    }
+    let shared = crate::gpu::shared_metal()?;
+    let device = &shared.device;
+    let queue = &shared.queue;
+    let upload = |xs: &[f32]| -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MetalError> {
+        let mut owned = xs.to_vec();
+        // SAFETY: `owned` outlives the call and the buffer copies it.
+        unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(owned.as_mut_ptr() as *mut _).ok_or(MetalError::BufferAllocFailed)?,
+                std::mem::size_of_val(owned.as_slice()),
+                objc2_metal::MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or(MetalError::BufferAllocFailed)
+    };
+    let state_buf = upload(state)?;
+    let (q_buf, k_buf, v_buf) = (upload(q)?, upload(k)?, upload(v)?);
+    let (g_buf, beta_buf) = (upload(g)?, upload(beta)?);
+    let out_buf = device
+        .newBufferWithLength_options(
+            rows * val_row * 4,
+            objc2_metal::MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or(MetalError::BufferAllocFailed)?;
+
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    for r in 0..rows {
+        encode_delta_step_at(
+            &encoder,
+            device,
+            shape,
+            &state_buf,
+            (&q_buf, r * key_row),
+            (&k_buf, r * key_row),
+            (&v_buf, r * val_row),
+            (&g_buf, r * shape.n_v_heads),
+            (&beta_buf, r * shape.n_v_heads),
+            (&out_buf, r * val_row),
+        )?;
+    }
+    encoder.endEncoding();
+    let clock = crate::timing::SubmitClock::start();
+    crate::timing::commit_wait_note(&cmd_buf, "gdn-delta-rows", 16, clock);
+
+    // SAFETY: shared-storage buffers of exactly these lengths, written
+    // by kernels this call has waited for.
+    unsafe {
+        let st =
+            std::slice::from_raw_parts(state_buf.contents().as_ptr() as *const f32, state.len());
+        state.copy_from_slice(st);
+        let o =
+            std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const f32, rows * val_row);
         Ok(o.to_vec())
     }
 }

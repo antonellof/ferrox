@@ -2186,6 +2186,54 @@ impl WeightMatrix {
     /// value whose format or length does not match this matrix is simply
     /// ignored (the activations are re-quantized locally), so mixed-kind
     /// projection groups stay correct.
+    /// Two matrices of one batch, with a folded rotation applied ONCE
+    /// when they share it.
+    ///
+    /// `gate` and `up` read the same batch, and so do a gated
+    /// delta-net's `qkv` and `z`; each call to
+    /// [`Self::apply_batch_with_acts`] rotates the batch for itself, so
+    /// a folded pair transformed the same `[rows][n_embd]` block twice.
+    /// The butterfly is the second-largest cost of a Bonsai prefill
+    /// step (`sample`, beside the recurrence), and half of it was that
+    /// repeat.
+    ///
+    /// Falls back to two independent calls whenever the pair does not
+    /// share one fold, which is every unfolded model: there the cost
+    /// being saved does not exist.
+    pub fn apply_batch_pair_with_acts(
+        a: &Self,
+        b: &Self,
+        x_batch: &[f32],
+        batch_size: usize,
+        shared: Option<&BatchActs>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        if let (
+            WeightMatrix::Folded {
+                base: base_a,
+                fold: fold_a,
+            },
+            WeightMatrix::Folded {
+                base: base_b,
+                fold: fold_b,
+            },
+        ) = (a, b)
+        {
+            if std::sync::Arc::ptr_eq(fold_a, fold_b) && batch_size > 0 {
+                let transformed = fold_a.transform_rows(x_batch, batch_size);
+                // `shared` describes the UNROTATED batch, so it cannot
+                // be handed to a matrix reading the rotated one.
+                return (
+                    base_a.apply_batch_with_acts(&transformed, batch_size, None),
+                    base_b.apply_batch_with_acts(&transformed, batch_size, None),
+                );
+            }
+        }
+        (
+            a.apply_batch_with_acts(x_batch, batch_size, shared),
+            b.apply_batch_with_acts(x_batch, batch_size, shared),
+        )
+    }
+
     pub fn apply_batch_with_acts(
         &self,
         x_batch: &[f32],

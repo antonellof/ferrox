@@ -302,7 +302,8 @@ impl Gdn {
         let (qkv_all, z_all) = if rows == 1 {
             WeightMatrix::apply_pair(&self.qkv, &self.z_proj, normed)
         } else {
-            (project(&self.qkv), project(&self.z_proj))
+            // A batch rotates the shared input ONCE for the pair.
+            WeightMatrix::apply_batch_pair_with_acts(&self.qkv, &self.z_proj, normed, rows, None)
         };
         // The two per-head gate logits, whichever projection spells
         // them: `[rows][n_v]` each.
@@ -331,6 +332,16 @@ impl Gdn {
         let mut o = vec![0.0f32; value_dim];
         let mut g = vec![0.0f32; n_v];
         let mut beta = vec![0.0f32; n_v];
+        // A PREFILL batch keeps the recurrence on the host too, and
+        // this one is the most surprising of the measurements: it is
+        // 23% of a Bonsai prefill step, the state is uploaded ONCE for
+        // the whole batch rather than per token, and running it on the
+        // device still cost `pp128` 32.7 -> 28.5 tok/s. The reason is
+        // the state's working set: 3.1 MB per layer stays in the CPU's
+        // shared cache across the batch's rows, where the GPU re-reads
+        // and re-writes it from memory for every row (38 GB of traffic
+        // for a 128-token prefill). `docs/plans/gdn-resident-state.md`
+        // carries this beside the decode measurement.
         for r in 0..rows {
             // :251-262: the two per-head gates from the layer input.
             for hd in 0..n_v {

@@ -15,6 +15,18 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Changed
+
+- **A folded pair rotates its batch once, not twice.**
+  `WeightMatrix::apply_batch_pair_with_acts` is the entry `gate`/`up`
+  and a delta-net's `qkv`/`z` take: they read the same batch and
+  carried the same fold, so each was rotating the same
+  `[rows][n_embd]` block for itself. Bonsai `pp128` 32.2 to 33.2 tok/s,
+  parity unmoved. `transform_rows` also stopped allocating a `Vec` per
+  ROW inside its parallel region (`transform_into` writes into the
+  caller's slice), which on a 128-token prefill was some fifty thousand
+  multi-kilobyte allocations.
+
 ### Added
 
 - **The gated delta-net recurrence and its gated output norm as Metal
