@@ -1357,8 +1357,8 @@ PTQ1_0 matvec returned zeros on its first run because
 had been quietly running Q5_0 through their fallbacks for two weeks
 while the capability table and the kernel registry said otherwise.
 Each is derived from the one table now, with a test that holds it.
-The speed gap that remains (7.3 vs 11.5 tok/s decode, 32 vs 67
-prefill on the M2 Pro) is structural: ~120 command buffers a token at
+The speed gap that remains (7.7 vs 11.5 tok/s decode, 32.7 vs 66.8
+prefill on the M2 Pro, measured back to back on a quiet box) is structural: ~120 command buffers a token at
 0.166 ms of submission latency each, where the fork encodes one graph,
 and the delta-net recurrence on the CPU. Two of the levers pulled at
 it are worth as much as the one that worked: the device-side Hadamard
@@ -1368,6 +1368,17 @@ a spin-then-block wait on the command buffer, aimed at that 0.166 ms,
 measured 3.7 tok/s against 7.1 -- polling the status through objc
 takes the core the host work needs. Both are recorded where the code
 is, so the next attempt starts after them.
+`docs/plans/gdn-resident-state.md` IS that next attempt, with the
+ledger it has to beat: 159 submissions, 66 ms of GPU, 34 ms of
+submission overhead and 41 ms of host compute in a 141 ms token, and a
+`sample` that says 83% of the decode thread sits in
+`waitUntilCompleted`. Its delta-rule and gated-norm kernels LANDED
+(`ferrox-metal/src/gdn.rs`, pinned against
+`ferrox_core::gdn::delta_step`, sabotage red) and wiring them TODAY is
+a LOSS -- 6.0 tok/s against 7.1 -- because Bonsai's state is 3.1 MB a
+layer and copying it both ways is 300 MB a token, more traffic than
+the whole weight read. The state has to live on the device first,
+behind an accessor its host readers cannot forget.
 
 Do not read the architecture catalog as a support matrix. `ferrox
 parity` is the oracle: its tokenizer half matches llama.cpp on every

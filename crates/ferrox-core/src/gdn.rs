@@ -184,6 +184,89 @@ fn update_and_dot(row: &mut [f32], k: &[f32], d: f32, q: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
+    /// The device kernel IS this recurrence: same decay, same
+    /// prediction, same beta-scaled error, same rank-one update, same
+    /// scaled read-out, and the same state left behind. Run on the M2
+    /// Pro; a kernel that disagreed would move a Bonsai token's logits
+    /// without moving any test that does not launch it.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn the_device_delta_step_matches_this_one() {
+        use ferrox_metal::gdn::{DeltaShape, HeadMapKind};
+
+        for (n_k, n_v, s, map, kind) in [
+            (
+                4usize,
+                48usize,
+                128usize,
+                HeadMap::Tiled,
+                HeadMapKind::Tiled,
+            ),
+            (4, 48, 128, HeadMap::Grouped, HeadMapKind::Grouped),
+            (2, 2, 4, HeadMap::Tiled, HeadMapKind::Tiled),
+        ] {
+            let dims = DeltaDims {
+                n_k_heads: n_k,
+                n_v_heads: n_v,
+                head_dim: s,
+                map,
+            };
+            let mut seed = 12345u32;
+            let mut draw = |n: usize, scale: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        ((seed >> 8) as f32 / 8388608.0 - 1.0) * scale
+                    })
+                    .collect()
+            };
+            let state0 = draw(dims.state_len(), 0.5);
+            let q = draw(n_k * s, 1.0);
+            let k = draw(n_k * s, 1.0);
+            let v = draw(n_v * s, 1.0);
+            // The decay is `exp(g)`, so g is negative in a real layer.
+            let g: Vec<f32> = draw(n_v, 1.0).iter().map(|x| -x.abs()).collect();
+            let beta: Vec<f32> = draw(n_v, 1.0).iter().map(|x| 0.5 + 0.25 * x).collect();
+
+            let mut host_state = state0.clone();
+            let mut host_out = vec![0.0f32; n_v * s];
+            delta_step(dims, &mut host_state, &q, &k, &v, &g, &beta, &mut host_out);
+
+            let mut device_state = state0.clone();
+            let shape = DeltaShape {
+                n_k_heads: n_k,
+                n_v_heads: n_v,
+                head_dim: s,
+                map: kind,
+            };
+            let device_out = ferrox_metal::gdn::launch_delta_step(
+                shape,
+                &mut device_state,
+                &q,
+                &k,
+                &v,
+                &g,
+                &beta,
+            )
+            .expect("the kernel launches");
+
+            let tol = 2e-4;
+            for (i, (a, b)) in device_out.iter().zip(host_out.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol * b.abs().max(1.0),
+                    "{n_v}x{s} {map:?} out[{i}]: device={a} host={b}"
+                );
+            }
+            for (i, (a, b)) in device_state.iter().zip(host_state.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol * b.abs().max(1.0),
+                    "{n_v}x{s} {map:?} state[{i}]: device={a} host={b}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn l2_normalize_clamps_the_divisor() {
         let mut v = [3.0f32, 4.0];

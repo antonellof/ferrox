@@ -21,6 +21,10 @@ pub mod gpu;
 #[cfg(feature = "metal")]
 pub mod hadamard;
 
+/// The gated delta-net recurrence as a device kernel.
+#[cfg(feature = "metal")]
+pub mod gdn;
+
 /// PrismML's PTQ1_0 trit format on Metal (`ternary::PTQ1_0Dequant`).
 pub mod ternary;
 

@@ -8,7 +8,7 @@ Two files hold the plan:
   own.
 - **[`roadmap.md`](roadmap.md)** is every open item, merged by theme.
 
-Three items are large enough to carry their own design document:
+Four items are large enough to carry their own design document:
 
 - **[`speculative-decoding.md`](speculative-decoding.md)**, the one
   decode item that raises throughput without buying hardware. Decode
@@ -21,6 +21,14 @@ Three items are large enough to carry their own design document:
   was written and is 6702 today, the first time it has shrunk.
 - **[`out-of-core-moe.md`](out-of-core-moe.md)**, running a 155 GB model
   on a 32 GB machine.
+- **[`gdn-resident-state.md`](gdn-resident-state.md)**, a recurrent
+  layer that does not come back to the host. It is the measured next
+  step for Bonsai-2-27B decode (7.2 tok/s against the PrismML fork's
+  11.5), with the per-token ledger that says why, the delta-rule and
+  gated-norm kernels that already exist and are pinned against the CPU
+  definition, the reason wiring them TODAY is a loss (3.1 MB of state
+  per layer, copied both ways), and four measured non-results so they
+  are not tried again.
 
 How work lands is written down too:
 

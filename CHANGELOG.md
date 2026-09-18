@@ -15,6 +15,20 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Added
+
+- **The gated delta-net recurrence and its gated output norm as Metal
+  kernels** (`ferrox-metal/src/gdn.rs`), pinned against
+  `ferrox_core::gdn::delta_step` on three shapes including Bonsai's;
+  swapping the head map in the kernel turns the test red. They are NOT
+  wired, and the reason is measured: in place, the fused tail runs at
+  6.0 tok/s against 7.1, because the state is 3.1 MB a layer and
+  copying it both ways is 300 MB a token, more traffic than the whole
+  weight read. `docs/plans/gdn-resident-state.md` carries the per-token
+  ledger the next attempt has to beat (159 submissions, 66 ms GPU,
+  34 ms submission overhead, 41 ms host) and four measured
+  non-results, so none of them is tried twice.
+
 ## [0.23.1] - 2026-09-18
 
 A packaging release: 0.22.0 and 0.23.0 shipped binaries but never
