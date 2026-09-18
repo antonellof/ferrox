@@ -165,8 +165,8 @@ is faster.
   launches and Q5_0 prefill as N matvecs while the kernel registry
   recorded a GEMM hit), and `ferrox bench` refused every hybrid model
   because its cache probe read KV rows on a recurrent layer. Speed on
-  the M2 Pro: pp128 32.3 / tg32 7.3 tok/s against the fork's 66.6 /
-  11.5, up from 2.9 / 2.4 at first light. The last 9% of decode came
+  the M2 Pro, back to back on a quiet box: pp128 32.7 / tg32 7.7 tok/s
+  against the fork's 66.8 / 11.5, up from 2.9 / 2.4 at first light. The last 9% of decode came
   from putting the ROTATION on the device
   (`ferrox-metal/src/hadamard.rs`) so a folded FFN could take the
   fused `gate -> SwiGLU -> down` launch, which halves a layer's
