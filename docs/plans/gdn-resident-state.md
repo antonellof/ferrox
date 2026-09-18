@@ -90,6 +90,22 @@ the fused decode stack (`ferrox-metal/src/decode_dense.rs`, already
 serving dense models) would have to take over for PTQ1_0 and for folded
 weights.
 
+## The prefill surprise
+
+The recurrence is **23% of a prefill step** (a `sample` of `pp512`-shaped
+work), and a batch amortises the state copy over all its rows: upload
+once, `rows` dispatches in one command buffer against one state buffer,
+read back once. `launch_delta_step_rows` does exactly that and is pinned
+against the host stepping the same rows in order
+(`the_device_delta_rows_step_in_order`).
+
+It measured `pp128` **32.7 -> 28.5 tok/s**. The state's working set is
+why: 3.1 MB per layer stays in the CPU's shared cache across a batch's
+rows, while the GPU re-reads and re-writes it from memory for every row,
+which is 38 GB of traffic for a 128-token prefill. So the batched entry
+is also kernels-without-a-caller until the state is resident AND the
+rows are chunked so a block of them shares one pass over it.
+
 ## Measured non-results, so they are not tried again
 
 - The Hadamard rotation on the device for a prefill BATCH: `pp128` 33.96
@@ -102,3 +118,5 @@ weights.
   against 7.1, for an `unsafe` invariant somebody has to keep.
 - 8 rows per simdgroup in the PTQ1_0 matvec instead of 4: 6.9 against
   7.1 end to end.
+- The batched recurrence on the device, with the state copied once per
+  BATCH rather than once per token: `pp128` 32.7 to 28.5 (above).
