@@ -29,14 +29,22 @@ are the ones worth reading twice.
 
 ### Added
 
+- **A page-aligned recurrent state**
+  (`ferrox_core::recurrent_state::AlignedF32`), so Metal can wrap the
+  host's own bytes for a kernel instead of copying them. It is what
+  turned the second and third measurements below into measurements
+  rather than guesses.
 - **The gated delta-net recurrence and its gated output norm as Metal
   kernels** (`ferrox-metal/src/gdn.rs`), pinned against
   `ferrox_core::gdn::delta_step` on three shapes including Bonsai's;
   swapping the head map in the kernel turns the test red. They are NOT
-  wired, and the reason is measured: in place, the fused tail runs at
-  6.0 tok/s against 7.1, because the state is 3.1 MB a layer and
-  copying it both ways is 300 MB a token, more traffic than the whole
-  weight read. `docs/plans/gdn-resident-state.md` carries the per-token
+  wired, and the reason is measured three ways against a 7.3 tok/s host
+  baseline: 6.0 with the state copied both ways (3.1 MB a layer, 300 MB
+  a token, more traffic than the whole weight read), 6.6 wrapped in
+  place with no copy at all, and 6.9 with the wrapper cached so the
+  host pages are mapped once. With every copy gone it is still behind,
+  so the difference is the kernel, and the answer is the chunked delta
+  rule rather than this loop on the GPU. `docs/plans/gdn-resident-state.md` carries the per-token
   ledger the next attempt has to beat (159 submissions, 66 ms GPU,
   34 ms submission overhead, 41 ms host) and four measured
   non-results, so none of them is tried twice.
