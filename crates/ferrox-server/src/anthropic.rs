@@ -1474,7 +1474,7 @@ async fn messages_full(
             active.name(),
         )
         .map_err(anthropic_shape)?;
-    let posture = OutputPosture::resolve(active.name(), &prompt);
+    let posture = OutputPosture::resolve_with(active.reasoning_format(), active.name(), &prompt);
     // The client's own list, kept apart from `params.stop`, which the
     // template adds its end-of-turn marker to. See `caller_stop`.
     let caller_stops = chat.stop_sequences();
@@ -1541,7 +1541,7 @@ async fn messages_stream(
             &served_model,
         )
         .map_err(anthropic_shape)?;
-    let posture = OutputPosture::resolve(&served_model, &prompt);
+    let posture = OutputPosture::resolve_with(active.reasoning_format(), &served_model, &prompt);
     // See `messages_full`: the client's list, not the template's.
     let caller_stops = chat.stop_sequences();
     let mut params =

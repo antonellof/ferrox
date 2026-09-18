@@ -83,6 +83,14 @@ struct Inner {
     eos_token: Option<String>,
     thinking: crate::policy::effort::ThinkingProfile,
     handles_tools: bool,
+    /// The reasoning format the template's own text implies: `Think`
+    /// when a thinking-on render of it contains `<think>`. Learned at
+    /// load, like the gears, because the served NAME is not a family:
+    /// Bonsai-2-27B's `general.name` is `Hf`, every Qwen3.5 export's is
+    /// `Original`, and `--alias` can make it anything, so a parser
+    /// picked from the name alone left `<think>` prose in `content`
+    /// with `reasoning_content` empty on exactly those checkpoints.
+    implied_reasoning: Option<crate::policy::parser::ReasoningFormat>,
 }
 
 impl std::fmt::Debug for PromptTemplate {
@@ -145,6 +153,7 @@ impl PromptTemplate {
             probe_efforts(&template, bos, eos),
         );
         let handles_tools = probe_tools_consumed(&template, bos, eos);
+        let implied_reasoning = probe_implied_reasoning(probe_render(&template, bos, eos));
         Self {
             inner: Arc::new(Inner {
                 // A terminator that IS the EOS adds nothing to the stop
@@ -158,8 +167,23 @@ impl PromptTemplate {
                 eos_token,
                 thinking,
                 handles_tools,
+                implied_reasoning,
             }),
         }
+    }
+
+    /// The reasoning parser for a checkpoint served under `served_model`:
+    /// the name's family when it has one
+    /// ([`crate::policy::parser::ReasoningFormat::infer`]), else what the
+    /// template's own text implies. ONE accessor, because the split, the
+    /// token count, the budget and the continuation writer all have to
+    /// agree about which family this is, and each used to ask the name
+    /// on its own.
+    pub(crate) fn reasoning_format(
+        &self,
+        served_model: &str,
+    ) -> Option<crate::policy::parser::ReasoningFormat> {
+        crate::policy::parser::ReasoningFormat::infer(served_model).or(self.inner.implied_reasoning)
     }
 
     /// Short human-readable identity, for the load-time log line.
@@ -406,6 +430,20 @@ fn probe_render<'a>(
     }
 }
 
+/// What the template's markers say about its chain of thought: a render
+/// with thinking on that contains `<think>` is the plain think block
+/// ([`crate::policy::parser::ReasoningFormat::Think`]). A render that
+/// fails, or shows no marker, implies nothing; the channel formats
+/// (harmony, Gemma-4, MiniMax-M3) are not inferred here because their
+/// names carry them and their markers are not a `<think>` pair.
+fn probe_implied_reasoning(
+    mut render: impl FnMut(&Map<String, Value>, Option<&[Value]>) -> Result<String, TemplateError>,
+) -> Option<crate::policy::parser::ReasoningFormat> {
+    let on = render(&crate::policy::effort::thinking_on_kwargs(), None).ok()?;
+    on.contains("<think>")
+        .then_some(crate::policy::parser::ReasoningFormat::Think)
+}
+
 /// Learn the effort vocabulary by rendering probes through the template.
 ///
 /// A template that rejects the probe shape entirely is reported inert
@@ -545,6 +583,38 @@ mod tests {
                 .expect("renders"),
             "hi"
         );
+    }
+
+    /// The parser comes from the template when the name says nothing.
+    /// Bonsai-2-27B is served as `Hf` and every Qwen3.5 export as
+    /// `Original`; both templates open a `<think>` block, and before
+    /// this the thinking landed in `content` for both.
+    #[test]
+    fn a_think_template_implies_the_think_parser_whatever_the_name() {
+        use crate::policy::parser::ReasoningFormat;
+        let src = "{{ messages[0].content }}{% if enable_thinking %}<think>\n{% endif %}";
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(src), Some("qwen3"), false, true, None, None);
+        assert_eq!(tmpl.reasoning_format("Hf"), Some(ReasoningFormat::Think));
+        assert_eq!(
+            tmpl.reasoning_format("Original"),
+            Some(ReasoningFormat::Think)
+        );
+        // The name still wins where it names a family the text cannot.
+        assert_eq!(
+            tmpl.reasoning_format("gpt-oss-20b"),
+            Some(ReasoningFormat::GptOss)
+        );
+        let plain = PromptTemplate::from_gguf_metadata(
+            Some("{{ messages[0].content }}"),
+            Some("llama"),
+            false,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(plain.reasoning_format("Hf"), None);
+        assert_eq!(plain.reasoning_format("llama-3.1-8b"), None);
     }
 
     #[test]

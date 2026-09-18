@@ -1781,8 +1781,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     // is not asked at all, for the same reason -- it has no template to
     // probe, and `ThinkGears::default()` would be an invented answer.
     if let Some(model) = active.generative_opt() {
-        let parser_configured =
-            crate::policy::parser::ReasoningFormat::infer(active.name()).is_some();
+        let parser_configured = active.reasoning_format().is_some();
         let gears = model.chat_template().think_gears(parser_configured);
         if !gears.is_empty() {
             model_entry["supported_reasoning_efforts"] = serde_json::json!(gears.supported);
@@ -2755,7 +2754,7 @@ async fn chat_completions_full(
     let (message, finish_reason) = build_response_message(
         content,
         if tools_active { &req.tools } else { &[] },
-        output::OutputPosture::resolve(active.name(), &prompt),
+        output::OutputPosture::resolve_with(active.reasoning_format(), active.name(), &prompt),
         completion.finish.as_str(),
     );
 
@@ -2825,7 +2824,8 @@ async fn chat_completions_stream(
     // How to read this stream, fixed before the first token: the family
     // from the served checkpoint, and whether the prompt that was
     // actually rendered left the model inside a reasoning block.
-    let posture = output::OutputPosture::resolve(&served_model, &prompt);
+    let posture =
+        output::OutputPosture::resolve_with(active.reasoning_format(), &served_model, &prompt);
     // The offered tools, captured for the terminal parse: the request
     // itself does not outlive the closure that consumes it.
     let offered_tools: Vec<ToolDef> = if tools_active {
@@ -3475,6 +3475,13 @@ fn price_batcher_config(path: Option<&str>) -> serving::batch::BatcherConfig {
         tracing::info!(
             "derived KV block budget: {} blocks x {} positions; override with FERROX_CB_KV_BLOCKS",
             derived.kv_blocks,
+            batcher.kv_block_size
+        );
+    }
+    if let Some(narrowed) = adopted.max_context_narrowed {
+        tracing::info!(
+            "per-request context ceiling narrowed to {narrowed} token positions: the whole KV              ledger is {} blocks x {} positions, so a longer request could never be admitted",
+            batcher.kv_blocks.unwrap_or_default(),
             batcher.kv_block_size
         );
     }

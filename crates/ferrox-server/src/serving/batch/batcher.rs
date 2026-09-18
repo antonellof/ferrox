@@ -211,6 +211,17 @@ impl ContinuousBatcher {
         // with the ceiling named: queueing it would only make it wait
         // for capacity that will never be enough. This is the
         // immovable half of the rejection split -- 400, not 503.
+        //
+        // `fit` first, the same call the private loop makes: a prompt
+        // that fits with room to spare is SERVED with whatever output
+        // budget remains, rather than refused over a `max_tokens` the
+        // caller never sent (`ContextCeiling::fit`). Only the prompt's
+        // own size and an unrepresentable sum refuse here.
+        let mut params = params;
+        params.max_tokens = self
+            .budget
+            .ceiling
+            .fit(prompt_tokens.len(), params.max_tokens)?;
         let max_seq_len = prompt_tokens.len().saturating_add(params.max_tokens);
         // What this request will HOLD, which is its whole length unless
         // a sliding window gives the tail back as it goes. The ceiling

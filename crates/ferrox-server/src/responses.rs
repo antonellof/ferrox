@@ -1469,7 +1469,7 @@ async fn responses_full(
     let kwargs = chat.resolve_template_kwargs(&template);
     let offered = offered_tools(&chat);
     let prompt = chat.render_prompt(&chat.messages, &template, &offered, kwargs, active.name())?;
-    let posture = OutputPosture::resolve(active.name(), &prompt);
+    let posture = OutputPosture::resolve_with(active.reasoning_format(), active.name(), &prompt);
     let params =
         chat.generation_params_for_template(&template, active.name(), active.sampler_model())?;
 
@@ -1530,7 +1530,7 @@ async fn responses_stream(
     let offered = offered_tools(&chat);
     let served_model = active.name().to_string();
     let prompt = chat.render_prompt(&chat.messages, &template, &offered, kwargs, &served_model)?;
-    let posture = OutputPosture::resolve(&served_model, &prompt);
+    let posture = OutputPosture::resolve_with(active.reasoning_format(), &served_model, &prompt);
     let mut params =
         chat.generation_params_for_template(&template, &served_model, active.sampler_model())?;
 

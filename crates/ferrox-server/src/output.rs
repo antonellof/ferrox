@@ -90,8 +90,22 @@ pub(crate) struct OutputPosture {
 }
 
 impl OutputPosture {
+    /// The posture for a name alone: what the live routes did before the
+    /// template's evidence joined the decision. Tests that pin a family
+    /// by name use it; every route goes through [`Self::resolve_with`].
+    #[cfg(test)]
     pub(crate) fn resolve(model_name: &str, prompt: &str) -> Self {
-        let reasoning = ReasoningFormat::infer(model_name);
+        Self::resolve_with(ReasoningFormat::infer(model_name), model_name, prompt)
+    }
+
+    /// The posture with the reasoning format decided elsewhere
+    /// (`PromptTemplate::reasoning_format`, which also reads the
+    /// template); the tool-call format still comes from the name.
+    pub(crate) fn resolve_with(
+        reasoning: Option<ReasoningFormat>,
+        model_name: &str,
+        prompt: &str,
+    ) -> Self {
         OutputPosture {
             reasoning,
             reasoning_open: reasoning.is_some_and(|f| f.prompt_opens_reasoning(prompt)),

@@ -186,6 +186,41 @@ impl ContextCeiling {
         }
     }
 
+    /// The `max_tokens` this request actually gets: the caller's, or
+    /// what the ceiling leaves after the prompt, or a refusal when the
+    /// prompt has no room at all.
+    ///
+    /// ONE function for the decision, because the two decode paths used
+    /// to answer it differently. `generate` clamped (the private loop,
+    /// and the reason `DEFAULT_CHAT_MAX_TOKENS` is allowed to be 32k at
+    /// all), while the continuous batcher called [`Self::refusal`] with
+    /// `prompt + max_tokens` and rejected. Since the batcher became the
+    /// default decode path, EVERY chat request that omitted `max_tokens`
+    /// against a deployment with a ceiling under 32k was a 400 naming a
+    /// number the caller never sent -- a server started `-c 16384`
+    /// answered `hi` with `context_length_exceeded`, measured.
+    ///
+    /// The refusing cases stay refusals, and both are the request's own
+    /// shape rather than the budget's: a prompt at or past the ceiling
+    /// ([`Self::prompt_refusal`]) has nothing to clamp to, and a sum
+    /// that does not fit a `usize` ([`Self::overflow_refusal`]) is not
+    /// a request any deployment could serve.
+    pub fn fit(&self, prompt_tokens: usize, max_tokens: usize) -> Result<usize, DecodeError> {
+        if let Some(err) = self.prompt_refusal(prompt_tokens) {
+            return Err(err);
+        }
+        // Before the clamp's own comparison, which is where the wrap
+        // used to walk past the guard.
+        if let Some(err) = self.overflow_refusal(prompt_tokens, max_tokens) {
+            return Err(err);
+        }
+        match self.limit {
+            // `prompt_refusal` has already established `prompt < limit`.
+            Some(limit) if prompt_tokens + max_tokens > limit => Ok(limit - prompt_tokens),
+            _ => Ok(max_tokens),
+        }
+    }
+
     /// The typed refusal for a request of `positions` positions, or
     /// `None` when it fits.
     ///
@@ -284,6 +319,26 @@ pub fn apply_derived(
         config.kv_blocks = Some(derived.kv_blocks);
         adopted.kv_blocks = true;
     }
+    // The two ceilings must agree about one thing: the longest request
+    // this deployment can ever admit. A per-request ceiling above what
+    // the WHOLE ledger holds is a promise nothing can keep -- the
+    // clamp lets `max_tokens` grow up to it and the block budget then
+    // refuses the result as immovable, which is the same request
+    // refused by the ceiling that did not advertise itself. Measured:
+    // `serve -c 65536` on a machine whose derived ledger was 99 blocks
+    // of 256 answered every default-budget chat request with
+    // `device_memory_budget_exceeded`.
+    //
+    // Narrowing only, and only against a ledger: an operator who names
+    // a smaller context keeps it, and a deployment with no ledger has
+    // nothing to narrow against.
+    if let (Some(blocks), Some(ctx)) = (config.kv_blocks, config.max_context) {
+        let ledger_positions = blocks.saturating_mul(config.kv_block_size);
+        if ledger_positions > 0 && ctx > ledger_positions {
+            config.max_context = Some(ledger_positions);
+            adopted.max_context_narrowed = Some(ledger_positions);
+        }
+    }
     adopted
 }
 
@@ -292,6 +347,12 @@ pub fn apply_derived(
 pub struct Adopted {
     pub max_context: bool,
     pub kv_blocks: bool,
+    /// The per-request ceiling was narrowed to what the whole KV ledger
+    /// holds, and this is the number it became. `None` when the two
+    /// already agreed. Reported separately from `max_context` because
+    /// it can happen to a ceiling the OPERATOR set, which
+    /// [`apply_derived`]'s precedence rule otherwise leaves alone.
+    pub max_context_narrowed: Option<usize>,
 }
 
 /// Prices the GGUF at `path` against the machine, best effort.
@@ -516,6 +577,53 @@ mod tests {
         }
     }
 
+    fn cfg(
+        max_context: Option<usize>,
+        kv_blocks: Option<usize>,
+        block: usize,
+    ) -> crate::serving::batch::BatcherConfig {
+        crate::serving::batch::BatcherConfig {
+            max_context,
+            kv_blocks,
+            kv_block_size: block,
+            ..Default::default()
+        }
+    }
+
+    /// A per-request ceiling above what the whole ledger holds is a
+    /// promise nothing can keep: `fit` would clamp `max_tokens` up to
+    /// it and the block budget would then refuse the result. `serve -c
+    /// 65536` against a 99-block ledger of 256 did exactly that, and
+    /// every default-budget chat request got
+    /// `device_memory_budget_exceeded`.
+    #[test]
+    fn a_ceiling_above_the_whole_ledger_is_narrowed_to_it() {
+        let mut config = cfg(Some(65_536), Some(99), 256);
+        let adopted = apply_derived(&mut config, &derived(4096, 16));
+        assert_eq!(config.max_context, Some(99 * 256));
+        assert_eq!(adopted.max_context_narrowed, Some(99 * 256));
+        assert!(
+            !adopted.max_context,
+            "the operator's number was narrowed, not filled in"
+        );
+    }
+
+    /// Narrowing only. An operator asking for less than the ledger
+    /// holds keeps their number, and a deployment with no ledger has
+    /// nothing to narrow against.
+    #[test]
+    fn a_ceiling_the_ledger_can_hold_is_left_alone() {
+        let mut config = cfg(Some(4096), Some(99), 256);
+        let adopted = apply_derived(&mut config, &derived(4096, 16));
+        assert_eq!(config.max_context, Some(4096));
+        assert_eq!(adopted.max_context_narrowed, None);
+
+        let mut no_ledger = cfg(Some(65_536), None, 256);
+        let adopted = apply_derived(&mut no_ledger, &derived(100, 0));
+        assert_eq!(no_ledger.max_context, Some(65_536));
+        assert_eq!(adopted.max_context_narrowed, None);
+    }
+
     /// The precedence contract: an operator who set a number keeps it.
     ///
     /// Confirmed to FAIL when `apply_derived` assigns unconditionally
@@ -550,7 +658,8 @@ mod tests {
             adopted,
             Adopted {
                 max_context: true,
-                kv_blocks: true
+                kv_blocks: true,
+                max_context_narrowed: None
             }
         );
 
@@ -566,7 +675,8 @@ mod tests {
             adopted,
             Adopted {
                 max_context: false,
-                kv_blocks: true
+                kv_blocks: true,
+                max_context_narrowed: None
             }
         );
     }
