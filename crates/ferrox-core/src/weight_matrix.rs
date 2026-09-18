@@ -1464,32 +1464,6 @@ impl WeightMatrix {
         crate::par::join2(|| a.apply(x), || b.apply(x))
     }
 
-    /// Any number of projections of ONE activation, in one GPU
-    /// submission where the backend allows it.
-    ///
-    /// [`Self::apply_pair`] and [`Self::apply_three`] are this for the
-    /// two arities that read better at their call sites; a gated
-    /// delta-net layer projects `qkv`, `z` and its gate logits from the
-    /// same normed vector and so takes this one, which is one command
-    /// buffer per layer rather than two.
-    pub fn apply_many(mats: &[&Self], x: &[f32]) -> Vec<Vec<f32>> {
-        if mats.len() < 2 {
-            return mats.iter().map(|m| m.apply(x)).collect();
-        }
-        if Self::gpu_dense_active() {
-            #[cfg(any(feature = "cuda", feature = "metal"))]
-            if let Some(outs) = Self::apply_gpu_multi(mats, x) {
-                return outs;
-            }
-            return mats.iter().map(|m| m.apply(x)).collect();
-        }
-        // The CPU pool spreads ONE matvec across every core already, so
-        // the arms run in sequence there for the reason `apply_three`
-        // records: overlapping them buys a fork-join the persistent
-        // pool does not pay.
-        mats.iter().map(|m| m.apply(x)).collect()
-    }
-
     /// Whether a dense matvec would go to an accelerator right now.
     fn gpu_dense_active() -> bool {
         #[cfg(feature = "metal")]

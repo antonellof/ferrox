@@ -5710,6 +5710,9 @@ pub fn launch_matvec_fused_folded(
     }
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    // Unretained references were measured here and are NOT kept: 7.00
+    // tok/s against 7.1 on Bonsai, i.e. nothing, for an `unsafe` whose
+    // invariant is that every bound buffer outlives the wait.
     // One compute encoder for the whole fused batch — creating an
     // encoder per matvec (previous behavior) paid Metal encoder setup
     // cost N times and is a large share of the ~14× gap vs ggml-metal.
@@ -5813,6 +5816,11 @@ pub fn launch_dense_ffn_swiglu_folded(
     let shared = shared_metal()?;
     let device = &shared.device;
     let queue = &shared.queue;
+    // Timed like every other submission: an untimed command buffer's
+    // GPU time reads as host time in the ledger, which is the exact
+    // confusion issue #149 was. This path carries a whole FFN, so it
+    // was the largest thing the ledger could not see.
+    let clock = crate::timing::SubmitClock::start();
 
     // A rotation rewrites the activation in place, so a folded launch
     // takes a private copy rather than the shared decode scratch (see
@@ -5895,8 +5903,7 @@ pub fn launch_dense_ffn_swiglu_folded(
     }
     encode_matvec(&encoder, device, down, &down_w, &act_buf, &out_buf)?;
     encoder.endEncoding();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
+    crate::timing::commit_wait_note(&cmd_buf, "dense-ffn", 32, clock);
 
     let out_ptr = out_buf.contents();
     Ok(unsafe { std::slice::from_raw_parts(out_ptr.as_ptr() as *const f32, down.rows).to_vec() })

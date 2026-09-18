@@ -15,6 +15,23 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The fused dense FFN's command buffer is timed.** It carries a whole
+  feed-forward block and was the largest submission the GPU ledger could
+  not see, so its GPU time read as host time (the confusion issue #149
+  was about). With it, a Bonsai decode token accounts for itself: 159
+  submissions, 66 ms of GPU, 34 ms of submission overhead beyond it and
+  41 ms of host compute, against a 141 ms token.
+
+### Changed
+
+- Two more measured non-results, recorded where the next attempt will
+  look: `commandBufferWithUnretainedReferences` on the matvec path
+  (7.00 tok/s against 7.1, for an `unsafe`), and sending a delta-net
+  layer's gate projections in the same fused launch as `qkv`/`z`
+  (neutral, and it made the launch all-or-nothing across two folds).
+
 ## [0.23.0] - 2026-09-18
 
 ### Added
