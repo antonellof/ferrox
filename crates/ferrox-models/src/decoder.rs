@@ -1095,6 +1095,75 @@ impl Decoder {
             && !config.rope_dim_varies_by_layer()
     }
 
+    /// The blocked prefill attention, on the GPU when this shape is one
+    /// the Metal flash kernel serves and on the Rayon host kernel
+    /// otherwise, which is the ONE place that choice is made.
+    ///
+    /// It is reached only by layers the FUSED Metal attention block
+    /// cannot take -- a gated softmax attention, a V width that differs
+    /// from K's, a projection with no Metal launch -- so the layer's
+    /// Q, K and V are on the host either way and there is nothing to
+    /// fuse; what is left is whether the `n_q x n_kv` score matrix is
+    /// built by six cores or by the GPU. On Bonsai's 16 attention
+    /// layers that matrix is the largest single host cost of a prefill
+    /// (`dot_f32`, `pv_tile` and `qk_tile` are 11178 of a sampled
+    /// prefill's top-of-stack against 1504 for the next thing).
+    ///
+    /// The refusals are the kernel's, not a guess: it takes no sliding
+    /// window, no ALiBi slopes, no attention sink and one head width
+    /// for K and V, and a shape it does not serve falls through to the
+    /// host body below rather than being approximated.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_attention_blocked(
+        &self,
+        q_batch: &[f32],
+        cache_k: &[f32],
+        cache_v: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        batch_size: usize,
+        base_seq_len: usize,
+        softcap: Option<f32>,
+        window: Option<usize>,
+    ) -> Vec<f32> {
+        #[cfg(feature = "metal")]
+        if window.is_none()
+            && self.alibi_slopes.is_none()
+            && v_head_dim == head_dim
+            && ferrox_core::weight_matrix::metal_dense_enabled()
+        {
+            if let Ok(out) = ferrox_metal::attn::launch_gqa_prefill_host_ex(
+                q_batch,
+                cache_k,
+                cache_v,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                base_seq_len,
+                softcap,
+            ) {
+                return out;
+            }
+        }
+        causal_gqa_attention_prefill_shared_kv_split(
+            q_batch,
+            cache_k,
+            cache_v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            v_head_dim,
+            batch_size,
+            base_seq_len,
+            softcap,
+            window,
+            self.alibi_slopes.as_deref(),
+        )
+    }
+
     /// True when this layer can use the fused Metal attention block
     /// (Norm or NeoX RoPE, quantized projections; QKV bias + QK-norm
     /// via [`ferrox_metal::attn::AttnExtras`]).
@@ -4665,7 +4734,7 @@ impl Decoder {
                     | (crate::config::BatchWindow::PerQuery, _) => None,
                 };
                 let mut attn_out_batch = match blocked {
-                    Some(window) => causal_gqa_attention_prefill_shared_kv_split(
+                    Some(window) => self.prefill_attention_blocked(
                         &q_batch,
                         cache_k,
                         cache_v,
@@ -4677,7 +4746,6 @@ impl Decoder {
                         base_seq_len,
                         softcap,
                         window,
-                        self.alibi_slopes.as_deref(),
                     ),
                     None => {
                         let mut out = vec![0f32; batch_size * out_width];
