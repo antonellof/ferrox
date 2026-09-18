@@ -1,7 +1,8 @@
 # A recurrent layer that does not come back to the host
 
-Status: **kernels landed and verified, not wired.** The wiring was
-measured and is a LOSS until the state stays on the device.
+Status: **the chunked rule landed for prefill** (`ferrox_core::gdn_chunk`,
+2.1x on the step, ~7% end to end). The GPU kernels are still not wired,
+and the three measurements below say why.
 
 ## The measurement this plan exists for
 

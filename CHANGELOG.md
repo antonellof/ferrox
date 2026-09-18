@@ -15,6 +15,27 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Added
+
+- **The chunked gated delta rule** (`ferrox_core::gdn_chunk`), which a
+  prefill batch takes: the same recurrence with the state read once per
+  CHUNK of rows instead of once per row. The sequential step is
+  bandwidth-bound (36 GB/s of state, measured by its own probe) and a
+  128-token Bonsai prefill moves 38 GB through it, so trading 1.5x the
+  multiply-adds for a 32nd of the traffic is **2.1x on the step** and
+  ~7% end to end (interleaved A/B on a 1201-token prompt: branch 33.45,
+  35.49, base 33.19, 33.00, branch 35.63). Chunk size swept: 16 gives
+  1.96x, 32 gives 2.09x, 64 gives 1.66x.
+
+  Correctness rests on the sequential step as an oracle, since that one
+  is already verified against libllama: the two are compared row by row
+  across five shapes, three chunk-boundary positions and decays from
+  "barely forgets" to "forgets at once". Every decay ratio in the
+  unrolled form is a PRODUCT, never a quotient, so a chunk of tiny
+  decays underflows to zero instead of dividing by it; a test pins the
+  `exp(-90)` case that the textbook `d_u / A_u` form cannot take
+  without renormalising.
+
 ### Changed
 
 - **A folded pair rotates its batch once, not twice.**
