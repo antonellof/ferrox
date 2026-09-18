@@ -15,6 +15,21 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-18
+
+The largest span between two tags this repo has had: 28 architecture
+closures (92 architectures on the audited generic path, the Mamba-1,
+Mamba-2 and gated-delta-net engines, Llama 4), the CUDA GEMM verified
+on hardware, CUDA prefill kept on the device and moved to the tensor
+cores (pp512 305 to 1932 tok/s on an RTX 3090), the IQ4_XS and Q5_K
+CPU paths fixed, and x86 and CUDA re-measured on rented hardware.
+
+Where this leaves the north star, measured: Metal at parity with
+llama.cpp on every ledger row; x86 CPU 1.0x to 1.4x behind; CUDA
+prefill 4.3x and decode 2.75x behind on the RTX 3090 row, from 25.5x
+and 3.4x when that card was first measured on 2026-09-15. `docs/plans/cpu-cuda-parity.md` has the order of
+the remaining work.
+
 ### Added
 
 - **CUDA `mul_mm` runs on the tensor cores.** `ferrox_cuda::mul_mm_tc`
@@ -1739,6 +1754,8 @@ benchmark ledger.
 First tag. GGUF mmap loader, quantized CPU kernels, Metal backend,
 `ferrox` CLI and `ferrox-server`.
 
+[0.22.0]: https://github.com/antonellof/ferrox/compare/v0.21.0...v0.22.0
+[0.21.0]: https://github.com/antonellof/ferrox/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/antonellof/ferrox/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/antonellof/ferrox/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/antonellof/ferrox/compare/v0.18.0...v0.19.0
