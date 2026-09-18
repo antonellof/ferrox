@@ -3294,6 +3294,7 @@ pub fn launch_q4_k_mul_mm_sg(
         "q4_k_mul_mm_sg",
         144,
         256,
+        None,
     )
 }
 
@@ -3314,6 +3315,7 @@ pub fn launch_q5_k_mul_mm_sg(
         "q5_k_mul_mm_sg",
         176,
         256,
+        None,
     )
 }
 
@@ -3337,6 +3339,7 @@ pub fn launch_q8_0_mul_mm_sg(
         "q8_0_mul_mm_sg",
         34,
         32,
+        None,
     )
 }
 
@@ -3359,6 +3362,7 @@ pub fn launch_q4_0_mul_mm_sg(
         "q4_0_mul_mm_sg",
         18,
         32,
+        None,
     )
 }
 
@@ -3382,6 +3386,7 @@ pub fn launch_iq4_xs_mul_mm_sg(
         "iq4_xs_mul_mm_sg",
         136,
         256,
+        None,
     )
 }
 
@@ -3403,6 +3408,7 @@ pub fn launch_ptq1_0_mul_mm_sg(
         "ptq1_0_mul_mm_sg",
         28,
         128,
+        None,
     )
 }
 
@@ -3426,6 +3432,7 @@ pub fn launch_q6_k_mul_mm_sg(
         "q6_k_mul_mm_sg",
         210,
         256,
+        None,
     )
 }
 
@@ -3571,6 +3578,7 @@ pub fn launch_mul_mm_sg(
         fn_name,
         block_bytes,
         block_elems,
+        None,
     )
     .map(Some)
 }
@@ -4407,6 +4415,7 @@ fn launch_k_quant_mul_mm_sg(
     fn_name: &'static str,
     block_bytes: usize,
     block_elems: usize,
+    fold: Option<&crate::hadamard::FoldPlan<'_>>,
 ) -> Result<Vec<f32>, MetalError> {
     if batch_size == 0 || rows == 0 {
         return Ok(vec![0.0; batch_size * rows]);
@@ -4450,6 +4459,33 @@ fn launch_k_quant_mul_mm_sg(
     let enc = cmd_buf
         .computeCommandEncoder()
         .ok_or(MetalError::CommandFailed)?;
+
+    // The rotation first, per row, on the batch buffer this GEMM is
+    // about to read. `x_buf` is this call's own upload, so rewriting it
+    // in place reaches nobody else.
+    if let Some(plan) = fold {
+        let signs_buf = match plan.signs {
+            None => None,
+            Some(signs) => {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        signs.as_ptr() as *const u8,
+                        std::mem::size_of_val(signs),
+                    )
+                };
+                Some(resident_weight_buffer(device, bytes)?)
+            }
+        };
+        crate::hadamard::encode_fold_rows(
+            &enc,
+            device,
+            &x_buf,
+            cols,
+            batch_size,
+            plan,
+            signs_buf.as_ref().map(|b| &*b.buffer),
+        )?;
+    }
 
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
@@ -5591,6 +5627,24 @@ pub fn launch_matvec_fused_with(
     launches: &[MatvecLaunch<'_>],
     epilogue: MatvecEpilogue,
 ) -> Result<Vec<Vec<f32>>, MetalError> {
+    launch_matvec_fused_folded(x, launches, epilogue, None)
+}
+
+/// [`launch_matvec_fused_with`], with PrismML's folded Hadamard applied
+/// to `x` on the device first (`crate::hadamard`).
+///
+/// One command buffer for the rotation AND the matvecs it feeds: the
+/// host used to run the butterfly itself and hand down a fresh vector,
+/// which is a CPU pass and an upload per projection. The fold is shared
+/// by every launch here for the same reason `x` is -- they are the same
+/// activation, and a caller with two different folds has two different
+/// activations and must make two calls.
+pub fn launch_matvec_fused_folded(
+    x: &[f32],
+    launches: &[MatvecLaunch<'_>],
+    epilogue: MatvecEpilogue,
+    fold: Option<&crate::hadamard::FoldPlan<'_>>,
+) -> Result<Vec<Vec<f32>>, MetalError> {
     if launches.is_empty() {
         return Ok(Vec::new());
     }
@@ -5615,8 +5669,34 @@ pub fn launch_matvec_fused_with(
     // Reuses the dense stack's own `x` buffer when `x` IS the vector
     // that stack just returned, and uploads otherwise. One helper, not
     // one copy per consumer: see `crate::resident_act`.
+    //
+    // A fold rewrites the activation IN PLACE, and the reused buffer
+    // belongs to the shared decode scratch, so a folded launch takes a
+    // private copy instead. That is the same single upload the host
+    // path already paid -- what it saves is the butterfly, not the copy.
     let clock = crate::timing::SubmitClock::start();
-    let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
+    let x_buf = match fold {
+        None => crate::resident_act::upload_or_reuse(device, x)?,
+        Some(plan) => {
+            plan.check(x.len())?;
+            crate::resident_act::upload_private(device, x)?
+        }
+    };
+    // Signs live as long as the fold does and never change, so the
+    // weight cache holds them for free rather than re-uploading 70 KB
+    // per projection.
+    let signs_buf = match fold.and_then(|p| p.signs) {
+        None => None,
+        Some(signs) => {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    signs.as_ptr() as *const u8,
+                    std::mem::size_of_val(signs),
+                )
+            };
+            Some(resident_weight_buffer(device, bytes)?)
+        }
+    };
 
     let mut weight_bufs = Vec::with_capacity(launches.len());
     let mut out_bufs = Vec::with_capacity(launches.len());
@@ -5636,6 +5716,18 @@ pub fn launch_matvec_fused_with(
     let encoder = cmd_buf
         .computeCommandEncoder()
         .ok_or(MetalError::CommandFailed)?;
+    // The rotation runs first on a serial encoder, so every matvec
+    // below reads the rotated vector without a barrier of its own.
+    if let Some(plan) = fold {
+        crate::hadamard::encode_fold(
+            &encoder,
+            device,
+            &x_buf,
+            x.len(),
+            plan,
+            signs_buf.as_ref().map(|b| &*b.buffer),
+        )?;
+    }
     for (i, launch) in launches.iter().enumerate() {
         encode_matvec(
             &encoder,
@@ -5679,6 +5771,25 @@ pub fn launch_dense_ffn_swiglu(
     down: &MatvecLaunch<'_>,
     x: &[f32],
 ) -> Result<Vec<f32>, MetalError> {
+    launch_dense_ffn_swiglu_folded(gate, up, down, x, None, None)
+}
+
+/// [`launch_dense_ffn_swiglu`] with PrismML's folded rotation applied on
+/// the device to each of the two activations the FFN reads: `x` before
+/// gate/up, and the SwiGLU output before `down`
+/// (`crate::hadamard`).
+///
+/// The whole FFN is one command buffer either way; the folds are what
+/// let a Bonsai layer take it at all, and the layer drops from two
+/// submissions to one.
+pub fn launch_dense_ffn_swiglu_folded(
+    gate: &MatvecLaunch<'_>,
+    up: &MatvecLaunch<'_>,
+    down: &MatvecLaunch<'_>,
+    x: &[f32],
+    fold_x: Option<&crate::hadamard::FoldPlan<'_>>,
+    fold_act: Option<&crate::hadamard::FoldPlan<'_>>,
+) -> Result<Vec<f32>, MetalError> {
     assert_eq!(gate.rows, up.rows, "gate/up row counts must match");
     assert!(down.rows > 0);
     let n_blocks_gate = gate.row_bytes / gate.block_bytes;
@@ -5703,7 +5814,34 @@ pub fn launch_dense_ffn_swiglu(
     let device = &shared.device;
     let queue = &shared.queue;
 
-    let x_buf = crate::resident_act::upload_or_reuse(device, x)?;
+    // A rotation rewrites the activation in place, so a folded launch
+    // takes a private copy rather than the shared decode scratch (see
+    // `launch_matvec_fused_folded`).
+    let x_buf = match fold_x {
+        None => crate::resident_act::upload_or_reuse(device, x)?,
+        Some(plan) => {
+            plan.check(x.len())?;
+            crate::resident_act::upload_private(device, x)?
+        }
+    };
+    if let Some(plan) = fold_act {
+        plan.check(gate.rows)?;
+    }
+    let signs_buf = |plan: Option<&crate::hadamard::FoldPlan<'_>>| match plan.and_then(|p| p.signs)
+    {
+        None => Ok(None),
+        Some(signs) => {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    signs.as_ptr() as *const u8,
+                    std::mem::size_of_val(signs),
+                )
+            };
+            resident_weight_buffer(device, bytes).map(Some)
+        }
+    };
+    let x_signs = signs_buf(fold_x)?;
+    let act_signs = signs_buf(fold_act)?;
 
     let gate_w = resident_weight_buffer(device, gate.weights)?;
     let up_w = resident_weight_buffer(device, up.weights)?;
@@ -5725,6 +5863,16 @@ pub fn launch_dense_ffn_swiglu(
     let encoder = cmd_buf
         .computeCommandEncoder()
         .ok_or(MetalError::CommandFailed)?;
+    if let Some(plan) = fold_x {
+        crate::hadamard::encode_fold(
+            &encoder,
+            device,
+            &x_buf,
+            x.len(),
+            plan,
+            x_signs.as_ref().map(|b| &*b.buffer),
+        )?;
+    }
     encode_matvec(&encoder, device, gate, &gate_w, &x_buf, &gate_buf)?;
     encode_matvec(&encoder, device, up, &up_w, &x_buf, &up_buf)?;
     crate::elem::encode_silu_mul(
@@ -5735,6 +5883,16 @@ pub fn launch_dense_ffn_swiglu(
         &act_buf,
         gate.rows as u32,
     )?;
+    if let Some(plan) = fold_act {
+        crate::hadamard::encode_fold(
+            &encoder,
+            device,
+            &act_buf,
+            gate.rows,
+            plan,
+            act_signs.as_ref().map(|b| &*b.buffer),
+        )?;
+    }
     encode_matvec(&encoder, device, down, &down_w, &act_buf, &out_buf)?;
     encoder.endEncoding();
     cmd_buf.commit();
@@ -7332,7 +7490,7 @@ pub(crate) fn encode_matvec_with_offsets(
         "iq4_xs_matvec" => (64usize, 128usize),
         // PTQ1_0: the fork's geometry, ONE simdgroup on NR=4 rows
         // (`N_SG_PTQ1_0 1`, `N_R0_PTQ1_0 4`), simd_sum only.
-        "ptq1_0_matvec" => (32usize, 0usize),
+        "ptq1_0_matvec" => (32usize, 0usize), // NR rows per simdgroup
         _ if rows_per_tg > 1 => (32usize, 256 * 4),
         _ => {
             let tg = n_blocks_per_row.next_power_of_two().clamp(32, 256);

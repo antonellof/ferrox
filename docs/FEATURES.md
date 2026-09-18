@@ -165,9 +165,18 @@ is faster.
   launches and Q5_0 prefill as N matvecs while the kernel registry
   recorded a GEMM hit), and `ferrox bench` refused every hybrid model
   because its cache probe read KV rows on a recurrent layer. Speed on
-  the M2 Pro: pp128 34.0 / tg32 7.0 tok/s against the fork's 66.6 /
-  11.5, up from 2.9 / 2.4 at first light; what remains is the
-  per-matvec command buffer and the CPU delta-net recurrence.
+  the M2 Pro: pp128 32.3 / tg32 7.3 tok/s against the fork's 66.6 /
+  11.5, up from 2.9 / 2.4 at first light. The last 9% of decode came
+  from putting the ROTATION on the device
+  (`ferrox-metal/src/hadamard.rs`) so a folded FFN could take the
+  fused `gate -> SwiGLU -> down` launch, which halves a layer's
+  submissions; the same prologue LOST 6% on prefill and the module
+  records that, because `transform_rows` is already parallel across
+  cores and the kernel only serialises into the GEMM's own buffer.
+  What remains is structural and measured: ~120 command buffers a
+  token at 0.166 ms of submission latency each beyond their GPU time,
+  where the fork encodes one graph, plus the delta-net recurrence on
+  the CPU.
 - **Llama 4: Scout and Maverick** (`llama4`), audited against libllama
   on 2026-09-14 (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16- and
   128-expert shapes, and the last of 8200 positions across the chunk

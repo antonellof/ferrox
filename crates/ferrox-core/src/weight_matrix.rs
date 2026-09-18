@@ -1464,6 +1464,32 @@ impl WeightMatrix {
         crate::par::join2(|| a.apply(x), || b.apply(x))
     }
 
+    /// Any number of projections of ONE activation, in one GPU
+    /// submission where the backend allows it.
+    ///
+    /// [`Self::apply_pair`] and [`Self::apply_three`] are this for the
+    /// two arities that read better at their call sites; a gated
+    /// delta-net layer projects `qkv`, `z` and its gate logits from the
+    /// same normed vector and so takes this one, which is one command
+    /// buffer per layer rather than two.
+    pub fn apply_many(mats: &[&Self], x: &[f32]) -> Vec<Vec<f32>> {
+        if mats.len() < 2 {
+            return mats.iter().map(|m| m.apply(x)).collect();
+        }
+        if Self::gpu_dense_active() {
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            if let Some(outs) = Self::apply_gpu_multi(mats, x) {
+                return outs;
+            }
+            return mats.iter().map(|m| m.apply(x)).collect();
+        }
+        // The CPU pool spreads ONE matvec across every core already, so
+        // the arms run in sequence there for the reason `apply_three`
+        // records: overlapping them buys a fork-join the persistent
+        // pool does not pay.
+        mats.iter().map(|m| m.apply(x)).collect()
+    }
+
     /// Whether a dense matvec would go to an accelerator right now.
     fn gpu_dense_active() -> bool {
         #[cfg(feature = "metal")]
@@ -3076,6 +3102,19 @@ impl WeightMatrix {
             return Some(out);
         }
         if let WeightMatrix::Folded { base, fold } = self {
+            // The rotation goes into the matvec's own command buffer
+            // when Metal can serve it, so the host neither runs the
+            // butterfly nor ships a second vector. Every other backend
+            // takes the host transform, which is the definition both
+            // sides are checked against.
+            #[cfg(feature = "metal")]
+            if metal_dense_enabled() {
+                if let Some(plan) = fold.metal_plan(x.len()) {
+                    if let Some(out) = base.apply_gpu_folded(x, Some(&plan)) {
+                        return Some(out);
+                    }
+                }
+            }
             return base.apply_gpu(&fold.transform_input(x));
         }
 
@@ -3163,6 +3202,35 @@ impl WeightMatrix {
     /// should fall back to sequential [`Self::apply`].
     #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn apply_gpu_multi(mats: &[&WeightMatrix], x: &[f32]) -> Option<Vec<Vec<f32>>> {
+        Self::apply_gpu_multi_folded(mats, x, None)
+    }
+
+    /// One matrix through the fused path, with an optional device-side
+    /// Hadamard prologue. The single-matrix caller of
+    /// [`Self::apply_gpu_multi_folded`], so a folded projection and a
+    /// folded q/k/v triple take the same launch.
+    #[cfg(feature = "metal")]
+    pub(crate) fn apply_gpu_folded(
+        &self,
+        x: &[f32],
+        fold: Option<&ferrox_metal::hadamard::FoldPlan<'_>>,
+    ) -> Option<Vec<f32>> {
+        Self::apply_gpu_multi_folded(&[self], x, fold).map(|mut outs| outs.pop().unwrap())
+    }
+
+    /// [`Self::apply_gpu_multi`] with PrismML's folded rotation applied
+    /// to `x` on the device before the matvecs read it.
+    ///
+    /// `fold` is Metal-only: the rotation kernel is
+    /// `ferrox_metal::hadamard`, and a CUDA or Vulkan caller takes the
+    /// host butterfly rather than a rotation nothing there implements.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    pub(crate) fn apply_gpu_multi_folded(
+        mats: &[&WeightMatrix],
+        x: &[f32],
+        #[cfg(feature = "metal")] fold: Option<&ferrox_metal::hadamard::FoldPlan<'_>>,
+        #[cfg(not(feature = "metal"))] fold: Option<&()>,
+    ) -> Option<Vec<Vec<f32>>> {
         if mats.is_empty() {
             return None;
         }
@@ -3295,7 +3363,12 @@ impl WeightMatrix {
                     rows_per_tg,
                 });
             }
-            match ferrox_metal::gpu::launch_matvec_fused(x, &launches) {
+            match ferrox_metal::gpu::launch_matvec_fused_folded(
+                x,
+                &launches,
+                ferrox_metal::gpu::MatvecEpilogue::default(),
+                fold,
+            ) {
                 Ok(outs) => return Some(outs),
                 Err(e) => {
                     eprintln!("ferrox: Metal fused matvec failed, falling back to CPU: {e}");
@@ -3371,19 +3444,22 @@ impl WeightMatrix {
                         rows,
                         cols: _,
                         kind,
-                    } = m
+                        // Through the fold, which travels as a plan beside
+                        // the launch rather than as a transformed vector.
+                        // `base()` unwraps a LoRA only, deliberately: an
+                        // adapter is arithmetic this kernel cannot do.
+                    } = (match m {
+                        WeightMatrix::Folded { base, .. } => base.as_ref(),
+                        other => other,
+                    })
                     else {
                         return None;
                     };
-                    let kind_name = match kind {
-                        QuantKind::Q8_0 => "Q8_0",
-                        QuantKind::Q4_0 => "Q4_0",
-                        QuantKind::Q4K => "Q4_K",
-                        QuantKind::Q5K => "Q5_K",
-                        QuantKind::Q6K => "Q6_K",
-                        QuantKind::IQ4XS => "IQ4_XS",
-                        _ => return None,
-                    };
+                    // The one Metal kind table again: this was the
+                    // THIRD hand-written copy of it, and it lacked
+                    // Q5_0 and PTQ1_0, so those kinds ran their FFN as
+                    // three submissions with a host SwiGLU between.
+                    let kind_name = Metal::matvec_kernel(*kind)?;
                     let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
                         ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
                     // A zero-row matrix has no rows to stride over, so
@@ -3402,13 +3478,35 @@ impl WeightMatrix {
                         rows_per_tg,
                     })
                 }
-                if let (Some(g), Some(u), Some(d)) =
-                    (metal_launch(gate), metal_launch(up), metal_launch(down))
-                {
+                // A folded FFN reads TWO rotated activations: `x`
+                // before gate/up, and the SwiGLU output before `down`.
+                // They are different widths and therefore different
+                // folds, so both travel with the launch rather than
+                // one standing in for the other.
+                let fold_x = gate.hadamard_fold().and_then(|f| f.metal_plan(x.len()));
+                let fold_act = down.hadamard_fold().and_then(|f| f.metal_plan(gate.rows()));
+                let folds_agree = match (gate.hadamard_fold(), up.hadamard_fold()) {
+                    (Some(g), Some(u)) => std::sync::Arc::ptr_eq(g, u) && fold_x.is_some(),
+                    (None, None) => true,
+                    _ => false,
+                } && (down.hadamard_fold().is_none() == fold_act.is_none());
+                if let (Some(g), Some(u), Some(d), true) = (
+                    metal_launch(gate),
+                    metal_launch(up),
+                    metal_launch(down),
+                    folds_agree,
+                ) {
                     assert_eq!(gate.cols(), x.len());
                     assert_eq!(up.cols(), x.len());
                     assert_eq!(down.cols(), gate.rows());
-                    match ferrox_metal::gpu::launch_dense_ffn_swiglu(&g, &u, &d, x) {
+                    match ferrox_metal::gpu::launch_dense_ffn_swiglu_folded(
+                        &g,
+                        &u,
+                        &d,
+                        x,
+                        fold_x.as_ref(),
+                        fold_act.as_ref(),
+                    ) {
                         Ok(out) => return Some(out),
                         Err(e) => {
                             eprintln!("ferrox: Metal dense FFN fuse failed, falling back: {e}");
@@ -3441,6 +3539,14 @@ impl WeightMatrix {
             return Some(out);
         }
         if let WeightMatrix::Folded { base, fold } = self {
+            // A BATCH keeps the host rotation, and that is a
+            // measurement rather than an omission: the same device
+            // prologue that pays for itself on a decode token
+            // (`apply_gpu`) cost 6% of Bonsai prefill, because
+            // `transform_rows` is already parallel across cores and the
+            // kernel serialises into the GEMM's own command buffer
+            // instead. `pp128` 33.96 -> 32.04 tok/s on an M2 Pro, three
+            // reps each, which is why `apply_gpu_batch` takes no fold.
             let transformed = fold.transform_rows(x_batch, batch_size);
             return base.apply_gpu_batch(&transformed, batch_size);
         }

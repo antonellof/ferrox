@@ -29,14 +29,29 @@ are the ones worth reading twice.
   2.2e-6 (Metal GEMM), tokenizer MATCH with the new `qwen35`
   pre-tokenizer pattern. M2 Pro: pp128 34.0 / tg32 7.0 tok/s (fork
   66.6 / 11.5). `PQ2_0` (142) is recognised and refused.
-- `WeightMatrix::apply_pair` and a GPU arm in `apply_three`: two or
-  three projections of one activation go into one command buffer
-  through `apply_gpu_multi` (a delta-net layer's `qkv` and `z`, q/k/v)
-  instead of one round trip each.
+- **PrismML's Hadamard rotation runs on the GPU** for a decode token
+  (`ferrox-metal/src/hadamard.rs`): `perm -> signs -> FWHT` encoded into
+  the SAME command buffer as the matvecs it feeds, so the host neither
+  runs the butterfly nor ships a second vector. With it, a folded FFN
+  can take the fused `gate -> SwiGLU -> down` launch, which halves a
+  Bonsai layer's submissions. Interleaved A/B on an M2 Pro, three reps
+  each, raw sequence `base 6.69, branch 7.30, base 6.68, branch 7.25`:
+  **tg32 +9%**, `pp128` unchanged. A batch keeps the HOST rotation and
+  the module says why: the same prologue cost prefill 6% there, because
+  `transform_rows` is already parallel across cores while the kernel
+  serialises into the GEMM's command buffer.
+- `WeightMatrix::apply_pair`, `apply_many`, and a GPU arm in
+  `apply_three`: every projection of ONE activation goes into one
+  command buffer through `apply_gpu_multi` instead of a round trip
+  each. A gated delta-net layer now sends `qkv`, `z` and its gate
+  logits together, which is one submission per layer rather than two
+  or three; on Bonsai that was NEUTRAL (tg32 7.2 either way, those
+  buffers are small), and it is kept for collapsing the split and
+  fused gate spellings onto one call rather than for speed.
 
 ### Fixed
 
-- **Three hand-written copies of the Metal kind table, each lagging
+- **Four hand-written copies of the Metal kind table, each lagging
   it.** `rows_per_threadgroup` walked its own list of matvec kinds, so
   a kernel absent from the copy dispatched at one row per threadgroup
   and returned zeros for most rows (the PTQ1_0 matvec, on its first
@@ -44,7 +59,9 @@ are the ones worth reading twice.
   dispatch each matched kinds by hand and lacked Q5_0 and PTQ1_0, so a
   Q5_0 gate/up pair ran as two launches and a Q5_0 prefill as N
   matvecs while `gemm_supported` claimed, and the kernel registry
-  recorded, a GEMM. All three read the one table now
+  recorded, a GEMM; and `apply_gpu_dense_ffn_swiglu`'s own six-row
+  match kept both kinds off the fused FFN entirely. All four read the
+  one table now
   (`MATVEC_KINDS`, `Metal::matvec_kernel`, `launch_mul_mm_sg` off
   `mul_mm_sg_meta`), with tests holding each to it.
 - **`ferrox bench` refused every hybrid model** (`layer 0 consumed 0

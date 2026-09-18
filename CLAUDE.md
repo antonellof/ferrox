@@ -1357,10 +1357,17 @@ PTQ1_0 matvec returned zeros on its first run because
 had been quietly running Q5_0 through their fallbacks for two weeks
 while the capability table and the kernel registry said otherwise.
 Each is derived from the one table now, with a test that holds it.
-The speed gap that remains (7.0 vs 11.5 tok/s decode, 34 vs 67
-prefill on the M2 Pro) is structural: ~200 command buffers a token
-where the fork encodes one graph, and the delta-net recurrence on the
-CPU.
+The speed gap that remains (7.3 vs 11.5 tok/s decode, 32 vs 67
+prefill on the M2 Pro) is structural: ~120 command buffers a token at
+0.166 ms of submission latency each, where the fork encodes one graph,
+and the delta-net recurrence on the CPU. Two of the levers pulled at
+it are worth as much as the one that worked: the device-side Hadamard
+bought 9% of decode (it let the folded FFN take the fused launch) and
+COST 6% of prefill, where the host transform is already parallel; and
+a spin-then-block wait on the command buffer, aimed at that 0.166 ms,
+measured 3.7 tok/s against 7.1 -- polling the status through objc
+takes the core the host work needs. Both are recorded where the code
+is, so the next attempt starts after them.
 
 Do not read the architecture catalog as a support matrix. `ferrox
 parity` is the oracle: its tokenizer half matches llama.cpp on every

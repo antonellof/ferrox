@@ -123,6 +123,21 @@ impl HadamardFold {
         out
     }
 
+    /// This fold as the Metal kernel's plan, so the device applies the
+    /// same three steps in the same order rather than a second reading
+    /// of them. `None` for a fold no kernel serves (a block wider than
+    /// one threadgroup holds), which keeps the host butterfly as the
+    /// answer instead of a wrong rotation.
+    #[cfg(feature = "metal")]
+    pub fn metal_plan(&self, width: usize) -> Option<ferrox_metal::hadamard::FoldPlan<'_>> {
+        let plan = ferrox_metal::hadamard::FoldPlan {
+            block: self.block,
+            signs: self.signs.as_deref(),
+            perm: self.perm.map(|p| (p.hd, p.nk, p.rep)),
+        };
+        plan.check(width).ok().map(|()| plan)
+    }
+
     /// A stored (rotated) row back to the primal basis: `e = S (H z)`.
     pub fn restore_row(&self, row: &mut [f32]) {
         self.check(row.len());
@@ -202,6 +217,98 @@ pub fn fwht_normalized(x: &mut [f32], block: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device rotation IS the host one: same perm, same signs, same
+    /// butterfly, same scale. Run on the M2 Pro; the kernel is the only
+    /// other reading of this transform, and a reading that disagreed
+    /// would move the logits without moving any test that does not
+    /// launch it.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn the_device_fold_matches_the_host_fold() {
+        use crate::weight_matrix::{QuantKind, WeightMatrix};
+        use std::sync::Arc;
+
+        // A Q8_0 identity-ish matrix is beside the point: what is
+        // compared is the ROTATION, so the same base matrix runs twice
+        // and only the path to it differs.
+        let cols = 2048usize;
+        let rows = 64usize;
+        let block = 1024usize;
+        let mut weights = Vec::new();
+        for r in 0..rows {
+            for b in 0..cols / 32 {
+                let _ = (r, b);
+                // f16 1.0; the scale is beside the point here, because
+                // the two paths differ only in WHERE the rotation ran.
+                weights.extend_from_slice(&0x3C00u16.to_le_bytes());
+                for i in 0..32 {
+                    weights.push(((r * 31 + b * 7 + i) % 251) as u8);
+                }
+            }
+        }
+        let base = WeightMatrix::Quantized {
+            data: crate::weight_matrix::WeightBytes::Owned(weights),
+            rows,
+            cols,
+            kind: QuantKind::Q8_0,
+        };
+        let signs: Arc<[f32]> = (0..cols)
+            .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 })
+            .collect::<Vec<_>>()
+            .into();
+        for (label, fold) in [
+            (
+                "signs only",
+                HadamardFold {
+                    block,
+                    signs: Some(Arc::clone(&signs)),
+                    perm: None,
+                    site: FoldSite::Input,
+                },
+            ),
+            (
+                "identity signs",
+                HadamardFold {
+                    block,
+                    signs: None,
+                    perm: None,
+                    site: FoldSite::Input,
+                },
+            ),
+            (
+                "head permutation",
+                HadamardFold {
+                    block,
+                    signs: Some(Arc::clone(&signs)),
+                    // hd * nk * rep == cols
+                    perm: Some(HeadPerm {
+                        hd: 128,
+                        nk: 4,
+                        rep: 4,
+                    }),
+                    site: FoldSite::Input,
+                },
+            ),
+        ] {
+            let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.013).sin()).collect();
+            let host = base
+                .apply_gpu(&fold.transform_input(&x))
+                .expect("the base matrix has a Metal matvec");
+            let plan = fold.metal_plan(cols).expect("a 1024 block is servable");
+            let device = base
+                .apply_gpu_folded(&x, Some(&plan))
+                .expect("the folded launch runs");
+            let scale = host.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            for (i, (a, b)) in device.iter().zip(host.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-3 * scale,
+                    "{label} row {i}: device={a} host={b}"
+                );
+            }
+        }
+    }
 
     /// The butterfly is the matrix llama.cpp builds (`llama-model.cpp:
     /// 2015-2027`), entry for entry, and is its own inverse.
