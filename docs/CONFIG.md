@@ -47,6 +47,7 @@ library or overriding the CLI.
 | `FERROX_METAL_ATTN` | `1` / `0`, fused Metal attention + resident KV |
 | `FERROX_CTK` | KV dtype: `f16` (default), `q8_0` / `turbo8` / `fp8` / `turbo4`; `turbo3` falls back to F16. Same as `--ctk`, and like it **Metal only**: the CPU and CUDA KV cache is the host `Vec<f32>` |
 | `FERROX_CUDA` | `1` / `0` / `auto` (build with `--features cuda`) |
+| `FERROX_CUDA_MUL_MM` | `simt` keeps the batched GEMM on the f32 SIMT body where the device (`sm_80`+) would take the tensor-core body. An A/B lever, not a tuning knob: the tensor-core body is the faster one wherever it runs |
 | `FERROX_VULKAN` | `1` / `0` / `auto` (build with `--features vulkan`). `Q8_0` matvec only and no GEMM, so a prefill stays on the host |
 | `FERROX_VULKAN_LOADER` | Path to a `libvulkan` the loader should use. Only needed when the platform default is not found; the error names this variable |
 | `FERROX_MODEL_NAME` | What the served model is called in `/v1/models` and every response's `model` field. Same as `--alias`. Read in one place, so it cannot apply to some routes and not others |
