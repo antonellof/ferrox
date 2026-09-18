@@ -149,11 +149,35 @@ pub fn delta_chunk(
             // The state against this chunk's keys and queries: the two
             // `S x S x C` products that replace one pass over the state
             // per row.
+            //
+            // Four `t` at a time against one read of the row, because
+            // this is the loop the step is now bound BY: chunking
+            // traded 1.5x the multiply-adds for a 32nd of the traffic,
+            // so the arithmetic is what is left, and a row dotted
+            // against one vector at a time leaves the pipeline waiting
+            // on the load rather than on the multiply.
             for j in 0..s {
                 let row = &st[j * s..(j + 1) * s];
-                for t in 0..c {
+                let mut t = 0;
+                while t + 4 <= c {
+                    let (m0, m1, m2, m3) =
+                        dot4(row, krow(t), krow(t + 1), krow(t + 2), krow(t + 3));
+                    m[j * CHUNK + t] = m0;
+                    m[j * CHUNK + t + 1] = m1;
+                    m[j * CHUNK + t + 2] = m2;
+                    m[j * CHUNK + t + 3] = m3;
+                    let (n0, n1, n2, n3) =
+                        dot4(row, qrow(t), qrow(t + 1), qrow(t + 2), qrow(t + 3));
+                    n[j * CHUNK + t] = n0;
+                    n[j * CHUNK + t + 1] = n1;
+                    n[j * CHUNK + t + 2] = n2;
+                    n[j * CHUNK + t + 3] = n3;
+                    t += 4;
+                }
+                while t < c {
                     m[j * CHUNK + t] = dot(row, krow(t));
                     n[j * CHUNK + t] = dot(row, qrow(t));
+                    t += 1;
                 }
             }
             // The two triangles over the chunk's own vectors.
@@ -217,6 +241,41 @@ pub fn delta_chunk(
             start += c;
         }
     });
+}
+
+/// Four dots against one vector, from one pass over it: the four
+/// accumulator sets keep the multiply pipeline busy where a single dot
+/// waits on `row`'s loads.
+#[inline]
+fn dot4(row: &[f32], a: &[f32], b: &[f32], c: &[f32], d: &[f32]) -> (f32, f32, f32, f32) {
+    let mut acc = [[0.0f32; 4]; 4];
+    let (rb, rt) = row.as_chunks::<4>();
+    let (ab, at) = a.as_chunks::<4>();
+    let (bb, bt) = b.as_chunks::<4>();
+    let (cb, ct) = c.as_chunks::<4>();
+    let (db, dt) = d.as_chunks::<4>();
+    for ((((r, x), y), z), w) in rb.iter().zip(ab).zip(bb).zip(cb).zip(db) {
+        for l in 0..4 {
+            acc[0][l] += r[l] * x[l];
+            acc[1][l] += r[l] * y[l];
+            acc[2][l] += r[l] * z[l];
+            acc[3][l] += r[l] * w[l];
+        }
+    }
+    let mut tail = [0.0f32; 4];
+    for ((((r, x), y), z), w) in rt.iter().zip(at).zip(bt).zip(ct).zip(dt) {
+        tail[0] += *r * *x;
+        tail[1] += *r * *y;
+        tail[2] += *r * *z;
+        tail[3] += *r * *w;
+    }
+    let sum = |v: [f32; 4], t: f32| v[0] + v[1] + v[2] + v[3] + t;
+    (
+        sum(acc[0], tail[0]),
+        sum(acc[1], tail[1]),
+        sum(acc[2], tail[2]),
+        sum(acc[3], tail[3]),
+    )
 }
 
 /// A dot with four accumulators, as the sequential step's reductions
