@@ -58,6 +58,41 @@ and 64 FFNs is the 159.
 - `launch_gdn_tail`: delta step, gated norm, the folded rotation and
   `ssm_out` in ONE command buffer.
 
+## Why the decode step is not the kernel, measured at last
+
+The three losses below were only ever measured END TO END, where they
+read as "the kernel is not better than six cores" without saying why.
+Measured on its own, at one row, Bonsai's shape, state wrapped in place
+and nothing copied (`gdn_chunk::tests::device_chunk_against_host_throughput`):
+
+| rows | host | device | |
+|---|---|---|---|
+| 1 | 0.26 ms | 1.01 ms | 0.25x |
+| 2 | 0.58 ms | 0.95 ms | 0.61x |
+| 8 | 0.81 ms | 1.08 ms | 0.75x |
+| 32 | 3.47 ms | 1.45 ms | 2.40x |
+
+One row and eight rows cost the DEVICE the same, so what it is paying
+is not the recurrence: it is about 0.9 ms of fixed submission and
+buffer setup, and the kernel is the small part. That is why no faster
+recurrence kernel can win a decode token, and it is the measurement
+that turns the three rows below from "the GPU is not better at this"
+into "a decode token cannot afford a submission per layer". The fix is
+the one the arithmetic at the end of this file already names -- fewer
+command buffers, not a better kernel -- and `DEVICE_ROWS = 32` in
+`ferrox_core::gdn_chunk` is where the two sides cross.
+
+The access pattern was still wrong, and fixing it is what made the
+prefill numbers above: `gdn_delta_step` gave each thread a whole state
+ROW and walked it, so adjacent threads touched addresses `head_dim`
+floats apart and every 128-byte transaction carried 4 useful bytes.
+`GDN_DELTA_STEP_COALESCED_SRC` replaces it -- one threadgroup per
+`(head, row)`, one thread per COLUMN, the dot products as threadgroup
+reductions -- and is what `encode_delta_step` now encodes, so there is
+one kernel rather than two that would have to agree. A head width that
+is not a power of two is refused there, because the reduction halves
+its stride from it.
+
 ## Why it is not wired: three measurements, not one
 
 Wired into `Gdn::forward_rows`, the fused tail is slower every way it

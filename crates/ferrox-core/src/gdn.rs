@@ -184,6 +184,78 @@ fn update_and_dot(row: &mut [f32], k: &[f32], d: f32, q: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
+    /// The device step against this one at B=1, printed rather than
+    /// asserted: run with `--nocapture`.
+    ///
+    /// This is the number the three losses in
+    /// `docs/plans/gdn-resident-state.md` came down to, and it was
+    /// never measured on its own -- only end to end, where it read as
+    /// "the kernel is not better than six cores" without saying why.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn device_delta_step_against_host_throughput() {
+        use ferrox_metal::gdn::{DeltaShape, HeadMapKind};
+
+        let (n_k, n_v, s) = (4usize, 48usize, 128usize);
+        let dims = DeltaDims {
+            n_k_heads: n_k,
+            n_v_heads: n_v,
+            head_dim: s,
+            map: HeadMap::Tiled,
+        };
+        let shape = DeltaShape {
+            n_k_heads: n_k,
+            n_v_heads: n_v,
+            head_dim: s,
+            map: HeadMapKind::Tiled,
+        };
+        let mut seed = 11u32;
+        let mut draw = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((seed >> 8) as f32 / 8388608.0 - 1.0) * scale
+                })
+                .collect()
+        };
+        let state0 = draw(dims.state_len(), 0.5);
+        let q = draw(n_k * s, 1.0);
+        let k = draw(n_k * s, 1.0);
+        let v = draw(n_v * s, 1.0);
+        let g: Vec<f32> = draw(n_v, 3.0).iter().map(|x| -x.abs()).collect();
+        let beta: Vec<f32> = draw(n_v, 1.0).iter().map(|x| 0.5 + 0.25 * x).collect();
+        let reps = 20;
+
+        let mut host_state = state0.clone();
+        let mut out = vec![0.0f32; n_v * s];
+        delta_step(dims, &mut host_state, &q, &k, &v, &g, &beta, &mut out);
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            delta_step(dims, &mut host_state, &q, &k, &v, &g, &beta, &mut out);
+        }
+        let host_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+
+        let mut device_state = state0.clone();
+        ferrox_metal::gdn::launch_delta_step(shape, &mut device_state, &q, &k, &v, &g, &beta)
+            .expect("warm");
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            ferrox_metal::gdn::launch_delta_step(shape, &mut device_state, &q, &k, &v, &g, &beta)
+                .expect("the kernel launches");
+        }
+        let device_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        // The state is read and written once, which is the floor either
+        // side is working against.
+        let gb = 2.0 * dims.state_len() as f64 * 4.0 / 1e9;
+        eprintln!(
+            "one row, {n_v}x{s}: host {host_us:.0} us ({:.1} GB/s), device {device_us:.0} us \
+             ({:.1} GB/s, uploads and readback included)",
+            gb / (host_us / 1e6),
+            gb / (device_us / 1e6),
+        );
+    }
+
     /// The device kernel IS this recurrence: same decay, same
     /// prediction, same beta-scaled error, same rank-one update, same
     /// scaled read-out, and the same state left behind. Run on the M2

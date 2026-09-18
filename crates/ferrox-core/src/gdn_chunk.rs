@@ -391,7 +391,7 @@ mod tests {
             head_dim: s,
             map: HeadMapKind::Tiled,
         };
-        for rows in [8usize, 32, 64, 128, 512, 1201] {
+        for rows in [1usize, 2, 8, 32, 64, 128, 512, 1201] {
             let mut seed = 5u32;
             let mut draw = |n: usize, scale: f32| -> Vec<f32> {
                 (0..n)
