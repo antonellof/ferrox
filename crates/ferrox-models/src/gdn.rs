@@ -332,16 +332,44 @@ impl Gdn {
         let mut o = vec![0.0f32; value_dim];
         let mut g = vec![0.0f32; n_v];
         let mut beta = vec![0.0f32; n_v];
-        // A PREFILL batch keeps the recurrence on the host too, and
-        // this one is the most surprising of the measurements: it is
-        // 23% of a Bonsai prefill step, the state is uploaded ONCE for
-        // the whole batch rather than per token, and running it on the
-        // device still cost `pp128` 32.7 -> 28.5 tok/s. The reason is
-        // the state's working set: 3.1 MB per layer stays in the CPU's
-        // shared cache across the batch's rows, where the GPU re-reads
-        // and re-writes it from memory for every row (38 GB of traffic
-        // for a 128-token prefill). `docs/plans/gdn-resident-state.md`
-        // carries this beside the decode measurement.
+        // A PREFILL batch takes the CHUNKED delta rule
+        // (`ferrox_core::gdn_chunk`): the same recurrence with the
+        // state read once per chunk of rows instead of once per row.
+        // The sequential step is bandwidth-bound (36 GB/s of state,
+        // measured) and a 128-token Bonsai prefill moves 38 GB through
+        // it, so trading 1.5x the multiply-adds for a 32nd of the
+        // traffic is 2.1x on the step. A decode token still steps one
+        // row at a time, where there is no traffic to amortise, and
+        // running the row step on the GPU is a loss three ways
+        // (`docs/plans/gdn-resident-state.md`).
+        if rows > 1 {
+            let (q_all, k_all, v_all, g_all, beta_gate) =
+                self.conv_and_gates_for_rows(rows, &qkv_all, &beta_all, &alpha_all, state, rms_eps);
+            let mut o_all = vec![0.0f32; rows * value_dim];
+            ferrox_core::gdn_chunk::delta_chunk(
+                dims,
+                rows,
+                &mut state.ssm,
+                &q_all,
+                &k_all,
+                &v_all,
+                &g_all,
+                &beta_gate,
+                &mut o_all,
+            );
+            for r in 0..rows {
+                let o = &o_all[r * value_dim..(r + 1) * value_dim];
+                let y = &mut ys[r * value_dim..(r + 1) * value_dim];
+                let z = &z_all[r * value_dim..(r + 1) * value_dim];
+                for hd in 0..n_v {
+                    let normed_head = rms_norm(&o[hd * s..(hd + 1) * s], &self.norm, rms_eps);
+                    for i in 0..s {
+                        y[hd * s + i] = normed_head[i] * silu(z[hd * s + i]);
+                    }
+                }
+            }
+            return self.out_proj.apply_batch(&ys, rows);
+        }
         for r in 0..rows {
             // :251-262: the two per-head gates from the layer input.
             for hd in 0..n_v {
@@ -395,6 +423,62 @@ impl Gdn {
         } else {
             self.out_proj.apply_batch(&ys, rows)
         }
+    }
+}
+
+impl Gdn {
+    /// Every row's conv step, gates and l2 norms, which the chunked
+    /// recurrence needs up front: none of them reads the delta state,
+    /// so they do not have to interleave with it the way the
+    /// row-at-a-time loop does.
+    ///
+    /// Returns `(q, k, v, g, beta)`, each `[rows][...]`.
+    #[allow(clippy::type_complexity)]
+    fn conv_and_gates_for_rows(
+        &self,
+        rows: usize,
+        qkv_all: &[f32],
+        beta_all: &[f32],
+        alpha_all: &[f32],
+        state: &mut RecurrentState,
+        rms_eps: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let h = self.h;
+        let (s, n_k, n_v) = (h.head_dim, h.n_k_heads, h.n_v_heads);
+        let (key_dim, value_dim, conv_dim) = (h.key_dim(), h.value_dim(), h.conv_dim());
+        let mut q_all = vec![0.0f32; rows * key_dim];
+        let mut k_all = vec![0.0f32; rows * key_dim];
+        let mut v_all = vec![0.0f32; rows * value_dim];
+        let mut g_all = vec![0.0f32; rows * n_v];
+        let mut beta_gate = vec![0.0f32; rows * n_v];
+        let mut conv_out = vec![0.0f32; conv_dim];
+        for r in 0..rows {
+            for hd in 0..n_v {
+                beta_gate[r * n_v + hd] = sigmoid(beta_all[r * n_v + hd]);
+                g_all[r * n_v + hd] =
+                    softplus(alpha_all[r * n_v + hd] + self.dt_bias[hd]) * self.a[hd];
+            }
+            conv_step(
+                &mut state.conv,
+                &self.conv1d,
+                h.d_conv,
+                &qkv_all[r * conv_dim..(r + 1) * conv_dim],
+                &mut conv_out,
+            );
+            for x in conv_out.iter_mut() {
+                *x = silu(*x);
+            }
+            let (q, rest) = conv_out.split_at_mut(key_dim);
+            let (k, v) = rest.split_at_mut(key_dim);
+            for hd in 0..n_k {
+                l2_normalize(&mut q[hd * s..(hd + 1) * s], rms_eps);
+                l2_normalize(&mut k[hd * s..(hd + 1) * s], rms_eps);
+            }
+            q_all[r * key_dim..(r + 1) * key_dim].copy_from_slice(q);
+            k_all[r * key_dim..(r + 1) * key_dim].copy_from_slice(k);
+            v_all[r * value_dim..(r + 1) * value_dim].copy_from_slice(v);
+        }
+        (q_all, k_all, v_all, g_all, beta_gate)
     }
 }
 
@@ -532,7 +616,17 @@ mod tests {
         for (a, b) in batched.iter().zip(&seq) {
             assert!((a - b).abs() < 1e-6, "{a} vs {b}");
         }
-        assert_eq!(s_batch, s_seq);
+        // Close, not identical: a batch takes the CHUNKED delta rule
+        // (`ferrox_core::gdn_chunk`), which is the same recurrence
+        // with the rank-one updates unrolled across the chunk, so the
+        // float association differs from stepping row by row. The
+        // chunked module pins the two against each other directly; what
+        // this test is for is that the batched path has not lost a
+        // FEATURE, which a tolerance still catches.
+        assert_eq!(s_batch.conv, s_seq.conv, "the conv window is exact");
+        for (a, b) in s_batch.ssm.iter().zip(s_seq.ssm.iter()) {
+            assert!((a - b).abs() < 1e-6, "state: {a} vs {b}");
+        }
         let again = m.forward_rows(&flat, 4, &mut s_batch, 1e-5);
         assert!(again
             .iter()
