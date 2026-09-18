@@ -15,6 +15,15 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-09-18
+
+A packaging release: 0.22.0 and 0.23.0 shipped binaries but never
+reached crates.io, because `ferrox-models` packaged 22 MB of golden
+GGUF fixtures and the registry refuses an upload over 10 MB. Every
+crate downstream of it then had no registry version to build against,
+so `cargo install ferrox-cli` still installed 0.21.0. The fixtures are
+`cargo test` inputs and are excluded from the package.
+
 ### Fixed
 
 - **The fused dense FFN's command buffer is timed.** It carries a whole
