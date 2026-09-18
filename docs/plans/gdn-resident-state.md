@@ -225,6 +225,35 @@ no traffic to amortise and the three losses below still hold.
   tile ONCE into threadgroup memory and the simdgroup matrix ops hide
   it, so the trit decode is not what that kernel waits on.
 
+## What prefill spends itself on now
+
+With the recurrence on the device the profile moved twice in one day,
+and the second move is the one that matters. A `sample` of a 2420-token
+Bonsai prefill, by top-of-stack:
+
+| | samples |
+|---|---|
+| `attention::dot_f32` | 5640 |
+| `attention::pv_tile` | 3295 |
+| `attention::qk_tile` | 2243 |
+| `hadamard::fwht_normalized` | 1504 |
+| `mamba2::conv_step` | 769 |
+
+`delta_chunk` is not in it. The attention rows are Bonsai's 16 softmax
+layers, which the FUSED Metal attention block refuses because their Q
+is gated, so they fell back to the Rayon host kernel while
+`ferrox-metal`'s own `launch_gqa_prefill_host_ex` sat there with no
+caller. Wiring it (`Decoder::prefill_attention_blocked`) is 41.5 to
+43.1 tok/s.
+
+That is much less than 11178 of ~18000 samples suggests, and the
+`FERROX_METAL_GPU_TIMING` ledger says why: those samples are on worker
+threads that were already overlapping the GPU. With both host costs
+gone, prefill is the GEMM and nothing else -- 82 ms a submission over
+some 500 submissions of a 56 s run, about 3.2 TFLOP/s against the
+fork's 3.6 overall. So the prefill gap is now entirely the kernel
+below, and the host side of it is finished.
+
 ## Where the prefill gap actually is
 
 Arithmetic, not a profile: 128 tokens through 26.9B parameters is
