@@ -383,114 +383,83 @@ pub fn launch_delta_step(
     }
 }
 
-/// `rows` consecutive tokens' delta steps in ONE command buffer.
+/// A host allocation wrapped as a Metal buffer WITHOUT copying it.
 ///
-/// The recurrence is sequential in rows and the dispatches are too: a
-/// serial compute encoder runs them in order against the same state
-/// buffer, which is what makes this one submission rather than `rows`
-/// of them. The state is uploaded once and read back once, so its cost
-/// is amortised over the whole batch instead of paid per token, which
-/// is the difference between this path and a decode token's (see
-/// `docs/plans/gdn-resident-state.md`).
+/// Apple Silicon shares memory between the CPU and the GPU, so a
+/// page-aligned host buffer (`ferrox_core::recurrent_state::AlignedF32`)
+/// can be handed to a kernel as it stands. This is what makes the
+/// recurrence worth running on the device: the alternative measured
+/// slower, because a 3.1 MB state copied in and out per layer per token
+/// is more traffic than the whole weight read.
 ///
-/// `q`, `k` are `[rows][n_k_heads * head_dim]`, `v` is
-/// `[rows][n_v_heads * head_dim]`, `g` and `beta` are `[rows][n_v_heads]`,
-/// and the returned outputs are `[rows][n_v_heads * head_dim]`.
-#[allow(clippy::too_many_arguments)]
-pub fn launch_delta_step_rows(
-    shape: DeltaShape,
-    rows: usize,
-    state: &mut [f32],
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    g: &[f32],
-    beta: &[f32],
-) -> Result<Vec<f32>, MetalError> {
-    if rows == 0 {
-        return Ok(Vec::new());
+/// # Safety
+///
+/// `ptr` must point at `bytes` readable-writable bytes that outlive the
+/// returned buffer, and both `ptr` and `bytes` must be page-aligned.
+/// The caller must not touch those bytes while the GPU is using them,
+/// which here means: the caller holds `&mut` to the allocation across
+/// the whole submission.
+pub unsafe fn buffer_no_copy(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    ptr: *mut f32,
+    bytes: usize,
+) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
+    // Wrapping host pages is not free: Metal maps them for the GPU, and
+    // a decode token would pay that for every layer. The wrapper is
+    // cached by address, which is sound because the buffer IS those
+    // bytes -- there is no copy that could go stale -- and dropped with
+    // the allocation through `forget_no_copy`.
+    /// Address to (byte length, the buffer wrapping it).
+    type WrapCache =
+        std::collections::HashMap<usize, (usize, Retained<ProtocolObject<dyn MTLBuffer>>)>;
+    thread_local! {
+        static WRAPPED: std::cell::RefCell<WrapCache> =
+            std::cell::RefCell::new(WrapCache::new());
     }
-    let key_row = shape.n_k_heads * shape.head_dim;
-    let val_row = shape.n_v_heads * shape.head_dim;
-    if q.len() != rows * key_row
-        || k.len() != rows * key_row
-        || v.len() != rows * val_row
-        || g.len() != rows * shape.n_v_heads
-        || beta.len() != rows * shape.n_v_heads
-    {
-        return Err(MetalError::CommandFailed);
+    let key = ptr as usize;
+    if let Some(hit) = WRAPPED.with(|w| {
+        w.borrow()
+            .get(&key)
+            .filter(|(len, _)| *len == bytes)
+            .map(|(_, buf)| buf.clone())
+    }) {
+        return Some(hit);
     }
-    let shared = crate::gpu::shared_metal()?;
-    let device = &shared.device;
-    let queue = &shared.queue;
-    let upload = |xs: &[f32]| -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MetalError> {
-        let mut owned = xs.to_vec();
-        // SAFETY: `owned` outlives the call and the buffer copies it.
-        unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(owned.as_mut_ptr() as *mut _).ok_or(MetalError::BufferAllocFailed)?,
-                std::mem::size_of_val(owned.as_slice()),
-                objc2_metal::MTLResourceOptions::StorageModeShared,
-            )
-        }
-        .ok_or(MetalError::BufferAllocFailed)
-    };
-    let state_buf = upload(state)?;
-    let (q_buf, k_buf, v_buf) = (upload(q)?, upload(k)?, upload(v)?);
-    let (g_buf, beta_buf) = (upload(g)?, upload(beta)?);
-    let out_buf = device
-        .newBufferWithLength_options(
-            rows * val_row * 4,
+    let buf = unsafe {
+        device.newBufferWithBytesNoCopy_length_options_deallocator(
+            NonNull::new(ptr as *mut std::ffi::c_void)?,
+            bytes,
             objc2_metal::MTLResourceOptions::StorageModeShared,
+            None,
         )
-        .ok_or(MetalError::BufferAllocFailed)?;
-
-    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .ok_or(MetalError::CommandFailed)?;
-    for r in 0..rows {
-        encode_delta_step_at(
-            &encoder,
-            device,
-            shape,
-            &state_buf,
-            (&q_buf, r * key_row),
-            (&k_buf, r * key_row),
-            (&v_buf, r * val_row),
-            (&g_buf, r * shape.n_v_heads),
-            (&beta_buf, r * shape.n_v_heads),
-            (&out_buf, r * val_row),
-        )?;
-    }
-    encoder.endEncoding();
-    let clock = crate::timing::SubmitClock::start();
-    crate::timing::commit_wait_note(&cmd_buf, "gdn-delta-rows", 16, clock);
-
-    // SAFETY: shared-storage buffers of exactly these lengths, written
-    // by kernels this call has waited for.
-    unsafe {
-        let st =
-            std::slice::from_raw_parts(state_buf.contents().as_ptr() as *const f32, state.len());
-        state.copy_from_slice(st);
-        let o =
-            std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const f32, rows * val_row);
-        Ok(o.to_vec())
-    }
+    }?;
+    WRAPPED.with(|w| w.borrow_mut().insert(key, (bytes, buf.clone())));
+    Some(buf)
 }
 
-/// One token's recurrent tail in ONE command buffer: the delta step,
-/// the gated output norm, the rotation `ssm_out` was folded with, and
-/// `ssm_out` itself.
+/// A token's recurrent tail in ONE command buffer: the delta step, the
+/// gated output norm, the rotation `ssm_out` was folded with, and
+/// `ssm_out` itself, with the state read and written IN PLACE.
 ///
-/// This is the submission the host used to make three of, because the
-/// recurrence sat between two matvecs. `state` is read and written in
-/// place; `out_proj` is the matvec descriptor the caller would have
-/// passed to `launch_matvec_fused_folded`.
+/// `state_ptr` / `state_bytes` describe a page-aligned host allocation
+/// (`ferrox_core::recurrent_state::AlignedF32`) the kernel uses
+/// directly, so this submission copies no state at all.
+///
+/// Measured against the host path it replaces and NOT adopted: see
+/// `docs/plans/gdn-resident-state.md`. It stays because it is the
+/// second half of that plan and the kernels under it are pinned against
+/// `ferrox_core::gdn::delta_step`.
+///
+/// # Safety
+///
+/// As [`buffer_no_copy`]: the allocation must outlive the call, be
+/// page-aligned in pointer and length, and be exclusively borrowed by
+/// the caller for its duration.
 #[allow(clippy::too_many_arguments)]
-pub fn launch_gdn_tail(
+pub unsafe fn launch_gdn_tail_in_place(
     shape: DeltaShape,
-    state: &mut [f32],
+    state_ptr: *mut f32,
+    state_bytes: usize,
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -527,7 +496,9 @@ pub fn launch_gdn_tail(
             .ok_or(MetalError::BufferAllocFailed)
     };
 
-    let state_buf = upload(state)?;
+    // SAFETY: the caller's contract, forwarded.
+    let state_buf = unsafe { buffer_no_copy(device, state_ptr, state_bytes) }
+        .ok_or(MetalError::BufferAllocFailed)?;
     let (q_buf, k_buf, v_buf) = (upload(q)?, upload(k)?, upload(v)?);
     let (g_buf, beta_buf, z_buf) = (upload(g)?, upload(beta)?, upload(z)?);
     let norm_buf = upload(norm_weight)?;
@@ -583,12 +554,9 @@ pub fn launch_gdn_tail(
     let clock = crate::timing::SubmitClock::start();
     crate::timing::commit_wait_note(&cmd_buf, "gdn-tail", 32, clock);
 
-    // SAFETY: both are shared-storage buffers of exactly these lengths,
-    // written by kernels this call has waited for.
+    // SAFETY: shared storage of exactly `out_proj.rows` floats, written
+    // by a kernel this call has waited for.
     unsafe {
-        let st =
-            std::slice::from_raw_parts(state_buf.contents().as_ptr() as *const f32, state.len());
-        state.copy_from_slice(st);
         let o =
             std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const f32, out_proj.rows);
         Ok(o.to_vec())

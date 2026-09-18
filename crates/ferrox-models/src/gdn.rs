@@ -366,16 +366,18 @@ impl Gdn {
                 l2_normalize(&mut q[hd * s..(hd + 1) * s], rms_eps);
                 l2_normalize(&mut k[hd * s..(hd + 1) * s], rms_eps);
             }
-            // The recurrence stays on the HOST, and that is a
-            // measurement rather than an omission. Running it, the
+            // The recurrence stays on the HOST, and that is THREE
+            // measurements rather than an omission. Running it, the
             // gated norm and `ssm_out` as one Metal submission works
-            // and is SLOWER -- 6.0 tok/s against 7.1 on Bonsai-2-27B --
-            // because the state is 3.1 MB per layer and copying it to
-            // the device and back costs more than the submission it
-            // saves. The kernels exist and are pinned against this code
-            // (`ferrox_metal::gdn`); what they need is the state living
-            // on the device across tokens, which is
-            // `docs/plans/gdn-resident-state.md`.
+            // and is slower every way it has been tried on
+            // Bonsai-2-27B: 6.0 tok/s against 7.1 with the state copied
+            // both ways, 6.6 with it wrapped in place (the state buffer
+            // is page-aligned for exactly that, `AlignedF32`), and 6.9
+            // with the wrapper cached so the pages are mapped once.
+            // The kernels are real and pinned against this code
+            // (`ferrox_metal::gdn`); what beats a host recurrence is a
+            // CHUNKED delta rule, which is a different algorithm.
+            // `docs/plans/gdn-resident-state.md` carries all of it.
             delta_step(dims, &mut state.ssm, q, k, v, &g, &beta, &mut o);
             // :311-313 (`build_norm_gated`, :171-178): per head,
             // rms_norm(o, ssm_norm) * silu(z).

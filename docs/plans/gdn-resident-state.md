@@ -53,16 +53,45 @@ and 64 FFNs is the 159.
 - `launch_gdn_tail`: delta step, gated norm, the folded rotation and
   `ssm_out` in ONE command buffer.
 
-## Why it is not wired
+## Why it is not wired: three measurements, not one
 
-Wired into `Gdn::forward_rows`, the fused tail measured **6.0 tok/s
-against 7.1**. The reason is the state, not the kernels: Bonsai's is
-`48 heads x 128 x 128 x 4 B = 3.1 MB` per layer, so uploading it and
-reading it back costs `48 x 3.1 MB x 2 = 300 MB` of copies per token.
-That is more traffic than the whole weight read, to save one submission
-per layer.
+Wired into `Gdn::forward_rows`, the fused tail is slower every way it
+has been built, against a host baseline of **7.3 to 7.4 tok/s**:
+
+| how the state travels | tg32 |
+|---|---|
+| copied to the device and back each token | 6.0 |
+| wrapped in place, `newBufferWithBytesNoCopy` | 6.6 |
+| wrapped in place, the wrapper cached by address | 6.9 |
+
+The first says what everyone expects: Bonsai's state is
+`48 heads x 128 x 128 x 4 B = 3.1 MB` per layer, so copying it both ways
+is 300 MB a token, more traffic than the whole 5.95 GB weight read.
+
+The second and third are the interesting ones. `RecurrentState::ssm` is
+page-aligned (`ferrox_core::recurrent_state::AlignedF32`) precisely so
+that Metal can wrap the host's own bytes with no copy at all, and
+wrapping them still costs: mapping host pages for the GPU is not free,
+which the cached wrapper then removes. With BOTH of those gone the fused
+tail is STILL 6% behind the host recurrence.
+
+So the remaining difference is the kernel, not the plumbing: one
+threadgroup per head streaming a 128x128 state through registers is
+simply not better than six CPU cores doing the same reduction out of
+cache, when the layer's own work is only 3 MFLOP.
 
 ## What would close it
+
+The answer is not "move this loop to the GPU". It is the CHUNKED delta
+rule llama.cpp uses (`delta-net-base.cpp`): a block of C rows is
+processed together with matrix products, so the state is read and
+written once per CHUNK instead of once per row, and the arithmetic
+intensity rises to where a GPU beats a cache. That is a different
+algorithm with its own correctness story (a WY-style representation of
+the rank-one updates), and it is the honest next step. Everything below
+is what the plumbing around it should look like.
+
+## The plumbing, once the algorithm is right
 
 The state has to live on the device across tokens, with the host copy
 updated only when a host consumer actually reads it. The consumers are

@@ -1374,11 +1374,18 @@ submission overhead and 41 ms of host compute in a 141 ms token, and a
 `sample` that says 83% of the decode thread sits in
 `waitUntilCompleted`. Its delta-rule and gated-norm kernels LANDED
 (`ferrox-metal/src/gdn.rs`, pinned against
-`ferrox_core::gdn::delta_step`, sabotage red) and wiring them TODAY is
-a LOSS -- 6.0 tok/s against 7.1 -- because Bonsai's state is 3.1 MB a
-layer and copying it both ways is 300 MB a token, more traffic than
-the whole weight read. The state has to live on the device first,
-behind an accessor its host readers cannot forget.
+`ferrox_core::gdn::delta_step`, sabotage red) and wiring them is a LOSS
+three different ways: 6.0 tok/s against 7.3 with the state copied both
+ways (3.1 MB a layer, 300 MB a token, more traffic than the whole
+weight read), 6.6 with it wrapped in place -- `RecurrentState::ssm` is
+page-aligned for exactly that -- and 6.9 with the wrapper cached so the
+host pages are mapped once. With every copy removed it is STILL behind,
+so the difference is the KERNEL: one threadgroup per head streaming a
+128x128 state does not beat six cores doing the same reduction out of
+cache when the layer's own work is 3 MFLOP. What beats it is the
+CHUNKED delta rule llama.cpp uses, which reads the state once per chunk
+of rows rather than once per row. That is a different algorithm, and it
+is the honest next step.
 
 Do not read the architecture catalog as a support matrix. `ferrox
 parity` is the oracle: its tokenizer half matches llama.cpp on every
