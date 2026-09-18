@@ -291,33 +291,25 @@ impl Gdn {
                 m.apply_batch(normed, rows)
             }
         };
-        // `qkv`, `z` AND the gate logits all read the same normed
-        // input, so a decode token projects them in ONE submission
-        // (`apply_many`) instead of one per projection. The order here
-        // is the order they are popped back off below.
-        let mut gate_mats: Vec<&WeightMatrix> = vec![&self.qkv, &self.z_proj];
-        match &self.beta_alpha {
-            BetaAlpha::Split { beta, alpha } => gate_mats.extend([beta, alpha]),
-            BetaAlpha::Fused { ba } => gate_mats.push(ba),
-        }
-        let mut projected = if rows == 1 {
-            WeightMatrix::apply_many(&gate_mats, normed)
+        // `qkv` and `z` read the same input: one launch on a GPU
+        // backend (`apply_pair`), two overlapped regions on the CPU.
+        //
+        // The gate projections are NOT in that launch, and that is a
+        // measurement: sending all of them together as one list was
+        // neutral on Bonsai (tg32 7.2 either way) because those
+        // matrices are tiny and unquantized, and it made the fused
+        // launch all-or-nothing across two different folds.
+        let (qkv_all, z_all) = if rows == 1 {
+            WeightMatrix::apply_pair(&self.qkv, &self.z_proj, normed)
         } else {
-            gate_mats.iter().map(|m| project(m)).collect()
+            (project(&self.qkv), project(&self.z_proj))
         };
-        let mut drain = projected.drain(..);
-        let qkv_all = drain.next().expect("qkv is the first projection");
-        let z_all = drain.next().expect("z is the second projection");
         // The two per-head gate logits, whichever projection spells
         // them: `[rows][n_v]` each.
         let (beta_all, alpha_all) = match &self.beta_alpha {
-            BetaAlpha::Split { .. } => {
-                let beta = drain.next().expect("split beta");
-                let alpha = drain.next().expect("split alpha");
-                (beta, alpha)
-            }
-            BetaAlpha::Fused { .. } => {
-                let mixed = drain.next().expect("fused beta/alpha");
+            BetaAlpha::Split { beta, alpha } => (project(beta), project(alpha)),
+            BetaAlpha::Fused { ba } => {
+                let mixed = project(ba);
                 let ratio = n_v / n_k;
                 let mut beta_all = vec![0.0f32; rows * n_v];
                 let mut alpha_all = vec![0.0f32; rows * n_v];
