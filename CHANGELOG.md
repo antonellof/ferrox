@@ -15,7 +15,48 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Added
+
+- **PrismML's `PTQ1_0` ternary format and the folded Hadamard rotation
+  behind Ternary-Bonsai-2-27B.** `ferrox_quant::ternary` is one trit
+  codec for `PTQ1_0` (ggml 143) and `TQ1_0`; `ferrox-metal/src/
+  ternary.rs` is the Metal matvec (the fork's byte-owning, float-pipe
+  shape) and the simdgroup GEMM functor; `ferrox_models::hadamard_fold`
+  reads `prism.hadamard.*` and `WeightMatrix::Folded` applies the
+  rotation to the activation before every launch and undoes it on the
+  embedding row. Verified on the real 27B checkpoint against PrismML's
+  llama.cpp fork: first-token KL 2.1e-5 (CPU), 2.3e-5 (Metal decode),
+  2.2e-6 (Metal GEMM), tokenizer MATCH with the new `qwen35`
+  pre-tokenizer pattern. M2 Pro: pp128 34.0 / tg32 7.0 tok/s (fork
+  66.6 / 11.5). `PQ2_0` (142) is recognised and refused.
+- `WeightMatrix::apply_pair` and a GPU arm in `apply_three`: two or
+  three projections of one activation go into one command buffer
+  through `apply_gpu_multi` (a delta-net layer's `qkv` and `z`, q/k/v)
+  instead of one round trip each.
+
 ### Fixed
+
+- **Three hand-written copies of the Metal kind table, each lagging
+  it.** `rows_per_threadgroup` walked its own list of matvec kinds, so
+  a kernel absent from the copy dispatched at one row per threadgroup
+  and returned zeros for most rows (the PTQ1_0 matvec, on its first
+  run); `apply_gpu_multi`'s Metal arm and `apply_gpu_batch`'s GEMM
+  dispatch each matched kinds by hand and lacked Q5_0 and PTQ1_0, so a
+  Q5_0 gate/up pair ran as two launches and a Q5_0 prefill as N
+  matvecs while `gemm_supported` claimed, and the kernel registry
+  recorded, a GEMM. All three read the one table now
+  (`MATVEC_KINDS`, `Metal::matvec_kernel`, `launch_mul_mm_sg` off
+  `mul_mm_sg_meta`), with tests holding each to it.
+- **`ferrox bench` refused every hybrid model** (`layer 0 consumed 0
+  of 128 prompt tokens`): the cache probe read KV rows, which a
+  recurrent layer never has; it reads the position counter there.
+- `Hadamard` fold memo was thread-local, so gate and up loaded on
+  different threads carried different `Arc`s and never fused.
+- `delta_step` (the gated delta-net recurrence) runs its heads in
+  parallel with vectorisable reductions; `matmul_f32` dots through the
+  resolved SIMD kernel attention already used; `HadamardFold::
+  transform_rows` is parallel over rows with a vectorised butterfly.
+  Together 2.4 to 7.0 tok/s decode and 2.9 to 34 prefill on Bonsai.
 
 - **Chat templates that call `str.startswith` / `str.endswith` render.**
   Qwen3.5's template tests a user turn for `<tool_response>` wrapping

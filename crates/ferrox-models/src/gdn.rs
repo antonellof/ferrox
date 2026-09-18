@@ -291,8 +291,13 @@ impl Gdn {
                 m.apply_batch(normed, rows)
             }
         };
-        let qkv_all = project(&self.qkv);
-        let z_all = project(&self.z_proj);
+        // `qkv` and `z` read the same input: one launch on a GPU
+        // backend (`apply_pair`), two overlapped regions on the CPU.
+        let (qkv_all, z_all) = if rows == 1 {
+            WeightMatrix::apply_pair(&self.qkv, &self.z_proj, normed)
+        } else {
+            (project(&self.qkv), project(&self.z_proj))
+        };
         // The two per-head gate logits, whichever projection spells
         // them: `[rows][n_v]` each.
         let (beta_all, alpha_all) = match &self.beta_alpha {

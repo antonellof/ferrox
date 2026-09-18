@@ -130,6 +130,28 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// [`dot_f32`] resolved ONCE to the arm this CPU takes, for a caller
+/// that dots many rows against one vector and should not re-run the
+/// feature probe per row (`matmul::matmul_f32`).
+pub(crate) fn dot_f32_fn() -> fn(&[f32], &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: NEON was just detected on this CPU, and the
+            // returned function is only ever called on this process.
+            return |a, b| unsafe { dot_f32_neon(a, b) };
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: AVX2 and FMA were just detected on this CPU.
+            return |a, b| unsafe { dot_f32_avx2(a, b) };
+        }
+    }
+    |a, b| a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {

@@ -19,6 +19,8 @@ pub use encode::q6_k::{encode_block_q6_k, encode_row_q6_k, probe_q6_k_group};
 pub use encode::{encode_block_q8_0, encode_row_q8_0};
 
 pub mod iq4_xs_q8;
+/// The base-3 trit formats, ggml's `TQ1_0` and PrismML's `PTQ1_0`.
+pub mod ternary;
 pub use iq4_xs_q8::{dot_iq4_xs_q8_k, dot_iq4_xs_q8_k_scalar};
 pub mod iq_tables;
 /// ggml-produced golden vectors for the IQ2_XS/IQ2_S/IQ3_S/IQ1_M

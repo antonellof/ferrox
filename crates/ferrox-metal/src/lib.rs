@@ -16,6 +16,8 @@ pub mod capability;
 
 #[cfg(feature = "metal")]
 pub mod gpu;
+/// PrismML's PTQ1_0 trit format on Metal (`ternary::PTQ1_0Dequant`).
+pub mod ternary;
 
 #[cfg(feature = "metal")]
 pub mod attn;

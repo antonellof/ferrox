@@ -135,6 +135,39 @@ is faster.
   GROUPED (`gdn::GROUPED_HEAD_ARCHITECTURES`, `HeadMap::Grouped`) and
   beta / alpha come from one `ssm_ba` projection (`gdn::BetaAlpha::
   Fused`); plain NEOX RoPE; KL 8.7e-12.
+- **Ternary-Bonsai-2-27B** (PrismML's `PTQ1_0` export of a `qwen35`
+  graph with a folded Hadamard rotation), verified on the REAL
+  checkpoint on 2026-09-18 against PrismML's llama.cpp fork (the only
+  libllama that reads the format): `ferrox parity` first-token KL
+  2.1e-5 CPU, 2.3e-5 Metal decode, 2.2e-6 through the Metal GEMM,
+  tokenizer MATCH (`pre=qwen35`, a `qwen2` pattern with marks kept in
+  letter runs). `PTQ1_0` (ggml type 143) is `ferrox_quant::ternary`:
+  128 weights a block, five trits a byte in `qs[24]`, four in `qh[2]`,
+  the f16 scale LAST, decoded with the fork's `((q * 3^n) mod 256) *
+  3 >> 8` trick; `TQ1_0` is the same codec with the other layout. On
+  Metal (`ferrox-metal/src/ternary.rs`) the matvec is the fork's
+  byte-owning shape (eight lanes a block, the trit peeled on the float
+  pipe as `floor(3^{n+1} u) - 3 floor(3^n u)`, the byte's dot collapsed
+  to five activation coefficients staged once for four rows) and the
+  GEMM is one dequant functor spliced into the shared simdgroup body.
+  The Hadamard (`prism.hadamard.*`: block 1024, explicit signs per
+  input width, `W' = W S H`) is `WeightMatrix::Folded` over
+  `ferrox_core::weight_matrix::hadamard` and read from the file by
+  `ferrox_models::hadamard_fold`: the activation is permuted, signed
+  and transformed before every launch of a listed weight, the
+  `token_embd` row restored after its lookup, `ssm_out`'s input
+  permuted tiled-to-grouped first. Building it found four defects on
+  paths that predate it: `rows_per_threadgroup` carried its own copy
+  of the matvec kind list (a kind absent from it dispatched at one row
+  per threadgroup and answered zeros), `apply_gpu_multi`'s Metal arm
+  and `apply_gpu_batch`'s GEMM dispatch each carried a hand-written
+  kind match that lacked Q5_0 as well (so Q5_0 gate/up ran as two
+  launches and Q5_0 prefill as N matvecs while the kernel registry
+  recorded a GEMM hit), and `ferrox bench` refused every hybrid model
+  because its cache probe read KV rows on a recurrent layer. Speed on
+  the M2 Pro: pp128 34.0 / tg32 7.0 tok/s against the fork's 66.6 /
+  11.5, up from 2.9 / 2.4 at first light; what remains is the
+  per-matvec command buffer and the CPU delta-net recurrence.
 - **Llama 4: Scout and Maverick** (`llama4`), audited against libllama
   on 2026-09-14 (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16- and
   128-expert shapes, and the last of 8200 positions across the chunk

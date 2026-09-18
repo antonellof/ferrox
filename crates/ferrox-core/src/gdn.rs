@@ -110,37 +110,74 @@ pub fn delta_step(
     assert_eq!(out.len(), n_v_heads * s);
     assert!(n_k_heads > 0 && n_v_heads.is_multiple_of(n_k_heads), ":308");
     let scale = 1.0 / (s as f32).sqrt();
-    let mut d = vec![0.0f32; s];
-    for h in 0..n_v_heads {
+    // Heads are independent (each owns an `S x S` state and `S`
+    // outputs), so they run as one parallel region over the head axis;
+    // a serial version of this loop was 15% of a Bonsai-2-27B decode
+    // step (48 layers x 48 heads x 128 x 128 state floats per token).
+    // The two inner reductions are written over four accumulators so
+    // the compiler can vectorise them (a single-accumulator float sum
+    // cannot be reordered without fast-math).
+    crate::par::chunks_mut2_by(state, out, s * s, s, 1, |h, st, oh| {
         let kh = map.k_head(h, n_k_heads, n_v_heads);
         let (qh, kk) = (&q[kh * s..(kh + 1) * s], &k[kh * s..(kh + 1) * s]);
         let vh = &v[h * s..(h + 1) * s];
-        let st = &mut state[h * s * s..(h + 1) * s * s];
         let decay = g[h].exp();
+        let mut d = vec![0.0f32; s];
         // :340 then :343-350: decay, the state's prediction, the error
         // scaled by beta.
         for j in 0..s {
             let row = &mut st[j * s..(j + 1) * s];
-            let mut pred = 0.0f32;
-            for i in 0..s {
-                row[i] *= decay;
-                pred += row[i] * kk[i];
-            }
+            let pred = decay_and_dot(row, kk, decay);
             d[j] = (vh[j] - pred) * beta[h];
         }
         // :357-363: the rank-one update, then the read-out with the
         // scaled query.
-        let oh = &mut out[h * s..(h + 1) * s];
         for j in 0..s {
             let row = &mut st[j * s..(j + 1) * s];
-            let mut o = 0.0f32;
-            for i in 0..s {
-                row[i] += kk[i] * d[j];
-                o += row[i] * qh[i] * scale;
-            }
-            oh[j] = o;
+            oh[j] = update_and_dot(row, kk, d[j], qh) * scale;
+        }
+    });
+}
+
+/// `row *= decay`, then `row . k`, over four lanes of accumulation.
+#[inline]
+fn decay_and_dot(row: &mut [f32], k: &[f32], decay: f32) -> f32 {
+    let mut acc = [0.0f32; 4];
+    let (rb, rt) = row.as_chunks_mut::<4>();
+    let (kb, kt) = k.as_chunks::<4>();
+    for (r, kk) in rb.iter_mut().zip(kb) {
+        for l in 0..4 {
+            r[l] *= decay;
+            acc[l] += r[l] * kk[l];
         }
     }
+    let mut tail = 0.0f32;
+    for (r, kk) in rt.iter_mut().zip(kt) {
+        *r *= decay;
+        tail += *r * *kk;
+    }
+    acc[0] + acc[1] + acc[2] + acc[3] + tail
+}
+
+/// `row += k * d`, then `row . q`, over four lanes of accumulation.
+#[inline]
+fn update_and_dot(row: &mut [f32], k: &[f32], d: f32, q: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 4];
+    let (rb, rt) = row.as_chunks_mut::<4>();
+    let (kb, kt) = k.as_chunks::<4>();
+    let (qb, qt) = q.as_chunks::<4>();
+    for ((r, kk), qq) in rb.iter_mut().zip(kb).zip(qb) {
+        for l in 0..4 {
+            r[l] += kk[l] * d;
+            acc[l] += r[l] * qq[l];
+        }
+    }
+    let mut tail = 0.0f32;
+    for ((r, kk), qq) in rt.iter_mut().zip(kt).zip(qt) {
+        *r += *kk * d;
+        tail += *r * *qq;
+    }
+    acc[0] + acc[1] + acc[2] + acc[3] + tail
 }
 
 #[cfg(test)]

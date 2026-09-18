@@ -86,6 +86,7 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | Falcon-H1 (`falcon-h1`: 0.5B to 34B) | **Generic path, audited 2026-09-14** (`tests/falcon_h1_graphs.rs`, KL 1.3e-13 plain, 6.2e-13 without `ssm_norm`, 3.2e-13 separate `output`). Attention and Mamba-2 in parallel on every layer (`ferrox_models::mamba2::PARALLEL_WITH_ATTENTION`); no prefix-cache reuse and no `--model-draft`, as for every Mamba model |
 | openPangu-Embedded (`pangu-embedded`: 1B / 7B) | **Generic path, audited 2026-09-14** (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13 on split, fused-QKV and separate-`output` fixtures). A decoder LLM, not an embedding model; `llama.cpp`'s graph plus a required `attn_output.bias` |
 | Qwen3.5 dense (`qwen35`: 0.8B / 2B / 4B / 9B / 27B) | **Generic path, audited 2026-09-14** (`tests/qwen35_graphs.rs`, KL 4.1e-13 / 4.1e-13 (the `attention.recurrent_layers` spelling) / 5.7e-13). The gated delta net where attention would be (`ferrox_models::gdn`, `ferrox_core::gdn`), gated full attention on every fourth layer, partial IMROPE. The old GDN scaffold (`gdn.rs`, `hybrid_gguf_loader.rs`, 1.8k lines that had never met libllama) is deleted. `qwen35moe` (Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B) **runs** too (KL 2.9e-11, `qwen2moe`'s FFN with the sigmoid-gated shared expert); `qwen3next` (Qwen3-Next-80B-A3B) **runs** too (KL 8.7e-12): the same layers with the V heads grouped over the K heads (`HeadMap::Grouped`) and beta / alpha in one `ssm_ba` projection. No prefix-cache reuse and no `--model-draft`, as for every recurrent model |
+| Ternary-Bonsai-2-27B (PrismML; `qwen35` + `PTQ1_0` + folded Hadamard) | **Runs, verified on the real checkpoint 2026-09-18** against PrismML's llama.cpp fork (`ferrox parity`, first-token KL 2.1e-5 on CPU, 2.3e-5 on Metal decode, 2.2e-6 through the Metal GEMM path; tokenizer MATCH on 1198 tokens, `pre=qwen35`). `PTQ1_0` (ggml type 143: 128 trits in 24 + 2 bytes and an f16 scale, `ferrox_quant::ternary`) has a scalar CPU dot, a Metal matvec and a Metal simdgroup GEMM (`ferrox-metal/src/ternary.rs`); `PQ2_0` (142) is recognised and sized, not executed. The `prism.hadamard.*` metadata (block-1024 normalised Walsh-Hadamard with explicit signs, folded into every listed weight; the inverse on `token_embd` rows; the tiled-to-grouped head permutation on `ssm_out`) is `ferrox_models::hadamard_fold` and `WeightMatrix::Folded`, applied to the activation before every launch and to the embedding row after the lookup. Speed on the M2 Pro (`ferrox bench`, pp128 / tg32): 34.0 / 7.0 tok/s against the fork's 66.6 / 11.5; the gap is the per-matvec command buffer (0.2 ms of latency beyond each kernel, ~200 launches a token) and the delta-net recurrence on the CPU, both of which the fork does in one Metal graph |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders and primitives only. Nothing has been run end to end on a real checkpoint |
 | Vision | Finds an mmproj file and warns about it. An `image_url` in a request returns an error |
 | MTP / speculative | `--mtp` errors by design. `ferrox speculative` is prompt-lookup only (an n-gram match over the history, no draft model) and runs on **synthetic random weights**, so the hit rate it prints is not representative of a real drafter. Plan for a real one: [`docs/plans/on-hold/dflash-speculative-decoding.md`](plans/on-hold/dflash-speculative-decoding.md) |
@@ -1256,7 +1257,7 @@ and carry on.
 Parsed and executable on CPU: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`,
 `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`,
 `IQ4_NL`, `IQ4_XS`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
-`IQ3_XXS`, `IQ3_S`, `MXFP4`.
+`IQ3_XXS`, `IQ3_S`, `MXFP4`, `TQ1_0`, `PTQ1_0`.
 
 "Executable" is not one speed. What a format actually gets, read off
 the kernel tables (`ferrox_quant`'s dispatch functions, and
@@ -1268,6 +1269,7 @@ the kernel tables (`ferrox_quant`'s dispatch functions, and
 |---|---|---|---|
 | Full | `Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` | AVX2 + NEON, plus the int-dot path (`FERROX_CPU_INT_DOT=1`) | Metal matvec + simdgroup GEMM, CUDA matvec |
 | Metal only | `IQ4_XS`, `Q5_0` | AVX2 + NEON | Metal matvec + simdgroup GEMM; no CUDA kernel of either kind |
+| Metal only, scalar CPU | `PTQ1_0` (PrismML ternary) | scalar | Metal matvec + simdgroup GEMM (`ferrox-metal/src/ternary.rs`); no CUDA kernel |
 | CPU-vectorized | `Q4_1`, `Q5_1`, `Q8_1`, `Q2_K`, `Q3_K`, `IQ4_NL`, safetensors two-buffer `MXFP4` | AVX2 + NEON | none |
 | AVX2 only | `IQ1_S`, `IQ2_XXS`, `IQ3_XXS` | AVX2; **scalar on ARM** | none |
 | Scalar only | `IQ2_XS`, `IQ2_S`, `IQ3_S`, `IQ1_M`, GGUF-block `MXFP4` | none | none |
@@ -1301,12 +1303,14 @@ Three caveats that matter in practice:
 - **On an Apple machine the "AVX2 only" row is the scalar row.**
   `IQ1_S`, `IQ2_XXS` and `IQ3_XXS` have x86 kernels and no NEON ones, so
   on ARM they run at the same speed as the scalar tier below them.
-- **`I32`, `TQ1_0`, `TQ2_0`, `NVFP4`, `Q1_0` and `Q2_0` are recognized
+- **`I32`, `TQ2_0`, `NVFP4`, `Q1_0`, `Q2_0` and `PQ2_0` are recognized
   and sized, but nothing executes them.** They parse, `ferrox inspect`
   reports their real footprint, and a checkpoint that needs one stops
   with an error naming the format rather than being quietly skipped or
-  silently mis-measured. Ternary (`TQ*`) and the two newest `Q*_0`
-  formats are a real gap, not a claim of support.
+  silently mis-measured. `TQ1_0` has the CPU trit dot (`ferrox_quant::
+  ternary` is one codec for the two layouts) and no GPU kernel, and no
+  real `TQ1_0` checkpoint has been run through it; `PTQ1_0` is the one
+  ternary format verified end to end (Bonsai-2-27B, above).
 
 `IQ2_XS`, `IQ2_S`, `IQ3_S` and `IQ1_M` were validated bit-exact against
 llama.cpp's own `dequantize_row_*` by linking `ggml-quants.c`, not by

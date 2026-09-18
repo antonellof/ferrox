@@ -2267,9 +2267,32 @@ kernel void q4_k_mul_mm(
 /// A is `[n_rows, K]` Q4_K, B is `[batch, K]` f32, C is `[batch, n_rows]`
 /// f32 — the same layouts the matvec path already uses, so this drops in
 /// without touching callers.
-pub const K_QUANT_MUL_MM_SG_KERNEL_SRC: &str = r#"
+/// The GEMM translation unit: the K-quant, legacy and IQ4_XS functors
+/// written here, plus PrismML's ternary functor spliced in from
+/// `crate::ternary` so the trit decode exists once (the matvec is
+/// built from the same text). Built on first use and leaked, because
+/// `ensure_pipeline` keys its cache on a `&'static str`.
+pub static K_QUANT_MUL_MM_SG_KERNEL_SRC: std::sync::LazyLock<&'static str> =
+    std::sync::LazyLock::new(|| {
+        let src = K_QUANT_MUL_MM_SG_KERNEL_BODY
+            .replacen(
+                "// @FERROX_TERNARY_FUNCTOR@",
+                crate::ternary::PTQ1_0_DEQUANT_MSL,
+                1,
+            )
+            .replacen(
+                "// @FERROX_TERNARY_ENTRIES@",
+                crate::ternary::PTQ1_0_GEMM_ENTRIES_MSL,
+                1,
+            );
+        Box::leak(src.into_boxed_str())
+    });
+
+const K_QUANT_MUL_MM_SG_KERNEL_BODY: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+
+// @FERROX_TERNARY_FUNCTOR@
 
 // llama `get_scale_min_k4_just2`: Q4_K packs eight 6-bit scale/min pairs
 // into 12 bytes, the low four pairs plainly and the high four with their
@@ -3231,6 +3254,7 @@ MUL_MM_SG_ENTRY(q8_0_mul_mm_sg, Q8_0Dequant)
 MUL_MM_SG_ENTRY(q4_0_mul_mm_sg, Q4_0Dequant)
 MUL_MM_SG_ENTRY(q5_0_mul_mm_sg, Q5_0Dequant)
 MUL_MM_SG_ENTRY(iq4_xs_mul_mm_sg, IQ4XSDequant)
+// @FERROX_TERNARY_ENTRIES@
 MUL_MM_ID_ENTRY(q4_0_mul_mm_id, Q4_0Dequant)
 MUL_MM_ID_ENTRY(q4_k_mul_mm_id, Q4KDequant)
 MUL_MM_ID_ENTRY(q8_0_mul_mm_id, Q8_0Dequant)
@@ -3358,6 +3382,27 @@ pub fn launch_iq4_xs_mul_mm_sg(
         "iq4_xs_mul_mm_sg",
         136,
         256,
+    )
+}
+
+/// PTQ1_0 twin, on the same body through `crate::ternary`'s dequant
+/// functor (`MUL_MM_SG_ENTRY(ptq1_0_mul_mm_sg, PTQ1_0Dequant)`).
+pub fn launch_ptq1_0_mul_mm_sg(
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+) -> Result<Vec<f32>, MetalError> {
+    launch_k_quant_mul_mm_sg(
+        weights,
+        x_batch,
+        rows,
+        row_bytes,
+        batch_size,
+        "ptq1_0_mul_mm_sg",
+        28,
+        128,
     )
 }
 
@@ -3499,6 +3544,37 @@ impl MulMmSgLaunch<'_> {
     }
 }
 
+/// The simdgroup GEMM for any kind [`mul_mm_sg_meta`] names, read off
+/// that table. `Ok(None)` is "no GEMM for this kind"; the per-kind
+/// `launch_*_mul_mm_sg` wrappers above are this call with the row
+/// written out, and `apply_gpu_batch` used to name them one by one in
+/// a match that lacked Q5_0 and PTQ1_0 while `gemm_supported` said both
+/// had a GEMM, so a Bonsai prefill ran N matvecs per matrix with the
+/// kernel registry reporting a GEMM hit.
+pub fn launch_mul_mm_sg(
+    kind: &str,
+    weights: &[u8],
+    x_batch: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    batch_size: usize,
+) -> Result<Option<Vec<f32>>, MetalError> {
+    let Some((fn_name, block_bytes, block_elems)) = mul_mm_sg_meta(kind) else {
+        return Ok(None);
+    };
+    launch_k_quant_mul_mm_sg(
+        weights,
+        x_batch,
+        rows,
+        row_bytes,
+        batch_size,
+        fn_name,
+        block_bytes,
+        block_elems,
+    )
+    .map(Some)
+}
+
 /// Kernel name and block geometry for the kinds that have a simdgroup
 /// GEMM. `None` for anything still limited to a matvec.
 pub fn mul_mm_sg_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
@@ -3510,6 +3586,7 @@ pub fn mul_mm_sg_meta(kind: &str) -> Option<(&'static str, usize, usize)> {
         "Q4_0" => Some(("q4_0_mul_mm_sg", 18, 32)),
         "Q5_0" => Some(("q5_0_mul_mm_sg", 22, 32)),
         "IQ4_XS" => Some(("iq4_xs_mul_mm_sg", 136, 256)),
+        "PTQ1_0" => Some(("ptq1_0_mul_mm_sg", 28, 128)),
         _ => None,
     }
 }
@@ -3607,7 +3684,7 @@ pub(crate) fn encode_mul_mm_id_f16(
     row_bytes: u32,
     src1_per_slot: u32,
 ) -> Result<(), MetalError> {
-    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
+    let pipeline = ensure_pipeline(device, *K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
         enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
@@ -3979,7 +4056,7 @@ pub(crate) fn encode_mul_mm_id(
     row_bytes: u32,
     src1_per_slot: u32,
 ) -> Result<(), MetalError> {
-    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
+    let pipeline = ensure_pipeline(device, *K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
         enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
@@ -4104,7 +4181,7 @@ pub(crate) fn encode_mul_mm_sg_f16(
         _ => return Err(MetalError::CommandFailed),
     };
     let (fn_pick, smem) = mul_mm_sg_variant(fn_f16, l.rows, batch_size);
-    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
+    let pipeline = ensure_pipeline(device, *K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
         enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset, 0);
@@ -4179,7 +4256,7 @@ pub(crate) fn encode_mul_mm_sg_offset_ex(
     batch_size: usize,
 ) -> Result<(), MetalError> {
     let (fn_pick, smem) = mul_mm_sg_variant(l.fn_name, l.rows, batch_size);
-    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
+    let pipeline = ensure_pipeline(device, *K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
     unsafe {
         enc.setComputePipelineState(&pipeline.0);
         enc.setBuffer_offset_atIndex(Some(&w.buffer), w.weight_offset + weight_byte_offset, 0);
@@ -4366,7 +4443,7 @@ fn launch_k_quant_mul_mm_sg(
     let out_buf = out_scratch.get();
 
     let (fn_pick, smem) = mul_mm_sg_variant(fn_name, rows, batch_size);
-    let pipeline = ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
+    let pipeline = ensure_pipeline(device, *K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
     let setup_us = t_setup.elapsed().as_micros();
 
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
@@ -4971,10 +5048,39 @@ pub fn launch_iq4_xs_matvec(
     )
 }
 
+/// Launches the PTQ1_0 matvec kernel (`crate::ternary`).
+pub fn launch_ptq1_0_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+) -> Result<Vec<f32>, MetalError> {
+    launch_matvec(
+        crate::ternary::ptq1_0_matvec_src(),
+        "ptq1_0_matvec",
+        28,
+        128,
+        weights,
+        x,
+        rows,
+        row_bytes,
+    )
+}
+
 /// Kernel metadata for building a [`MatvecLaunch`] from a GGML quant
 /// tag name used by `WeightMatrix` (Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K).
 /// The fifth field is rows-per-threadgroup (`1` for legacy one-row
 /// kernels; `2` for Q5_K/Q8_0; `4` for Q4_K/Q6_K/IQ4_XS; `8` for Q4_0).
+/// Every kind [`matvec_launch_meta`] answers for. `rows_per_threadgroup`
+/// walks this list to find a kernel by entry-point name; it used to
+/// carry its own copy of the names, and the copy lacked the newest kind
+/// (PTQ1_0), so that kernel was dispatched at one row per threadgroup
+/// and answered zeros for every row but the first group's. The test
+/// below holds the two together.
+pub const MATVEC_KINDS: &[&str] = &[
+    "F32", "Q8_0", "Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "IQ4_XS", "PTQ1_0",
+];
+
 pub fn matvec_launch_meta(kind: &str) -> Option<(&'static str, &'static str, usize, usize, usize)> {
     match kind {
         "F32" => Some((F32_MATVEC_KERNEL_SRC, "f32_matvec", 4, 1, 1)),
@@ -4985,6 +5091,13 @@ pub fn matvec_launch_meta(kind: &str) -> Option<(&'static str, &'static str, usi
         "Q5_K" => Some((Q5_K_MATVEC_KERNEL_SRC, "q5_k_matvec", 176, 256, 2)),
         "Q6_K" => Some((Q6_K_MATVEC_KERNEL_SRC, "q6_k_matvec", 210, 256, 4)),
         "IQ4_XS" => Some((IQ4_XS_MATVEC_KERNEL_SRC, "iq4_xs_matvec", 136, 256, 4)),
+        "PTQ1_0" => Some((
+            crate::ternary::ptq1_0_matvec_src(),
+            "ptq1_0_matvec",
+            28,
+            128,
+            4,
+        )),
         _ => None,
     }
 }
@@ -5094,7 +5207,7 @@ pub(crate) fn warm_mul_mm_sg_pipeline(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     fn_name: &'static str,
 ) -> Result<Arc<CachedPipeline>, MetalError> {
-    ensure_pipeline(device, K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)
+    ensure_pipeline(device, *K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_name)
 }
 
 /// Process-wide cache of quantized weight `MTLBuffer`s, looked up by
@@ -7076,9 +7189,7 @@ pub(crate) fn encode_matvec(
 /// Falls back to 1 only when no meta row names this kernel, which is a
 /// kernel outside the table entirely rather than a forgotten row.
 fn rows_per_threadgroup(fn_name: &str) -> usize {
-    for kind in [
-        "F32", "Q8_0", "Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "IQ4_XS",
-    ] {
+    for kind in MATVEC_KINDS {
         if let Some((_, name, _, _, rows_per_tg)) = matvec_launch_meta(kind) {
             if name == fn_name {
                 return rows_per_tg;
@@ -7219,6 +7330,9 @@ pub(crate) fn encode_matvec_with_offsets(
         // ggml IQ4_XS: 2 simdgroups x 32 lanes; 32 floats of TG memory
         // hold the non-linear codebook (one copy per 16 lanes).
         "iq4_xs_matvec" => (64usize, 128usize),
+        // PTQ1_0: the fork's geometry, ONE simdgroup on NR=4 rows
+        // (`N_SG_PTQ1_0 1`, `N_R0_PTQ1_0 4`), simd_sum only.
+        "ptq1_0_matvec" => (32usize, 0usize),
         _ if rows_per_tg > 1 => (32usize, 256 * 4),
         _ => {
             let tg = n_blocks_per_row.next_power_of_two().clamp(32, 256);
@@ -7464,6 +7578,75 @@ mod tests {
 
         let result = launch_iq4_xs_matvec(&weights, &x, rows, row_bytes).expect("kernel launch");
 
+        assert_eq!(result.len(), expected.len());
+        for (i, (a, b)) in result.iter().zip(expected.iter()).enumerate() {
+            let tol = 1e-3 * b.abs().max(1.0);
+            assert!((a - b).abs() < tol, "row {i}: gpu={a} cpu={b} tol={tol}");
+        }
+    }
+
+    /// `MATVEC_KINDS` and `matvec_launch_meta` agree: every listed kind
+    /// has a row, and every kind the meta answers for is listed (the
+    /// meta is a `match`, so the second half is the first half plus the
+    /// kinds the CPU side knows).
+    #[test]
+    fn every_matvec_kind_is_listed_and_every_listed_kind_has_a_row() {
+        for kind in MATVEC_KINDS {
+            let (_, fn_name, _, _, rows_per_tg) =
+                matvec_launch_meta(kind).expect("listed kind has a meta row");
+            assert_eq!(
+                rows_per_threadgroup(fn_name),
+                rows_per_tg,
+                "{kind}: {fn_name} resolves to the fallback geometry"
+            );
+        }
+        // Every kind the CPU side names for Metal is in the list
+        // (`ferrox-core`'s gpu_backend test holds the other direction
+        // through `metal_matvec_launch`); the cheap check here is that
+        // the GEMM table's kinds all have a matvec.
+        for kind in [
+            "Q8_0", "Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "IQ4_XS", "PTQ1_0",
+        ] {
+            assert!(mul_mm_sg_meta(kind).is_some(), "{kind} has no GEMM row");
+            assert!(
+                MATVEC_KINDS.contains(&kind),
+                "{kind} has a GEMM and no matvec"
+            );
+        }
+    }
+
+    /// The PTQ1_0 matvec against `ferrox_quant::ternary`'s scalar dot on
+    /// a ternary row the quantizer packed: rows=6 exercises the row
+    /// guard (NR=4 x NSG=2), 5 blocks/row leaves lanes idle.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_ptq1_0_matvec_matches_cpu_reference() {
+        use ferrox_quant::ternary::{dot_trits_f32, quantize_trits, PTQ1_0};
+        let rows = 6;
+        let cols = 640;
+        let row_bytes = cols / 128 * 28;
+        let mut seed = 5u32;
+        let mut weights = Vec::with_capacity(rows * row_bytes);
+        let mut rows_f32 = Vec::new();
+        for _ in 0..rows {
+            let w: Vec<f32> = (0..cols)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    match (seed >> 24) % 3 {
+                        0 => -0.5,
+                        1 => 0.0,
+                        _ => 0.5,
+                    }
+                })
+                .collect();
+            weights.extend(quantize_trits(&w, PTQ1_0));
+            rows_f32.push(w);
+        }
+        let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.05).sin()).collect();
+        let expected: Vec<f32> = (0..rows)
+            .map(|r| dot_trits_f32(&weights[r * row_bytes..(r + 1) * row_bytes], PTQ1_0, &x))
+            .collect();
+        let result = launch_ptq1_0_matvec(&weights, &x, rows, row_bytes).expect("kernel launch");
         assert_eq!(result.len(), expected.len());
         for (i, (a, b)) in result.iter().zip(expected.iter()).enumerate() {
             let tol = 1e-3 * b.abs().max(1.0);
@@ -8793,6 +8976,102 @@ mod tests {
             launch_iq4_xs_matvec,
             launch_iq4_xs_mul_mm_sg,
         );
+    }
+
+    /// PTQ1_0's GEMM against its matvec (which the test above pins to
+    /// the scalar reference). `realistic_blocks` writes the scale at
+    /// byte 0 and PTQ1_0 keeps it at the END of the block, so the
+    /// fixture is a real `quantize_trits` row rather than pseudo-bytes;
+    /// the 128-element block makes NL = 8, the widest the shared body
+    /// runs, and the il = 5, 6 (16-weight stage) and il = 7 (8-weight
+    /// stage) arms of `ptq1_0_dequant_16` are reached only here.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn launch_ptq1_0_mul_mm_sg_matches_the_matvec_it_replaces() {
+        use ferrox_quant::ternary::{quantize_trits, PTQ1_0};
+        for &(rows, cols, batch_size) in &[
+            (64usize, 512usize, 32usize),
+            (128, 512, 64),
+            (9, 512, 7),
+            (70, 768, 33),
+        ] {
+            let row_bytes = cols / 128 * 28;
+            let mut seed = 5u32 + rows as u32;
+            let mut weights = Vec::with_capacity(rows * row_bytes);
+            for _ in 0..rows {
+                let w: Vec<f32> = (0..cols)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match (seed >> 24) % 3 {
+                            0 => -0.5,
+                            1 => 0.0,
+                            _ => 0.5,
+                        }
+                    })
+                    .collect();
+                weights.extend(quantize_trits(&w, PTQ1_0));
+            }
+            let mut x_batch = Vec::with_capacity(batch_size * cols);
+            let mut expected = Vec::with_capacity(batch_size * rows);
+            for b in 0..batch_size {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| ((i + b * 23) as f32 * 0.027).sin())
+                    .collect();
+                expected
+                    .extend(launch_ptq1_0_matvec(&weights, &x, rows, row_bytes).expect("matvec"));
+                x_batch.extend_from_slice(&x);
+            }
+            let got = launch_ptq1_0_mul_mm_sg(&weights, &x_batch, rows, row_bytes, batch_size)
+                .expect("mul_mm_sg");
+            assert_eq!(got.len(), expected.len());
+            let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let tol = 1e-3 * scale.max(1.0);
+            for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "ptq1_0 {rows}x{cols}x{batch_size} idx {i}: gemm={a} matvec={b} (tol {tol})"
+                );
+            }
+        }
+    }
+
+    /// Achieved weight bandwidth of the PTQ1_0 matvec on Bonsai's two
+    /// FFN shapes, printed, not asserted: run with `--nocapture`.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn ptq1_0_matvec_bandwidth_probe() {
+        for &(rows, cols) in &[
+            (64usize, 512usize),
+            (17408usize, 5120usize),
+            (5120usize, 17408usize),
+            (248320usize, 5120usize),
+        ] {
+            let row_bytes = cols / 128 * 28;
+            let weights = pseudo_bytes(3, rows * row_bytes);
+            let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.01).sin()).collect();
+            launch_ptq1_0_matvec(&weights, &x, rows, row_bytes).expect("warm");
+            let n = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                launch_ptq1_0_matvec(&weights, &x, rows, row_bytes).expect("kernel");
+            }
+            let per = t.elapsed().as_secs_f64() / n as f64;
+            let q4_row_bytes = cols / 32 * 18;
+            let q4 = pseudo_bytes(4, rows * q4_row_bytes);
+            launch_q4_0_matvec(&q4, &x, rows, q4_row_bytes).expect("warm");
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                launch_q4_0_matvec(&q4, &x, rows, q4_row_bytes).expect("kernel");
+            }
+            let per_q4 = t.elapsed().as_secs_f64() / n as f64;
+            eprintln!(
+                "ptq1_0 {rows}x{cols}: {:.3} ms, {:.1} GB/s | q4_0 same shape: {:.3} ms, {:.1} GB/s",
+                per * 1e3,
+                (rows * row_bytes) as f64 / per / 1e9,
+                per_q4 * 1e3,
+                (rows * q4_row_bytes) as f64 / per_q4 / 1e9
+            );
+        }
     }
 
     #[test]

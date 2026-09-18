@@ -26,26 +26,21 @@ pub fn matmul_f32(a: &Tensor, b_t: &Tensor) -> Tensor {
     );
 
     let mut out = vec![0f32; m * n];
+    // The SIMD dot attention uses, resolved once: the single-accumulator
+    // loop this replaced could not be vectorised (a float sum cannot be
+    // reordered without fast-math) and was 12% of a Bonsai-2-27B decode
+    // step on two 48 x 5120 F32 projections per layer.
+    let dot = crate::attention::dot_f32_fn();
     if m == 1 {
         let a_row = a.row(0);
         crate::par::items_mut(&mut out, 1, |col, out_val| {
-            let b_row = b_t.row(col);
-            let mut acc = 0f32;
-            for i in 0..k {
-                acc += a_row[i] * b_row[i];
-            }
-            *out_val = acc;
+            *out_val = dot(a_row, b_t.row(col));
         });
     } else {
         crate::par::chunks_mut(&mut out, n, 1, |row, out_row| {
             let a_row = a.row(row);
             for (col, out_val) in out_row.iter_mut().enumerate() {
-                let b_row = b_t.row(col);
-                let mut acc = 0f32;
-                for i in 0..k {
-                    acc += a_row[i] * b_row[i];
-                }
-                *out_val = acc;
+                *out_val = dot(a_row, b_t.row(col));
             }
         });
     }

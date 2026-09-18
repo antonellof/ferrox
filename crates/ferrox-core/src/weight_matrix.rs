@@ -16,6 +16,7 @@ use ferrox_gguf::GgmlType;
 use crate::tensor::Tensor;
 
 pub mod gpu_backend;
+pub mod hadamard;
 pub mod lora;
 mod repack_cache;
 
@@ -161,6 +162,10 @@ pub enum QuantKind {
     /// safetensors form, though the math is identical. Scalar kernel
     /// only so far.
     Mxfp4Gguf,
+    /// ggml `TQ1_0` and PrismML `PTQ1_0`: base-3 trits, 256 and 128 to
+    /// a block (`ferrox_quant::ternary`). Bonsai 2 27B is PTQ1_0.
+    Tq1_0,
+    Ptq1_0,
 }
 
 impl QuantKind {
@@ -190,6 +195,8 @@ impl QuantKind {
         QuantKind::IQ3S,
         QuantKind::IQ1M,
         QuantKind::Mxfp4Gguf,
+        QuantKind::Tq1_0,
+        QuantKind::Ptq1_0,
     ];
 
     /// The GGUF-facing name. Also the key
@@ -218,6 +225,8 @@ impl QuantKind {
             QuantKind::IQ3S => "IQ3_S",
             QuantKind::IQ1M => "IQ1_M",
             QuantKind::Mxfp4Gguf => "MXFP4",
+            QuantKind::Tq1_0 => "TQ1_0",
+            QuantKind::Ptq1_0 => "PTQ1_0",
         }
     }
 }
@@ -278,6 +287,8 @@ pub fn quant_kind_for(dtype: GgmlType) -> Option<QuantKind> {
         GgmlType::IQ2XXS => Some(QuantKind::IQ2XXS),
         GgmlType::IQ3XXS => Some(QuantKind::IQ3XXS),
         GgmlType::MXFP4 => Some(QuantKind::Mxfp4Gguf),
+        GgmlType::TQ1_0 => Some(QuantKind::Tq1_0),
+        GgmlType::PTQ1_0 => Some(QuantKind::Ptq1_0),
         _ => None,
     }
 }
@@ -697,6 +708,16 @@ pub enum WeightMatrix {
         base: Box<WeightMatrix>,
         lora: LoraStack,
     },
+    /// A weight PrismML folded a Hadamard rotation into
+    /// (`hadamard::HadamardFold`): the product is right only after the
+    /// activation has been transformed the same way, so every `apply`
+    /// here transforms and then runs `base`, and every fused launch
+    /// view answers `None` for it as it does for `Adapted`. The row
+    /// lookup (`FoldSite::RowLookup`) restores a stored row instead.
+    Folded {
+        base: Box<WeightMatrix>,
+        fold: std::sync::Arc<hadamard::HadamardFold>,
+    },
 }
 
 impl WeightMatrix {
@@ -726,7 +747,37 @@ impl WeightMatrix {
         }
     }
 
-    /// The weights under any adapter: `self` when there is none.
+    /// Wraps `self` in a Hadamard fold (`hadamard::HadamardFold`).
+    /// The fold's width, when it has signs, must be this matrix's
+    /// column count.
+    pub fn fold_hadamard(&mut self, fold: std::sync::Arc<hadamard::HadamardFold>) {
+        if let Some(w) = fold.width() {
+            assert_eq!(
+                w,
+                self.cols(),
+                "Hadamard sign vector width vs matrix columns"
+            );
+        }
+        let placeholder = WeightMatrix::F32(Tensor::new(Vec::new(), vec![0, 0]));
+        let base = std::mem::replace(self, placeholder);
+        *self = WeightMatrix::Folded {
+            base: Box::new(base),
+            fold,
+        };
+    }
+
+    /// The fold on this matrix, if any.
+    pub fn hadamard_fold(&self) -> Option<&std::sync::Arc<hadamard::HadamardFold>> {
+        match self {
+            WeightMatrix::Folded { fold, .. } => Some(fold),
+            _ => None,
+        }
+    }
+
+    /// The weights under any adapter: `self` when there is none. NOT
+    /// under a fold: a folded matrix's base answers a different
+    /// product, so `base()` of a `Folded` is the `Folded` itself and a
+    /// caller that wants the bytes goes through `hadamard_fold()`.
     pub fn base(&self) -> &WeightMatrix {
         match self {
             WeightMatrix::Adapted { base, .. } => base,
@@ -739,7 +790,9 @@ impl WeightMatrix {
     pub fn bytes_len(&self) -> usize {
         match self {
             WeightMatrix::Quantized { data, .. } => data.len(),
-            WeightMatrix::Adapted { base, .. } => base.bytes_len(),
+            WeightMatrix::Adapted { base, .. } | WeightMatrix::Folded { base, .. } => {
+                base.bytes_len()
+            }
             _ => 0,
         }
     }
@@ -763,7 +816,7 @@ impl WeightMatrix {
             WeightMatrix::F32(t) => t.rows(),
             WeightMatrix::Quantized { rows, .. } => *rows,
             WeightMatrix::Mxfp4 { rows, .. } => *rows,
-            WeightMatrix::Adapted { base, .. } => base.rows(),
+            WeightMatrix::Adapted { base, .. } | WeightMatrix::Folded { base, .. } => base.rows(),
         }
     }
 
@@ -774,7 +827,9 @@ impl WeightMatrix {
         match self {
             WeightMatrix::Quantized { kind, .. } => Some(*kind),
             WeightMatrix::F32(_) | WeightMatrix::Mxfp4 { .. } => None,
-            WeightMatrix::Adapted { base, .. } => base.quant_kind(),
+            WeightMatrix::Adapted { base, .. } | WeightMatrix::Folded { base, .. } => {
+                base.quant_kind()
+            }
         }
     }
 
@@ -783,7 +838,7 @@ impl WeightMatrix {
             WeightMatrix::F32(t) => t.cols(),
             WeightMatrix::Quantized { cols, .. } => *cols,
             WeightMatrix::Mxfp4 { cols, .. } => *cols,
-            WeightMatrix::Adapted { base, .. } => base.cols(),
+            WeightMatrix::Adapted { base, .. } | WeightMatrix::Folded { base, .. } => base.cols(),
         }
     }
 
@@ -851,6 +906,14 @@ impl WeightMatrix {
             }
             QuantKind::Mxfp4Gguf => {
                 (cols / ferrox_quant::MXFP4_GGUF_BLOCK_ELEMS) * ferrox_quant::MXFP4_GGUF_BLOCK_BYTES
+            }
+            QuantKind::Tq1_0 => {
+                (cols / ferrox_quant::ternary::TQ1_0_BLOCK_ELEMS)
+                    * ferrox_quant::ternary::TQ1_0_BLOCK_BYTES
+            }
+            QuantKind::Ptq1_0 => {
+                (cols / ferrox_quant::ternary::PTQ1_0_BLOCK_ELEMS)
+                    * ferrox_quant::ternary::PTQ1_0_BLOCK_BYTES
             }
         }
     }
@@ -1058,6 +1121,12 @@ impl WeightMatrix {
             QuantKind::IQ3S => ferrox_quant::dot_iq3_s_f32(row, x),
             QuantKind::IQ1M => ferrox_quant::dot_iq1_m_f32(row, x),
             QuantKind::Mxfp4Gguf => ferrox_quant::dot_mxfp4_gguf_f32(row, x),
+            QuantKind::Tq1_0 => {
+                ferrox_quant::ternary::dot_trits_f32(row, ferrox_quant::ternary::TQ1_0, x)
+            }
+            QuantKind::Ptq1_0 => {
+                ferrox_quant::ternary::dot_trits_f32(row, ferrox_quant::ternary::PTQ1_0, x)
+            }
         }
     }
 
@@ -1086,6 +1155,12 @@ impl WeightMatrix {
             QuantKind::IQ3S => ferrox_quant::dequant_iq3_s(bytes),
             QuantKind::IQ1M => ferrox_quant::dequant_iq1_m(bytes),
             QuantKind::Mxfp4Gguf => ferrox_quant::dequant_mxfp4_gguf(bytes),
+            QuantKind::Tq1_0 => {
+                ferrox_quant::ternary::dequant_trits(bytes, ferrox_quant::ternary::TQ1_0)
+            }
+            QuantKind::Ptq1_0 => {
+                ferrox_quant::ternary::dequant_trits(bytes, ferrox_quant::ternary::PTQ1_0)
+            }
         };
         out.expect("row byte length is block-aligned by construction (block_bytes_per_row)")
     }
@@ -1128,6 +1203,16 @@ impl WeightMatrix {
                 lora.add_row_to(r, &mut row);
                 row
             }
+            // A stored row of a lookup table comes back to the primal
+            // basis; a row of an input-folded weight stays folded, which
+            // is what a caller splitting or widening the matrix needs.
+            WeightMatrix::Folded { base, fold } => {
+                let mut row = base.dequant_row(r);
+                if fold.site == hadamard::FoldSite::RowLookup {
+                    fold.restore_row(&mut row);
+                }
+                row
+            }
         }
     }
 
@@ -1164,6 +1249,7 @@ impl WeightMatrix {
             QuantKind::Q5K => "Q5_K",
             QuantKind::Q6K => "Q6_K",
             QuantKind::IQ4XS => "IQ4_XS",
+            QuantKind::Ptq1_0 => "PTQ1_0",
             _ => return None,
         };
         let (fn_name, block_bytes, block_elems) = ferrox_metal::gpu::mul_mm_sg_meta(kind_name)?;
@@ -1247,6 +1333,9 @@ impl WeightMatrix {
             let mut out = base.apply(x);
             lora.add_to(x, &mut out);
             return out;
+        }
+        if let WeightMatrix::Folded { base, fold } = self {
+            return base.apply(&fold.transform_input(x));
         }
         #[cfg(feature = "cuda")]
         {
@@ -1339,20 +1428,51 @@ impl WeightMatrix {
     /// [`crate::par::join3`], not here, so it cannot drift from the one
     /// in `ferrox-moe`'s gate/up pair.
     ///
-    /// CPU only. On a GPU backend each `apply` submits and waits on its
-    /// own command buffer, and Metal decode is already at or ahead of
-    /// parity -- there is nothing to win and a live path to disturb.
+    /// On a GPU backend the three go into ONE command buffer
+    /// ([`Self::apply_gpu_multi`]: one upload of `x`, one wait) and fall
+    /// back to three sequential launches when the fused path declines
+    /// (a kind without a kernel, folds that differ). Each round trip a
+    /// per-matvec model pays is ~0.2 ms of latency beyond the kernel
+    /// (measured on an M2 Pro with `FERROX_METAL_GPU_TIMING`), which
+    /// is what this saves.
     pub fn apply_three(a: &Self, b: &Self, c: &Self, x: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        if Self::gpu_dense_active() {
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            if let Some(mut outs) = Self::apply_gpu_multi(&[a, b, c], x) {
+                let c = outs.pop().unwrap();
+                let b = outs.pop().unwrap();
+                let a = outs.pop().unwrap();
+                return (a, b, c);
+            }
+            return (a.apply(x), b.apply(x), c.apply(x));
+        }
+        crate::par::join3(|| a.apply(x), || b.apply(x), || c.apply(x))
+    }
+
+    /// Two projections of one activation: [`Self::apply_three`] for a
+    /// pair (a gated delta-net's `qkv` and `z`, a GLU's gate and up).
+    pub fn apply_pair(a: &Self, b: &Self, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        if Self::gpu_dense_active() {
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            if let Some(mut outs) = Self::apply_gpu_multi(&[a, b], x) {
+                let b = outs.pop().unwrap();
+                let a = outs.pop().unwrap();
+                return (a, b);
+            }
+            return (a.apply(x), b.apply(x));
+        }
+        crate::par::join2(|| a.apply(x), || b.apply(x))
+    }
+
+    /// Whether a dense matvec would go to an accelerator right now.
+    fn gpu_dense_active() -> bool {
         #[cfg(feature = "metal")]
         let gpu = metal_dense_enabled();
         #[cfg(not(feature = "metal"))]
         let gpu = false;
         #[cfg(feature = "cuda")]
         let gpu = gpu || cuda_dense_enabled();
-        if gpu {
-            return (a.apply(x), b.apply(x), c.apply(x));
-        }
-        crate::par::join3(|| a.apply(x), || b.apply(x), || c.apply(x))
+        gpu
     }
 
     pub fn apply_cpu(&self, x: &[f32]) -> Vec<f32> {
@@ -1704,6 +1824,7 @@ impl WeightMatrix {
                 lora.add_to(x, &mut out);
                 out
             }
+            WeightMatrix::Folded { base, fold } => base.apply_cpu_inner(&fold.transform_input(x)),
         }
     }
 
@@ -1986,6 +2107,12 @@ impl WeightMatrix {
             // f32 batch itself.
             return base.quantize_batch_acts(x_batch, batch_size);
         }
+        if let WeightMatrix::Folded { .. } = self {
+            // The base consumes the TRANSFORMED batch, which no sibling
+            // matrix shares unless it shares the fold; `apply_batch`
+            // quantizes its own.
+            return None;
+        }
         #[cfg(feature = "metal")]
         {
             if metal_dense_enabled()
@@ -2079,6 +2206,10 @@ impl WeightMatrix {
             let mut out = base.apply_batch_with_acts(x_batch, batch_size, shared);
             lora.add_batch_to(x_batch, batch_size, &mut out);
             return out;
+        }
+        if let WeightMatrix::Folded { base, fold } = self {
+            let transformed = fold.transform_rows(x_batch, batch_size);
+            return base.apply_batch_with_acts(&transformed, batch_size, None);
         }
 
         /// Raw pointer to this function's `[batch][rows]` output, shared
@@ -2901,7 +3032,9 @@ impl WeightMatrix {
                 });
                 out
             }
-            WeightMatrix::Adapted { .. } => unreachable!("handled before dispatch"),
+            WeightMatrix::Adapted { .. } | WeightMatrix::Folded { .. } => {
+                unreachable!("handled before dispatch")
+            }
         }
     }
 
@@ -2914,6 +3047,7 @@ impl WeightMatrix {
             WeightMatrix::Quantized { data, .. } => data.len(),
             WeightMatrix::Mxfp4 { packed, scale, .. } => packed.len() + scale.len(),
             WeightMatrix::Adapted { base, lora } => base.resident_bytes() + lora.resident_bytes(),
+            WeightMatrix::Folded { base, .. } => base.resident_bytes(),
         }
     }
 
@@ -2940,6 +3074,9 @@ impl WeightMatrix {
             let mut out = base.apply_gpu(x)?;
             lora.add_to(x, &mut out);
             return Some(out);
+        }
+        if let WeightMatrix::Folded { base, fold } = self {
+            return base.apply_gpu(&fold.transform_input(x));
         }
 
         // F32 stays on CPU in apply_gpu: a lone small router matvec is
@@ -3046,6 +3183,30 @@ impl WeightMatrix {
             }
             return Some(outs);
         }
+        if let Some(fold) = mats[0].hadamard_fold() {
+            // One fold shared by every matrix (q/k/v split from one folded
+            // fused projection): transform once, launch the bases.
+            // Different folds, or a fold on only some, is not a shared
+            // activation any more, and the caller runs them one by one.
+            if !mats.iter().all(|m| {
+                m.hadamard_fold()
+                    .is_some_and(|f| std::sync::Arc::ptr_eq(f, fold))
+            }) {
+                return None;
+            }
+            let bases: Vec<&WeightMatrix> = mats
+                .iter()
+                .map(|m| match m {
+                    WeightMatrix::Folded { base, .. } => base.as_ref(),
+                    _ => unreachable!("every matrix carries the fold"),
+                })
+                .collect();
+            let xt = fold.transform_input(x);
+            return Self::apply_gpu_multi(&bases, &xt);
+        }
+        if mats.iter().any(|m| m.hadamard_fold().is_some()) {
+            return None;
+        }
 
         // Try CUDA first if enabled.
         #[cfg(feature = "cuda")]
@@ -3110,15 +3271,13 @@ impl WeightMatrix {
                 else {
                     return None;
                 };
-                let kind_name = match kind {
-                    QuantKind::Q8_0 => "Q8_0",
-                    QuantKind::Q4_0 => "Q4_0",
-                    QuantKind::Q4K => "Q4_K",
-                    QuantKind::Q5K => "Q5_K",
-                    QuantKind::Q6K => "Q6_K",
-                    QuantKind::IQ4XS => "IQ4_XS",
-                    _ => return None,
-                };
+                // The one Metal kind table (`Metal::matvec_kernel`).
+                // This was a hand-written six-row match that lacked
+                // Q5_0 and PTQ1_0, so every gate/up and q/k/v pair of
+                // those kinds ran as separate launches: correct, and
+                // one GPU round trip per layer slower than the single
+                // path for the kinds the copy happened to name.
+                let kind_name = Metal::matvec_kernel(*kind)?;
                 let row_bytes = m.block_bytes_per_row(*kind, *cols);
                 held.push((data.as_slice(), *rows, row_bytes, kind_name));
             }
@@ -3281,6 +3440,10 @@ impl WeightMatrix {
             lora.add_batch_to(x_batch, batch_size, &mut out);
             return Some(out);
         }
+        if let WeightMatrix::Folded { base, fold } = self {
+            let transformed = fold.transform_rows(x_batch, batch_size);
+            return base.apply_gpu_batch(&transformed, batch_size);
+        }
         let WeightMatrix::Quantized {
             data,
             rows,
@@ -3304,16 +3467,27 @@ impl WeightMatrix {
         let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
             ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
         let row_bytes = self.block_bytes_per_row(*kind, *cols);
-        // Weight-reuse mul_mm for prefill batch >= 4 (Q4_0 / Q4_K / Q6_K).
-        // Threshold 4 (was 8) covers shorter prompts without changing the
-        // decode path (batch_size == 1 still uses matvec).
-        let use_mul_mm = batch_size >= 4;
-        if use_mul_mm {
-            // Observation only: a kind with a matvec kernel but no
-            // simdgroup GEMM still runs on Metal, as `batch` separate
-            // matvecs over the same weights. That is the shape that cost
-            // IQ4_XS 13.7x, and it is invisible in the output.
+        // Weight-reuse simdgroup GEMM for prefill batch >= 4: each 64x32
+        // output tile reads its weight slice once into threadgroup
+        // memory instead of once per token. The batched matvec below is
+        // the fallback it replaces -- correct, but it re-reads the whole
+        // matrix for every token, which is why Metal `pp512` was 14-99x
+        // behind llama.cpp. Threshold 4 (was 8) covers shorter prompts
+        // without changing the decode path (batch_size == 1 is matvec).
+        //
+        // ONE launcher keyed by the kind's name, read off the same table
+        // `gemm_supported` is derived from. This was a seven-arm match
+        // naming each kind's wrapper, and the arms lagged the table:
+        // Q5_0 and PTQ1_0 had a GEMM the table admitted and the match
+        // did not reach, so their prefill ran N matvecs while the kernel
+        // registry recorded a GEMM hit.
+        if batch_size >= 4 {
             if !metal_mul_mm_kind_supported(*kind) {
+                // Observation only: a kind with a matvec kernel but no
+                // simdgroup GEMM still runs on Metal, as `batch`
+                // separate matvecs over the same weights. That is the
+                // shape that cost IQ4_XS 13.7x, and it is invisible in
+                // the output.
                 crate::kernel_registry::miss(
                     crate::kernel_registry::Lookup::new(
                         crate::kernel_registry::Backend::Metal,
@@ -3323,143 +3497,51 @@ impl WeightMatrix {
                     "Metal N x matvec batch",
                 );
             }
-            match kind {
-                QuantKind::Q4_0 => {
-                    match ferrox_metal::gpu::launch_q4_0_mul_mm_sg(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q4_0 simdgroup mul_mm failed, batched fallback: {e}"
-                            );
-                        }
-                    }
-                    match ferrox_metal::gpu::launch_q4_0_mul_mm(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!("ferrox: Metal Q4_0 mul_mm failed, matvec fallback: {e}");
-                        }
-                    }
+            match ferrox_metal::gpu::launch_mul_mm_sg(
+                kind.name(),
+                data.as_slice(),
+                x_batch,
+                *rows,
+                row_bytes,
+                batch_size,
+            ) {
+                Ok(Some(out)) => return Some(out),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!(
+                        "ferrox: Metal {} simdgroup mul_mm failed, batched fallback: {e}",
+                        kind.name()
+                    );
                 }
-                // Q8_0 had no batched GPU kernel at all, so a 512-token
-                // prefill ran 512 independent matvecs over the same
-                // weights. Those are the 14-30x `pp512` rows.
-                QuantKind::Q8_0 => {
-                    match ferrox_metal::gpu::launch_q8_0_mul_mm_sg(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q8_0 simdgroup mul_mm failed, matvec fallback: {e}"
-                            );
-                        }
-                    }
+            }
+            // The older non-simdgroup GEMMs, kept for the two kinds that
+            // have one, between the simdgroup kernel and the matvec.
+            let older = match kind {
+                QuantKind::Q4_0 => Some(ferrox_metal::gpu::launch_q4_0_mul_mm(
+                    data.as_slice(),
+                    x_batch,
+                    *rows,
+                    row_bytes,
+                    batch_size,
+                )),
+                QuantKind::Q4K => Some(ferrox_metal::gpu::launch_q4_k_mul_mm(
+                    data.as_slice(),
+                    x_batch,
+                    *rows,
+                    row_bytes,
+                    batch_size,
+                )),
+                _ => None,
+            };
+            match older {
+                Some(Ok(out)) => return Some(out),
+                Some(Err(e)) => {
+                    eprintln!(
+                        "ferrox: Metal {} mul_mm failed, matvec fallback: {e}",
+                        kind.name()
+                    );
                 }
-                QuantKind::Q5K => {
-                    match ferrox_metal::gpu::launch_q5_k_mul_mm_sg(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q5_K simdgroup mul_mm failed, matvec fallback: {e}"
-                            );
-                        }
-                    }
-                }
-                QuantKind::IQ4XS => {
-                    match ferrox_metal::gpu::launch_iq4_xs_mul_mm_sg(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal IQ4_XS simdgroup mul_mm failed, matvec fallback: {e}"
-                            );
-                        }
-                    }
-                }
-                QuantKind::Q4K => {
-                    // True simdgroup GEMM: each 64x32 output tile reads its
-                    // weight slice once into threadgroup memory instead of
-                    // once per token. `launch_q4_k_mul_mm` below is the
-                    // batched-matvec fallback it replaces -- correct, but it
-                    // re-reads the whole matrix for every token, which is why
-                    // Metal `pp512` was 14-99x behind llama.cpp.
-                    match ferrox_metal::gpu::launch_q4_k_mul_mm_sg(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q4_K simdgroup mul_mm failed, batched-matvec fallback: {e}"
-                            );
-                        }
-                    }
-                    match ferrox_metal::gpu::launch_q4_k_mul_mm(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q4_K mul_mm (MUL_MM path) failed, matvec fallback: {e}"
-                            );
-                        }
-                    }
-                }
-                QuantKind::Q6K => {
-                    // Same simdgroup GEMM as Q4_K. `ffn_down` and `attn_v`
-                    // are Q6_K in every Q4_K_M checkpoint, so without this
-                    // a third of the FFN stayed on the batched-matvec path
-                    // and capped what the Q4_K GEMM could deliver.
-                    match ferrox_metal::gpu::launch_q6_k_mul_mm_sg(
-                        data.as_slice(),
-                        x_batch,
-                        *rows,
-                        row_bytes,
-                        batch_size,
-                    ) {
-                        Ok(out) => return Some(out),
-                        Err(e) => {
-                            eprintln!(
-                                "ferrox: Metal Q6_K simdgroup mul_mm failed, matvec fallback: {e}"
-                            );
-                        }
-                    }
-                }
-                _ => {}
+                None => {}
             }
         }
         let launch = ferrox_metal::gpu::MatvecLaunch {
@@ -4961,7 +5043,7 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), total, "QuantKind::ALL has a duplicate");
         assert_eq!(
-            total, 21,
+            total, 23,
             "a QuantKind variant was added without updating ALL"
         );
     }
