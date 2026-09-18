@@ -149,3 +149,20 @@ rows are chunked so a block of them shares one pass over it.
   7.1 end to end.
 - The batched recurrence on the device, with the state copied once per
   BATCH rather than once per token: `pp128` 32.7 to 28.5 (above).
+- The PTQ1_0 GEMM's dequant moved to the float pipe, the rewrite that
+  bought the matvec 1.8x: `pp128` 32.8 to 31.9. The GEMM dequantizes a
+  tile ONCE into threadgroup memory and the simdgroup matrix ops hide
+  it, so the trit decode is not what that kernel waits on.
+
+## Where the prefill gap actually is
+
+Arithmetic, not a profile: 128 tokens through 26.9B parameters is
+6.9 TFLOP of matmul. The fork's `pp128` of 66.8 tok/s is 1.92 s, so
+3.6 TFLOP/s; ours of 32.9 is 3.89 s, so 1.8 TFLOP/s. An M2 Pro's GPU
+peaks near 6.8 TFLOP/s in f32, so the fork runs its PTQ1_0 GEMM at 53%
+of peak and ferrox at 26%. Both use llama.cpp's simdgroup-matrix
+`mul_mm` shape with the tile dequantized once into threadgroup memory,
+so the difference is in the tiling constants and the dequant's cost per
+tile, not in the algorithm. That is a bounded kernel project and it is
+the prefill half of this gap; the decode half is the chunked recurrence
+above plus the submissions the fused stack would remove.
