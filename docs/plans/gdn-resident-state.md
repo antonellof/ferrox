@@ -142,6 +142,61 @@ algorithm with its own correctness story (a WY-style representation of
 the rank-one updates), and it is the honest next step. Everything below
 is what the plumbing around it should look like.
 
+## The decode token, priced
+
+Measured on the real checkpoint, `FERROX_METAL_GPU_TIMING=1`, 24 decode
+tokens after a short prompt. The submissions are two `matvec-fused` and
+one `dense-ffn` per layer, 64 layers:
+
+| per decode token | count | GPU each | latency each | GPU | latency |
+|---|---|---|---|---|---|
+| `matvec-fused` | 128 | 0.185 ms | 0.152 ms | 23.7 ms | 19.5 ms |
+| `dense-ffn` | 64 | 0.748 ms | 0.162 ms | 47.9 ms | 10.4 ms |
+| | **192** | | | **71.6 ms** | **29.9 ms** |
+
+Host work is the remaining ~35 ms of a 137 ms token, and a `sample`
+puts two thirds of it in `delta_step`.
+
+Three things follow, and the third is why no increment closes this.
+
+**The GPU work is already ahead.** 71.6 ms for a 5.95 GB weight read is
+83 GB/s; the reference's WHOLE token is 87 ms, so its GPU cannot be
+under about 68 GB/s. Nothing in the kernels is the gap.
+
+**The latency per submission is irreducible.** 0.15 ms is the OS
+wake-up from `waitUntilCompleted`, and every way around it has been
+measured and lost: spin-then-block (3.7 against 7.1, polling takes the
+core the host work needs) and
+`commandBufferWithUnretainedReferences` (7.00 against 7.1). So the only
+lever on 29.9 ms is the COUNT.
+
+**And the count only falls to one per layer if the host has nothing to
+do inside a layer.** Fusing the tail -- output projection, residual,
+FFN norm, FFN, residual -- into the FFN's own command buffer removes
+64 submissions, which is 64 x 0.152 = 9.7 ms, or 137 ms to 127: **7.3
+to 7.9 tok/s**. Making the host recurrence hit 60 GB/s instead of the
+25.8 it measures would be about 7 ms more, so **8.3**. Both together do
+not reach 11.5, and each one adds a branch to the hottest, most
+decorated code in the repo -- `ffn_block_row` alone applies a parallel
+sum scale, a down scale, a post-FFN norm, a residual scale, a skip
+stream and two FFN-input shapes, and this file's own history is eight
+model features lost one at a time to exactly that kind of branch.
+
+So the honest ceiling on increments is ~8.3 tok/s, and parity needs the
+whole layer in one command buffer with NO host step inside it: the QKV
+projection, the conv and gates, the recurrence, the output projection,
+the residual, the norm and the FFN, with the hidden state resident
+across layers. That is `ferrox-metal/src/decode_dense.rs` -- which
+already does exactly this for dense models -- extended to PTQ1_0
+weights, to the folded Hadamard rotation between matmuls, and to the
+gated delta-net block. At one submission per layer the arithmetic is
+64 x 0.15 = 9.6 ms of latency, 71.6 ms of GPU plus about 5 ms for the
+recurrence on device, and no host time: **about 86 ms, which is the
+reference's 87.**
+
+That is the project. It is three pieces, each with its own correctness
+story, and none of them is a faster kernel.
+
 ## The plumbing, once the algorithm is right
 
 The state has to live on the device across tokens, with the host copy
