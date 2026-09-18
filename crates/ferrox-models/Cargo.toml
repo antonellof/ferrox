@@ -9,6 +9,15 @@ description = "Model loaders and decoder stacks for the Ferrox inference engine"
 readme = "README.md"
 keywords = ["llm", "inference", "gguf", "transformer", "ferrox"]
 categories = ["science", "algorithms"]
+# The golden fixtures are 22 MB of tiny GGUF files, and crates.io
+# refuses an upload over 10 MB: `ferrox-models` failed to publish for
+# v0.22.0 AND v0.23.0 with `413 Payload Too Large`, which left every
+# crate after it in the chain unpublished and `cargo install
+# ferrox-cli` pinned to 0.21.0 while two releases shipped tarballs.
+# They are build inputs for `cargo test` in a checkout, never for a
+# consumer of the published crate, so they stay out of the package and
+# the repository keeps them.
+exclude = ["tests/fixtures/**", "tests/data/**"]
 
 [dependencies]
 ferrox-core = { workspace = true }
