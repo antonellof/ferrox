@@ -3231,6 +3231,12 @@ impl WeightMatrix {
         #[cfg(feature = "metal")] fold: Option<&ferrox_metal::hadamard::FoldPlan<'_>>,
         #[cfg(not(feature = "metal"))] fold: Option<&()>,
     ) -> Option<Vec<Vec<f32>>> {
+        // Off Metal there is no rotation kernel, so `None` is the only
+        // value this can take and nothing below reads it. Bound here
+        // rather than renamed, because the parameter is part of one
+        // signature both builds call.
+        #[cfg(not(feature = "metal"))]
+        let _ = &fold;
         if mats.is_empty() {
             return None;
         }
