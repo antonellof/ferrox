@@ -342,11 +342,17 @@ impl Gdn {
         // row at a time, where there is no traffic to amortise, and
         // running the row step on the GPU is a loss three ways
         // (`docs/plans/gdn-resident-state.md`).
+        //
+        // Chunking is also what finally makes the GPU worth it, and
+        // for the same reason it made the host faster: with the
+        // traffic amortised the step is compute-dense, which is the
+        // thing the three earlier attempts never had.
+        // `delta_chunk_rows` is the one place that choice is made.
         if rows > 1 {
             let (q_all, k_all, v_all, g_all, beta_gate) =
                 self.conv_and_gates_for_rows(rows, &qkv_all, &beta_all, &alpha_all, state, rms_eps);
             let mut o_all = vec![0.0f32; rows * value_dim];
-            ferrox_core::gdn_chunk::delta_chunk(
+            ferrox_core::gdn_chunk::delta_chunk_rows(
                 dims,
                 rows,
                 &mut state.ssm,

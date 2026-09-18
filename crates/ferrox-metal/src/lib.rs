@@ -25,6 +25,11 @@ pub mod hadamard;
 #[cfg(feature = "metal")]
 pub mod gdn;
 
+/// The gated delta-net recurrence a CHUNK of rows at a time, which is
+/// what makes it worth putting on the device at all.
+#[cfg(feature = "metal")]
+pub mod gdn_chunk;
+
 /// PrismML's PTQ1_0 trit format on Metal (`ternary::PTQ1_0Dequant`).
 pub mod ternary;
 

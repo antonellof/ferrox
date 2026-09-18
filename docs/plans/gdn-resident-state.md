@@ -1,8 +1,12 @@
 # A recurrent layer that does not come back to the host
 
-Status: **the chunked rule landed for prefill** (`ferrox_core::gdn_chunk`,
-2.1x on the step, ~7% end to end). The GPU kernels are still not wired,
-and the three measurements below say why.
+Status: **the chunked rule landed for prefill, and then took the device
+with it.** `ferrox_core::gdn_chunk` is 2.1x on the step alone, and
+`ferrox_metal::gdn_chunk` is 3.0x on top of THAT at prefill lengths, so
+a batch's recurrence now runs on the GPU after three attempts that lost.
+The row-at-a-time kernels in `ferrox-metal/src/gdn.rs` are still not
+wired, and the three measurements below still say why: the thing that
+changed is not the kernel, it is what the kernel is given to do.
 
 ## The measurement this plan exists for
 
@@ -147,6 +151,59 @@ which is 38 GB of traffic for a 128-token prefill. So the batched entry
 is also kernels-without-a-caller until the state is resident AND the
 rows are chunked so a block of them shares one pass over it.
 
+
+## What reversed it
+
+The three losses above share one cause, and it is not "the GPU is bad at
+this": every one of them moved the state once per ROW. Bonsai's state is
+3.1 MB a layer, so a row-at-a-time kernel reads and writes 38 GB for a
+128-token prefill whatever it computes, and 3 MFLOP of work cannot hide
+that. Chunking is what removes it -- the state is touched once per CHUNK
+-- and only then is there anything for a GPU to be good AT.
+
+`ferrox-metal/src/gdn_chunk.rs` is the same algebra as the host chunk:
+one threadgroup per value head, one thread per state ROW, the `t` loop
+kept sequential behind threadgroup barriers because that is the
+recurrence, and the `j` loop spread across threads because it is not.
+`CHUNK` is 16 there against the host's 32, since what bounds it is a
+threadgroup's 32 KiB rather than cache, and the two agreeing about the
+answer at different widths is the test
+(`gdn_chunk::tests::the_device_chunk_matches_this_one`, both measured
+against the sequential rule, which is the definition).
+
+Measured on an M2 Pro at Bonsai's shape, device against host, both
+warmed (`device_chunk_against_host_throughput`):
+
+| rows | host chunk | device chunk | |
+|---|---|---|---|
+| 8 | 1.24 ms | 1.13 ms | 1.10x |
+| 32 | 3.43 ms | 2.49 ms | 1.37x |
+| 64 | 5.48 ms | 2.48 ms | 2.21x |
+| 128 | 10.43 ms | 5.41 ms | 1.93x |
+| 512 | 43.38 ms | 13.86 ms | 3.13x |
+| 1201 | 96.10 ms | 32.15 ms | 2.99x |
+
+The first version of that kernel read **1.05x at 512 rows**, and what
+fixed it is worth more than the kernel: `m[t]` and `n[t]` are per-thread
+arrays indexed by a loop whose trip count was the RUNTIME `c`, so the
+compiler could not unroll it and spilled both out of registers into
+device memory. Padding the chunk's tiles to the compile-time `CHUNK` and
+running every hot loop to that constant is 50 GFLOP/s to 160, on a part
+that peaks near 6.8 TFLOP/s -- so there is more there, and the next step
+is the simdgroup-matrix form, since the two `S x S x C` products are
+exactly a matmul.
+
+End to end on the real checkpoint, a 2420-token prompt, interleaved
+A/B/A on the same box, `--max-load 0` with `suggestd` held down:
+
+    device  39.78 / 41.27 / 41.66 t/s
+    host             36.49 / 36.60
+
+so +13% of prefill, and parity stays MATCH through it (KL 2.03e-6
+against the fork's libllama on a 256-token prompt, which is the same
+path). A decode token still steps one row on the host, where there is
+no traffic to amortise and the three losses below still hold.
+
 ## Measured non-results, so they are not tried again
 
 - The Hadamard rotation on the device for a prefill BATCH: `pp128` 33.96
@@ -160,7 +217,9 @@ rows are chunked so a block of them shares one pass over it.
 - 8 rows per simdgroup in the PTQ1_0 matvec instead of 4: 6.9 against
   7.1 end to end.
 - The batched recurrence on the device, with the state copied once per
-  BATCH rather than once per token: `pp128` 32.7 to 28.5 (above).
+  BATCH rather than once per token: `pp128` 32.7 to 28.5 (above). This
+  is the one entry that was later REVERSED, and only by changing what
+  the kernel was asked to do: chunked, the same idea is 3x ahead.
 - The PTQ1_0 GEMM's dequant moved to the float pipe, the rewrite that
   bought the matvec 1.8x: `pp128` 32.8 to 31.9. The GEMM dequantizes a
   tile ONCE into threadgroup memory and the simdgroup matrix ops hide
