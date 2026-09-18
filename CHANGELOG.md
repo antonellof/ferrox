@@ -15,6 +15,8 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-18
+
 ### Added
 
 - **PrismML's `PTQ1_0` ternary format and the folded Hadamard rotation
