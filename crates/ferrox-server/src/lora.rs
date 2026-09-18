@@ -354,10 +354,19 @@ mod tests {
             _guard: Guard::Read(GATE.read().unwrap()),
             restore: None,
         };
+        // While either is held, the write side is not available.
+        assert!(GATE.try_write().is_err());
         drop(a);
         drop(b);
-        // And the write side is free afterwards.
-        assert!(GATE.try_write().is_ok());
+        // And the write side is free afterwards. A BLOCKING acquire,
+        // not `try_write`: `GATE` is process-wide and the `http_tests`
+        // module takes read leases on it from other test threads, so
+        // `try_write` here failed whenever one of those happened to be
+        // in flight (red on `main` twice on 2026-09-18 with nothing
+        // changed near it). What this test proves is that its own two
+        // guards were released; a leaked guard would hang this line,
+        // and another test's transient lease merely delays it.
+        drop(GATE.write().unwrap());
     }
 }
 
