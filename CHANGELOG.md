@@ -15,6 +15,15 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Chat templates that call `str.startswith` / `str.endswith` render.**
+  Qwen3.5's template tests a user turn for `<tool_response>` wrapping
+  with both (`chat:72`), and the Python-method shim had neither, so
+  every chat request against a Qwen3.5 GGUF failed with `unknown
+  method: string has no method named startswith`. Both take a string
+  or a tuple of strings, as in Python.
+
 ## [0.22.0] - 2026-09-18
 
 The largest span between two tags this repo has had: 28 architecture
