@@ -212,6 +212,25 @@ head, no tiling) is the other sixth. Those are the next two items,
 in that order, and both are kernel bodies now that the copies are
 gone -- which is the order the 2026-09-15 paragraph asked for.
 
+**Both landed the same day (#261).** `mul_mm_tc` puts the product on
+`mma.sync.m16n8k16` (f16 operands, f32 accumulation) under the same
+per-kind dequantization; the attention kernel reads `float4` slices
+with four query rows per block. RTX 3090, three interleaves with the
+SIMT body in the same binary (`FERROX_CUDA_MUL_MM=simt`): pp512
+Llama-3.2-3B Q4_K_M **975 to 1932 tok/s**, Llama-3.2-1B 2368 to 4577.
+Per two steps the kernels are now `q4_k_mul_mm_tc` 0.24 s (0.70 ms a
+call, from 1.88), `causal_gqa_prefill_f32` 0.054 s (0.96 ms a layer,
+from 2.5), `q6_k_mul_mm_tc` 0.054 s: about 0.17 s of GPU time per
+step against a measured 0.26 s per step, so a third of the step is
+now HOST time between launches, which no kernel can remove. Against
+llama.cpp's ~8,200 tok/s on this card the row is at **4.3x** (from
+25.5x on 2026-09-15). The next three items, in order: profile the
+host third (`perf`, not a guess); the GEMM's remaining 3x against
+`mmq` (int8 operands and scales applied after the MMA, no per-tile
+dequant); a K/V-tiled attention kernel. Building the tensor-core body
+found `resident_cuda_weights` trusting a host address that a freed
+buffer can hand to another tensor (fixed with a byte fingerprint).
+
 ## Measured state, 2026-09-04
 
 ### CUDA (GTX 1080, CUDA 12.4, llama.cpp built with CUDA on the same box)
@@ -648,7 +667,7 @@ all, which is honest and temporary.
 |---|---|---|
 | 1 CUDA K-quant GEMM verified | #131 | **done**: verify token-identical on RTX 3090 (2026-09-15), all 13 hardware tests pass |
 | 2 CUDA decode | #133 | GQA and graphs ruled out; GPU at 86% to 93% util, kernel-bound; 2.75x to 9.25x on Ampere |
-| 2b CUDA prefill | #259 | counted and measured 2026-09-17: copies were two thirds of the step; the resident stack (#260) took pp512 306 to 930 tok/s; GEMM body next, then attention tiling |
+| 2b CUDA prefill | #259 | resident stack (#260) 305 to 912 tok/s, tensor-core GEMM and float4 attention (#261) to 1932; 4.3x off llama.cpp; host third of the step next |
 | 3 CPU pool rule | #27 | measured, needs the predicate |
 | 4 fixed per-token cost | #128 | named: rayon's cold submit |
 | 5 x86 decode | #127 | **done**: default was wrong, 6.8x to 1.4x; 1.04x to 1.17x on Zen 2 (2026-09-15) |

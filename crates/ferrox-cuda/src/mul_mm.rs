@@ -455,21 +455,29 @@ pub fn kernel_src(kind: &MulMmKind) -> String {
          #define FX_BK {}\n\
          #define FX_TM {}\n\
          #define FX_TN {}\n\
-         #define FX_THREADS {}\n\
-         #define FX_SUB {}\n\
+         #define FX_THREADS {}\n",
+        BM, BN, BK, TM, TN, THREADS,
+    );
+    let body = BODY_SRC.replace("FX_FN_NAME", kind.fn_name);
+    format!("{defines}{}", kernel_src_with_body(kind, &body))
+}
+
+/// The kind's preamble -- the f16 decode, llama's 6-bit K-scale
+/// unpack, the codebook when the kind has one, and the kind's own
+/// `ferrox_dequant_sub` -- followed by `body`. Shared by the SIMT unit
+/// above and the tensor-core unit in [`crate::mul_mm_tc`], so the two
+/// bodies dequantize with the same functions by construction. `FX_SUB`,
+/// `FX_NL` and `FX_BLOCK_BYTES`, which every dequant function reads,
+/// are defined here for the same reason.
+pub fn kernel_src_with_body(kind: &MulMmKind, body: &str) -> String {
+    let defines = format!(
+        "#define FX_SUB {}\n\
          #define FX_NL {}\n\
          #define FX_BLOCK_BYTES {}\n",
-        BM,
-        BN,
-        BK,
-        TM,
-        TN,
-        THREADS,
         SUB,
         kind.nl(),
         kind.block_bytes,
     );
-    let body = BODY_SRC.replace("FX_FN_NAME", kind.fn_name);
     // The codebook comes from the kind's own row, so this is not a
     // second table that has to agree with `KINDS` -- it is `KINDS`.
     let codebook = kind.codebook.as_ref().map(codebook_src).unwrap_or_default();

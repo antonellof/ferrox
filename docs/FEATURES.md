@@ -608,15 +608,17 @@ CUDA C against a barrier shim
 across **11 kinds, 33 shapes and 75,042 compared positions**. Below
 the width threshold a single token stays on the matvec kernels.
 
-**CUDA prefill is resident, and still 9x off.** A dense layer used to
-be seven synchronous round trips with everything else on the host:
-3.1 GB over PCIe per Llama-3.2-3B pp512 step, two thirds of the step
-by `nsys`. `ferrox_cuda::prefill` runs a run of dense layers on the
-device with one upload and one download of the hidden batch, and
-pp512 on that model went 305 to 912 tok/s on an RTX 3090 (#259). What
-is left is the GEMM body itself, at about 7 TFLOPS against llama.cpp's
-int8 tensor-core `mmq`, and an untiled attention kernel. Decode is
-2.2x to 5.0x behind on the same cards (#133). So a Windows or Linux
+**CUDA prefill is resident and on the tensor cores, and still 4x
+off.** A dense layer used to be seven synchronous round trips with
+everything else on the host: 3.1 GB over PCIe per Llama-3.2-3B pp512
+step, two thirds of the step by `nsys`. `ferrox_cuda::prefill` runs a
+run of dense layers on the device with one upload and one download of
+the hidden batch (#259), and `mul_mm_tc` puts the GEMM on `mma.sync`
+with f16 operands on `sm_80` and up (#261): pp512 on that model went
+305 to 1932 tok/s on an RTX 3090 against llama.cpp's ~8,200. What is
+left is a host third of the step between launches, the GEMM's
+remaining distance to int8 `mmq`, and a K/V-tiled attention kernel.
+Decode is 2.2x to 5.0x behind on the same cards (#133). So a Windows or Linux
 install runs, answers correctly, and should not be chosen for speed
 yet. `/health` reports the same thing per capability, with a reason
 string, instead of quietly greying a control out.
@@ -860,7 +862,7 @@ checked against the code rather than asserted. The gap is the roadmap.
 | NVFP4 / FP8 | **No.** Neither is parsed. |
 | DeepSeek-V4-Flash, GLM-5.2, Kimi K3 | **Loaders and primitives only.** Nothing has run end to end on a real checkpoint. |
 | OpenAI + Anthropic compatible APIs | **Yes**, both, plus Responses. Tool calls parsed in eleven wire formats. |
-| NVIDIA RTX 30/40/50 | **Runs, measured, behind.** Receipts on a GTX 1080, an RTX 3060 and an RTX 3090; correct by `ferrox verify`; prefill about 9x and decode 2x to 5x off llama.cpp. No GPU in CI. |
+| NVIDIA RTX 30/40/50 | **Runs, measured, behind.** Receipts on a GTX 1080, an RTX 3060 and an RTX 3090; correct by `ferrox verify`; prefill about 4x and decode 2x to 5x off llama.cpp. No GPU in CI. |
 
 Two honest notes. Ferrox runs on Apple Metal, which that description
 does not cover, and Metal is where it is fastest: every `pp512` row is

@@ -145,8 +145,12 @@ extern "C" __global__ void rope_rows_f32(
 "#;
 
 /// Causal GQA over a prefill batch: `ferrox_core::attention::
-/// causal_gqa_attention_row` for every query row at once. One warp per
-/// (query row, head); the online softmax is the decode kernel's
+/// causal_gqa_attention_row` for every query row at once. Four warps
+/// per block, one query row per warp, the four rows consecutive so the
+/// K/V rows they share sit in L1; each lane holds a `float4` slice of
+/// the query and of the running V sum, so a key costs one `float4`
+/// load of K, one warp reduction and one `float4` load of V. The
+/// online softmax is the decode kernel's
 /// (`crate::attn::GQA_DECODE_KERNEL_SRC`), extended by:
 ///
 /// * the causal bound: query row `r` sits at position `start_pos + r`
@@ -158,18 +162,22 @@ extern "C" __global__ void rope_rows_f32(
 ///   softcap)` after the scale, Gemma-2's `attn_logit_softcapping`.
 ///
 /// `scale` is passed in rather than derived so the caller and the host
-/// body cannot disagree about it. `head_dim <= 256` (eight
-/// accumulators per lane).
+/// body cannot disagree about it. `head_dim` is a multiple of 4 and at
+/// most 256 (two `float4` per lane); the first version of this kernel,
+/// one warp per block and scalar loads, measured 2.5 ms per
+/// Llama-3.2-3B layer at pp512 on an RTX 3090, a sixth of the step.
 pub const CAUSAL_GQA_PREFILL_KERNEL_SRC: &str = r#"
 __device__ __forceinline__ float ferrox_inf_pf() {
     return __int_as_float(0x7f800000);
 }
 
+#define FX_ATTN_WARPS 4
+
 extern "C" __global__ void causal_gqa_prefill_f32(
-    const float* q,
-    const float* k_all,
-    const float* v_all,
-    float* out,
+    const float* __restrict__ q,
+    const float* __restrict__ k_all,
+    const float* __restrict__ v_all,
+    float* __restrict__ out,
     int n_q,
     int n_heads,
     int n_kv_heads,
@@ -179,54 +187,76 @@ extern "C" __global__ void causal_gqa_prefill_f32(
     float scale,
     float softcap
 ) {
-    int r = blockIdx.x;
-    int h = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int r = blockIdx.x * FX_ATTN_WARPS + warp;
+    const int h = blockIdx.y;
     if (r >= n_q || h >= n_heads) return;
-    int lane = threadIdx.x;
-    int W = blockDim.x;
-    int group_size = n_heads / max(n_kv_heads, 1);
-    int kv_h = h / max(group_size, 1);
-    int seq_len = start_pos + r + 1;
+    const int group_size = n_heads / max(n_kv_heads, 1);
+    const int kv_h = h / max(group_size, 1);
+    const int seq_len = start_pos + r + 1;
     int lo = 0;
     if (window > 0 && seq_len > window) lo = seq_len - window;
-    const float* q_h = q + ((size_t)r * n_heads + h) * head_dim;
+    const int d4 = head_dim >> 2;          // float4s per row, <= 64
+    const int n_slices = (d4 + 31) >> 5;   // float4s per lane, 1 or 2
+    const float4* q_h = (const float4*)(q + ((size_t)r * n_heads + h) * head_dim);
 
-    float acc[8];
-    int n_local = 0;
-    for (int d = lane; d < head_dim; d += W) { acc[n_local++] = 0.f; }
+    float4 qv[2];
+    float4 acc[2];
+#pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const int i = lane + 32 * s;
+        qv[s] = (s < n_slices && i < d4) ? q_h[i] : make_float4(0.f, 0.f, 0.f, 0.f);
+        acc[s] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
 
     float m = -ferrox_inf_pf();
-    float s = 0.f;
+    float l = 0.f;
     const unsigned mask = 0xffffffffu;
 
     for (int t = lo; t < seq_len; t++) {
-        const float* k_t = k_all + ((size_t)t * n_kv_heads + kv_h) * head_dim;
+        const float4* k_t = (const float4*)(k_all + ((size_t)t * n_kv_heads + kv_h) * head_dim);
         float pdot = 0.f;
-        for (int d = lane; d < head_dim; d += W) pdot += q_h[d] * k_t[d];
-        for (int off = W / 2; off > 0; off >>= 1) {
-            pdot += __shfl_down_sync(mask, pdot, off);
+#pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const int i = lane + 32 * s;
+            if (s < n_slices && i < d4) {
+                const float4 kv = k_t[i];
+                pdot += qv[s].x * kv.x + qv[s].y * kv.y + qv[s].z * kv.z + qv[s].w * kv.w;
+            }
         }
-        float dot = __shfl_sync(mask, pdot, 0);
-        float score = dot * scale;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            pdot += __shfl_xor_sync(mask, pdot, off);
+        }
+        float score = pdot * scale;
         if (softcap > 0.f) score = softcap * tanhf(score / softcap);
-        float m2 = fmaxf(m, score);
-        float a = (m == -ferrox_inf_pf()) ? 0.f : expf(m - m2);
-        float b = expf(score - m2);
-        s = s * a + b;
-        const float* v_t = v_all + ((size_t)t * n_kv_heads + kv_h) * head_dim;
-        int li = 0;
-        for (int d = lane; d < head_dim; d += W) {
-            acc[li] = acc[li] * a + b * v_t[d];
-            li++;
+        const float m2 = fmaxf(m, score);
+        const float a = (m == -ferrox_inf_pf()) ? 0.f : expf(m - m2);
+        const float b = expf(score - m2);
+        l = l * a + b;
+        const float4* v_t = (const float4*)(v_all + ((size_t)t * n_kv_heads + kv_h) * head_dim);
+#pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const int i = lane + 32 * s;
+            if (s < n_slices && i < d4) {
+                const float4 vv = v_t[i];
+                acc[s].x = acc[s].x * a + b * vv.x;
+                acc[s].y = acc[s].y * a + b * vv.y;
+                acc[s].z = acc[s].z * a + b * vv.z;
+                acc[s].w = acc[s].w * a + b * vv.w;
+            }
         }
         m = m2;
     }
-    float inv = (s > 0.f) ? (1.f / s) : 0.f;
-    float* out_h = out + ((size_t)r * n_heads + h) * head_dim;
-    int li = 0;
-    for (int d = lane; d < head_dim; d += W) {
-        out_h[d] = acc[li] * inv;
-        li++;
+    const float inv = (l > 0.f) ? (1.f / l) : 0.f;
+    float4* out_h = (float4*)(out + ((size_t)r * n_heads + h) * head_dim);
+#pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const int i = lane + 32 * s;
+        if (s < n_slices && i < d4) {
+            out_h[i] = make_float4(acc[s].x * inv, acc[s].y * inv, acc[s].z * inv, acc[s].w * inv);
+        }
     }
 }
 "#;

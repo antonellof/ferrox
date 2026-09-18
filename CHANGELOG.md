@@ -17,6 +17,31 @@ are the ones worth reading twice.
 
 ### Added
 
+- **CUDA `mul_mm` runs on the tensor cores.** `ferrox_cuda::mul_mm_tc`
+  is the same per-kind dequantization as the SIMT body (the kind's own
+  `ferrox_dequant_sub`, through one shared preamble) with the product
+  on `mma.sync.m16n8k16`: weight tiles dequantized into shared memory
+  as f16, activations converted on the way in, f32 accumulation.
+  Selected on `sm_80` and up, the SIMT body below that or under
+  `FERROX_CUDA_MUL_MM=simt`. Held against the scalar twin exactly, on
+  fixtures whose every value is representable in f16, and on every
+  kind within the f16 bound of the products' L1 norm. On an RTX 3090
+  pp512 went 975 to 1932 tok/s on Llama-3.2-3B Q4_K_M and 2368 to 4577
+  on Llama-3.2-1B, three interleaves, `ferrox verify` token-identical
+  on both and on Qwen3-0.6B; the `q4_k` GEMM fell from 1.88 to 0.70 ms
+  a call. The prefill attention kernel reads `float4` slices with four
+  query rows per block, 2.5 to 0.96 ms a layer.
+
+### Fixed
+
+- **CUDA resident weights were trusted by host address.** The device
+  copy of a weight matrix was cached on `(pointer, len)`, and a buffer
+  freed and reallocated at the same address with the same length was
+  served the previous tensor's weights; the tensor-core twin test
+  caught it multiplying one fixture by another. Latent in production
+  (a GGUF's weights are one mmap for the process), live for any
+  short-lived matrix. Entries carry a byte sample of what they were
+  uploaded from and a mismatching hit re-uploads.
 - **CUDA prefill keeps the dense layer on the device.**
   `ferrox_cuda::prefill` runs a run of dense layers resident: the
   hidden batch goes up once, the norms, QKV biases, QK norms, RoPE, the
