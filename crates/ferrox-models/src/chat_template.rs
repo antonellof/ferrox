@@ -549,6 +549,42 @@ fn python_method(
                 _ => s.trim_end_matches(pred),
             }))
         }
+        // str.startswith(prefix) / str.endswith(suffix), with Python's
+        // "a string or a tuple of strings" argument. Qwen3.5's template
+        // (`chat:72`) tests a user turn for `<tool_response>` wrapping
+        // with both; without them the render failed on every request,
+        // which is a model that cannot chat, not a template detail.
+        "startswith" | "endswith" => {
+            let s = value.as_str().ok_or_else(unknown)?;
+            let [needle] = args else {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("{method}() takes exactly one argument"),
+                ));
+            };
+            let test = |n: &str| {
+                if method == "startswith" {
+                    s.starts_with(n)
+                } else {
+                    s.ends_with(n)
+                }
+            };
+            let hit = if let Some(n) = needle.as_str() {
+                test(n)
+            } else if let Ok(iter) = needle.try_iter() {
+                let mut any = false;
+                for n in iter {
+                    any |= test(as_str(&n)?);
+                }
+                any
+            } else {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("{method}() takes a string or a sequence of strings"),
+                ));
+            };
+            Ok(JinjaValue::from(hit))
+        }
         _ => Err(unknown()),
     }
 }
@@ -1281,6 +1317,26 @@ mod tests {
             .unwrap()
             .handles_tools());
         assert!(!ChatTemplate::builtin(BuiltinTemplate::ChatMl).handles_tools());
+    }
+
+    /// Qwen3.5's template (`chat:72`) tests a user turn with
+    /// `content.startswith('<tool_response>') and content.endswith(...)`;
+    /// before the shim had them every request failed to render.
+    #[test]
+    fn python_startswith_and_endswith_take_a_string_or_a_tuple() {
+        let t = ChatTemplate::from_jinja(
+            "{% for m in messages %}{{ m.content.startswith('<tool_response>') }}\
+             {{ m.content.endswith(('a', '</tool_response>')) }}\
+             {{ m.content.startswith(('x', 'y')) }};{% endfor %}",
+        )
+        .unwrap();
+        let out = t
+            .render(
+                &[serde_json::json!({"role": "user", "content": "<tool_response>ok</tool_response>"})],
+                &RenderOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(out, "truetruefalse;");
     }
 
     #[test]
