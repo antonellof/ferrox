@@ -30,6 +30,22 @@ pub mod gdn;
 #[cfg(feature = "metal")]
 pub mod gdn_chunk;
 
+/// The HEAD of a recurrent layer -- convolution, l2 norms, gates --
+/// which is what the host still does between the QKV projection and
+/// the recurrence, and so what keeps a layer from being one submission.
+#[cfg(feature = "metal")]
+pub mod gdn_head;
+
+/// A recurrent layer's whole branch in ONE command buffer: the head,
+/// the recurrence, the gated norm and the output projection.
+#[cfg(feature = "metal")]
+pub mod gdn_branch;
+
+/// Shared-storage buffers reused across launches, because allocating
+/// them per launch is host time the GPU ledger cannot see.
+#[cfg(feature = "metal")]
+pub(crate) mod scratch_pool;
+
 /// PrismML's PTQ1_0 trit format on Metal (`ternary::PTQ1_0Dequant`).
 pub mod ternary;
 

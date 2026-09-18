@@ -197,6 +197,68 @@ reference's 87.**
 That is the project. It is three pieces, each with its own correctness
 story, and none of them is a faster kernel.
 
+## The host recurrence is gone, and what that bought
+
+`ferrox-metal/src/gdn_branch.rs` runs a recurrent layer's WHOLE branch
+in the submission `ssm_out` already cost: the two gates, the causal
+convolution with its SiLU, the per-head l2 norms
+(`ferrox-metal/src/gdn_head.rs`), the delta rule, the gated norm, the
+folded rotation and the output projection. A `sample` of a decode run
+no longer has `delta_step` in it at all, where it had been two thirds
+of the host time.
+
+Interleaved A/B on one build, Bonsai, 220 decode tokens:
+
+    device branch  7.27 / 7.27 / 7.30 / 7.26 tok/s
+    host branch    7.13 / 7.10
+
+**+2.2%, and that is the honest surprise**: removing what the profile
+said was two thirds of the host time is worth 3 ms of a 137 ms token,
+because a decode thread spends 83% of itself in `waitUntilCompleted`
+and most of the host work was already inside somebody else's wait. The
+profile named the biggest host cost correctly and the ledger says host
+cost was never the gap.
+
+Getting there took three findings, each worth more than the 2.2%:
+
+- **`Q5_0` and `PTQ1_0` were unreachable from every fused Metal path in
+  `ferrox-models`.** `ferrox_metal::gpu::MATVEC_KINDS` served both and
+  a hand-written match in the decoder listed six kinds and neither.
+  `QuantKind::metal_kind_name` is exhaustive with no `_` arm now, and
+  `crate::metal_launch` asks the backend's own table by that name, so
+  the two cannot drift again. This is the repo's dominant bug shape,
+  found for the fifth time.
+- **A launch that allocates its own scratch pays for it per call, and
+  the GPU ledger cannot see that.** The first version of this branch
+  ran 7.22 to 6.68 -- SLOWER -- while the ledger accounted for only 10
+  ms of the 19 it had lost, because it made eleven fresh Metal buffers
+  per layer per token, some 500 allocations a token. Resident
+  constants, the convolution window wrapped in place, and
+  `ferrox-metal/src/scratch_pool.rs` took it 6.68 to 6.98 to 7.11 to
+  7.27.
+- **`RecurrentState::conv` was not page-aligned** while `ssm` was, so
+  the one state small enough to seem harmless was the one being copied
+  both ways per layer per token.
+
+## What the decode token looks like now
+
+GPU 79 ms, submission latency 35 ms, host about 20 ms -- and the host
+that is left is the SIXTEEN attention layers' row kernel, not the 48
+recurrent ones. The token is submission-bound, and the count is
+unchanged at 192 because this branch rides in a submission that already
+existed.
+
+So the next step is the one the arithmetic named before any of this was
+built, and it is now the ONLY step: merge a layer's three submissions
+into one. The branch ends with `ssm_out` and the FFN begins with a
+residual add and a norm, with nothing host-side between them; the
+pieces are all `encode_` functions already. What stands in the way is
+not a kernel, it is that the FFN's weights live in the decoder's layer
+loop while the branch's live in `Gdn`, so the fusion has to happen at a
+call site that owns both. At one submission per layer the arithmetic is
+64 x 0.15 = 9.6 ms of latency against today's 35, no host step, and
+about 86 ms a token: the reference's 87.
+
 ## The plumbing, once the algorithm is right
 
 The state has to live on the device across tokens, with the host copy

@@ -916,73 +916,12 @@ impl Decoder {
         }
     }
 
-    /// Builds a Metal [`MatvecLaunch`] for a quantized matrix, or `None`
-    /// if the storage/kind cannot run on Metal.
+    /// Metal's launch description for `m`, or `None` when no kernel
+    /// serves its storage. Delegates to `crate::metal_launch`, which is
+    /// where both this file and `crate::gdn` read it from.
     #[cfg(feature = "metal")]
     fn metal_matvec_launch<'a>(m: &'a WeightMatrix) -> Option<ferrox_metal::gpu::MatvecLaunch<'a>> {
-        match m {
-            WeightMatrix::F32(t) => {
-                let rows = t.shape[0];
-                let cols = t.shape[1];
-                let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
-                    ferrox_metal::gpu::matvec_launch_meta("F32")?;
-                // SAFETY: f32 ↔ little-endian byte view for Metal upload/alias.
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(t.data.as_ptr() as *const u8, t.data.len() * 4)
-                };
-                Some(ferrox_metal::gpu::MatvecLaunch {
-                    kernel_src: src,
-                    fn_name,
-                    block_bytes,
-                    block_elems,
-                    weights: bytes,
-                    rows,
-                    row_bytes: cols * 4,
-                    rows_per_tg,
-                })
-            }
-            WeightMatrix::Quantized {
-                data,
-                rows,
-                cols: _,
-                kind,
-            } => {
-                let kind_name = match kind {
-                    ferrox_core::QuantKind::Q8_0 => "Q8_0",
-                    ferrox_core::QuantKind::Q4_0 => "Q4_0",
-                    ferrox_core::QuantKind::Q4K => "Q4_K",
-                    ferrox_core::QuantKind::Q5K => "Q5_K",
-                    ferrox_core::QuantKind::Q6K => "Q6_K",
-                    ferrox_core::QuantKind::IQ4XS => "IQ4_XS",
-                    _ => return None,
-                };
-                let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
-                    ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
-                // A zero-row matrix has no rows to stride over, so
-                // there is no meaningful row size; `checked_div`
-                // says that once instead of splitting it across a
-                // guard and a bare division.
-                let row_bytes = data.as_slice().len().checked_div(*rows).unwrap_or(0);
-                Some(ferrox_metal::gpu::MatvecLaunch {
-                    kernel_src: src,
-                    fn_name,
-                    block_bytes,
-                    block_elems,
-                    weights: data.as_slice(),
-                    rows: *rows,
-                    row_bytes,
-                    rows_per_tg,
-                })
-            }
-            // No fused kernel adds a LoRA delta, and the safetensors
-            // MXFP4 pair has no Metal matvec. Spelled out rather than
-            // `_` so a fifth storage has to answer here.
-            // A folded matrix's launch would read the untransformed
-            // activation; `apply` transforms and then runs the base.
-            WeightMatrix::Mxfp4 { .. }
-            | WeightMatrix::Adapted { .. }
-            | WeightMatrix::Folded { .. } => None,
-        }
+        crate::metal_launch::matvec(m)
     }
 
     /// The per-model facts no fused Metal kernel implements, as ONE

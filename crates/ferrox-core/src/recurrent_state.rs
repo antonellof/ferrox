@@ -34,7 +34,13 @@
 pub struct RecurrentState {
     /// The conv window, `[d_conv - 1][width]`, oldest row first
     /// (`llama_hparams::n_embd_r`).
-    pub conv: Vec<f32>,
+    ///
+    /// Page-aligned for the same reason `ssm` is, and the reason is
+    /// measured: a fused recurrent branch that UPLOADED this window and
+    /// read it back cost 123 KB of copy per layer per token on Bonsai,
+    /// 11.8 MB a token, which was most of why the first version of that
+    /// launch ran slower than the host body it replaced.
+    pub conv: AlignedF32,
     /// The SSM state, `[n_head][head_dim][d_state]`
     /// (`llama_hparams::n_embd_s`).
     ///
@@ -49,7 +55,7 @@ impl RecurrentState {
     /// sequence's (`llama-graph.cpp`, `llm_graph_input_rs`).
     pub fn zeros(conv_len: usize, ssm_len: usize) -> Self {
         Self {
-            conv: vec![0.0; conv_len],
+            conv: AlignedF32::zeros(conv_len),
             ssm: AlignedF32::zeros(ssm_len),
         }
     }

@@ -169,6 +169,46 @@ pub enum QuantKind {
 }
 
 impl QuantKind {
+    /// The name a GPU kernel table indexes this storage by, or `None`
+    /// for a storage no matvec kernel is written for.
+    ///
+    /// Exhaustive on purpose, with no `_` arm: a kind added to the enum
+    /// has to answer here, and a caller asks the BACKEND's own table
+    /// (`ferrox_metal::gpu::matvec_launch_meta`) whether that name has
+    /// a kernel. A second hand-written match of kinds to kernels is how
+    /// `Q5_0` and `PTQ1_0` came to be refused by every fused Metal path
+    /// in `ferrox-models` while the Metal table served both.
+    pub fn metal_kind_name(self) -> Option<&'static str> {
+        match self {
+            QuantKind::Q8_0 => Some("Q8_0"),
+            QuantKind::Q4_0 => Some("Q4_0"),
+            QuantKind::Q5_0 => Some("Q5_0"),
+            QuantKind::Q4K => Some("Q4_K"),
+            QuantKind::Q5K => Some("Q5_K"),
+            QuantKind::Q6K => Some("Q6_K"),
+            QuantKind::IQ4XS => Some("IQ4_XS"),
+            QuantKind::Ptq1_0 => Some("PTQ1_0"),
+            // No Metal matvec kernel: scalar host paths only.
+            QuantKind::Q2K
+            | QuantKind::Q3K
+            | QuantKind::Q4_1
+            | QuantKind::Q5_1
+            | QuantKind::Q8_1
+            | QuantKind::IQ4NL
+            | QuantKind::IQ1S
+            | QuantKind::IQ2XXS
+            | QuantKind::IQ3XXS
+            | QuantKind::IQ2XS
+            | QuantKind::IQ2S
+            | QuantKind::IQ3S
+            | QuantKind::IQ1M
+            | QuantKind::Mxfp4Gguf
+            | QuantKind::Tq1_0 => None,
+        }
+    }
+}
+
+impl QuantKind {
     /// Every variant, so exhaustiveness can be *tested* rather than
     /// trusted. The kernel-coverage tests below iterate this; adding a
     /// variant without adding it here fails to compile (the match in
@@ -771,6 +811,25 @@ impl WeightMatrix {
         match self {
             WeightMatrix::Folded { fold, .. } => Some(fold),
             _ => None,
+        }
+    }
+
+    /// The matrix a GPU launch should read, and the rotation its INPUT
+    /// needs before it does.
+    ///
+    /// One accessor rather than two, because a caller that took the
+    /// base and forgot the fold would run transformed weights against
+    /// an untransformed activation: a wrong answer that nothing fails
+    /// on. `(self, None)` for every matrix that is not folded.
+    pub fn launch_parts(
+        &self,
+    ) -> (
+        &WeightMatrix,
+        Option<&std::sync::Arc<hadamard::HadamardFold>>,
+    ) {
+        match self {
+            WeightMatrix::Folded { base, fold } => (base, Some(fold)),
+            _ => (self, None),
         }
     }
 

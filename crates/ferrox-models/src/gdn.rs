@@ -348,6 +348,22 @@ impl Gdn {
         // traffic amortised the step is compute-dense, which is the
         // thing the three earlier attempts never had.
         // `delta_chunk_rows` is the one place that choice is made.
+        // A DECODE token takes the whole branch on the device when
+        // the shapes allow, which is what removes the host step INSIDE
+        // a recurrent layer -- the thing that, priced in
+        // `docs/plans/gdn-resident-state.md`, is two thirds of a token's
+        // host time and the reason a layer cannot be one submission.
+        // It rides in the submission `ssm_out` already cost, so the
+        // count does not go up; the host body below is the fallback and
+        // the oracle.
+        #[cfg(feature = "metal")]
+        if rows == 1 {
+            if let Some(out) =
+                self.device_branch(&qkv_all, &z_all, &beta_all, &alpha_all, state, rms_eps)
+            {
+                return out;
+            }
+        }
         if rows > 1 {
             let (q_all, k_all, v_all, g_all, beta_gate) =
                 self.conv_and_gates_for_rows(rows, &qkv_all, &beta_all, &alpha_all, state, rms_eps);
@@ -433,6 +449,88 @@ impl Gdn {
 }
 
 impl Gdn {
+    /// One decode token's whole branch in ONE command buffer:
+    /// `ferrox_metal::gdn_branch`. `None` when this layer is not what
+    /// those kernels serve, and then the host body runs.
+    ///
+    /// The refusals are shapes the kernels state, not guesses: a head
+    /// width that is not a power of two (the two reductions halve their
+    /// stride from it), a tap count past the window the convolution
+    /// holds in registers, an output projection with no Metal launch,
+    /// and the FUSED beta/alpha spelling, whose per-group interleave
+    /// (`qwen3next.cpp:422-436`) is host arithmetic this has no kernel
+    /// for. Each one falls through rather than being approximated.
+    #[cfg(feature = "metal")]
+    fn device_branch(
+        &self,
+        qkv: &[f32],
+        z: &[f32],
+        beta_in: &[f32],
+        alpha_in: &[f32],
+        state: &mut RecurrentState,
+        rms_eps: f32,
+    ) -> Option<Vec<f32>> {
+        if !ferrox_core::weight_matrix::metal_dense_enabled() {
+            return None;
+        }
+        // The fused spelling's interleave happens on the host before
+        // this is reached, so `beta_in` / `alpha_in` are already split
+        // either way; what this refuses is a layer whose gates ARE
+        // fused, because that path has not been measured here.
+        if matches!(self.beta_alpha, BetaAlpha::Fused { .. }) {
+            return None;
+        }
+        let h = self.h;
+        let (base, fold) = self.out_proj.launch_parts();
+        let out_proj = crate::metal_launch::matvec(base)?;
+        let fold_y = match fold {
+            None => None,
+            Some(f) => Some(f.metal_plan(h.value_dim())?),
+        };
+        let w = ferrox_metal::gdn_branch::BranchWeights {
+            shape: ferrox_metal::gdn::DeltaShape {
+                n_k_heads: h.n_k_heads,
+                n_v_heads: h.n_v_heads,
+                head_dim: h.head_dim,
+                map: match h.map {
+                    HeadMap::Tiled => ferrox_metal::gdn::HeadMapKind::Tiled,
+                    HeadMap::Grouped => ferrox_metal::gdn::HeadMapKind::Grouped,
+                },
+            },
+            head: ferrox_metal::gdn_head::HeadShape {
+                n_k_heads: h.n_k_heads,
+                n_v_heads: h.n_v_heads,
+                head_dim: h.head_dim,
+                d_conv: h.d_conv,
+            },
+            conv1d: &self.conv1d,
+            dt_bias: &self.dt_bias,
+            a: &self.a,
+            ssm_norm: &self.norm,
+            eps: rms_eps,
+            out_proj: &out_proj,
+            fold_y: fold_y.as_ref(),
+        };
+        if !w.is_supported() {
+            return None;
+        }
+        let conv_len = state.conv.len();
+        // Both states travel as their own page-aligned bytes, so the
+        // 3.1 MB delta state and the 123 KB convolution window are read
+        // and written in place rather than copied either way.
+        let (ssm_bytes, ssm_ptr) = (state.ssm.alloc_bytes(), state.ssm.as_ptr());
+        let (conv_bytes, conv_ptr) = (state.conv.alloc_bytes(), state.conv.as_ptr());
+        // SAFETY: `AlignedF32` is page-aligned and page-rounded, both
+        // are borrowed mutably here so nothing else touches those
+        // bytes, and the launch waits for the GPU before returning.
+        unsafe {
+            ferrox_metal::gdn_branch::launch_gdn_branch(
+                &w, ssm_ptr, ssm_bytes, conv_ptr, conv_bytes, conv_len, qkv, z, beta_in, alpha_in,
+            )
+        }
+        .ok()
+    }
+
     /// Every row's conv step, gates and l2 norms, which the chunked
     /// recurrence needs up front: none of them reads the delta state,
     /// so they do not have to interleave with it the way the
@@ -576,6 +674,289 @@ mod tests {
         let h = hp();
         assert_eq!((h.key_dim(), h.value_dim(), h.conv_dim()), (2, 4, 8));
         assert_eq!(h.state_floats(), (2 * 8, 2 * 2 * 2));
+    }
+
+    /// The device head IS this one: same convolution, same SiLU, same
+    /// per-head l2 norms, same two gates, and the same convolution
+    /// window left behind.
+    ///
+    /// It matters that this is measured against `conv_and_gates_for_rows`
+    /// rather than against a formula: the l2 norm sums in f64 on the
+    /// host and cannot on the device, and the softplus has a threshold
+    /// at 20 that a kernel taking the log anyway would miss exactly
+    /// where the argument is large. Both are drawn for here.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn the_device_head_matches_this_one() {
+        use ferrox_metal::gdn_head::{launch_gdn_head, HeadShape};
+
+        for h in [
+            GdnHparams {
+                d_conv: 4,
+                head_dim: 128,
+                n_k_heads: 4,
+                n_v_heads: 48,
+                map: HeadMap::Tiled,
+            },
+            GdnHparams {
+                d_conv: 2,
+                head_dim: 4,
+                n_k_heads: 1,
+                n_v_heads: 2,
+                map: HeadMap::Grouped,
+            },
+        ] {
+            let n_embd = 8;
+            let mut seed = 424_242u32;
+            let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (((seed >> 9) as f32 / (1u32 << 23) as f32) - 0.5) * scale
+                    })
+                    .collect()
+            };
+            let mat = |rows: usize, cols: usize, v: Vec<f32>| {
+                WeightMatrix::F32(Tensor::new(v, vec![rows, cols]))
+            };
+            let conv_dim = h.conv_dim();
+            let m = Gdn {
+                h,
+                qkv: mat(conv_dim, n_embd, rnd(conv_dim * n_embd, 1.0)),
+                z_proj: mat(h.value_dim(), n_embd, rnd(h.value_dim() * n_embd, 1.0)),
+                conv1d: rnd(h.d_conv * conv_dim, 1.0),
+                dt_bias: rnd(h.n_v_heads, 1.0),
+                a: rnd(h.n_v_heads, 1.0),
+                beta_alpha: BetaAlpha::Split {
+                    beta: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd, 1.0)),
+                    alpha: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd, 1.0)),
+                },
+                norm: rnd(h.head_dim, 1.0),
+                out_proj: mat(n_embd, h.value_dim(), rnd(n_embd * h.value_dim(), 1.0)),
+            };
+            let qkv = rnd(conv_dim, 1.0);
+            let beta_in = rnd(h.n_v_heads, 4.0);
+            // Wide enough that some `alpha + dt_bias` clears 88, which
+            // is where the softplus threshold becomes OBSERVABLE: below
+            // it `log(1 + exp(z))` is already `z` in f32, so a draw that
+            // only reached 20 left the threshold untested and a kernel
+            // without it passing. Above 88 `exp` overflows and the
+            // naive form returns infinity where the host returns `z`.
+            let alpha_in = rnd(h.n_v_heads, 400.0);
+            let conv0 = rnd(h.state_floats().0, 1.0);
+            let eps = 1e-6f32;
+
+            let aligned = |v: &[f32]| {
+                let mut a = ferrox_core::recurrent_state::AlignedF32::zeros(v.len());
+                a.copy_from_slice(v);
+                a
+            };
+            let mut host_state = RecurrentState {
+                conv: aligned(&conv0),
+                ssm: ferrox_core::recurrent_state::AlignedF32::zeros(h.state_floats().1),
+            };
+            let (hq, hk, hv, hg, hbeta) =
+                m.conv_and_gates_for_rows(1, &qkv, &beta_in, &alpha_in, &mut host_state, eps);
+
+            let mut device_conv = conv0;
+            let (dq, dk, dv, dg, dbeta) = launch_gdn_head(
+                HeadShape {
+                    n_k_heads: h.n_k_heads,
+                    n_v_heads: h.n_v_heads,
+                    head_dim: h.head_dim,
+                    d_conv: h.d_conv,
+                },
+                &mut device_conv,
+                &m.conv1d,
+                &qkv,
+                &beta_in,
+                &alpha_in,
+                &m.dt_bias,
+                &m.a,
+                eps,
+            )
+            .expect("the kernels launch");
+
+            let tol = 2e-5;
+            for (what, a, b) in [
+                ("q", &dq, &hq),
+                ("k", &dk, &hk),
+                ("v", &dv, &hv),
+                ("g", &dg, &hg),
+                ("beta", &dbeta, &hbeta),
+                ("conv state", &device_conv, &host_state.conv[..].to_vec()),
+            ] {
+                assert_eq!(a.len(), b.len(), "{what} length");
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    assert!(
+                        (x - y).abs() <= tol * y.abs().max(1.0),
+                        "{}x{} {what}[{i}]: device={x} host={y}",
+                        h.n_v_heads,
+                        h.head_dim
+                    );
+                }
+            }
+        }
+    }
+
+    /// The device BRANCH is the host branch: same convolution, same
+    /// gates, same recurrence, same gated norm, same projection, and
+    /// the same two states left behind.
+    ///
+    /// The oracle is the host pieces composed in the order the row body
+    /// composes them -- `conv_and_gates_for_rows`, `delta_step`, the
+    /// gated norm, `out_proj` -- because that IS the definition, and
+    /// `forward_rows` now takes the device path when one is available,
+    /// so it cannot be its own reference.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn the_device_branch_matches_the_host_branch() {
+        use ferrox_core::gdn::delta_step;
+
+        for h in [
+            GdnHparams {
+                d_conv: 4,
+                head_dim: 128,
+                n_k_heads: 4,
+                n_v_heads: 48,
+                map: HeadMap::Tiled,
+            },
+            GdnHparams {
+                d_conv: 2,
+                head_dim: 8,
+                n_k_heads: 2,
+                n_v_heads: 4,
+                map: HeadMap::Grouped,
+            },
+        ] {
+            let n_embd = 16;
+            let mut seed = 777_001u32;
+            let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (((seed >> 9) as f32 / (1u32 << 23) as f32) - 0.5) * scale
+                    })
+                    .collect()
+            };
+            let mat = |rows: usize, cols: usize, v: Vec<f32>| {
+                WeightMatrix::F32(Tensor::new(v, vec![rows, cols]))
+            };
+            let (key_dim, value_dim, conv_dim) = (h.key_dim(), h.value_dim(), h.conv_dim());
+            let m = Gdn {
+                h,
+                qkv: mat(conv_dim, n_embd, rnd(conv_dim * n_embd, 1.0)),
+                z_proj: mat(value_dim, n_embd, rnd(value_dim * n_embd, 1.0)),
+                conv1d: rnd(h.d_conv * conv_dim, 1.0),
+                dt_bias: rnd(h.n_v_heads, 1.0),
+                a: rnd(h.n_v_heads, 1.0),
+                beta_alpha: BetaAlpha::Split {
+                    beta: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd, 1.0)),
+                    alpha: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd, 1.0)),
+                },
+                norm: rnd(h.head_dim, 1.0),
+                out_proj: mat(n_embd, value_dim, rnd(n_embd * value_dim, 1.0)),
+            };
+            let (conv_len, ssm_len) = h.state_floats();
+            let conv0 = rnd(conv_len, 1.0);
+            let ssm0 = rnd(ssm_len, 0.5);
+            let normed = rnd(n_embd, 1.0);
+            let eps = 1e-6f32;
+            let state0 = || RecurrentState {
+                conv: {
+                    let mut a = ferrox_core::recurrent_state::AlignedF32::zeros(conv_len);
+                    a.copy_from_slice(&conv0);
+                    a
+                },
+                ssm: {
+                    let mut a = ferrox_core::recurrent_state::AlignedF32::zeros(ssm_len);
+                    a.copy_from_slice(&ssm0);
+                    a
+                },
+            };
+
+            // The host branch, composed from the pieces the row body
+            // composes.
+            let mut host_state = state0();
+            let qkv_all = m.qkv.apply(&normed);
+            let z_all = m.z_proj.apply(&normed);
+            let (beta_all, alpha_all) = match &m.beta_alpha {
+                BetaAlpha::Split { beta, alpha } => (beta.apply(&normed), alpha.apply(&normed)),
+                BetaAlpha::Fused { .. } => unreachable!("split above"),
+            };
+            let (q, k, v, g, beta) =
+                m.conv_and_gates_for_rows(1, &qkv_all, &beta_all, &alpha_all, &mut host_state, eps);
+            let mut o = vec![0.0f32; value_dim];
+            delta_step(
+                h.delta_dims(),
+                &mut host_state.ssm,
+                &q,
+                &k,
+                &v,
+                &g,
+                &beta,
+                &mut o,
+            );
+            let mut ys = vec![0.0f32; value_dim];
+            for hd in 0..h.n_v_heads {
+                let normed_head =
+                    rms_norm(&o[hd * h.head_dim..(hd + 1) * h.head_dim], &m.norm, eps);
+                for i in 0..h.head_dim {
+                    ys[hd * h.head_dim + i] =
+                        normed_head[i] * super::silu(z_all[hd * h.head_dim + i]);
+                }
+            }
+            let host_out = m.out_proj.apply(&ys);
+
+            // The device branch, through the path `forward_rows` takes.
+            let mut device_state = state0();
+            let device_out = m
+                .device_branch(
+                    &qkv_all,
+                    &z_all,
+                    &beta_all,
+                    &alpha_all,
+                    &mut device_state,
+                    eps,
+                )
+                .expect("this shape is one the kernels serve");
+
+            let tol = 2e-4;
+            for (what, a, b) in [
+                ("out", &device_out, &host_out),
+                (
+                    "conv state",
+                    &device_state.conv[..].to_vec(),
+                    &host_state.conv[..].to_vec(),
+                ),
+            ] {
+                assert_eq!(a.len(), b.len(), "{what} length");
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    assert!(
+                        (x - y).abs() <= tol * y.abs().max(1.0),
+                        "{}x{} {what}[{i}]: device={x} host={y}",
+                        h.n_v_heads,
+                        h.head_dim
+                    );
+                }
+            }
+            for (i, (x, y)) in device_state
+                .ssm
+                .iter()
+                .zip(host_state.ssm.iter())
+                .enumerate()
+            {
+                assert!(
+                    (x - y).abs() <= tol * y.abs().max(1.0),
+                    "{}x{} ssm state[{i}]: device={x} host={y}",
+                    h.n_v_heads,
+                    h.head_dim
+                );
+            }
+            let _ = key_dim;
+        }
     }
 
     /// Batched rows and one-at-a-time rows agree and leave the same

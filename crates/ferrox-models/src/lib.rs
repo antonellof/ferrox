@@ -33,6 +33,7 @@ pub mod engine;
 pub mod engine_factory;
 pub mod execution_plan;
 pub mod gdn;
+
 pub mod gemma4_engine;
 pub mod gemma4_gguf_loader;
 pub mod glm52_decoder;
@@ -63,6 +64,10 @@ pub mod lora;
 pub mod lora_attach;
 pub mod mamba1;
 pub mod mamba2;
+/// Metal launch descriptions built from a `WeightMatrix`, in one place
+/// because the decoder and the recurrent branch both read them.
+#[cfg(feature = "metal")]
+pub(crate) mod metal_launch;
 pub mod minimax_engine;
 pub mod mla;
 pub mod mla_arch;
