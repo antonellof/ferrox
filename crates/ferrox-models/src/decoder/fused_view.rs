@@ -121,6 +121,12 @@ impl Decoder {
         }
         // QKV bias (Qwen2) and QK-norm -- per-head (Qwen3/Gemma-3) or
         // whole-vector (OLMoE) -- run on the device through the extras.
+        // NOT the per-head norm with a DISTINCT row per head (PLaMo-2):
+        // its weight is exactly as long as a whole-vector one, and every
+        // fused kernel would read it as one norm over the projection.
+        if self.config.qk_norm_style == crate::capability::QkNormStyle::PerHeadDistinct {
+            return false;
+        }
         let q_len = self.config.n_heads * self.config.head_dim;
         let k_len = self.config.n_kv_heads * self.config.head_dim;
         let qk_norm_ok = |w: Option<&Vec<f32>>, vec_len: usize| -> bool {

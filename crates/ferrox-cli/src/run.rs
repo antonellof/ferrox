@@ -13,8 +13,8 @@ use ferrox_models::tokenizer::SpecialTokens;
 use ferrox_models::{
     ensure_generic_decoder, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, Decoder, Engine, GgufBpeTokenizer,
-    GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, PenaltyWindow, Sampler, SamplerOrder,
-    SamplingParams, SelectedEngineKind, ServedEngine,
+    GgufPlamo2Tokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, ModelConfig, PenaltyWindow,
+    Sampler, SamplerOrder, SamplingParams, SelectedEngineKind, ServedEngine,
 };
 
 /// llama.cpp-compatible completion flags.
@@ -917,6 +917,9 @@ fn cli_tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<CliTokenizer> {
         Some("t5") => Ok(CliTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(
             file,
         )?)),
+        Some("plamo2") => Ok(CliTokenizer::Plamo2(Box::new(
+            GgufPlamo2Tokenizer::from_gguf(file)?,
+        ))),
         // `bert` is NOT here because the tokenizer is missing -- ferrox
         // has WordPiece, and it is byte-exact against llama.cpp
         // (`ferrox parity`). It is here because this is the *generation*
@@ -932,11 +935,12 @@ fn cli_tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<CliTokenizer> {
         ),
         Some(known @ ("rwkv" | "none")) => anyhow::bail!(
             "this checkpoint's tokenizer is `{known}`, which ferrox cannot read yet. \
-             Supported: `llama` (SentencePiece), `gpt2` and `gemma4` (BPE), `t5` (Unigram)."
+             Supported: `llama` (SentencePiece), `gpt2` and `gemma4` (BPE), `t5` (Unigram), \
+             `plamo2`."
         ),
         other => anyhow::bail!(
             "this checkpoint declares tokenizer.ggml.model = {other:?}, which ferrox does \
-             not recognise. Supported: `llama`, `gpt2`, `gemma4`, `t5`. Serving it would \
+             not recognise. Supported: `llama`, `gpt2`, `gemma4`, `t5`, `plamo2`. Serving it would \
              mean feeding the model ids from a vocabulary it was not trained on, which \
              produces fluent text that is wrong rather than an error."
         ),
@@ -947,6 +951,7 @@ enum CliTokenizer {
     Bpe(Box<GgufBpeTokenizer>),
     Spm(GgufSpmTokenizer),
     Unigram(GgufUnigramTokenizer),
+    Plamo2(Box<GgufPlamo2Tokenizer>),
 }
 
 impl CliTokenizer {
@@ -971,6 +976,11 @@ impl CliTokenizer {
                 .into_iter()
                 .map(|id| id as usize)
                 .collect(),
+            CliTokenizer::Plamo2(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
         }
     }
 
@@ -980,6 +990,7 @@ impl CliTokenizer {
             CliTokenizer::Bpe(t) => t.decode(&ids32),
             CliTokenizer::Spm(t) => t.decode(&ids32),
             CliTokenizer::Unigram(t) => t.decode(&ids32),
+            CliTokenizer::Plamo2(t) => t.decode(&ids32),
         }
     }
 
@@ -988,6 +999,7 @@ impl CliTokenizer {
             CliTokenizer::Bpe(_) => "gguf-bpe",
             CliTokenizer::Spm(_) => "gguf-spm",
             CliTokenizer::Unigram(_) => "gguf-unigram",
+            CliTokenizer::Plamo2(_) => "gguf-plamo2",
         }
     }
 
@@ -996,6 +1008,7 @@ impl CliTokenizer {
             CliTokenizer::Bpe(t) => t.vocab_size(),
             CliTokenizer::Spm(t) => t.vocab_size(),
             CliTokenizer::Unigram(t) => t.vocab_size(),
+            CliTokenizer::Plamo2(t) => t.vocab_size(),
         }
     }
 }

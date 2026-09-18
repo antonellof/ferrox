@@ -2706,6 +2706,24 @@ impl Decoder {
                                 ));
                             }
                             refined_qk_norm = crate::capability::QkNormStyle::PerHeadScalar;
+                        } else if crate::capability::uses_per_head_distinct_qk_norm(&arch) {
+                            // `plamo2.cpp:92-93`: `{head_dim, n_head}`, one
+                            // row per head, RMS per head. The same length as
+                            // a whole-vector weight, so the architecture
+                            // decides (`capability::PER_HEAD_DISTINCT_QK_NORM`).
+                            if w.len() != n_heads * config.head_dim {
+                                return Err(LoadError::UnsupportedFeature(
+                                    config.name.to_string(),
+                                    format!(
+                                        "blk.{l}.attn_q_norm.weight length {} is not one row per \
+                                         head (n_heads={n_heads} x head_dim={}; plamo2.cpp:92 \
+                                         creates it {{head_dim, n_head}})",
+                                        w.len(),
+                                        config.head_dim
+                                    ),
+                                ));
+                            }
+                            refined_qk_norm = crate::capability::QkNormStyle::PerHeadDistinct;
                         } else if w.len() == config.head_dim {
                             refined_qk_norm = crate::capability::QkNormStyle::PerHead;
                         } else if w.len() == n_heads * config.head_dim {

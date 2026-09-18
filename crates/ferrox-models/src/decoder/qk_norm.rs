@@ -44,6 +44,17 @@ impl Decoder {
                 self.config.head_dim,
                 self.config.rms_norm_eps,
             ),
+            // `plamo2.cpp:163,166`: RMS over each head, times THAT head's
+            // row of the weight. `weight` is `[n_heads * head_dim]`.
+            QkNormStyle::PerHeadDistinct => {
+                let head_dim = self.config.head_dim;
+                assert_eq!(weight.len(), x.len(), "one weight row per head");
+                let mut out = Vec::with_capacity(x.len());
+                for (head, w) in x.chunks_exact(head_dim).zip(weight.chunks_exact(head_dim)) {
+                    out.extend(rms_norm(head, w, self.config.rms_norm_eps));
+                }
+                out
+            }
         }
     }
 

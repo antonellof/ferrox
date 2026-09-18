@@ -15,6 +15,22 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Added
+
+- **`plamo2` runs (PLaMo-2 1B / 2B / 8B).** PLaMo-2's own state-space
+  block (`ferrox_models::plamo2_ssm`: Mamba-1's dt / B / C path in
+  the order B, C, dt with REQUIRED norms, feeding Mamba-2's per-head
+  scan; z and x interleaved per head; no conv bias) where the KV count
+  is zero, attention with a per-head QK RMSNorm carrying a distinct
+  weight row per head (`QkNormStyle::PerHeadDistinct`) elsewhere, and
+  the `plamo2` tokenizer (a port of llama.cpp's suffix-table
+  segmenter, byte-identical on the parity corpus). KL 3.0e-12 against
+  libllama on the fixture where libllama rotates. Finding: llama.cpp
+  seeds `n_rot` from layer 0's head count and so runs every current
+  PLaMo-2 export unrotated (`print_info: n_rot = 0`); ferrox rotates,
+  as the model does, and the deviation is pinned as a number in
+  `tests/plamo2_graphs.rs`.
+
 ## [0.24.0] - 2026-09-19
 
 ### Added

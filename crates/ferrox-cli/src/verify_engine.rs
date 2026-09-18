@@ -15,7 +15,7 @@ use ferrox_models::engine_factory::{
     SelectedEngineKind, ServedEngine,
 };
 use ferrox_models::tokenizer::{
-    GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, SpecialTokens,
+    GgufBpeTokenizer, GgufPlamo2Tokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, SpecialTokens,
 };
 use ferrox_models::GEMMA4_ARCHES;
 use std::path::Path;
@@ -24,6 +24,7 @@ enum Tok {
     Bpe(Box<GgufBpeTokenizer>),
     Spm(GgufSpmTokenizer),
     Unigram(GgufUnigramTokenizer),
+    Plamo2(Box<GgufPlamo2Tokenizer>),
 }
 
 impl Tok {
@@ -40,6 +41,11 @@ impl Tok {
                 .map(|i| i as usize)
                 .collect(),
             Tok::Unigram(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|i| i as usize)
+                .collect(),
+            Tok::Plamo2(t) => t
                 .encode(text, specials)
                 .into_iter()
                 .map(|i| i as usize)
@@ -172,6 +178,7 @@ fn tokenize_checkpoint(
         Some("gpt2" | "gemma4") => Tok::Bpe(Box::new(GgufBpeTokenizer::from_gguf(&file)?)),
         Some("llama") => Tok::Spm(GgufSpmTokenizer::from_gguf(&file)?),
         Some("t5") => Tok::Unigram(GgufUnigramTokenizer::from_gguf(&file)?),
+        Some("plamo2") => Tok::Plamo2(Box::new(GgufPlamo2Tokenizer::from_gguf(&file)?)),
         other => anyhow::bail!("verify does not cover tokenizer {other:?}"),
     };
     let eos = file

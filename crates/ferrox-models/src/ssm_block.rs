@@ -12,6 +12,7 @@ use ferrox_core::recurrent_state::RecurrentState;
 use crate::gdn::Gdn;
 use crate::mamba1::Mamba1;
 use crate::mamba2::Mamba2;
+use crate::plamo2_ssm::Plamo2Ssm;
 
 pub enum SsmBlock {
     /// `build_mamba_layer` (`mamba-base.cpp:4-148`).
@@ -21,6 +22,8 @@ pub enum SsmBlock {
     /// `build_layer_attn_linear` (`qwen35.cpp:236-317`), the gated delta
     /// net.
     Gdn(Gdn),
+    /// `build_plamo2_mamba_layer` (`plamo2.cpp:218-343`).
+    Plamo2(Plamo2Ssm),
 }
 
 impl SsmBlock {
@@ -30,6 +33,7 @@ impl SsmBlock {
             SsmBlock::Mamba1(m) => m.zero_state(),
             SsmBlock::Mamba2(m) => m.zero_state(),
             SsmBlock::Gdn(m) => m.zero_state(),
+            SsmBlock::Plamo2(m) => m.zero_state(),
         }
     }
 
@@ -46,6 +50,7 @@ impl SsmBlock {
             SsmBlock::Mamba1(m) => m.forward_rows(normed, rows, state, rms_eps),
             SsmBlock::Mamba2(m) => m.forward_rows(normed, rows, state, rms_eps),
             SsmBlock::Gdn(m) => m.forward_rows(normed, rows, state, rms_eps),
+            SsmBlock::Plamo2(m) => m.forward_rows(normed, rows, state, rms_eps),
         }
     }
 

@@ -85,6 +85,28 @@ pub enum QkNormStyle {
     /// by the weight's length: a file whose `n_head == head_dim` would
     /// make the length ambiguous. Applied after RoPE, as the graph does.
     PerHeadScalar,
+    /// PLaMo-2 (`plamo2.cpp:92-93,163,166`): RMSNorm per head with a
+    /// DISTINCT weight per head -- `attn_q_norm` is `{head_dim, n_head}`
+    /// and `attn_k_norm` `{head_dim, n_head_kv}`, and `build_norm` over
+    /// the 3-d `{head_dim, n_head, n_tokens}` view norms each head and
+    /// multiplies by that head's row. The weight is `n_heads * head_dim`
+    /// long, the same length as [`QkNormStyle::WholeVector`]'s, which is
+    /// why it is decided by architecture ([`PER_HEAD_DISTINCT_QK_NORM`])
+    /// and not by the length rule.
+    PerHeadDistinct,
+}
+
+/// Architectures whose Q/K norm is the per-head RMSNorm with one weight
+/// row per head ([`QkNormStyle::PerHeadDistinct`]). Measured over the
+/// 140 graphs: `attn_q_norm` created `{n_embd_head_k, n_head}` in five
+/// (`chameleon`, `command-r`, `stablelm`, which norm with LLM_NORM and
+/// are `crate::qk_layer_norm`'s; `talkie`, whose weight is `{1,
+/// n_head}`; and `plamo2`, the one RMS row).
+pub const PER_HEAD_DISTINCT_QK_NORM: &[&str] = &["plamo2"];
+
+/// See [`PER_HEAD_DISTINCT_QK_NORM`].
+pub fn uses_per_head_distinct_qk_norm(arch: &str) -> bool {
+    PER_HEAD_DISTINCT_QK_NORM.contains(&arch)
 }
 
 /// Architectures whose Q norm weight is one scalar per head and whose K
@@ -1159,6 +1181,13 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     "jamba",
     "mamba",
     "mamba2",
+    // tests/plamo2_graphs.rs: `plamo2` (PLaMo-2 1B / 2B / 8B). PLaMo-2's
+    // own SSM block (`crate::plamo2_ssm`: Mamba-1's dt / B / C path,
+    // B-C-dt order, REQUIRED norms, feeding Mamba-2's per-head scan;
+    // z / x interleaved per head) where the KV count is zero, attention
+    // with the per-head QK RMSNorm with a distinct row per head
+    // (`QkNormStyle::PerHeadDistinct`) elsewhere.
+    "plamo2",
     // tests/qwen35_graphs.rs: `qwen35` (Qwen3.5 0.8B to 27B). The gated
     // delta net (`crate::gdn`: `qwen35.cpp:236-317` over
     // `delta-net-base.cpp:289-365`, V heads TILED over K heads) on the
@@ -2587,18 +2616,25 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 PerHead,
             ));
         }
-        // The one hybrid row still off the generic path.
+        // PLaMo-2 (`plamo2`: PLaMo-2 1B / 2B / 8B). Its own SSM block
+        // where the KV count is zero (`crate::plamo2_ssm`, `ZeroKvLayer::
+        // Plamo2`), attention elsewhere with a fused `attn_qkv`, the
+        // per-head QK RMSNorm with a DISTINCT row per head
+        // (`QkNormStyle::PerHeadDistinct`, `plamo2.cpp:92-93,163,166`),
+        // NEOX RoPE (llama-model.cpp:2640), post-attention and post-FFN
+        // norms, the Phi-3 fused `ffn_up`. `kq_scale` is `1/sqrt(v_dim)`
+        // (`:171`), which is `1/sqrt(head_dim)` on every export
+        // (`conversion/plamo.py:99-100` write one width for both); a file
+        // whose two widths differ is refused (`crate::kv_head_dims`).
+        // Audited on tests/plamo2_graphs.rs.
         v.push(prof(
             "plamo2",
             TextGeneration,
             DecoderFamily::Hybrid,
             MemoryKind::Hybrid,
             Neox,
-            ArchPath::DedicatedOnly {
-                reason: "PLaMo-2's own Mamba-1 spelling (plamo2.cpp:218-219: its dt / B / C \
-                         norms and gating order), which `crate::mamba1` does not spell",
-            },
-            WholeVector,
+            ArchPath::GenericGqa { rope: Neox },
+            PerHeadDistinct,
         ));
         // `lfm2` left the hybrid group on 2026-09-14: its recurrent
         // block is a short convolution at the attention site

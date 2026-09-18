@@ -209,6 +209,9 @@ pub enum AttnShape {
     /// `jamba.cpp:128`, `mamba.cpp:106`): as [`AttnShape::Mamba2`] with
     /// `crate::mamba1`'s block.
     Mamba1,
+    /// PLaMo-2's block (`plamo2.cpp:218-343`; `crate::plamo2_ssm`): as
+    /// [`AttnShape::Mamba2`] with that block.
+    Plamo2Ssm,
     /// The gated delta net (`qwen35.cpp:236-317`; `crate::gdn`): as
     /// [`AttnShape::Mamba2`] with that block. Decided by
     /// `crate::gdn::recurrent_layers`, not by the head counts, which
@@ -260,6 +263,8 @@ pub enum ZeroKvLayer {
     Mamba2,
     /// `jamba.cpp:128`: the Mamba-1 block (`crate::mamba1`).
     Mamba1,
+    /// `plamo2.cpp:218`: PLaMo-2's own block (`crate::plamo2_ssm`).
+    Plamo2,
     /// `nemotron-h.cpp:9-11`: the Mamba-2 block when the layer's FFN
     /// width is ALSO zero, and an FFN-only layer (no attention block at
     /// all, [`AttnShape::Absent`]) when it is not -- every Nemotron-H
@@ -300,10 +305,10 @@ impl ZeroKvLayer {
             // ([`BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT`]) or an FFN with no
             // block.
             "nemotron_h" | "nemotron_h_moe" => ZeroKvLayer::Mamba2UnlessFfn,
-            "plamo2" => ZeroKvLayer::Unserved(
-                "PLaMo-2's Mamba-1 block (plamo2.cpp:218-219), which has its own dt / B / C \
-                 norms and gating order that `crate::mamba1` does not spell",
-            ),
+            // `plamo2.cpp:19,142-146`: PLaMo-2's block where the KV
+            // count is zero, attention elsewhere; served since 2026-09-18
+            // by its own spelling (`crate::plamo2_ssm`).
+            "plamo2" => ZeroKvLayer::Plamo2,
             "kimi-linear" => ZeroKvLayer::Unserved(
                 "a KDA block (kimi-linear.cpp:18), served by `crate::kimi_decoder` and not \
                  the generic path",
@@ -330,6 +335,11 @@ impl AttnShape {
         zero_kv: ZeroKvLayer,
     ) -> Result<Self, String> {
         match (n_heads, n_kv_heads) {
+            // `plamo2.cpp:19` reads ONLY `n_head_kv(il)`, and
+            // `conversion/plamo.py:87-88` writes BOTH arrays as 0 on an
+            // SSM layer, so on that architecture the pair means the
+            // block and not deci's attention-free layer.
+            (0, 0) if zero_kv == ZeroKvLayer::Plamo2 => Ok(AttnShape::Plamo2Ssm),
             (0, 0) => Ok(AttnShape::Absent),
             (0, kv) => Err(format!(
                 "head_count 0 with head_count_kv {kv}: deci.cpp:107 would skip attention while \
@@ -340,6 +350,7 @@ impl AttnShape {
                 ZeroKvLayer::ShortConv => Ok(AttnShape::ShortConv),
                 ZeroKvLayer::Mamba2 => Ok(AttnShape::Mamba2),
                 ZeroKvLayer::Mamba1 => Ok(AttnShape::Mamba1),
+                ZeroKvLayer::Plamo2 => Ok(AttnShape::Plamo2Ssm),
                 // nemotron-h.cpp:9-11: `n_head_kv == 0 && n_ff == 0`.
                 ZeroKvLayer::Mamba2UnlessFfn if ffn_dim == 0 => Ok(AttnShape::Mamba2),
                 // :152-153: the FFN alone, under `attn_norm` (:145).
@@ -368,6 +379,7 @@ impl AttnShape {
             | AttnShape::ShortConv
             | AttnShape::Mamba2
             | AttnShape::Mamba1
+            | AttnShape::Plamo2Ssm
             | AttnShape::Gdn => 0,
         }
     }
@@ -381,6 +393,7 @@ impl AttnShape {
             | AttnShape::ShortConv
             | AttnShape::Mamba2
             | AttnShape::Mamba1
+            | AttnShape::Plamo2Ssm
             | AttnShape::Gdn => 0,
         }
     }
@@ -388,7 +401,10 @@ impl AttnShape {
     /// True for a block whose state between tokens is a
     /// `RecurrentState` rather than rows (`crate::mamba2`).
     pub fn is_recurrent(self) -> bool {
-        matches!(self, AttnShape::Mamba2 | AttnShape::Mamba1 | AttnShape::Gdn)
+        matches!(
+            self,
+            AttnShape::Mamba2 | AttnShape::Mamba1 | AttnShape::Plamo2Ssm | AttnShape::Gdn
+        )
     }
 
     /// The layer's cache as `(n_kv_heads, k_head_dim, v_head_dim)`, the
@@ -415,6 +431,7 @@ impl AttnShape {
             | AttnShape::Absent
             | AttnShape::Mamba2
             | AttnShape::Mamba1
+            | AttnShape::Plamo2Ssm
             | AttnShape::Gdn => (0, head_dim, v_head_dim),
             AttnShape::ShortConv => (1, hidden_dim, 0),
         }
@@ -730,6 +747,15 @@ pub(crate) fn load_non_gqa_attention(
                 no_rows(0),
             )
         }
+        AttnShape::Plamo2Ssm => {
+            ssm = Some(crate::ssm_block::SsmBlock::Plamo2(
+                crate::plamo2_ssm::Plamo2Ssm::load(file, arch, layer, hidden_dim)?,
+            ));
+            (
+                norm_sites.load_pre_norm(norm_sites.attn, file, Some(layer))?,
+                no_rows(0),
+            )
+        }
         AttnShape::Gdn => {
             ssm = Some(crate::ssm_block::SsmBlock::Gdn(crate::gdn::Gdn::load(
                 file, arch, layer, hidden_dim,
@@ -765,7 +791,15 @@ pub(crate) fn load_non_gqa_attention(
         q_bias: None,
         k_bias: None,
         v_bias: None,
-        post_attn_norm: None,
+        // `plamo2.cpp:150` norms the BLOCK's output with `attn_post_norm`
+        // on every layer, SSM or attention; the table's row is read for
+        // that shape (and `Decoder::recurrent_block` applies it). No
+        // other recurrent graph creates one on a recurrent layer, and
+        // the two attention-less shapes have no output to norm.
+        post_attn_norm: match shape {
+            AttnShape::Plamo2Ssm => NormSites::load_post_norm(norm_sites.post_attn, file, layer)?,
+            _ => None,
+        },
         // The FFN's post-norm lives on this struct; a layer with no
         // attention may still have one, so the table decides.
         post_ffn_norm: NormSites::load_post_norm(norm_sites.post_ffn, file, layer)?,
@@ -1035,8 +1069,23 @@ mod tests {
             AttnShape::from_counts(4, 0, 16, ZeroKvLayer::for_arch("jamba")),
             Ok(AttnShape::Mamba1)
         );
-        let err = AttnShape::from_counts(4, 0, 16, ZeroKvLayer::for_arch("plamo2")).unwrap_err();
-        assert!(err.contains("Mamba-1"), "{err}");
+        // plamo2: the block under either head-count spelling -- the
+        // converter's `(0, 0)` (`conversion/plamo.py:87-88`) and the
+        // scalar-heads `(4, 0)` -- because `plamo2.cpp:19` reads only
+        // the KV count; `(0, 0)` is deci's attention-free layer
+        // everywhere else.
+        assert_eq!(
+            AttnShape::from_counts(4, 0, 16, ZeroKvLayer::for_arch("plamo2")),
+            Ok(AttnShape::Plamo2Ssm)
+        );
+        assert_eq!(
+            AttnShape::from_counts(0, 0, 16, ZeroKvLayer::for_arch("plamo2")),
+            Ok(AttnShape::Plamo2Ssm)
+        );
+        assert_eq!(
+            AttnShape::from_counts(0, 0, 16, ZeroKvLayer::for_arch("jamba")),
+            Ok(AttnShape::Absent)
+        );
         // A pure recurrent model: every layer the block, from uniform
         // zeros that would otherwise read as a zero-head GQA model.
         let s = LayerShapes::resolve("mamba", &[0, 0], &[0, 0], Some(&[0, 0]), 0, None).unwrap();
@@ -1093,8 +1142,13 @@ mod tests {
         assert!(AttnShape::Mamba2.is_recurrent() && !AttnShape::ShortConv.is_recurrent());
         assert_eq!(AttnShape::Linear.cache_geometry(6, 6, 24), (0, 6, 6));
         assert_eq!(AttnShape::ShortConv.n_kv_heads(), 0);
-        let err = LayerShapes::resolve("plamo2", &[4, 4], &[2, 0], None, 16, None).unwrap_err();
-        assert!(err.to_string().contains("Mamba-1"), "{err}");
+        let s = LayerShapes::resolve("plamo2", &[4, 4], &[2, 0], None, 16, None).unwrap();
+        let LayerShapes::PerLayer(v) = s else {
+            panic!("per layer");
+        };
+        assert_eq!(v[1].attention, AttnShape::Plamo2Ssm);
+        assert!(AttnShape::Plamo2Ssm.is_recurrent());
+        assert_eq!(AttnShape::Plamo2Ssm.cache_geometry(8, 8, 32), (0, 8, 8));
         let s = LayerShapes::resolve("lfm2", &[4, 4], &[0, 2], None, 16, None).unwrap();
         let LayerShapes::PerLayer(v) = s else {
             panic!("per layer");

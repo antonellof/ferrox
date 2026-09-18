@@ -92,7 +92,8 @@ is faster.
   `mamba-base.cpp:222` adds it unconditionally and libllama segfaults
   without it (measured). `nemotron-h` (one block per layer),
   `falcon-h1` (attention and Mamba-2 in parallel), `jamba` and `plamo2`
-  (Mamba-1) name what they still need (`layer_shapes::ZeroKvLayer`).
+  (Mamba-1) named what they still needed (`layer_shapes::ZeroKvLayer`);
+  all four have closed since, `plamo2` last on 2026-09-18.
 - **Nemotron-H** (`nemotron_h`: Nemotron-H 8B / 47B / 56B, Nemotron-3
   Nano dense), audited against libllama on 2026-09-14
   (`tests/nemotron_h_graphs.rs`, KL 2.0e-13 / 1.4e-12 / 7.5e-14). The
@@ -210,7 +211,8 @@ is faster.
   FFN is dense or MoE per layer by the router's presence
   (`moe_interleave::DENSE_LAYER_BY_ROUTER_ABSENCE`); the pure models
   have no heads at all (`layer_shapes::PURE_RECURRENT`, head_dim 0).
-  Every Mamba graph in llama.cpp is served but PLaMo-2's own spelling.
+  Every Mamba graph in llama.cpp is served, PLaMo-2's own spelling
+  included (`plamo2_ssm`, 2026-09-18).
 - **Falcon-H1** (`falcon-h1`: 0.5B / 1.5B / 3B / 7B / 34B), audited
   against libllama on 2026-09-14 (`tests/falcon_h1_graphs.rs`, KL
   1.3e-13 / 6.2e-13 / 3.2e-13). Attention AND the Mamba-2 block on
