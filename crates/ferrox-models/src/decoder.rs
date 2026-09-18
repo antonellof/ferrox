@@ -977,7 +977,11 @@ impl Decoder {
             // No fused kernel adds a LoRA delta, and the safetensors
             // MXFP4 pair has no Metal matvec. Spelled out rather than
             // `_` so a fifth storage has to answer here.
-            WeightMatrix::Mxfp4 { .. } | WeightMatrix::Adapted { .. } => None,
+            // A folded matrix's launch would read the untransformed
+            // activation; `apply` transforms and then runs the base.
+            WeightMatrix::Mxfp4 { .. }
+            | WeightMatrix::Adapted { .. }
+            | WeightMatrix::Folded { .. } => None,
         }
     }
 

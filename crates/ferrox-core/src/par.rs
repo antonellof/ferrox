@@ -400,14 +400,37 @@ where
     U: Send,
     F: Fn(usize, &mut [T], &mut [U]) + Send + Sync,
 {
-    assert!(chunk_len > 0, "chunk length must be positive");
     assert_eq!(a.len(), b.len(), "zipped slices must be the same length");
-    let len = a.len();
-    if len == 0 {
+    chunks_mut2_by(a, b, chunk_len, chunk_len, min_len, f);
+}
+
+/// [`chunks_mut2`] with a chunk length per slice: `a` in runs of
+/// `len_a`, `b` in runs of `len_b`, the SAME number of chunks (a gated
+/// delta-net's per-head `S x S` state beside its per-head `S` output).
+pub fn chunks_mut2_by<T, U, F>(
+    a: &mut [T],
+    b: &mut [U],
+    len_a: usize,
+    len_b: usize,
+    min_len: usize,
+    f: F,
+) where
+    T: Send,
+    U: Send,
+    F: Fn(usize, &mut [T], &mut [U]) + Send + Sync,
+{
+    assert!(len_a > 0 && len_b > 0, "chunk lengths must be positive");
+    let n_chunks = a.len().div_ceil(len_a);
+    assert_eq!(
+        n_chunks,
+        b.len().div_ceil(len_b),
+        "zipped slices must split into the same number of chunks"
+    );
+    if n_chunks == 0 {
         return;
     }
-    let n_chunks = len.div_ceil(chunk_len);
     if backend() == Backend::Spin {
+        let (total_a, total_b) = (a.len(), b.len());
         let base_a = SendPtr(a.as_mut_ptr());
         let base_b = SendPtr(b.as_mut_ptr());
         let (per, n_tasks) = split(n_chunks);
@@ -416,13 +439,14 @@ where
             let hi = ((t + 1) * per).min(n_chunks);
             for c in lo..hi {
                 // SAFETY: both pointers come from slices the caller
-                // borrows mutably for the whole call, of equal length,
-                // and chunk `c` of each is visited by exactly one task.
+                // borrows mutably for the whole call, splitting into
+                // the same number of chunks, and chunk `c` of each is
+                // visited by exactly one task.
                 unsafe {
                     f(
                         c,
-                        chunk_of(base_a, len, chunk_len, c),
-                        chunk_of(base_b, len, chunk_len, c),
+                        chunk_of(base_a, total_a, len_a, c),
+                        chunk_of(base_b, total_b, len_b, c),
                     );
                 }
             }
@@ -432,8 +456,8 @@ where
         }
     }
     note_rayon_region();
-    a.par_chunks_mut(chunk_len)
-        .zip(b.par_chunks_mut(chunk_len))
+    a.par_chunks_mut(len_a)
+        .zip(b.par_chunks_mut(len_b))
         .with_min_len(min_len.max(1))
         .enumerate()
         .for_each(|(c, (ca, cb))| f(c, ca, cb));

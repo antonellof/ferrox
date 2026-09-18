@@ -354,33 +354,32 @@ pub(crate) fn check_result(
 
 /// Snapshots every layer's KV cache for the guards in `bench_guard`.
 pub(crate) fn probe(caches: &[KvCache]) -> Vec<CacheProbe> {
-    caches
-        .iter()
-        .map(|c| CacheProbe {
-            // ROWS: this probe reports buffer state, beside the two
-            // lengths it is derived from.
-            seq_len: c.rows(),
-            k_len: c.k.len(),
-            v_len: c.v.len(),
-        })
-        .collect()
+    caches.iter().map(probe_one).collect()
+}
+
+/// One layer's probe. An attention layer reports its resident ROWS,
+/// beside the two buffer lengths they are derived from. A recurrent
+/// layer (a Mamba, delta-net or short-conv block: K width zero, so
+/// `rows()` is zero forever) has no rows to derive from, and its
+/// position counter is the one length the block advances; reading rows
+/// there refused every hybrid model's bench as "layer 0 consumed 0 of
+/// 128 prompt tokens".
+fn probe_one(c: &KvCache) -> CacheProbe {
+    CacheProbe {
+        seq_len: if c.k_width() == 0 {
+            c.positions()
+        } else {
+            c.rows()
+        },
+        k_len: c.k.len(),
+        v_len: c.v.len(),
+    }
 }
 
 /// Same, for Gemma-4's sparse `Vec<Option<KvCache>>` (shared-KV layers
 /// leave holes, which are not caches and are not checked).
 fn probe_gemma4(state: &ferrox_models::gemma4_engine::Gemma4DecodeState) -> Vec<CacheProbe> {
-    state
-        .kv
-        .iter()
-        .flatten()
-        .map(|c| CacheProbe {
-            // ROWS: this probe reports buffer state, beside the two
-            // lengths it is derived from.
-            seq_len: c.rows(),
-            k_len: c.k.len(),
-            v_len: c.v.len(),
-        })
-        .collect()
+    state.kv.iter().flatten().map(probe_one).collect()
 }
 
 /// `pp<N>`: one batched forward over N tokens into fresh KV caches.

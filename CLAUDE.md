@@ -1346,6 +1346,29 @@ llama.cpp line that decides it. llama.cpp hand-writes 140
 per-architecture graphs; `decoder.rs` is 6752 lines and that is why the
 counts differ.
 
+**Ternary-Bonsai-2-27B ran on the real checkpoint on 2026-09-18**, the
+first non-llama.cpp quantization format here (PrismML's `PTQ1_0`, with
+a Hadamard rotation folded into the weights), verified against the
+fork's libllama at first-token KL 2.1e-5 on all three paths (`docs/
+FEATURES.md`). The day's lesson is the old one three more times: the
+PTQ1_0 matvec returned zeros on its first run because
+`rows_per_threadgroup` walked a COPY of the matvec kind list, and
+`apply_gpu_multi` and `apply_gpu_batch` each matched kinds by hand and
+had been quietly running Q5_0 through their fallbacks for two weeks
+while the capability table and the kernel registry said otherwise.
+Each is derived from the one table now, with a test that holds it.
+The speed gap that remains (7.3 vs 11.5 tok/s decode, 32 vs 67
+prefill on the M2 Pro) is structural: ~120 command buffers a token at
+0.166 ms of submission latency each, where the fork encodes one graph,
+and the delta-net recurrence on the CPU. Two of the levers pulled at
+it are worth as much as the one that worked: the device-side Hadamard
+bought 9% of decode (it let the folded FFN take the fused launch) and
+COST 6% of prefill, where the host transform is already parallel; and
+a spin-then-block wait on the command buffer, aimed at that 0.166 ms,
+measured 3.7 tok/s against 7.1 -- polling the status through objc
+takes the core the host work needs. Both are recorded where the code
+is, so the next attempt starts after them.
+
 Do not read the architecture catalog as a support matrix. `ferrox
 parity` is the oracle: its tokenizer half matches llama.cpp on every
 local checkpoint libllama can load, and its logit half MATCHES on

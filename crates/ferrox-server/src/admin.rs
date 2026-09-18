@@ -173,6 +173,8 @@ fn ggml_type_name(t: GgmlType) -> Option<&'static str> {
         GgmlType::NVFP4 => "NVFP4",
         GgmlType::Q1_0 => "Q1_0",
         GgmlType::Q2_0 => "Q2_0",
+        GgmlType::PQ2_0 => "PQ2_0",
+        GgmlType::PTQ1_0 => "PTQ1_0",
         // I32 is a routing table, not a weight format, and `Other` is
         // a tag this build does not recognize. Neither names the
         // checkpoint's quantization.

@@ -54,7 +54,7 @@ impl ChatCompletionRequest {
                 template,
                 tools,
                 kwargs,
-                crate::policy::parser::ReasoningFormat::infer(served_model),
+                template.reasoning_format(served_model),
                 mode,
             )
             .map_err(|e| {
@@ -131,7 +131,7 @@ impl ChatCompletionRequest {
         // function's doc. Same name `OutputPosture::resolve` reads the
         // answer back with, so the count and the split cannot disagree
         // about which family this checkpoint is.
-        params.reasoning = crate::policy::parser::ReasoningFormat::infer(served_model);
+        params.reasoning = template.reasoning_format(served_model);
         // A budget the served family cannot honour is a 501 here, before
         // any prompt is rendered, and by name: the same rule the
         // tokenizer seam applies, so the two cannot disagree about
@@ -324,11 +324,22 @@ mod tests {
             .expect("renders");
         assert_eq!(prompt, "<|user|>why<|assistant|><think>Let me");
         // Under a served model with no reasoning family the same body
-        // is a refusal, not a guess.
+        // is a refusal, not a guess. The family comes from the name OR
+        // the template, so the template here must be silent about
+        // thinking too: `r1`'s opens `<think>` itself and would (rightly)
+        // imply the parser for any name.
+        let bare = chat_template::PromptTemplate::from_gguf_metadata(
+            Some("{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}"),
+            Some("llama"),
+            false,
+            true,
+            None,
+            None,
+        );
         let (status, _) = req
             .render_prompt(
                 &req.messages,
-                &r1,
+                &bare,
                 &req.tools,
                 serde_json::Map::new(),
                 "Llama-3.2-3B",
@@ -340,7 +351,7 @@ mod tests {
         let (status, body) = implied
             .render_prompt(
                 &implied.messages,
-                &r1,
+                &bare,
                 &implied.tools,
                 serde_json::Map::new(),
                 "Llama-3.2-3B",

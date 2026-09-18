@@ -1381,33 +1381,22 @@ pub fn generate(
     // The clamp is what makes a large default output budget safe.
     let clamped;
     let params = match ceiling {
-        Some(ceiling) => {
-            if let Some(err) = ceiling.prompt_refusal(prompt_tokens) {
-                return Err(err);
+        // `ContextCeiling::fit` IS the two outcomes above, and it is
+        // shared with the continuous batcher's admission so the two
+        // decode paths cannot answer the same request differently.
+        Some(ceiling) => match ceiling.fit(prompt_tokens, params.max_tokens)? {
+            fitted if fitted == params.max_tokens => params,
+            fitted => {
+                let mut p = params.clone();
+                tracing::debug!(
+                    "max_tokens clamped from {} to {fitted} by the context ceiling",
+                    p.max_tokens
+                );
+                p.max_tokens = fitted;
+                clamped = p;
+                &clamped
             }
-            // Checked BEFORE the clamp below, because the clamp's own
-            // comparison used to be the thing that wrapped: a
-            // `max_tokens` near `usize::MAX` summed to less than the
-            // limit and walked straight past the guard that existed to
-            // stop it. See `ContextCeiling::positions_refusal`.
-            if let Some(err) = ceiling.overflow_refusal(prompt_tokens, params.max_tokens) {
-                return Err(err);
-            }
-            match ceiling.limit() {
-                Some(limit) if prompt_tokens.saturating_add(params.max_tokens) > limit => {
-                    let mut p = params.clone();
-                    p.max_tokens = limit - prompt_tokens;
-                    tracing::debug!(
-                        "max_tokens clamped from {} to {} by the {limit}-position context ceiling",
-                        params.max_tokens,
-                        p.max_tokens
-                    );
-                    clamped = p;
-                    &clamped
-                }
-                _ => params,
-            }
-        }
+        },
         None => params,
     };
     // `params` is the clamped copy by now, so this cannot exceed the

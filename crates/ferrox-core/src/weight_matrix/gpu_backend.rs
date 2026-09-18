@@ -172,7 +172,7 @@ pub trait BackendDispatch: BackendCaps {
     /// crate is not a dependency and these function pointers do not
     /// exist. So the agreement is a test —
     /// `every_kind_a_compiled_backend_claims_can_actually_be_launched`,
-    /// over every backend and all 21 kinds — rather than the
+    /// over every backend and all 23 kinds — rather than the
     /// `debug_assert!` that used to guard it, which fired only for
     /// kinds a run actually reached and only in debug.
     ///
@@ -217,6 +217,7 @@ fn metal_matvec_launch(kind: QuantKind) -> Option<MetalMatvecLaunchFn> {
         QuantKind::Q5K => Some(ferrox_metal::gpu::launch_q5_k_matvec),
         QuantKind::Q6K => Some(ferrox_metal::gpu::launch_q6_k_matvec),
         QuantKind::IQ4XS => Some(ferrox_metal::gpu::launch_iq4_xs_matvec),
+        QuantKind::Ptq1_0 => Some(ferrox_metal::gpu::launch_ptq1_0_matvec),
         _ => None,
     }
 }
@@ -316,7 +317,8 @@ impl BackendCaps for Metal {
             | QuantKind::Q4K
             | QuantKind::Q5K
             | QuantKind::Q6K
-            | QuantKind::IQ4XS => Some(kind.name()),
+            | QuantKind::IQ4XS
+            | QuantKind::Ptq1_0 => Some(kind.name()),
             _ => None,
         }
     }
@@ -353,6 +355,7 @@ impl BackendCaps for Metal {
                 | QuantKind::Q5K
                 | QuantKind::Q6K
                 | QuantKind::IQ4XS
+                | QuantKind::Ptq1_0
         )
     }
 }
@@ -440,7 +443,7 @@ impl BackendCaps for Vulkan {
     /// plausible. A capability table that over-claims is how a kind ends
     /// up "supported" with no kernel behind it, which this repo has now
     /// paid for twice (IQ4_XS prefill, Q5_0 decode). The guard test
-    /// checks this against [`vulkan_matvec_launch`] for all 21 kinds.
+    /// checks this against [`vulkan_matvec_launch`] for all 23 kinds.
     fn matvec_kernel(kind: QuantKind) -> Option<&'static str> {
         match kind {
             QuantKind::Q8_0 => Some(kind.name()),
@@ -960,8 +963,27 @@ mod tests {
         }
     }
 
+    /// The GEMM twin of the test below: `Metal::gemm_supported` must
+    /// answer exactly what `ferrox_metal::gpu::mul_mm_sg_meta` has a row
+    /// for, because `apply_gpu_batch` launches through that table now.
+    /// It used to launch through a per-kind match, and the match lacked
+    /// Q5_0 and PTQ1_0 while this table claimed both: prefill for those
+    /// kinds ran N matvecs with the kernel registry recording a GEMM hit.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_gemm_claims_are_exactly_the_gemm_table() {
+        for &kind in QuantKind::ALL {
+            let claimed = Metal::gemm_supported(kind);
+            let has_row = ferrox_metal::gpu::mul_mm_sg_meta(kind.name()).is_some();
+            assert_eq!(
+                claimed, has_row,
+                "{kind:?}: gemm_supported {claimed}, mul_mm_sg_meta row {has_row}"
+            );
+        }
+    }
+
     /// Every kind a **compiled-in** backend's capability table CLAIMS
-    /// must have a launch function behind it, for all 21 kinds and
+    /// must have a launch function behind it, for all 23 kinds and
     /// without a device.
     ///
     /// `Q5_0` did not, on Metal, from the day it was added. The kernel

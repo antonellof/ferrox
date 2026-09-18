@@ -75,9 +75,12 @@ pub const GRAPH_PROMPT: [usize; 6] = [3, 7, 11, 19, 23, 5];
 /// Float32 accumulation order differs between the two engines (ggml
 /// blocks its matmuls; ferrox does not), so this is a numeric-agreement
 /// tolerance, not a bit-exactness claim. The measured worst case across
-/// the fixtures is ~1e-6; every sabotage test moves the outputs by orders
-/// of magnitude more.
-pub const GRAPH_TOL: f32 = 1e-5;
+/// the fixtures was ~1e-6 while `matmul_f32` summed each row in order;
+/// since it dots through the four-lane SIMD kernel (2026-09-18) the
+/// worst is 1.5e-5, on `nemotron_h_moe`'s F32 router, so the line sits
+/// at 3e-5. Every sabotage test moves the outputs by orders of
+/// magnitude more.
+pub const GRAPH_TOL: f32 = 3e-5;
 
 /// The tolerance for a row whose FFN is **GeGLU**, where the reference
 /// itself is the approximate side.

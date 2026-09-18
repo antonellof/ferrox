@@ -1824,6 +1824,14 @@ pub(crate) fn slice_quantized_rows(
     start: usize,
     n: usize,
 ) -> Option<WeightMatrix> {
+    // A folded fused projection splits into folded parts sharing ONE
+    // fold: the input transform is the same for q, k and v, and
+    // `apply_gpu_multi` recognises the shared `Arc`.
+    if let WeightMatrix::Folded { base, fold } = m {
+        let mut part = slice_quantized_rows(base, start, n)?;
+        part.fold_hadamard(fold.clone());
+        return Some(part);
+    }
     let WeightMatrix::Quantized {
         data,
         rows,
@@ -2068,6 +2076,20 @@ pub(crate) fn load_f32_vec(file: &impl TensorSource, name: &str) -> Result<Vec<f
 /// "dequant everything on load" is the difference between fitting in
 /// RAM and not.
 pub(crate) fn load_weight_matrix(
+    file: &impl TensorSource,
+    name: &str,
+) -> Result<WeightMatrix, LoadError> {
+    let mut m = load_weight_matrix_unfolded(file, name)?;
+    // A PrismML checkpoint folds a Hadamard rotation into the listed
+    // weights (`crate::hadamard_fold`); the matrix carries the
+    // activation-side transform so every `apply` undoes it.
+    if let Some(fold) = crate::hadamard_fold::fold_for(file, name, m.cols())? {
+        m.fold_hadamard(fold);
+    }
+    Ok(m)
+}
+
+fn load_weight_matrix_unfolded(
     file: &impl TensorSource,
     name: &str,
 ) -> Result<WeightMatrix, LoadError> {

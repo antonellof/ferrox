@@ -194,6 +194,18 @@ pub(crate) fn upload_or_reuse(
             });
         }
     }
+    upload_private(device, x)
+}
+
+/// A private copy of `x` on the device, never the published buffer.
+///
+/// The tail of [`upload_or_reuse`], named because a caller that will
+/// REWRITE the activation (the folded Hadamard prologue, which rotates
+/// in place) must not be handed the shared decode scratch.
+pub(crate) fn upload_private(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x: &[f32],
+) -> Result<ActivationBuffer, MetalError> {
     let mut x_owned = x.to_vec();
     // SAFETY: `x_owned` is a live, non-empty-capacity `Vec<f32>` of
     // exactly `x_owned.len() * 4` bytes, and `newBufferWithBytes` COPIES

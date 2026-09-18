@@ -45,6 +45,13 @@ const LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
 /// only if it folds case.
 const QWEN2: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// `LLAMA_VOCAB_PRE_TYPE_QWEN35` (`llama-vocab.cpp:382-388`): Qwen2's
+/// pattern with combining marks (`\p{M}`) admitted into a letter run
+/// and excluded from a punctuation run. Not an alias: on the parity
+/// corpus the two split `(x` apart (qwen2 arm, `(` then `x`) and
+/// together (this arm) on Bonsai 2 27B, found by `ferrox parity`.
+const QWEN35: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// `LLAMA_VOCAB_PRE_TYPE_GPT4O` (shared with `MINIMAX_M2`). Its own
 /// pattern, not an alias for anything: letter runs are split at the
 /// case boundary and may carry a trailing contraction, digits group in
@@ -113,6 +120,9 @@ pub(super) fn regex_for(pre: &str) -> fancy_regex::Regex {
         // DeepSeek-R1-Distill-Qwen-1.5B.
         "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2" | "hunyuan"
         | "solar-open" => QWEN2,
+
+        // `LLAMA_VOCAB_PRE_TYPE_QWEN35` (`llama-vocab.cpp:2221`).
+        "qwen35" => QWEN35,
 
         // `LLAMA_VOCAB_PRE_TYPE_GPT4O`. Previously aliased onto the
         // qwen2 arm, which tokenized every multi-digit number on

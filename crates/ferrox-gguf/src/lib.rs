@@ -198,6 +198,14 @@ pub enum GgmlType {
     /// sized, no execution path -- see [`GgmlType::TQ1_0`].
     Q1_0,
     Q2_0,
+    /// PrismML's private types (tags 142/143, `PrismML-Eng/llama.cpp`
+    /// branch `prism`, `ggml-common.h`): `PQ2_0` is Q2_0's 2-bit codec
+    /// at group 128, `PTQ1_0` is TQ1_0's trit packing at group 128 with
+    /// one f16 scale per 128 (`block_ptq1_0 { qs[24]; qh[2]; half d }`).
+    /// Bonsai 2 27B ships in PTQ1_0. Executable on CPU via
+    /// `ferrox-quant::ternary`; PQ2_0 is sized only.
+    PQ2_0,
+    PTQ1_0,
     Other(u32),
 }
 
@@ -248,6 +256,8 @@ const GGML_TYPE_TAGS: &[(u32, GgmlType)] = &[
     (40, GgmlType::NVFP4),
     (41, GgmlType::Q1_0),
     (42, GgmlType::Q2_0),
+    (142, GgmlType::PQ2_0),
+    (143, GgmlType::PTQ1_0),
 ];
 
 impl GgmlType {
@@ -333,6 +343,10 @@ impl GgmlType {
             //   block_q1_0  { half d; qs[128/8=16] }         (QK1_0   = 128)
             //   block_q2_0  { half d; qs[64/4=16] }          (QK2_0   = 64)
             GgmlType::TQ1_0 => (54, 256),
+            //   block_pq2_0  { half d; qs[128/4=32] }        (QK_PQ2_0  = 128)
+            //   block_ptq1_0 { qs[24]; qh[2]; half d }       (QK_PTQ1_0 = 128)
+            GgmlType::PQ2_0 => (34, 128),
+            GgmlType::PTQ1_0 => (28, 128),
             GgmlType::TQ2_0 => (66, 256),
             GgmlType::NVFP4 => (36, 64),
             GgmlType::Q1_0 => (18, 128),
@@ -741,7 +755,9 @@ mod tests {
             GgmlType::TQ2_0 => GgmlType::NVFP4,
             GgmlType::NVFP4 => GgmlType::Q1_0,
             GgmlType::Q1_0 => GgmlType::Q2_0,
-            GgmlType::Q2_0 => return None,
+            GgmlType::Q2_0 => GgmlType::PQ2_0,
+            GgmlType::PQ2_0 => GgmlType::PTQ1_0,
+            GgmlType::PTQ1_0 => return None,
             GgmlType::Other(_) => return None,
         })
     }
@@ -1003,6 +1019,8 @@ mod tests {
             (GgmlType::NVFP4, 40, 72),       // 4.5    bpw * 16
             (GgmlType::Q1_0, 41, 18),        // 1.125  bpw * 16
             (GgmlType::Q2_0, 42, 36),        // 2.25   bpw * 16
+            (GgmlType::PQ2_0, 142, 34),      // 2.125  bpw * 16 (Prism, group 128)
+            (GgmlType::PTQ1_0, 143, 28),     // 1.75   bpw * 16 (Prism, group 128)
         ] {
             assert_eq!(GgmlType::from_tag(tag), ty);
             let (bytes, elems) = ty.block_layout();

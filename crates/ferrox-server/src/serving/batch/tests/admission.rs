@@ -100,32 +100,28 @@ fn a_request_larger_than_the_whole_budget_is_refused_rather_than_queued() {
 /// `device_memory_budget_exceeded` here would go looking for a
 /// bigger box for a problem a shorter prompt solves.
 ///
-/// Confirmed to FAIL when the `max_context` branch is removed from
-/// `immovable_refusal` (the request is admitted and runs).
+/// Confirmed to FAIL when the `prompt_refusal` call is removed from
+/// `ContextCeiling::fit` (the request is admitted and runs).
+///
+/// The refusing case is the PROMPT's own size, not `prompt +
+/// max_tokens`: a prompt with room left over is clamped and served,
+/// which is what the test below pins.
 #[test]
-fn a_request_longer_than_the_context_ceiling_names_that_ceiling() {
+fn a_prompt_longer_than_the_context_ceiling_names_that_ceiling() {
     let decoder = tiny_decoder();
     let batcher = ContinuousBatcher::spawn_with_config(
         Arc::clone(&decoder),
         identity_decode(),
-        BatcherConfig {
-            prefill_chunk: 1,
-            max_context: Some(6),
-            // A generous block budget, so the *only* thing that can
-            // bind is the per-request context ceiling.
-            kv_block_size: 4,
-            kv_blocks: Some(1024),
-            ..BatcherConfig::default()
-        },
+        ceiling_config(6),
     );
 
     let err = batcher
         .generate(
-            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
             greedy_params(4, 1),
             StopTokens::from_eos(None),
         )
-        .expect_err("8 positions against a 6-position ceiling");
+        .expect_err("an 8-token prompt against a 6-position ceiling");
     let shape = test_shape();
     match &err {
         DecodeError::KvBudgetExceeded {
@@ -141,7 +137,7 @@ fn a_request_longer_than_the_context_ceiling_names_that_ceiling() {
             assert_eq!(*positions_limit, 6);
             assert_eq!(*estimated_bytes, shape.kv_bytes_for_tokens(8));
             assert_eq!(*limit_bytes, shape.kv_bytes_for_tokens(6));
-            assert!(detail.contains("max_tokens"), "{detail}");
+            assert!(detail.contains("prompt is too long"), "{detail}");
         }
         other => panic!("expected KvBudgetExceeded, got {other:?}"),
     }
@@ -164,6 +160,52 @@ fn a_request_longer_than_the_context_ceiling_names_that_ceiling() {
             StopTokens::from_eos(None),
         )
         .expect("6 positions is 6 positions");
+}
+
+/// A prompt that FITS is served with its output budget clamped to
+/// what remains, exactly as the private decode loop serves it. This is
+/// what makes a large default `max_tokens` safe, and the batcher used
+/// to refuse it instead: a server started `-c 16384` answered every
+/// chat request that omitted `max_tokens` with a 400 naming a number
+/// the caller never sent, because `DEFAULT_CHAT_MAX_TOKENS` is 32768.
+///
+/// Confirmed to FAIL when `generate_streaming` stops calling
+/// `ContextCeiling::fit` (the request is refused).
+#[test]
+fn an_output_budget_past_the_ceiling_is_clamped_rather_than_refused() {
+    let decoder = tiny_decoder();
+    let batcher = ContinuousBatcher::spawn_with_config(
+        Arc::clone(&decoder),
+        identity_decode(),
+        ceiling_config(6),
+    );
+
+    let (_finish, tokens, _text, _usage) = batcher
+        .generate(
+            vec![1, 2, 3, 4],
+            greedy_params(usize::MAX - 4, 1),
+            StopTokens::from_eos(None),
+        )
+        .expect("a 4-token prompt fits a 6-position ceiling with 2 to spare");
+    assert_eq!(tokens.len(), 2, "clamped to the 2 positions that remain");
+
+    let stats = batcher.stats();
+    assert_eq!(
+        stats.kv_rejected_context_length, 0,
+        "a clamp is not a refusal, and must not be counted as one"
+    );
+}
+
+/// A per-request context ceiling with a block budget generous enough
+/// that the ceiling is the only thing that can bind.
+fn ceiling_config(max_context: usize) -> BatcherConfig {
+    BatcherConfig {
+        prefill_chunk: 1,
+        max_context: Some(max_context),
+        kv_block_size: 4,
+        kv_blocks: Some(1024),
+        ..BatcherConfig::default()
+    }
 }
 
 /// With both ceilings configured and both exceeded, the request's

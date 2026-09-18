@@ -232,6 +232,14 @@ impl ActiveModel {
         }
     }
 
+    /// The reasoning parser for this checkpoint under its served name:
+    /// `PromptTemplate::reasoning_format`, the one place that decides
+    /// it. An encoder has no template and no chain of thought.
+    pub(crate) fn reasoning_format(&self) -> Option<crate::policy::parser::ReasoningFormat> {
+        self.generative_opt()
+            .and_then(|m| m.chat_template().reasoning_format(self.name()))
+    }
+
     /// The tokenizer this checkpoint carries. An encoder's is real and
     /// is reported as such -- `EmbeddingModel` only accepts
     /// `tokenizer.ggml.model = "bert"`, so WordPiece is a fact about
