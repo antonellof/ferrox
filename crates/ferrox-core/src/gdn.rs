@@ -267,6 +267,55 @@ mod tests {
         }
     }
 
+    /// What the recurrence achieves on this host, printed rather than
+    /// asserted: run with `--nocapture`. Bonsai's shape is 48 value
+    /// heads of 128, a 3.1 MB state per layer.
+    ///
+    /// It reads 36 GB/s of state on an M2 Pro, which is the memory
+    /// floor for reading and writing that state once per row, not a
+    /// missing vectorisation: rewriting the two passes as one read pass
+    /// plus a streaming update -- algebraically exact, since
+    /// `S_new . q` expands to `decay (S_old . q) + d (k . q)` -- moved
+    /// it to 197 us from 175, because both passes already hit the same
+    /// 512-byte row while it is hot in L1.
+    ///
+    /// What DOES move it is reading the state once per CHUNK of rows
+    /// instead of once per row (`docs/plans/gdn-resident-state.md`).
+    #[test]
+    #[ignore = "a measurement, not an assertion; run with --nocapture"]
+    fn delta_step_throughput_probe() {
+        let dims = DeltaDims {
+            n_k_heads: 4,
+            n_v_heads: 48,
+            head_dim: 128,
+            map: HeadMap::Tiled,
+        };
+        let mut state = vec![0.01f32; dims.state_len()];
+        let q: Vec<f32> = (0..4 * 128).map(|i| (i as f32 * 0.01).sin()).collect();
+        let k = q.clone();
+        let v: Vec<f32> = (0..48 * 128).map(|i| (i as f32 * 0.02).cos()).collect();
+        let g = vec![-0.1f32; 48];
+        let beta = vec![0.5f32; 48];
+        let mut out = vec![0.0f32; 48 * 128];
+        for _ in 0..8 {
+            delta_step(dims, &mut state, &q, &k, &v, &g, &beta, &mut out);
+        }
+        let n = 200;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            delta_step(dims, &mut state, &q, &k, &v, &g, &beta, &mut out);
+        }
+        let per = t.elapsed().as_secs_f64() / n as f64;
+        let flops = 48.0 * 2.0 * 2.0 * 128.0 * 128.0;
+        let bytes = (dims.state_len() * 4 * 2) as f64;
+        eprintln!(
+            "delta_step {:.1} us/call, {:.1} GFLOP/s, {:.1} GB/s of state",
+            per * 1e6,
+            flops / per / 1e9,
+            bytes / per / 1e9
+        );
+    }
+
     #[test]
     fn l2_normalize_clamps_the_divisor() {
         let mut v = [3.0f32, 4.0];

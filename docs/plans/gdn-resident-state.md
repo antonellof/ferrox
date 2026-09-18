@@ -82,11 +82,22 @@ cache, when the layer's own work is only 3 MFLOP.
 
 ## What would close it
 
-The answer is not "move this loop to the GPU". It is the CHUNKED delta
-rule llama.cpp uses (`delta-net-base.cpp`): a block of C rows is
-processed together with matrix products, so the state is read and
-written once per CHUNK instead of once per row, and the arithmetic
-intensity rises to where a GPU beats a cache. That is a different
+The answer is not "move this loop to the GPU", and it is not a faster
+kernel either. `delta_step_throughput_probe` measures the host step at
+**36 GB/s of state**, which is the floor for reading and writing 3.1 MB
+once per row: rewriting its two passes as one read pass plus a
+streaming update -- algebraically exact, because `S_new . q` expands to
+`decay (S_old . q) + d (k . q)` -- measured 197 us against 175, since
+both passes already hit the same 512-byte row while it is hot in L1.
+
+The prize is therefore sized, and it is the largest single one left.
+A 128-token prefill moves `128 rows x 48 layers x 6.2 MB = 38 GB` of
+state at that 36 GB/s, which is **1.05 s of a 3.9 s `pp128` run**, and
+the profile agrees (23% of samples). The CHUNKED delta rule llama.cpp
+uses (`delta-net-base.cpp`) processes a block of C rows together with
+matrix products, so the state is read and written once per CHUNK rather
+than once per row: at C = 16 that 1.05 s becomes about 0.07 s, which is
+`pp128` 32.9 -> roughly 44 tok/s on arithmetic alone. That is a different
 algorithm with its own correctness story (a WY-style representation of
 the rank-one updates), and it is the honest next step. Everything below
 is what the plumbing around it should look like.
