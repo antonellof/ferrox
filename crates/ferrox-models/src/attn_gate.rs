@@ -503,7 +503,14 @@ mod tests {
         let names: Vec<&str> = ATTN_GATE_ARCHS.iter().map(|(n, _)| *n).collect();
         assert_eq!(
             names,
-            ["afmoe", "laguna", "step35", "hrm_text", "muse-glimmer", "spark2_5"]
+            [
+                "afmoe",
+                "laguna",
+                "step35",
+                "hrm_text",
+                "muse-glimmer",
+                "spark2_5"
+            ]
         );
         for (arch, spec) in ATTN_GATE_ARCHS {
             assert!(spec.lines.contains(".cpp:"), "`{arch}` cites no line");
