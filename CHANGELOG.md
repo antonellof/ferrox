@@ -15,6 +15,61 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Added
+
+- **`--ctk turbo4` is TurboQuant now, not just its name.** The 4-bit KV
+  store applies the randomized Hadamard rotation to K before
+  quantizing it, and rotates the query by the same matrix at read time
+  so `q . k` is unchanged; V is left alone. Before this, frink shipped
+  a dtype called `turbo4` that was plain per-32-element absmax, which
+  is not what TurboQuant is.
+
+  `frink-quant`'s `turboquant` module is the host definition the Metal
+  kernel is checked against, and the sign hash is xInfer's
+  `tq_sign_flip` verbatim so a vector rotated by either engine is the
+  same vector (MIT, see `docs/THIRD_PARTY_NOTICES.md`). The wire is
+  unchanged: frink keeps its own f16 scale per 32 elements where
+  xInfer carries one per head.
+
+  Measured as next-token agreement with an f16 store across sixty
+  long-context windows, 2,000 to 20,172 characters of the corpus, on
+  Llama-3.2-3B-Instruct Q4_K_M, the rotation moves frink's wire from
+  45/60 to 48/60, and a per-head scale with the rotation, which is
+  what xInfer ships, reads 52/60 against 41/60 without it. The
+  rotation wins in both wires; whether the wire itself should change
+  is a four-window difference in sixty and is recorded as an open
+  question rather than acted on. It costs about 5% of turbo4 decode
+  (37.8 to 35.8 tok/s at a 5,110-token context on an M2 Pro, against
+  f16's 51.8). Two metrics were
+  discarded before that one, and both are recorded in
+  `docs/plans/xinfer-audit-2026-09-19.md`: a free-running greedy
+  generation is chaotic and separates nothing, and `frink perplexity`
+  returns byte-identical numbers for every KV dtype because that path
+  never touches the Metal store.
+
+  Two host paths had to learn the rotation with it, and neither would
+  have failed loudly: `MetalKvBuffers::upload_from_host` seeds the
+  device store after a CPU prefill, and `tokens_host` fills the host
+  cache when the dense stack runs ahead of it. A rotated row handed to
+  a host kernel whose query is not rotated is a different model, so
+  the round trip has a test of its own.
+
+  A head width the butterfly cannot serve (not a power of two, or not
+  a multiple of 32) keeps the unrotated wire rather than being
+  refused. `MetalKvBuffers::k_rotated` is the one field that answers
+  the question, set once at construction.
+
+### Changed
+
+- **The KV wire left `attn.rs` for `frink-metal/src/kv_wire.rs`.** The
+  dtype table, the append and dequant kernels and the store geometry
+  are one concept and the attention kernels are another; the split came
+  first, as the contribution rules ask, and `attn.rs` re-exports the
+  names `frink-models` and the tests read. The prefill warmup used to
+  restate the dtype-to-kernel mapping that the append table already
+  held, which is the two-structures-that-must-agree shape; it is
+  derived from that table now.
+
 ## [0.26.0] - 2026-09-19
 
 ### Changed

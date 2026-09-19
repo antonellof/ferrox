@@ -283,7 +283,7 @@ this is stale.
 
 **KV cache and memory**
 
-- The `turbo3` dtype, and Metal WHT on the CTK path
+- The `turbo3` dtype. Metal WHT on the CTK path shipped: `turbo4` rotates K, see `plans/xinfer-audit-2026-09-19.md`
 - Act on the residency plan `inspect-plan` produces: stream cold
   experts, bound the KV budget, report what a host really fits
 - Hybrid CPU/GPU expert placement for MoE, the main lever for running a

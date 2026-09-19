@@ -62,7 +62,6 @@ pub mod residency;
 pub mod summary_stats;
 pub mod tensor;
 pub mod threads;
-pub mod turboquant;
 pub mod vexp;
 pub mod weight_matrix;
 

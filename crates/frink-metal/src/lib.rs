@@ -52,6 +52,11 @@ pub mod ternary;
 #[cfg(feature = "metal")]
 pub mod attn;
 
+/// The KV wire format: dtypes, append and dequant kernels. Split from
+/// `attn` so the store and the softmax are separate concepts.
+#[cfg(feature = "metal")]
+pub mod kv_wire;
+
 #[cfg(feature = "metal")]
 pub mod rope;
 
