@@ -240,6 +240,17 @@ impl ActiveModel {
             .and_then(|m| m.chat_template().reasoning_format(self.name()))
     }
 
+    /// The tool-call grammar for this checkpoint under its served
+    /// name: `PromptTemplate::tool_call_format`, the one place that
+    /// decides it. An encoder emits no calls, so it takes the name's
+    /// family and never reads one.
+    pub(crate) fn tool_call_format(&self) -> crate::policy::parser::ToolCallFormat {
+        match self.generative_opt() {
+            Some(m) => m.chat_template().tool_call_format(self.name()),
+            None => crate::policy::parser::ToolCallFormat::infer(self.name()),
+        }
+    }
+
     /// The tokenizer this checkpoint carries. An encoder's is real and
     /// is reported as such -- `EmbeddingModel` only accepts
     /// `tokenizer.ggml.model = "bert"`, so WordPiece is a fact about

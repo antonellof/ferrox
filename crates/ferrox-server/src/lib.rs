@@ -2754,7 +2754,11 @@ async fn chat_completions_full(
     let (message, finish_reason) = build_response_message(
         content,
         if tools_active { &req.tools } else { &[] },
-        output::OutputPosture::resolve_with(active.reasoning_format(), active.name(), &prompt),
+        output::OutputPosture::resolve_full(
+            active.reasoning_format(),
+            active.tool_call_format(),
+            &prompt,
+        ),
         completion.finish.as_str(),
     );
 
@@ -2824,8 +2828,11 @@ async fn chat_completions_stream(
     // How to read this stream, fixed before the first token: the family
     // from the served checkpoint, and whether the prompt that was
     // actually rendered left the model inside a reasoning block.
-    let posture =
-        output::OutputPosture::resolve_with(active.reasoning_format(), &served_model, &prompt);
+    let posture = output::OutputPosture::resolve_full(
+        active.reasoning_format(),
+        active.tool_call_format(),
+        &prompt,
+    );
     // The offered tools, captured for the terminal parse: the request
     // itself does not outlive the closure that consumes it.
     let offered_tools: Vec<ToolDef> = if tools_active {
