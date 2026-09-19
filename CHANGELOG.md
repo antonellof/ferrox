@@ -60,6 +60,17 @@ are the ones worth reading twice.
   reference's own approximation, measured rather than assumed
   (`tests/gated_attention_graphs.rs`).
 
+- **`jina-bert-v3` embeds (jina-embeddings-v3)**, one line of
+  `bert_gguf_loader::ENCODER_ARCHS` after `nomic-bert`: it reuses
+  `llama_model_bert::graph` verbatim (`models.h:314-322`) and is the
+  OTHER combination of the two facts that table holds -- RoPE on Q/K
+  with `bert`'s ungated GELU FFN. Its refusal had named "RoPE and
+  per-projection QK norm", and the second half was wrong:
+  `jina-bert-v3.cpp:25-43` creates no `attn_q_norm` at all, so that
+  branch of the shared graph is dead for it. A verdict read from the
+  graph's branches rather than from the architecture's own tensor
+  loader named a blocker it does not have.
+
 - **`nomic-bert` embeds (nomic-embed-text v1 / v1.5)**, on the SAME
   encoder `bert` has used since it landed. It shares
   `src/models/bert.cpp`'s graph and differs in two lines of it: NEOX

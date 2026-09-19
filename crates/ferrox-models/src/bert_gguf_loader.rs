@@ -77,6 +77,12 @@ pub fn check_arch(arch: &str) -> Result<(), LoadError> {
 pub const ENCODER_ARCHS: &[(&str, BertFfn)] = &[
     ("bert", BertFfn::GeluSeq),
     ("nomic-bert", BertFfn::SwigluPar),
+    // `jina-bert-v3.cpp` reuses `llama_model_bert::graph` verbatim
+    // (`models.h:314-322`) and its own tensor loader creates NO
+    // position table and NO QK-norm tensors, so on this graph it is
+    // `nomic-bert`'s rotation with `bert`'s ungated GELU FFN -- one
+    // row, and the only row.
+    ("jina-bert-v3", BertFfn::GeluSeq),
 ];
 
 /// Reads and checks `bert.*` hparams. Fails closed on anything the
@@ -388,7 +394,6 @@ mod tests {
         for arch in [
             "nomic-bert-moe",
             "jina-bert-v2",
-            "jina-bert-v3",
             "neo-bert",
             "modern-bert",
             "llama",
