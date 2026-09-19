@@ -54,6 +54,11 @@ pub enum EncodeError {
     #[error("token id {id} is outside this checkpoint's {vocab_size}-entry vocabulary")]
     TokenOutOfRange { id: u32, vocab_size: usize },
     #[error(
+        "layer {layer} runs a gated FFN and carries no ffn_gate; the loader builds the \
+         pair together, so this is a bug in ferrox rather than in the checkpoint"
+    )]
+    MissingGate { layer: usize },
+    #[error(
         "segment id {id} at position {pos} is outside this checkpoint's {n_segments}-row \
          token-type table"
     )]
@@ -108,6 +113,15 @@ pub trait TextEncoder: Sync {
 
     /// What the checkpoint's own `{arch}.pooling_type` said.
     fn pooling_type(&self) -> PoolingType;
+
+    /// The BERT-family hyper-parameters, for a caller that needs the
+    /// facts the architecture decides -- the rotation and the FFN
+    /// shape (`crate::bert_encoder`). `None` for an encoder that is
+    /// not on that graph, so a second encoder family does not have to
+    /// invent a `BertHparams` to answer.
+    fn bert_hparams(&self) -> Option<&crate::bert_encoder::BertHparams> {
+        None
+    }
 
     /// Wraps a tokenizer's pieces in whatever the *model* requires
     /// around them — for BERT, `[CLS] … [SEP]`.

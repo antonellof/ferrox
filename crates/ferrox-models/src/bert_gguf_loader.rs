@@ -23,7 +23,7 @@
 
 use ferrox_gguf::{ShardedGguf, TensorSource};
 
-use crate::bert_encoder::{BertEncoder, BertHparams, BertLayer};
+use crate::bert_encoder::{BertEncoder, BertFfn, BertHparams, BertLayer};
 use crate::loader::{
     assert_every_tensor_consumed, load_f32_vec, load_f32_vec_optional, load_weight_matrix,
     LoadError,
@@ -58,12 +58,26 @@ fn reject_tensor(file: &ShardedGguf, name: &str, why: &str) -> Result<(), LoadEr
 /// The whole architecture policy of this loader, in one place so it can
 /// be tested without a GGUF: `bert` and nothing else.
 pub fn check_arch(arch: &str) -> Result<(), LoadError> {
-    if arch == BERT_ARCH {
+    if ENCODER_ARCHS.iter().any(|(a, _)| *a == arch) {
         Ok(())
     } else {
         Err(LoadError::UnsupportedArchitecture(arch.to_string()))
     }
 }
+
+/// The architectures this loader builds, with the FFN each one runs.
+///
+/// Both share `bert.cpp`'s graph; what differs is two lines of it,
+/// and both are read from the architecture because upstream reads
+/// them that way: the rotation at `:126-133` and the FFN at
+/// `:179-201`. A row here is a promise that every OTHER line of that
+/// graph is the same, which is why `nomic-bert-moe` is not in it (its
+/// `moe_every_n_layers` layers are a second FFN shape) and
+/// `jina-bert-v2` is not either (a second attention norm).
+pub const ENCODER_ARCHS: &[(&str, BertFfn)] = &[
+    ("bert", BertFfn::GeluSeq),
+    ("nomic-bert", BertFfn::SwigluPar),
+];
 
 /// Reads and checks `bert.*` hparams. Fails closed on anything the
 /// graph in [`crate::bert_encoder`] does not implement.
@@ -140,8 +154,34 @@ pub fn read_bert_hparams(file: &impl TensorSource) -> Result<BertHparams, LoadEr
         .metadata_u64("tokenizer.ggml.seperator_token_id")
         .unwrap_or(u64::from(DEFAULT_SEP_ID)) as u32;
 
+    // `bert.cpp:126-133` rotates for the architectures listed there and
+    // adds no position table for them (`:90` is gated on `bert`); the
+    // two facts are one field on `BertHparams`.
+    let ffn = ENCODER_ARCHS
+        .iter()
+        .find(|(a, _)| *a == arch)
+        .map(|(_, f)| *f)
+        .expect("check_arch admitted this architecture");
+    let rope_theta =
+        (arch != BERT_ARCH).then(|| file.metadata_f32(&p("rope.freq_base")).unwrap_or(10_000.0));
+    let head_dim = n_embd / n_head;
+    let rope_dim = file
+        .metadata_u64(&p("rope.dimension_count"))
+        .map(|v| v as usize)
+        .unwrap_or(head_dim);
+    if rope_theta.is_some() && (rope_dim == 0 || rope_dim > head_dim || !rope_dim.is_multiple_of(2))
+    {
+        return Err(refuse(&format!(
+            "rope.dimension_count is {rope_dim}, which is not an even width at or under \
+             the {head_dim}-wide head"
+        )));
+    }
+
     Ok(BertHparams {
         arch,
+        rope_theta,
+        rope_dim,
+        ffn,
         n_layer,
         n_embd,
         n_ff,
@@ -169,21 +209,40 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
     let hp = read_bert_hparams(file)?;
 
     let tok_embd = load_weight_matrix(file, "token_embd.weight")?;
-    let pos_embd = load_weight_matrix(file, "position_embd.weight")?;
-    if pos_embd.rows() != hp.n_ctx_train {
-        return Err(refuse(&format!(
-            "position_embd.weight has {} rows but {}.context_length says {} — the learned \
-             position table and the advertised context disagree",
-            pos_embd.rows(),
-            hp.arch,
-            hp.n_ctx_train
-        )));
+    // `bert.cpp:32` creates the table for every architecture on the
+    // graph, but `:90` reads it only for `bert` -- and libllama's own
+    // load log never names it for `nomic-bert`, measured. So a
+    // rotating file carries none and a rotating file that DOES carry
+    // one is refused rather than silently ignored.
+    let pos_embd = match hp.rope_theta {
+        None => Some(load_weight_matrix(file, "position_embd.weight")?),
+        Some(_) => {
+            if file.find_tensor("position_embd.weight").is_some() {
+                return Err(refuse(
+                    "a rotating encoder (bert.cpp:126-133) carries position_embd.weight, \
+                     which its graph never reads; llama.cpp refuses the file as carrying \
+                     an unread tensor and so does ferrox",
+                ));
+            }
+            None
+        }
+    };
+    if let Some(table) = &pos_embd {
+        if table.rows() != hp.n_ctx_train {
+            return Err(refuse(&format!(
+                "position_embd.weight has {} rows but {}.context_length says {} — the \
+                 learned position table and the advertised context disagree",
+                table.rows(),
+                hp.arch,
+                hp.n_ctx_train
+            )));
+        }
     }
-    if pos_embd.cols() != hp.n_embd || tok_embd.cols() != hp.n_embd {
+    if pos_embd.as_ref().is_some_and(|t| t.cols() != hp.n_embd) || tok_embd.cols() != hp.n_embd {
         return Err(refuse(&format!(
             "embedding tables are {} / {} wide but embedding_length is {}",
             tok_embd.cols(),
-            pos_embd.cols(),
+            pos_embd.as_ref().map_or(hp.n_embd, |t| t.cols()),
             hp.n_embd
         )));
     }
@@ -241,11 +300,18 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
             &format!("{b}.attn_norm_2.weight"),
             "jina-bert-v2's second attention norm, not implemented",
         )?;
-        reject_tensor(
-            file,
-            &format!("{b}.ffn_gate.weight"),
-            "a gated FFN (nomic-bert / jina-bert-v2 GEGLU); this graph runs a plain GELU MLP",
-        )?;
+        // The gate belongs to `BertFfn::SwigluPar` and to nothing
+        // else: a `bert` file that carries one is a file this graph
+        // would run as an ungated GELU while llama.cpp ran it gated,
+        // which is the silent-wrong shape the refusal exists for.
+        if hp.ffn == BertFfn::GeluSeq {
+            reject_tensor(
+                file,
+                &format!("{b}.ffn_gate.weight"),
+                "a gated FFN (jina-bert-v2 GEGLU); this architecture's graph runs a plain \
+                 GELU MLP (bert.cpp:179-187)",
+            )?;
+        }
         reject_tensor(
             file,
             &format!("{b}.ffn_up_exps.weight"),
@@ -265,6 +331,12 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
             attn_out_norm_b: load_f32_vec(file, &format!("{b}.attn_output_norm.bias"))?,
             ffn_up: load_weight_matrix(file, &format!("{b}.ffn_up.weight"))?,
             ffn_up_b: load_f32_vec_optional(file, &format!("{b}.ffn_up.bias"))?,
+            ffn_gate: match hp.ffn {
+                BertFfn::GeluSeq => None,
+                BertFfn::SwigluPar => {
+                    Some(load_weight_matrix(file, &format!("{b}.ffn_gate.weight"))?)
+                }
+            },
             ffn_down: load_weight_matrix(file, &format!("{b}.ffn_down.weight"))?,
             ffn_down_b: load_f32_vec_optional(file, &format!("{b}.ffn_down.bias"))?,
             layer_out_norm_w: load_f32_vec(file, &format!("{b}.layer_output_norm.weight"))?,
@@ -312,9 +384,8 @@ mod tests {
     /// `bert.cpp` upstream, and each of them differs from this graph in
     /// a way that would load clean and embed wrong.
     #[test]
-    fn a_non_bert_architecture_is_refused_by_name() {
+    fn an_architecture_outside_the_table_is_refused_by_name() {
         for arch in [
-            "nomic-bert",
             "nomic-bert-moe",
             "jina-bert-v2",
             "jina-bert-v3",
@@ -322,6 +393,10 @@ mod tests {
             "modern-bert",
             "llama",
         ] {
+            assert!(
+                !ENCODER_ARCHS.iter().any(|(a, _)| *a == arch),
+                "`{arch}` is in the table; the refusal below would be wrong"
+            );
             let err = check_arch(arch).unwrap_err();
             assert!(
                 matches!(&err, LoadError::UnsupportedArchitecture(a) if a == arch),

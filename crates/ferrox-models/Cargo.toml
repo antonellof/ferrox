@@ -44,10 +44,10 @@ rayon = { workspace = true }
 # a TLS stack, and a consumer that loads a local GGUF should not pay for
 # it.
 ureq = { workspace = true, optional = true }
+half = { workspace = true }
 
 [dev-dependencies]
 byteorder = { workspace = true }
-half = { workspace = true }
 
 [features]
 default = []

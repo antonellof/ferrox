@@ -60,6 +60,23 @@ are the ones worth reading twice.
   reference's own approximation, measured rather than assumed
   (`tests/gated_attention_graphs.rs`).
 
+- **`nomic-bert` embeds (nomic-embed-text v1 / v1.5)**, on the SAME
+  encoder `bert` has used since it landed. It shares
+  `src/models/bert.cpp`'s graph and differs in two lines of it: NEOX
+  RoPE on Q and K (`:126-133`) where `bert` adds a learned position
+  table instead (`:90`, gated on the architecture), and a gated SiLU
+  FFN with no biases (`:195-201`) where `bert`'s is an ungated GELU
+  with both. `bert_encoder::BertFfn` and `BertHparams::rope_theta`
+  are those two facts and `bert_gguf_loader::ENCODER_ARCHS` is the
+  table that decides them -- by ARCHITECTURE, because a `bert` file
+  that happens to carry a gate tensor would otherwise run gated here
+  and ungated in llama.cpp. A rotating file carries no
+  `position_embd` (measured: libllama never asks for one) and a
+  rotating file that does carry one is refused rather than ignored.
+  Checked against llama.cpp's own MEAN-pooled embedding on a
+  committed fixture (`tests/nomic_bert_graphs.rs`), so it runs in CI
+  rather than behind `--ignored` like the real-checkpoint BERT test.
+
 - **`hrm_text` runs (DFM Mimir 1B)**, the fifth row closed against the
   moved pin and the first decoder here that is not a walk down ONE
   residual stream. `src/models/hrm-text.cpp:183-196` runs `h_cycles`
