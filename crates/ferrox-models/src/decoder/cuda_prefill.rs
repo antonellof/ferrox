@@ -51,6 +51,13 @@ impl Decoder {
         {
             return None;
         }
+        // One `rms_eps` uniform for the whole layer (`:182`), so a
+        // model whose post-norms run at a different epsilon than its
+        // pre-norms (`ferrox_models::norm::POST_NORM_EPS_LITERAL`)
+        // stays on the host.
+        if self.config.post_norm_eps() != self.config.rms_norm_eps {
+            return None;
+        }
         let kv_width = self.config.n_kv_heads * self.config.head_dim;
 
         // Describe the run first, borrowing the caches for their

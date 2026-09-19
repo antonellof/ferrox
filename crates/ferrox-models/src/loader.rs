@@ -1548,6 +1548,9 @@ impl ModelConfig {
             vocab_size,
             rope_theta,
             rms_norm_eps,
+            // `crate::norm::POST_NORM_EPS_LITERAL`: the architecture's, which
+            // is the model's for all but one graph of 155.
+            post_norm_eps: crate::norm::post_norm_eps(&arch, rms_norm_eps),
             // No GGUF file encodes a hybrid KDA/Gated-MLA attention
             // topology today; every real checkpoint loaded this way
             // runs the standard Gqa path.
@@ -3301,7 +3304,15 @@ impl Decoder {
         let final_norm = norm_sites.load_pre_norm(Some(norm_sites.output), &file, None)?;
         // The embedding norm (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`),
         // `NormOp::None` where the site is absent.
-        let embedding_norm = norm_sites.load_pre_norm(norm_sites.embedding, &file, None)?;
+        // Two answers, one field: a STORED embedding norm (`bloom`) or
+        // a weightless one (`muse-glimmer.cpp:69`), and the tables that
+        // decide them are disjoint by construction
+        // (`norm_sites::WEIGHTLESS_EMBEDDING_NORM`).
+        let embedding_norm = if crate::norm_sites::weightless_embedding_norm(&arch) {
+            crate::norm::NormOp::RmsNoParams
+        } else {
+            norm_sites.load_pre_norm(norm_sites.embedding, &file, None)?
+        };
         // Many small Llama/Gemma-family GGUFs tie the lm-head to
         // `token_embd.weight` and omit `output.weight` (llama.cpp
         // `llama_model_loader` falls back the same way). Prefer the

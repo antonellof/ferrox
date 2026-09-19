@@ -161,6 +161,19 @@ pub const ATTN_GATE_ARCHS: &[(&str, AttnGateSpec)] = &[
     // multiplies it in per head, which is `step35`'s corner of the two
     // axes with the presence flipped. Nothing else in that graph was
     // new (`tests/gated_attention_graphs.rs`).
+    // `muse-glimmer.cpp:46` creates the tensor REQUIRED at
+    // `{n_embd, n_head * head_dim}` and `:100-135` sigmoid it and
+    // multiply it into the attention output PER ELEMENT before `wo`,
+    // which is `afmoe`'s corner; its own comment says "same as afmoe".
+    (
+        "muse-glimmer",
+        AttnGateSpec {
+            act: GateAct::Sigmoid,
+            widths: &[GateWidth::PerElement],
+            presence: GatePresence::Required,
+            lines: "src/models/muse-glimmer.cpp:46,100-135",
+        },
+    ),
     (
         "spark2_5",
         AttnGateSpec {
@@ -467,12 +480,16 @@ mod tests {
     /// The table is keyed by architecture, every row cites its lines,
     /// and the three GDN rows that share the tensor NAME are not in it.
     ///
-    /// Four rows since 2026-09-19: `spark2_5` landed upstream after the
-    /// 2026-08-04 pin and is `step35`'s pair with the tensor required.
+    /// Five rows since 2026-09-19: `spark2_5` and `muse-glimmer` both
+    /// landed upstream after the 2026-08-04 pin, the first `step35`'s
+    /// pair with the tensor required, the second `afmoe`'s.
     #[test]
     fn the_table_covers_the_softmax_gates_and_excludes_the_gdn_z_gates() {
         let names: Vec<&str> = ATTN_GATE_ARCHS.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["afmoe", "laguna", "step35", "spark2_5"]);
+        assert_eq!(
+            names,
+            ["afmoe", "laguna", "step35", "muse-glimmer", "spark2_5"]
+        );
         for (arch, spec) in ATTN_GATE_ARCHS {
             assert!(spec.lines.contains(".cpp:"), "`{arch}` cites no line");
             assert!(!spec.widths.is_empty(), "`{arch}` admits no width");

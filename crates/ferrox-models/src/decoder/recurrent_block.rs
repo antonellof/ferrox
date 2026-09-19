@@ -52,7 +52,9 @@ impl Decoder {
             let hidden = post.len();
             out = out
                 .chunks(hidden)
-                .flat_map(|row| ferrox_core::matmul::rms_norm(row, post, self.config.rms_norm_eps))
+                .flat_map(|row| {
+                    ferrox_core::matmul::rms_norm(row, post, self.config.post_norm_eps())
+                })
                 .collect();
         }
         out

@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-19 against a MOVED PIN. **96**
+Honest position, re-audited 2026-09-19 against a MOVED PIN. **97**
 architectures run with evidence (`capability::AUDITED_GENERIC_GQA`), 4
 more have dedicated engines, and everything else REFUSES. The "loads
 and is WRONG" class is closed: the generic path is opt-in, so an
@@ -75,12 +75,27 @@ full-attention one, layer 2 the unrotated one -- so a loader that read
 either into the other's field is caught by the golden rather than by
 luck.
 
-So **seven** triaged refusals are left, and they say which of three
+`muse-glimmer` closed the same day as the fourth, on two norm facts
+nothing else upstream has. `muse-glimmer.cpp:69` norms the EMBEDDINGS
+with a weightless RMS -- `bloom`'s embedding norm, the only other one
+of the 155, has a weight, and every other weightless RMS is a layer
+slot -- and `:63` runs the post-attention and post-FFN norms at a
+LITERAL eps of 1e-8 while the pre-norms use the model's key.
+`norm_sites::WEIGHTLESS_EMBEDDING_NORM` and
+`norm::POST_NORM_EPS_LITERAL` are the two tables,
+`ModelConfig::post_norm_eps()` the one accessor the three host
+post-norm sites read, and every fused Metal launch and the CUDA
+prefill refuse a model whose two epsilons differ, because each bakes
+ONE epsilon into its kernel. Its fixture declares the model epsilon
+four orders larger than the literal, so the two cannot be swapped
+without moving the logits.
+
+So **six** triaged refusals are left, and they say which of three
 things is missing: **0 are a fixture away, 0 are one match arm away**,
-6 need new code, 1 is unknown with the question stated. Both cheap
+5 need new code, 1 is unknown with the question stated. Both cheap
 classes are EMPTY again, which is where they were before the pin
-moved, and the three rows that closed were the three cheapest of the
-eight it brought in.
+moved, and FOUR of the eight rows the pin brought in closed the day it
+moved.
 
 Three things the pin move found that are not new architectures at all:
 `kimi_k3` had been spelled with an UNDERSCORE in the catalog since it

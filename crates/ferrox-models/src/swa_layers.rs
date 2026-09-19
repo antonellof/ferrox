@@ -196,6 +196,13 @@ pub fn array_length(arch: &str, trunk: &TrunkLayers) -> usize {
 pub const SCALAR_THEN_ARRAY_READERS: &[(&str, &str)] = &[
     ("mellum", "src/models/mellum.cpp:12-17"),
     ("cohere2moe", "src/models/cohere2moe.cpp:32-36"),
+    // `muse-glimmer.cpp:26` calls `load_swa_pattern(ml, 4)`, which
+    // tries the ARRAY first (`llama-model.cpp:3309`) and falls back to
+    // the scalar and then to a seeded period of 4 with `dense_first =
+    // false`. Array-first versus scalar-first is not observable: one
+    // key holds either a scalar or an array, and each overload returns
+    // false for the other's spelling.
+    ("muse-glimmer", "src/models/muse-glimmer.cpp:26"),
 ];
 
 /// THE table. Derived from the two censuses above rather than restated

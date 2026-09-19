@@ -8661,6 +8661,7 @@ pub(crate) mod tests {
             vocab_size,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
+            post_norm_eps: 1e-5,
             sliding_window: None,
             moe: MoeLayerConfig {
                 expert_weights_scale: 1.0,

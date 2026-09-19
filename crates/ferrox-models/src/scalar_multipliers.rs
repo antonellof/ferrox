@@ -498,6 +498,10 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     ("talkie", MultiplierSupport::TALKIE),
     ("command-r", MultiplierSupport::COMMAND_R),
     ("cohere2", MultiplierSupport::COHERE2),
+    // `muse-glimmer.cpp:8` reads `logit_scale` REQUIRED and `:186`
+    // MULTIPLIES by it, which is `cohere2`'s shape rather than
+    // Granite's divide.
+    ("muse-glimmer", MultiplierSupport::COHERE2),
     // `cohere2moe.cpp:14,287-289`: the same REQUIRED key, multiplied
     // when nonzero.
     ("cohere2moe", MultiplierSupport::COHERE2),

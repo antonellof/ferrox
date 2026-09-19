@@ -760,6 +760,12 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // layer is special, so a loader that read one into the other is
     // caught.
     "granite_swa",
+    // tests/muse_glimmer_graphs.rs: `muse-glimmer`, the fourth row
+    // closed against the moved pin. Two norm facts no other
+    // architecture has -- a weightless RMS on the EMBEDDINGS and a
+    // post-norm epsilon that is a literal in the graph rather than the
+    // model's key -- on top of four tables that each gained one name.
+    "muse-glimmer",
     // tests/attn_temperature_graphs.rs: `mistral3` (mistral3.cpp:5,
     // 14-17, 153-156), every Ministral-3 export. Its one blocker was
     // the PER-POSITION ATTENTION TEMPERATURE, `attention.temperature_scale`,
@@ -1615,19 +1621,18 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          `rope_pattern` with it, which is `rope_finetuned::unrotated` plus the per-layer \
          array `granite_swa` needs",
     ),
-    (
-        "muse-glimmer",
-        TriageClass::NewCode,
-        "two nameable pieces, both about norms. (1) `src/models/muse-glimmer.cpp:69` norms the \
-         EMBEDDING with a WEIGHTLESS RMS -- `crate::norm_sites`'s embedding-norm row is \
-         `bloom`'s weighted one and `NormOp::RmsNoParams` is a LAYER slot, so the pair does \
-         not exist yet. (2) `:140-141,166-167` apply the post-attention and post-FFN norms \
-         at a LITERAL eps of 1e-8 (`:63`), not the model's `f_norm_rms_eps`, so an eps that \
-         is one field per model cannot spell it. Everything else it has is served: the \
-         sigmoid attention gate (`:100-135`, `crate::attn_gate`), RoPE on the sliding \
-         layers only (`:88`, `RopeLayers::SlidingOnly`), the `logit_scale` multiply and \
-         the final tanh softcap (`:184-193`)",
-    ),
+    // `muse-glimmer` was HERE for one PR, NEW CODE on two norm facts,
+    // and is audited now: the WEIGHTLESS embedding norm is
+    // `norm_sites::WEIGHTLESS_EMBEDDING_NORM` with `NormOp::
+    // RmsNoParams` at the site `bloom`'s weighted one already had, and
+    // the post-norm epsilon literal is `norm::POST_NORM_EPS_LITERAL`
+    // read through `ModelConfig::post_norm_eps()` at the three host
+    // post-norm sites, with the fused Metal launches and the CUDA
+    // prefill refusing a model whose two epsilons differ. The rest was
+    // served and each table gained one name: the per-element sigmoid
+    // gate, `RopeLayers::SlidingOnly`, the `logit_scale` multiply with
+    // the final tanh softcap, and the window pattern read scalar-then-
+    // array. `tests/muse_glimmer_graphs.rs`.
     // `ernie4_5-moe` was HERE, ONE MATCH ARM on
     // `{arch}.interleave_moe_layer_step`. Building its fixture found the
     // arm is not implementable against a reference: llama.cpp's tensor
@@ -2409,6 +2414,24 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `rope_layers::RopeLayers::Never` as the other half of each.
         // `tests/rope_layout.rs`'s `LLAMA_NO_ROPE` pins that a row of
         // that group reaches the generic path ONLY under `Never`.
+        // `muse-glimmer` was NEW CODE in `NORM_ROPE_TRIAGED` for one
+        // PR on its two norm facts and is audited now
+        // (`tests/muse_glimmer_graphs.rs`). NORM RoPE:
+        // `llama_model_rope_type` puts LLM_ARCH_MUSE_GLIMMER in the
+        // NORM group, which `tests/rope_layout.rs` pins. Per-head QK
+        // norm: `muse-glimmer.cpp:40-41` stores `{n_embd_head_k}`
+        // weights and `:106-107` apply them per head.
+        v.push(prof(
+            "muse-glimmer",
+            TextGeneration,
+            StandardGqa,
+            KvIswa,
+            RopeLayout::Norm,
+            ArchPath::GenericGqa {
+                rope: RopeLayout::Norm,
+            },
+            PerHead,
+        ));
         // `granite_swa` was NEW CODE in `NORM_ROPE_TRIAGED` for one PR
         // on its two per-layer tables and is audited now
         // (`tests/granite_swa_graphs.rs`). NORM RoPE:
@@ -3601,7 +3624,7 @@ pub fn attention_scale_override(
 ///
 /// The Gemma family is not here because it is exempted as a family
 /// below; a name here is one whose graph was read for both softcaps.
-pub const LOGIT_SOFTCAP_ARCHITECTURES: &[&str] = &["grok"];
+pub const LOGIT_SOFTCAP_ARCHITECTURES: &[&str] = &["grok", "muse-glimmer"];
 
 /// Metadata keys that, when present with a nonzero value, require math
 /// ferrox's generic decoder does not implement *unless* the architecture
@@ -3965,7 +3988,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 7,
+            seen == 6,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -4092,11 +4115,14 @@ mod audit_tests {
              `maple.cpp` alone could have found: `llama-graph.cpp:2228` sends four \
              architectures, `maple` among them, to `ggml_swiglu_clamp`, which clamps the \
              gate BEFORE the SiLU where every other graph clamps the SiLU's output \
-             (`ferrox_moe::ClampForm`). `granite_swa` closed the same day too, on \
+             (`ferrox_moe::ClampForm`). `granite_swa` and `muse-glimmer` closed the same day too, the \
+             first on \
              `RopeLayers::FileMask` -- `attention.rope_pattern`, one line of 155 and the \
              FIRST upstream graph that lets the FILE say which layers rotate -- so the \
-             count is 7, and the three rows that closed were the three cheapest of the \
-             eight the pin brought in"
+             count is 6, and the second on two norm facts nothing else upstream has (a \
+             WEIGHTLESS RMS on the embeddings and a post-norm epsilon written as a \
+             literal in the graph). Four of the eight rows the pin brought in closed the \
+             day it moved"
         );
     }
 

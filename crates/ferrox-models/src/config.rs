@@ -202,6 +202,15 @@ pub struct ModelConfig {
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
+    /// The epsilon the POST-attention and POST-FFN norms run at.
+    ///
+    /// Equal to [`Self::rms_norm_eps`] for every architecture but the
+    /// one whose graph writes a literal (`crate::norm::
+    /// POST_NORM_EPS_LITERAL`, `muse-glimmer.cpp:63`). Set by the
+    /// loader from that table so the two cannot be given different
+    /// answers by two callers, and read through
+    /// [`Self::post_norm_eps`].
+    pub post_norm_eps: f32,
     /// The norm FUNCTION every weighted site applies
     /// (`crate::norm::norm_function`): the architecture's, or, for
     /// `crate::norm::NORM_BY_RMS_EPS_KEY`, the file's.
@@ -862,6 +871,12 @@ impl ModelConfig {
     /// take the base and the divisors without also answering "does this
     /// layer rotate": that is the third thing the three had to agree
     /// about, and two of them were already one value for this reason.
+    /// The epsilon the post-attention / post-FFN norms run at. One
+    /// accessor so a site cannot read the model's epsilon by habit.
+    pub fn post_norm_eps(&self) -> f32 {
+        self.post_norm_eps
+    }
+
     pub fn layer_rope(&self, layer_idx: usize) -> Option<LayerRopeParams<'_>> {
         let sliding = self.layer_sliding_window(layer_idx).is_some();
         if !self.rope_layers.rotates(layer_idx, sliding) {
@@ -1006,6 +1021,7 @@ pub fn glm_5_2() -> ModelConfig {
         vocab_size: 151552,
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-5,
+        post_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
             routed_weight_before_ffn: false,
@@ -1101,6 +1117,7 @@ pub fn deepseek_v4_pro() -> ModelConfig {
         vocab_size: 129280,
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-6,
+        post_norm_eps: 1e-6,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
             routed_weight_before_ffn: false,
@@ -1210,6 +1227,7 @@ pub fn kimi_k3() -> ModelConfig {
         // yet, so this remains an unconfirmed placeholder.
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-5,
+        post_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
             routed_weight_before_ffn: false,
@@ -1330,6 +1348,7 @@ pub fn test_dense_fixture() -> ModelConfig {
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
+        post_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
             routed_weight_before_ffn: false,
@@ -1405,6 +1424,7 @@ pub fn test_moe_fixture() -> ModelConfig {
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
+        post_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
             routed_weight_before_ffn: false,
@@ -1482,6 +1502,7 @@ pub fn test_mixed_fixture() -> ModelConfig {
         vocab_size: 32,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
+        post_norm_eps: 1e-5,
         moe: MoeLayerConfig {
             expert_weights_scale: 1.0,
             routed_weight_before_ffn: false,
