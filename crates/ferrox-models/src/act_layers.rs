@@ -41,7 +41,7 @@
 use std::sync::Arc;
 
 use ferrox_gguf::{GgufValue, TensorSource};
-use ferrox_moe::{GluAct, XieluParams};
+use ferrox_moe::{ClampForm, GluAct, XieluParams};
 
 use crate::config::{FfnActivation, ModelConfig};
 use crate::loader::LoadError;
@@ -163,12 +163,49 @@ pub fn read_xielu_layers(
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwigluClamps {
     /// `{arch}.swiglu_clamp_exp`, read by `build_moe_ffn` for the
-    /// ROUTED experts (llama-graph.cpp:2146).
+    /// ROUTED experts (llama-graph.cpp:2225).
     routed: Arc<[f32]>,
     /// `{arch}.swiglu_clamp_shexp`, read by `build_ffn` for the SHARED
-    /// experts AND the leading dense layers (llama-graph.cpp:1751),
+    /// experts AND the leading dense layers (llama-graph.cpp:1831),
     /// because `build_ffn` is both.
     dense: Arc<[f32]>,
+    /// WHERE the gate's clamp goes, which llama.cpp decides by
+    /// architecture (`llama-graph.cpp:2228`, `:1834`): the four
+    /// architectures listed in [`CLAMP_BEFORE_SILU`] call
+    /// `ggml_swiglu_clamp` and everyone else takes the `else` branch.
+    /// Carried HERE, beside the arrays, so a limit cannot be read
+    /// without the form that says what it means.
+    form: ClampForm,
+}
+
+/// The architectures whose clamped SwiGLU clamps the gate BEFORE the
+/// SiLU (`ggml_swiglu_clamp`), with the line that decides it.
+///
+/// `grep -n 'ggml_swiglu_clamp' src/llama-graph.cpp` is two sites --
+/// the routed experts at `:2228-2229` and the dense/shared FFN at
+/// `:1834-1835` -- and the two lists differ: `maple` and `hy_v4` take
+/// the special form for their ROUTED experts only, `deepseek4` and
+/// `dflash` (with `dsv4_hc_mult > 0`) for both. Only `maple` is on this
+/// engine, and it has no dense or shared FFN at all, so one field
+/// serves it; a row that needed the two sites to disagree would need a
+/// second field and this comment says so.
+pub const CLAMP_BEFORE_SILU: &[(&str, &str)] = &[
+    ("maple", "src/llama-graph.cpp:2228 (routed only)"),
+    ("deepseek4", "src/llama-graph.cpp:1834,2228 (own engine)"),
+    ("hy_v4", "src/llama-graph.cpp:2228 (refused: dedicated)"),
+    (
+        "dflash",
+        "src/llama-graph.cpp:1834,2228 when dsv4_hc_mult > 0 (deferred)",
+    ),
+];
+
+/// Which form `arch`'s clamped SwiGLU takes. See [`CLAMP_BEFORE_SILU`].
+pub fn clamp_form(arch: &str) -> ClampForm {
+    if CLAMP_BEFORE_SILU.iter().any(|(a, _)| *a == arch) {
+        ClampForm::BeforeSilu
+    } else {
+        ClampForm::AfterSilu
+    }
 }
 
 /// llama-graph.cpp:1753 / :2148: `constexpr float eps = 1e-6f; if
@@ -176,28 +213,33 @@ pub struct SwigluClamps {
 const CLAMP_EPS: f32 = 1e-6;
 
 impl SwigluClamps {
-    /// One entry per trunk layer in each array, in layer order.
-    pub fn new(routed: Vec<f32>, dense: Vec<f32>) -> Self {
+    /// One entry per trunk layer in each array, in layer order, with
+    /// the architecture's clamp form.
+    pub fn new(routed: Vec<f32>, dense: Vec<f32>, form: ClampForm) -> Self {
         assert_eq!(routed.len(), dense.len(), "one entry per layer in both");
         Self {
             routed: routed.into(),
             dense: dense.into(),
+            form,
         }
     }
 
     /// The activation layer `il`'s routed experts run.
     pub fn routed(&self, il: usize) -> GluAct {
-        Self::act(self.routed[il])
+        self.act(self.routed[il])
     }
 
     /// The activation layer `il`'s dense FFN or shared experts run.
     pub fn dense(&self, il: usize) -> GluAct {
-        Self::act(self.dense[il])
+        self.act(self.dense[il])
     }
 
-    fn act(limit: f32) -> GluAct {
+    fn act(&self, limit: f32) -> GluAct {
         if limit > CLAMP_EPS {
-            GluAct::SwigluClamped { limit }
+            GluAct::SwigluClamped {
+                limit,
+                form: self.form,
+            }
         } else {
             GluAct::Swiglu
         }
@@ -228,7 +270,7 @@ impl SwigluClamps {
 /// architecture the
 /// arrays stay zero-filled upstream whatever the file says, so the
 /// keys are dead metadata there and ferrox ignores them the same way.
-pub const SWIGLU_CLAMP_READERS: &[&str] = &["step35"];
+pub const SWIGLU_CLAMP_READERS: &[&str] = &["step35", "maple"];
 
 /// Does this architecture's graph read `swiglu_clamp_exp` / `_shexp`?
 pub fn reads_swiglu_clamps(arch: &str) -> bool {
@@ -266,7 +308,11 @@ pub fn read_swiglu_clamps(
         v.truncate(trunk.n_layers);
         Ok(v)
     };
-    Ok(Some(SwigluClamps::new(read(&exp_key)?, read(&shexp_key)?)))
+    Ok(Some(SwigluClamps::new(
+        read(&exp_key)?,
+        read(&shexp_key)?,
+        clamp_form(arch),
+    )))
 }
 
 /// Architectures whose FFN activation is xIELU: the graphs that call
@@ -519,6 +565,38 @@ mod tests {
         assert!(err.to_string().contains("xielu.alpha_p"), "{err}");
     }
 
+    /// The clamp FORM is decided by architecture, and the two forms
+    /// are different functions wherever the clamp binds.
+    ///
+    /// `maple` is the row that found this: everything else in its graph
+    /// matched libllama with the clamp arrays zeroed, and a fixture
+    /// whose limits never bind would have agreed with either form.
+    #[test]
+    fn the_clamp_form_is_per_architecture_and_the_two_forms_differ() {
+        assert_eq!(clamp_form("maple"), ClampForm::BeforeSilu);
+        assert_eq!(clamp_form("step35"), ClampForm::AfterSilu);
+        assert_eq!(clamp_form("llama"), ClampForm::AfterSilu);
+        for (arch, line) in CLAMP_BEFORE_SILU {
+            assert!(line.contains("llama-graph.cpp:"), "`{arch}` cites no line");
+            assert_eq!(clamp_form(arch), ClampForm::BeforeSilu);
+        }
+        // Above the limit the SiLU's output is clamped in one form and
+        // its INPUT in the other, and `silu(min(g, l)) != min(silu(g), l)`:
+        // at g = 6 and l = 2, `silu(2) = 1.7616` against `min(5.985, 2) = 2`.
+        let before = GluAct::SwigluClamped {
+            limit: 2.0,
+            form: ClampForm::BeforeSilu,
+        };
+        let after = GluAct::SwigluClamped {
+            limit: 2.0,
+            form: ClampForm::AfterSilu,
+        };
+        assert!((before.combine(6.0, 1.0) - 1.761_594).abs() < 1e-5);
+        assert!((after.combine(6.0, 1.0) - 2.0).abs() < 1e-5);
+        // Below it they agree, which is why a fixture has to bind.
+        assert!((before.combine(0.5, 1.0) - after.combine(0.5, 1.0)).abs() < 1e-7);
+    }
+
     /// The clamp tables: each site reads its own array, a zero entry is
     /// plain SwiGLU on that site alone, and the whole-model answer is
     /// `None` even when every entry is zero, because the variant is per
@@ -530,18 +608,25 @@ mod tests {
         cfg.ffn_activation = FfnActivation::SwigluClamped(SwigluClamps::new(
             vec![0.0, 1.5, 0.0],
             vec![2.0, 0.0, 1e-7],
+            ClampForm::AfterSilu,
         ));
         assert_eq!(
             cfg.layer_ffn_acts(0),
             LayerFfnActs {
                 routed: GluAct::Swiglu,
-                dense: GluAct::SwigluClamped { limit: 2.0 },
+                dense: GluAct::SwigluClamped {
+                    limit: 2.0,
+                    form: ClampForm::AfterSilu
+                },
             }
         );
         assert_eq!(
             cfg.layer_ffn_acts(1),
             LayerFfnActs {
-                routed: GluAct::SwigluClamped { limit: 1.5 },
+                routed: GluAct::SwigluClamped {
+                    limit: 1.5,
+                    form: ClampForm::AfterSilu
+                },
                 dense: GluAct::Swiglu,
             }
         );
@@ -574,14 +659,32 @@ mod tests {
             .expect("reads")
             .expect("one key is a table");
         assert_eq!(clamps.len(), 2, "trunk entries only");
-        assert_eq!(clamps.routed(1), GluAct::SwigluClamped { limit: 7.0 });
+        assert_eq!(
+            clamps.routed(1),
+            GluAct::SwigluClamped {
+                limit: 7.0,
+                form: ClampForm::AfterSilu
+            }
+        );
         assert_eq!(clamps.dense(1), GluAct::Swiglu, "the absent key is zeros");
         md.insert("step35.swiglu_clamp_shexp", GgufValue::F32(16.0));
         let clamps = read_swiglu_clamps(&md, "step35", &trunk)
             .expect("reads")
             .expect("table");
-        assert_eq!(clamps.dense(0), GluAct::SwigluClamped { limit: 16.0 });
-        assert_eq!(clamps.dense(1), GluAct::SwigluClamped { limit: 16.0 });
+        assert_eq!(
+            clamps.dense(0),
+            GluAct::SwigluClamped {
+                limit: 16.0,
+                form: ClampForm::AfterSilu
+            }
+        );
+        assert_eq!(
+            clamps.dense(1),
+            GluAct::SwigluClamped {
+                limit: 16.0,
+                form: ClampForm::AfterSilu
+            }
+        );
         md.insert("step35.swiglu_clamp_exp", arr(&[0.0, 7.0]));
         let err = read_swiglu_clamps(&md, "step35", &trunk).expect_err("wrong length refuses");
         assert!(err.to_string().contains("swiglu_clamp_exp"), "{err}");

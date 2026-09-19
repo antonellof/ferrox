@@ -86,14 +86,45 @@ use ferrox_core::matmul::{geglu, swiglu};
 ///
 /// Not `Eq`: two variants hold `f32`s. Every comparison in the tree is
 /// `assert_eq!` on values, which wants only `PartialEq`.
+/// Where the gate's clamp sits relative to the SiLU, which llama.cpp
+/// decides by ARCHITECTURE and not by any key.
+///
+/// `llama-graph.cpp:2221-2241` (the routed experts) and `:1827-1847`
+/// (the dense FFN and the shared experts) each branch: `LLM_ARCH_MAPLE`,
+/// `LLM_ARCH_DEEPSEEK4`, `LLM_ARCH_HY_V4` and `LLM_ARCH_DFLASH` with a
+/// nonzero `dsv4_hc_mult` call `ggml_swiglu_clamp`, whose CPU kernel is
+/// `gate = min(g, limit); up = clamp(u, -limit, limit); out = gate *
+/// sigmoid(gate) * up` (`ggml/src/ggml-cpu/ops.cpp:3450-3454`); every
+/// other architecture takes the `else` branch, which clamps the SiLU's
+/// OUTPUT instead.
+///
+/// The two agree wherever `silu(x) <= limit` and disagree above it, so
+/// a fixture whose clamp never binds cannot tell them apart -- which is
+/// how `maple` was first measured 0.12 off with everything else
+/// already matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClampForm {
+    /// `min(silu(gate), limit)` -- the generic `else` branch
+    /// (`step35`).
+    AfterSilu,
+    /// `silu(min(gate, limit))` -- `ggml_swiglu_clamp` (`maple`,
+    /// `deepseek4`, `hy_v4`, `dflash` with hyper-connections).
+    BeforeSilu,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GluAct {
     /// `silu(gate) * up`.
     Swiglu,
-    /// `min(silu(gate), limit) * clamp(up, -limit, limit)`.
+    /// `min(silu(gate), limit) * clamp(up, -limit, limit)`, or with
+    /// [`ClampForm::BeforeSilu`] `silu(min(gate, limit)) * clamp(up,
+    /// -limit, limit)`. The two are NOT the same function and llama.cpp
+    /// picks between them by architecture -- see [`ClampForm`].
     SwigluClamped {
         /// The layer's `swiglu_clamp_exp` / `_shexp` entry, above `1e-6`.
         limit: f32,
+        /// Where the gate's clamp goes relative to the SiLU.
+        form: ClampForm,
     },
     /// `gelu(gate) * up`.
     Geglu,
@@ -210,8 +241,12 @@ impl GluAct {
     pub fn combine(self, gate: f32, up: f32) -> f32 {
         match self {
             GluAct::Swiglu => ferrox_core::matmul::silu(gate) * up,
-            GluAct::SwigluClamped { limit } => {
-                ferrox_core::matmul::silu(gate).min(limit) * up.clamp(-limit, limit)
+            GluAct::SwigluClamped { limit, form } => {
+                let g = match form {
+                    ClampForm::AfterSilu => ferrox_core::matmul::silu(gate).min(limit),
+                    ClampForm::BeforeSilu => ferrox_core::matmul::silu(gate.min(limit)),
+                };
+                g * up.clamp(-limit, limit)
             }
             GluAct::Geglu => ferrox_core::matmul::gelu(gate) * up,
             GluAct::Reglu => ferrox_core::matmul::relu(gate) * up,
@@ -402,7 +437,10 @@ mod tests {
     /// inside it reduce to plain SwiGLU.
     #[test]
     fn clamped_swiglu_matches_llama_cpp_s_else_branch() {
-        let act = GluAct::SwigluClamped { limit: 2.0 };
+        let act = GluAct::SwigluClamped {
+            limit: 2.0,
+            form: ClampForm::AfterSilu,
+        };
         let silu = ferrox_core::matmul::silu;
         // Both clamps bite.
         assert!((act.combine(5.0, -7.0) - silu(5.0).min(2.0) * -2.0).abs() < 1e-6);
@@ -428,7 +466,10 @@ mod tests {
         let up = [0.9f32, -1.1, 0.5, -0.3, 1.7];
         for act in [
             GluAct::Swiglu,
-            GluAct::SwigluClamped { limit: 0.5 },
+            GluAct::SwigluClamped {
+                limit: 0.5,
+                form: ClampForm::AfterSilu,
+            },
             GluAct::Geglu,
             GluAct::Reglu,
             GluAct::ReluSqr,

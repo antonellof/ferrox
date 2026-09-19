@@ -60,7 +60,32 @@ are the ones worth reading twice.
   reference's own approximation, measured rather than assumed
   (`tests/gated_attention_graphs.rs`).
 
+- **`maple` runs (Maple-20B)**, the second row closed against the moved
+  pin, and the one that says what a verdict read from a single graph
+  file can miss. The row itself was one `crate::rope_layers` entry --
+  `src/models/maple.cpp:88` rotates the sliding layers and not the full
+  ones, `RopeLayers::SlidingOnly` -- and with the clamp arrays zeroed
+  the fixture matched libllama on the first run. With them nonzero it
+  was 0.12 off, because `llama-graph.cpp:2228` sends four architectures
+  (`maple`, `deepseek4`, `hy_v4`, `dflash` with hyper-connections) to
+  `ggml_swiglu_clamp`, whose kernel clamps the gate BEFORE the SiLU
+  where every other graph clamps the SiLU's output. `ferrox_moe::
+  ClampForm` is the two forms, carried ON `SwigluClamps` so a limit
+  cannot be read without the form that says what it means, and
+  `act_layers::CLAMP_BEFORE_SILU` is the list with the line. The two
+  agree wherever `silu(x) <= limit`, so a fixture whose clamp never
+  binds cannot tell them apart -- this one binds on two layers of four
+  (`tests/no_rope_layer_graphs.rs`).
+
 ### Fixed
+
+- **`expert_feed_forward_length` is scalar OR an array too**, and the
+  array spelling silently sized every expert at `feed_forward_length /
+  n_experts_used`. Same key shape and same converter as
+  `expert_used_count` below (`conversion/nemotron.py:573` writes a list
+  for Nemotron-H Puzzle), found because the `maple` fixture declares
+  the array and ferrox built its experts 24 wide where the file said
+  16. A uniform array is honoured; a varying one stops by name.
 
 - **`expert_used_count` is scalar OR an array, and the array spelling
   silently became 2.** `llama-model.cpp:1266` reads the key with

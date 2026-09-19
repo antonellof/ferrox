@@ -52,7 +52,7 @@ use common::{
 };
 use ferrox_models::act_layers::{LayerFfnActs, SwigluClamps};
 use ferrox_models::{FfnActivation, ModelConfig, RopeLayout};
-use ferrox_moe::GluAct;
+use ferrox_moe::{ClampForm, GluAct};
 
 const STEP35: &str = "step35";
 /// The same weights with neither clamp key.
@@ -235,13 +235,37 @@ fn each_layer_s_two_sites_carry_their_own_clamp() {
     // scripts/make_step35_fixture.py: CLAMP_EXP = [0, 1.5, 0, 2.5],
     // CLAMP_SHEXP = [2.0, 3.0, 1.0, 0].
     let want = [
-        (GluAct::Swiglu, GluAct::SwigluClamped { limit: 2.0 }),
         (
-            GluAct::SwigluClamped { limit: 1.5 },
-            GluAct::SwigluClamped { limit: 3.0 },
+            GluAct::Swiglu,
+            GluAct::SwigluClamped {
+                limit: 2.0,
+                form: ClampForm::AfterSilu,
+            },
         ),
-        (GluAct::Swiglu, GluAct::SwigluClamped { limit: 1.0 }),
-        (GluAct::SwigluClamped { limit: 2.5 }, GluAct::Swiglu),
+        (
+            GluAct::SwigluClamped {
+                limit: 1.5,
+                form: ClampForm::AfterSilu,
+            },
+            GluAct::SwigluClamped {
+                limit: 3.0,
+                form: ClampForm::AfterSilu,
+            },
+        ),
+        (
+            GluAct::Swiglu,
+            GluAct::SwigluClamped {
+                limit: 1.0,
+                form: ClampForm::AfterSilu,
+            },
+        ),
+        (
+            GluAct::SwigluClamped {
+                limit: 2.5,
+                form: ClampForm::AfterSilu,
+            },
+            GluAct::Swiglu,
+        ),
     ];
     for (il, (routed, dense)) in want.into_iter().enumerate() {
         assert_eq!(
@@ -275,7 +299,8 @@ fn reading_the_arrays_at_the_wrong_site_diverges_from_llama_cpp() {
         ("dense at both", dense.clone(), dense.clone()),
     ] {
         let mut dec = load_graph_fixture(STEP35);
-        dec.config.ffn_activation = FfnActivation::SwigluClamped(SwigluClamps::new(r, d));
+        dec.config.ffn_activation =
+            FfnActivation::SwigluClamped(SwigluClamps::new(r, d, ClampForm::AfterSilu));
         let mut kv = graph_caches(&dec);
         let worst = worst_vs(
             &dec.forward_batch_last(&GRAPH_PROMPT, 0, &mut kv),

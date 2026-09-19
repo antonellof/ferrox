@@ -709,7 +709,36 @@ impl ModelConfig {
                     }
                 });
         let feed_forward_length = ffn_per_layer.as_ref().and_then(|v| v.iter().copied().max());
-        let expert_ffn_dim = metadata_u64_any(file, &[key("expert_feed_forward_length")])
+        // Scalar OR an array, exactly as `expert_used_count` above:
+        // llama.cpp reads it with `get_key_or_arr` (`maple.cpp:6`,
+        // `dots3note.cpp:11`, `nemotron-h.cpp`), and
+        // `conversion/nemotron.py:573` writes a LIST for Nemotron-H
+        // Puzzle -- an architecture ferrox serves. Read as a scalar
+        // alone, an array answered `None` here and the fallback below
+        // silently sized every expert at `feed_forward_length /
+        // n_experts_used`, which is a different FFN and loads without
+        // complaint when the tensors happen to be that wide.
+        let expert_ffn_per_layer = crate::layer_shapes::read_u64_per_layer(
+            file,
+            &key("expert_feed_forward_length"),
+            block_count,
+        )?;
+        if let Some(per_layer) = expert_ffn_per_layer.as_ref() {
+            let first = per_layer[0];
+            if per_layer.iter().any(|v| *v != first) {
+                return Err(LoadError::UnsupportedFeature(
+                    key("expert_feed_forward_length"),
+                    format!(
+                        "a PER-LAYER expert FFN width ({per_layer:?}). llama.cpp sizes the \
+                         expert tensors from layer 0's entry and `LayerShapes` carries one \
+                         expert width for the model, so ferrox would build every layer at \
+                         {first} and read the others' weights at the wrong stride"
+                    ),
+                ));
+            }
+        }
+        let expert_ffn_dim = expert_ffn_per_layer
+            .map(|v| v[0])
             .or_else(|| {
                 feed_forward_length.map(|ff| {
                     if is_moe && n_experts_active > 0 {

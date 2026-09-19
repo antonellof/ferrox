@@ -194,11 +194,64 @@ const SMOLLM3_GOLDEN: [f32; 48] = [
     0.352763,
 ];
 
+/// llama.cpp's logits for `maple_tiny.gguf` over [`GRAPH_PROMPT`].
+const MAPLE_GOLDEN: [f32; 48] = [
+    0.6486808,
+    -0.23711741,
+    -0.5294898,
+    -0.46147358,
+    -1.9501901,
+    3.4603767,
+    0.15342909,
+    0.5967338,
+    0.26974905,
+    3.5528212,
+    -1.273411,
+    -1.2770839,
+    -1.8373278,
+    2.3348446,
+    0.009929895,
+    -0.6402428,
+    2.4302635,
+    0.2994001,
+    -1.1233808,
+    -0.85524726,
+    -2.314069,
+    0.15556979,
+    0.22562456,
+    0.4092492,
+    -2.305313,
+    1.2321382,
+    -0.66026187,
+    1.2131181,
+    3.2547603,
+    -1.1485307,
+    0.2499813,
+    0.66347164,
+    -2.2737732,
+    1.6876196,
+    0.4008119,
+    -0.59180975,
+    0.7276684,
+    0.29646862,
+    0.77146876,
+    1.9338744,
+    4.3427477,
+    1.137814,
+    1.5413116,
+    -0.009805858,
+    -0.3871348,
+    0.8032818,
+    -1.3253019,
+    1.0272561,
+];
+
 fn golden(name: &str) -> &'static [f32] {
     match name {
         "exaone4_32b" => &EXAONE4_32B_GOLDEN,
         "exaone_moe" => &EXAONE_MOE_GOLDEN,
         "smollm3" => &SMOLLM3_GOLDEN,
+        "maple" => &MAPLE_GOLDEN,
         other => panic!("no golden for {other}"),
     }
 }
@@ -213,6 +266,10 @@ fn expected_unrotated(name: &str, n_layers: usize) -> Vec<usize> {
         "exaone4_32b" | "exaone_moe" => (0..n_layers).filter(|il| il % 4 == 3).collect(),
         // smollm3.cpp:69: (il + 1) % 4 == 0.
         "smollm3" => (0..n_layers).filter(|il| (il + 1) % 4 == 0).collect(),
+        // maple.cpp:88 rotates only where `is_swa(il)`, and the
+        // fixture's `attention.sliding_window_pattern` array says
+        // [true, true, false, true] -- so layer 2, and only layer 2.
+        "maple" => vec![2],
         other => panic!("no expectation for {other}"),
     }
 }
@@ -226,6 +283,19 @@ fn argmax(v: &[f32]) -> usize {
 }
 
 // --- the evidence ------------------------------------------------------
+
+/// Maple, the SlidingOnly rule read off a per-layer ARRAY rather than a
+/// period.
+///
+/// The two EXAONE rows and `cohere2` reach `SlidingOnly` with the
+/// sliding layers decided by a seeded period; this fixture's pattern is
+/// an array the FILE carries, so what it adds is that the two seams
+/// compose -- `swa_layers` answers which layers slide, `rope_layers`
+/// rotates exactly those, and neither restates the other's answer.
+#[test]
+fn maple_matches_llama_cpp_on_all_three_paths() {
+    assert_all_three_paths_match("maple", &MAPLE_GOLDEN);
+}
 
 #[test]
 fn exaone4_32b_matches_llama_cpp_on_all_three_paths() {

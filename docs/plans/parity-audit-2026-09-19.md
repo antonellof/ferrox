@@ -43,11 +43,11 @@ $ comm -13 /tmp/pin.txt /tmp/up.txt
 
 | arch | graph | lines | what it is, and what ferrox would need |
 |---|---|---|---|
+| `spark2_5` | `spark2-5.cpp` | 146 | **CLOSED 2026-09-19**: one `attn_gate` row (sigmoid, per head) and three tables that each gained a name |
+| `maple` | `maple.cpp` | 150 | **CLOSED 2026-09-19**: one `rope_layers` row (`SlidingOnly`) plus `ClampForm::BeforeSilu`, which `maple.cpp` does not show -- `llama-graph.cpp:2228` decides it |
 | `granite_swa` | `granite-swa.cpp` | 319 | Granite's four multipliers (served) on an iSWA pattern array (served) with an optional per-layer `expert_used_count` ARRAY. Closest to a fixture-away row of the fourteen |
 | `graniteswitch` | `granite-switch.cpp` | 427 | the same multipliers plus an `adapter_ids` argument threaded through the layer: a per-token expert-adapter selection with no counterpart here |
-| `maple` | `maple.cpp` | 150 | iSWA with `rope.freq_base_swa` and the `swiglu_clamp_exp` array (both served, `step35`), MoE with a per-layer `expert_ff_length` array. Second-closest |
 | `muse-glimmer` | `muse-glimmer.cpp` | 203 | window + `logit_scale` + final logit softcap (all served) with an attention GATE (`attn_gate`, served since `afmoe`) |
-| `spark2_5` | `spark2-5.cpp` | 146 | plain layers with an attention gate |
 | `hrm_text` | `hrm-text.cpp` | 213 | two transformer stacks alternating over one token stream under H/L cycle counts. `crate::layer_loops` (nanbeige) is the same IDEA -- weights replayed, KV logical -- with a different schedule |
 | `dots3note` | `dots3note.cpp` | 476 | DSA indexer + absorbed MLA (the `glm-dsa` engine's shape) with step35's head-wise output gate |
 | `hy_v4` | `hy-v4.cpp` | 601 | independent hyper-connections: several residual streams reduced and redistributed per layer, plus a DSA cache |
@@ -192,8 +192,11 @@ gap of the same size.
 2. **Speculative decoding in the server.** Built, tested, lossless,
    unreachable; the metric for it already exists. Both engines have
    it; only ferrox has it and cannot serve it.
-3. **`granite_swa` and `maple`**, the two new llama.cpp rows that need
-   no new op. A fixture each.
+3. ~~**`granite_swa` and `maple`**~~ -- `maple` closed on 2026-09-19
+   with `spark2_5`; `granite_swa` is left and needs two small per-layer
+   tables (an `expert_used_count` array, which the loader now reads,
+   and `attention.rope_pattern`, the first upstream graph that lets the
+   FILE decide which layers rotate).
 4. **`bert` and the encoder/embedding family.** Eleven llama.cpp rows
    and vLLM's whole pooling scope in one seam, and ferrox already has
    the two routes that would serve them.

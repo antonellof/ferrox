@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-19 against a MOVED PIN. **94**
+Honest position, re-audited 2026-09-19 against a MOVED PIN. **95**
 architectures run with evidence (`capability::AUDITED_GENERIC_GQA`), 4
 more have dedicated engines, and everything else REFUSES. The "loads
 and is WRONG" class is closed: the generic path is opt-in, so an
@@ -43,11 +43,28 @@ row is pinned at 5e-3 with that measurement beside it. Three sabotages
 (the activation, the window-array reader, the GeGLU row) each move the
 logits by more than 0.8.
 
-So **nine** triaged refusals are left, and they say which of three
-things is missing: **0 are a fixture away, 1 is one match arm away**
-(`maple`, one `rope_layers` row), 7 need new code, 1 is unknown with
-the question stated. Before the pin moved both cheap classes were
-EMPTY, which is the state to get back to.
+`maple` (Maple-20B) closed the same day and is the better lesson,
+because its verdict was RIGHT about the row and INCOMPLETE about the
+graph. The row was one `crate::rope_layers` entry --
+`maple.cpp:88` rotates only the sliding layers, `cohere2`'s rule -- and
+with the clamp arrays zeroed the fixture matched libllama exactly.
+With them nonzero it was 0.12 off, and the cause is not in
+`maple.cpp` at all: `llama-graph.cpp:2228` sends FOUR architectures
+(`maple`, `deepseek4`, `hy_v4`, `dflash` with hyper-connections) to
+`ggml_swiglu_clamp`, which clamps the gate BEFORE the SiLU
+(`ggml/src/ggml-cpu/ops.cpp:3450-3454`), where every other graph takes
+the `else` branch and clamps the SiLU's OUTPUT. `ferrox_moe::ClampForm`
+is the two forms and `act_layers::CLAMP_BEFORE_SILU` the list; the two
+agree wherever `silu(x) <= limit`, so a fixture whose clamp never binds
+cannot tell them apart. Reading the graph file is not enough when the
+graph calls a GENERIC builder: the builder branches on the
+architecture too.
+
+So **eight** triaged refusals are left, and they say which of three
+things is missing: **0 are a fixture away, 0 are one match arm away**,
+7 need new code, 1 is unknown with the question stated. Both cheap
+classes are EMPTY again, which is where they were before the pin
+moved.
 
 Three things the pin move found that are not new architectures at all:
 `kimi_k3` had been spelled with an UNDERSCORE in the catalog since it

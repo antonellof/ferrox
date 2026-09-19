@@ -186,6 +186,28 @@ is faster.
   7.1. What remains is not plumbing: a token's GPU time is 88.8 ms
   against the fork's whole token of 86.7-87.3, so the last ~3% is
   inside the PTQ1_0 matvec.
+- **Spark-2.5 (`spark2_5`) and Maple-20B (`maple`)**, the first two
+  rows closed against the llama.cpp pin moved on 2026-09-19 (2026-08-04
+  to `5b59b83`, 792 commits, fifteen new graphs). Both were triaged ONE
+  MATCH ARM the same day and both cost what that class is supposed to
+  cost, a table row and a fixture. `spark2_5` is a per-head sigmoid
+  attention gate (`spark2-5.cpp:41,97-105`, `ferrox_models::attn_gate`
+  beside `step35`'s row) on a llama with a window ARRAY, per-layer head
+  counts that SIZE the gate, and a gated GELU FFN -- KL 7.70e-7, which
+  is llama.cpp's f16 GELU table and nothing else (3.34e-12 with the
+  table emulated). `maple` is `RopeLayers::SlidingOnly`
+  (`maple.cpp:88`, `cohere2`'s rule) plus the thing its own graph file
+  does not show: `llama-graph.cpp:2228` sends it to
+  `ggml_swiglu_clamp`, which clamps the gate BEFORE the SiLU where
+  every other graph clamps the SiLU's output, so
+  `ferrox_moe::ClampForm` is two forms and
+  `act_layers::CLAMP_BEFORE_SILU` the list. The two agree wherever
+  `silu(x) <= limit`, which is why the fixture's clamp binds on two
+  layers of four. Building them found `expert_feed_forward_length`
+  read as a scalar where upstream reads scalar-or-array, silently
+  sizing every expert at `feed_forward_length / n_experts_used` for any
+  file that writes the array -- which `conversion/nemotron.py:573`
+  does for Nemotron-H Puzzle, an architecture ferrox serves.
 - **Llama 4: Scout and Maverick** (`llama4`), audited against libllama
   on 2026-09-14 (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16- and
   128-expert shapes, and the last of 8200 positions across the chunk

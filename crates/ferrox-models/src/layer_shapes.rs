@@ -119,6 +119,13 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
          one `crate::attn_gate` row",
     ),
     (
+        "maple",
+        "generic. maple.cpp:6 reads `expert_feed_forward_length` as an ARRAY at \
+         n_layer_all length; the tensors are sized from n_ff_exp() (layer 0) at :27, so \
+         the array must LOAD even where every entry agrees. Landed upstream after the \
+         2026-08-04 pin and closed on 2026-09-19 with one `crate::rope_layers` row",
+    ),
+    (
         "nanbeige",
         "nanbeige.cpp:24-26 copies each physical layer's arrays to every logical slot; \
          `LayerShapes::replicated` does the same and `crate::layer_loops` is the seam the row \
@@ -1310,6 +1317,7 @@ mod tests {
                 "laguna",
                 "step35",
                 "spark2_5",
+                "maple",
                 "jamba",
                 "nemotron_h",
                 "granitehybrid",
