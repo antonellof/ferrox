@@ -565,7 +565,22 @@ overhead, the largest single identified inefficiency left, and
 halving it is worth about 2.4 ms: 10.12 to roughly 10.4 tok/s. Still
 not parity, and it is the biggest item on the list.
 
-Whoever picks this up starts here rather than at the probe.
+Whoever picks this up starts here rather than at the probe. The first
+one of those twelve is already merged: `h += branch` and `rms_norm(h)`
+are now the ONE `encode_add_rms_norm` the dense decode stack uses, so
+the layer is thirteen dispatches and not fourteen. **It is below
+measurement noise** -- 10.06 to 10.09 tok/s against 10.14 to 10.16,
+inside a spread that has read 10.06 to 10.20 for nominally identical
+builds all day -- which is the honest size of ONE dispatch: about 0.4
+ms of a 98 ms token, 0.4%. It is kept because it is strictly fewer
+dispatches and the standard fused form, not because it measured.
+
+That is also the shape of everything left on this list. The remaining
+merges are worth a fraction of a percent EACH and cannot be told apart
+from noise individually; only doing most of them would show up, and
+each one is a chance to break a layer that four oracle tests currently
+hold. That is the cost side of the 2.4 ms the twelve dispatches are
+worth in total.
 
 ### The probe, fixed, and still not predictive
 

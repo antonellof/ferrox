@@ -490,11 +490,17 @@ unsafe fn encode_layer(
             let up_w = resident_weight_buffer(device, f.up.weights)?;
             let down_w = resident_weight_buffer(device, f.down.weights)?;
 
-            crate::elem::encode_vec_add(encoder, device, h_buf, out_buf, hidden as u32)?;
-            crate::norm::encode_rms_norm(
+            // `h += branch` and then `rms_norm(h)` are ONE kernel, the
+            // same one the dense decode stack uses. Two dispatches here
+            // cost about 8 microseconds of fixed overhead each, which
+            // across 48 layers is where a measurable part of this
+            // token's GPU time goes (`docs/plans/gdn-resident-state.md`
+            // prices the branch's twelve dispatches at ~4.8 ms).
+            crate::norm::encode_add_rms_norm(
                 encoder,
                 device,
                 h_buf,
+                out_buf,
                 &norm_w.buffer,
                 normed,
                 hidden as u32,
