@@ -161,6 +161,111 @@ impl BranchWeights<'_> {
     }
 }
 
+/// `h += branch`, then `h += ffn(rms_norm(h))`, encoded into the
+/// caller's command buffer.
+///
+/// The ONE FFN tail: a fused recurrent layer ends with it
+/// ([`encode_layer`]) and so does a fused ATTENTION layer
+/// ([`launch_attn_tail`]), which has the same shape after `wo` and
+/// nothing else in common. `h_ext` is the residual stream when the
+/// caller already holds it on the device (a run of layers), else the
+/// stream is filled from `res` into the scratch's own buffer.
+///
+/// Returns the buffer holding the layer's output.
+#[allow(clippy::too_many_arguments)]
+fn encode_ffn_tail<'b>(
+    encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    device: &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    f: &LayerFfn<'_>,
+    sc: &'b crate::scratch_pool::Scratch,
+    branch: &ProtocolObject<dyn MTLBuffer>,
+    res: &[f32],
+    h_ext: Option<&'b ProtocolObject<dyn MTLBuffer>>,
+    hidden: usize,
+) -> Result<&'b ProtocolObject<dyn MTLBuffer>, MetalError> {
+    // The layer's residual stream: the caller's buffer when
+    // there is one (a RUN of layers shares it and it never
+    // comes back to the host between them), else this layer's
+    // own, filled from the host.
+    let h_buf = match h_ext {
+        Some(b) => b,
+        None => sc.write(0, res).ok_or(MetalError::CommandFailed)?,
+    };
+    let (normed, gate_buf) = (sc.buf(1), sc.buf(2));
+    let (up_buf, act_buf, ffn_out) = (sc.buf(3), sc.buf(4), sc.buf(5));
+    let ffn_signs = |plan: Option<&FoldPlan<'_>>| match plan.and_then(|p| p.signs) {
+        None => Ok(None),
+        Some(signs) => {
+            // SAFETY: a `&[f32]` viewed as its own bytes, read only.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    signs.as_ptr() as *const u8,
+                    std::mem::size_of_val(signs),
+                )
+            };
+            resident_weight_buffer(device, bytes).map(Some)
+        }
+    };
+    let x_signs = ffn_signs(f.fold_x)?;
+    let act_signs = ffn_signs(f.fold_act)?;
+    let norm_w = crate::gpu::resident_f32_buffer(device, f.norm)?;
+    let gate_w = resident_weight_buffer(device, f.gate.weights)?;
+    let up_w = resident_weight_buffer(device, f.up.weights)?;
+    let down_w = resident_weight_buffer(device, f.down.weights)?;
+
+    // `h += branch` and then `rms_norm(h)` are ONE kernel, the
+    // same one the dense decode stack uses. Two dispatches here
+    // cost about 8 microseconds of fixed overhead each, which
+    // across 48 layers is where a measurable part of this
+    // token's GPU time goes (`docs/plans/gdn-resident-state.md`
+    // prices the branch's twelve dispatches at ~4.8 ms).
+    crate::norm::encode_add_rms_norm(
+        encoder,
+        device,
+        h_buf,
+        branch,
+        &norm_w.buffer,
+        normed,
+        hidden as u32,
+        f.norm_eps,
+    )?;
+    if let Some(plan) = f.fold_x {
+        plan.check(hidden)?;
+        crate::hadamard::encode_fold(
+            encoder,
+            device,
+            normed,
+            hidden,
+            plan,
+            x_signs.as_ref().map(|b| &*b.buffer),
+        )?;
+    }
+    encode_matvec(encoder, device, f.gate, &gate_w, normed, gate_buf)?;
+    encode_matvec(encoder, device, f.up, &up_w, normed, up_buf)?;
+    crate::elem::encode_silu_mul(
+        encoder,
+        device,
+        gate_buf,
+        up_buf,
+        act_buf,
+        f.gate.rows as u32,
+    )?;
+    if let Some(plan) = f.fold_act {
+        plan.check(f.gate.rows)?;
+        crate::hadamard::encode_fold(
+            encoder,
+            device,
+            act_buf,
+            f.gate.rows,
+            plan,
+            act_signs.as_ref().map(|b| &*b.buffer),
+        )?;
+    }
+    encode_matvec(encoder, device, f.down, &down_w, act_buf, ffn_out)?;
+    crate::elem::encode_vec_add(encoder, device, h_buf, ffn_out, hidden as u32)?;
+    Ok(h_buf)
+}
+
 /// One layer encoded into a caller's command buffer, with its scratch
 /// handed back so the caller can hold it until that buffer completes.
 ///
@@ -460,87 +565,7 @@ unsafe fn encode_layer(
     // of layers keeps that buffer and does not read it here.
     let _ = match (&w.ffn, &ffn_scratch, residual) {
         (Some(f), Some(sc), Some(res)) => {
-            // The layer's residual stream: the caller's buffer when
-            // there is one (a RUN of layers shares it and it never
-            // comes back to the host between them), else this layer's
-            // own, filled from the host.
-            let h_buf = match h_ext {
-                Some(b) => b,
-                None => sc.write(0, res).ok_or(MetalError::CommandFailed)?,
-            };
-            let (normed, gate_buf) = (sc.buf(1), sc.buf(2));
-            let (up_buf, act_buf, ffn_out) = (sc.buf(3), sc.buf(4), sc.buf(5));
-            let ffn_signs = |plan: Option<&FoldPlan<'_>>| match plan.and_then(|p| p.signs) {
-                None => Ok(None),
-                Some(signs) => {
-                    // SAFETY: a `&[f32]` viewed as its own bytes, read only.
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            signs.as_ptr() as *const u8,
-                            std::mem::size_of_val(signs),
-                        )
-                    };
-                    resident_weight_buffer(device, bytes).map(Some)
-                }
-            };
-            let x_signs = ffn_signs(f.fold_x)?;
-            let act_signs = ffn_signs(f.fold_act)?;
-            let norm_w = crate::gpu::resident_f32_buffer(device, f.norm)?;
-            let gate_w = resident_weight_buffer(device, f.gate.weights)?;
-            let up_w = resident_weight_buffer(device, f.up.weights)?;
-            let down_w = resident_weight_buffer(device, f.down.weights)?;
-
-            // `h += branch` and then `rms_norm(h)` are ONE kernel, the
-            // same one the dense decode stack uses. Two dispatches here
-            // cost about 8 microseconds of fixed overhead each, which
-            // across 48 layers is where a measurable part of this
-            // token's GPU time goes (`docs/plans/gdn-resident-state.md`
-            // prices the branch's twelve dispatches at ~4.8 ms).
-            crate::norm::encode_add_rms_norm(
-                encoder,
-                device,
-                h_buf,
-                out_buf,
-                &norm_w.buffer,
-                normed,
-                hidden as u32,
-                f.norm_eps,
-            )?;
-            if let Some(plan) = f.fold_x {
-                plan.check(hidden)?;
-                crate::hadamard::encode_fold(
-                    encoder,
-                    device,
-                    normed,
-                    hidden,
-                    plan,
-                    x_signs.as_ref().map(|b| &*b.buffer),
-                )?;
-            }
-            encode_matvec(encoder, device, f.gate, &gate_w, normed, gate_buf)?;
-            encode_matvec(encoder, device, f.up, &up_w, normed, up_buf)?;
-            crate::elem::encode_silu_mul(
-                encoder,
-                device,
-                gate_buf,
-                up_buf,
-                act_buf,
-                f.gate.rows as u32,
-            )?;
-            if let Some(plan) = f.fold_act {
-                plan.check(f.gate.rows)?;
-                crate::hadamard::encode_fold(
-                    encoder,
-                    device,
-                    act_buf,
-                    f.gate.rows,
-                    plan,
-                    act_signs.as_ref().map(|b| &*b.buffer),
-                )?;
-            }
-            encode_matvec(encoder, device, f.down, &down_w, act_buf, ffn_out)?;
-            crate::elem::encode_vec_add(encoder, device, h_buf, ffn_out, hidden as u32)?;
-            h_buf
+            encode_ffn_tail(encoder, device, f, sc, out_buf, res, h_ext, hidden)?
         }
         _ => out_buf,
     };
@@ -799,5 +824,116 @@ impl GdnRun {
             )
             .to_vec()
         })
+    }
+}
+
+/// An ATTENTION layer's tail in one command buffer: `wo`, the residual
+/// add, the FFN norm, the FFN and the second residual add.
+///
+/// The recurrent layers are one submission each
+/// ([`encode_layer`]); the attention layers between them still cost
+/// three, because their attention runs on the host. Two of those three
+/// are this: `wo` was its own `matvec-fused` submission and the FFN its
+/// own `dense-ffn`, with nothing but a vector add and a norm in
+/// between. It reuses [`encode_ffn_tail`], so the two layer kinds
+/// cannot drift about what a layer tail is.
+///
+/// `branch` is the attention output BEFORE `wo`
+/// (`Decoder::attn_branch_rows`), `residual` the stream as it entered
+/// the layer.
+pub fn launch_attn_tail(
+    out_proj: &MatvecLaunch<'_>,
+    fold_branch: Option<&FoldPlan<'_>>,
+    ffn: &LayerFfn<'_>,
+    branch: &[f32],
+    residual: &[f32],
+) -> Result<Vec<f32>, MetalError> {
+    let hidden = residual.len();
+    let branch_cols = out_proj.row_bytes / out_proj.block_bytes * out_proj.block_elems;
+    if out_proj.rows != hidden
+        || branch.len() != branch_cols
+        || ffn.norm.len() != hidden
+        || ffn.gate.rows != ffn.up.rows
+        || ffn.down.rows != hidden
+    {
+        return Err(MetalError::CommandFailed);
+    }
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let scratch = crate::scratch_pool::Scratch::take(
+        device,
+        &[
+            // the branch, `wo`'s output, and the FFN tail's six
+            branch_cols,
+            hidden,
+            hidden,
+            hidden,
+            ffn.gate.rows,
+            ffn.up.rows,
+            ffn.gate.rows,
+            hidden,
+        ],
+    )
+    .ok_or(MetalError::BufferAllocFailed)?;
+    let branch_buf = scratch.write(0, branch).ok_or(MetalError::CommandFailed)?;
+    let proj_buf = scratch.buf(1);
+    // The FFN tail indexes its own scratch from 0, so it gets a view
+    // starting where its six buffers do.
+    let tail = crate::scratch_pool::Scratch::take(
+        device,
+        &[
+            hidden,
+            hidden,
+            ffn.gate.rows,
+            ffn.up.rows,
+            ffn.gate.rows,
+            hidden,
+        ],
+    )
+    .ok_or(MetalError::BufferAllocFailed)?;
+
+    let out_w = resident_weight_buffer(device, out_proj.weights)?;
+    let signs = match fold_branch.and_then(|p| p.signs) {
+        None => None,
+        Some(sg) => {
+            // SAFETY: a `&[f32]` viewed as its own bytes, read only.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(sg.as_ptr() as *const u8, std::mem::size_of_val(sg))
+            };
+            Some(resident_weight_buffer(device, bytes)?)
+        }
+    };
+
+    let cmd_buf = shared
+        .queue
+        .commandBuffer()
+        .ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    let encoder = &*encoder;
+    if let Some(plan) = fold_branch {
+        plan.check(branch_cols)?;
+        crate::hadamard::encode_fold(
+            encoder,
+            device,
+            branch_buf,
+            branch_cols,
+            plan,
+            signs.as_ref().map(|b| &*b.buffer),
+        )?;
+    }
+    encode_matvec(encoder, device, out_proj, &out_w, branch_buf, proj_buf)?;
+    let result = encode_ffn_tail(
+        encoder, device, ffn, &tail, proj_buf, residual, None, hidden,
+    )?;
+    encoder.endEncoding();
+    let clock = crate::timing::SubmitClock::start();
+    crate::timing::commit_wait_note(&cmd_buf, "attn-tail", 32, clock);
+
+    // SAFETY: shared storage of exactly `hidden` floats, written by
+    // kernels this call has waited for.
+    unsafe {
+        Ok(std::slice::from_raw_parts(result.contents().as_ptr() as *const f32, hidden).to_vec())
     }
 }

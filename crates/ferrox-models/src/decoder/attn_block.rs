@@ -63,6 +63,30 @@ impl KvStep<'_> {
     }
 }
 
+/// Who applies `wo` and the transforms after it.
+///
+/// `Defer` hands the caller the attention output BEFORE `wo` through
+/// the slot and returns `None`, which is what lets a fused Metal tail
+/// put `wo`, the residual add, the FFN norm and the FFN in one command
+/// buffer (`crate::decoder::fused_attention`).
+pub(crate) enum AttnTail<'a> {
+    Apply(std::marker::PhantomData<&'a ()>),
+    /// Hands the caller the attention output BEFORE `wo`. Only the
+    /// Metal decode path defers -- without that backend there is
+    /// nothing that could encode `wo` into somebody else's command
+    /// buffer -- so the variant is gated and `Apply` carries the
+    /// lifetime for both.
+    #[cfg(feature = "metal")]
+    Defer(&'a mut Option<Vec<f32>>),
+}
+
+impl AttnTail<'_> {
+    /// The projection stays where it has always been.
+    pub(crate) fn apply() -> Self {
+        AttnTail::Apply(std::marker::PhantomData)
+    }
+}
+
 impl Decoder {
     /// One layer's attention block for ONE row: QKV projection, the
     /// three QKV biases, the two QK norms, RoPE's `mscale`, per-head
@@ -90,7 +114,26 @@ impl Decoder {
         layer: &LayerWeights,
         normed: &[f32],
         pos: usize,
+        kv: KvStep<'_>,
+    ) -> Option<Vec<f32>> {
+        self.attn_block_tail(layer_idx, layer, normed, pos, kv, AttnTail::apply())
+    }
+
+    /// [`Self::attn_block`] with the choice of who applies `wo`.
+    ///
+    /// One body rather than two, because the decode path that defers
+    /// the projection needs every other thing this does -- the QKV
+    /// projections, the biases, the two QK norms, RoPE, the scale, the
+    /// temperature, the KV push, the attend, the gates -- identically.
+    /// A second copy of it is how this file lost eight model features.
+    pub(crate) fn attn_block_tail(
+        &self,
+        layer_idx: usize,
+        layer: &LayerWeights,
+        normed: &[f32],
+        pos: usize,
         mut kv: KvStep<'_>,
+        #[cfg_attr(not(feature = "metal"), allow(unused_variables))] tail: AttnTail<'_>,
     ) -> Option<Vec<f32>> {
         let head_dim = self.config.head_dim;
         let (n_heads, n_kv_heads) = match self.config.layer_shape(layer_idx).attention {
@@ -167,8 +210,20 @@ impl Decoder {
         // normed row, summed into the attention branch.
         let ssm = self.parallel_ssm_rows(layer_idx, layer, normed, 1, kv.recurrent_slot());
         let mut attn_out = self.push_and_attend_row(kv, layer_idx, layer, &k, &v, &q);
-        let mut projected =
-            self.attn_out_to_residual_rows(layer, normed, &mut attn_out, 1, q_gate.as_deref());
+        let branch = self.attn_branch_rows(layer, normed, &mut attn_out, 1, q_gate.as_deref());
+        #[cfg(feature = "metal")]
+        if let AttnTail::Defer(slot) = tail {
+            // `wo` and everything after it is the caller's, because it
+            // is going to encode them into one command buffer with the
+            // FFN (`crate::decoder::fused_attention`). A layer with a
+            // parallel Mamba-2 branch cannot take that path, and the
+            // caller's predicate refuses it -- this is the check that
+            // the fence held.
+            debug_assert!(ssm.is_none(), "a parallel SSM branch cannot defer its tail");
+            *slot = Some(branch);
+            return None;
+        }
+        let mut projected = self.project_attn_rows(layer, &branch, 1);
         Self::add_parallel_ssm(&mut projected, ssm);
         Some(projected)
     }
@@ -197,6 +252,27 @@ impl Decoder {
         rows: usize,
         q_gate: Option<&[f32]>,
     ) -> Vec<f32> {
+        let branch = self.attn_branch_rows(layer, normed, attn_out, rows, q_gate);
+        self.project_attn_rows(layer, &branch, rows)
+    }
+
+    /// Everything the attention tail does BEFORE `wo`: the interleaved
+    /// Q gate, the output gate, the sub-norm.
+    ///
+    /// Split from the projection because a fused Metal layer tail does
+    /// `wo` itself, inside the command buffer that then adds the
+    /// residual and runs the FFN
+    /// (`crate::decoder::fused_attention`). Two halves of one function
+    /// rather than two functions that must agree: the composition above
+    /// is the only other caller.
+    pub(crate) fn attn_branch_rows(
+        &self,
+        layer: &LayerWeights,
+        normed: &[f32],
+        attn_out: &mut [f32],
+        rows: usize,
+        q_gate: Option<&[f32]>,
+    ) -> Vec<f32> {
         if let Some(gate) = q_gate {
             crate::attn_gate::apply_interleaved_gate(attn_out, gate);
         }
@@ -207,18 +283,26 @@ impl Decoder {
         // `wo`. After the gate only by convention -- no graph has both
         // (`crate::sub_norms`, `crate::attn_gate`) -- and per row,
         // because the norm is over one token's heads.
-        let sub_normed;
-        let attn_out: &[f32] = match &layer.attn.attn_sub_norm {
-            None => attn_out,
+        match &layer.attn.attn_sub_norm {
+            None => attn_out.to_vec(),
             Some(w) => {
                 let width = w.len();
-                sub_normed = attn_out
+                attn_out
                     .chunks(width)
                     .flat_map(|row| rms_norm(row, w, self.config.rms_norm_eps))
-                    .collect::<Vec<f32>>();
-                &sub_normed
+                    .collect::<Vec<f32>>()
             }
-        };
+        }
+    }
+
+    /// `wo` and everything after it: the `{1}` scale companion, the
+    /// bias, the value scale, the post-attention norm.
+    pub(crate) fn project_attn_rows(
+        &self,
+        layer: &LayerWeights,
+        attn_out: &[f32],
+        rows: usize,
+    ) -> Vec<f32> {
         let mut projected = if rows == 1 {
             layer.attn.o_proj.apply(attn_out)
         } else {
