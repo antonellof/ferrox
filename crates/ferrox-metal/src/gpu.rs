@@ -5135,7 +5135,7 @@ pub fn matvec_launch_meta(kind: &str) -> Option<(&'static str, &'static str, usi
             "ptq1_0_matvec",
             28,
             128,
-            8,
+            4,
         )),
         _ => None,
     }
@@ -9251,9 +9251,30 @@ mod tests {
 
     /// Achieved weight bandwidth of the PTQ1_0 matvec on Bonsai's two
     /// FFN shapes, printed, not asserted: run with `--nocapture`.
+    ///
+    /// # What this measures, and what it does not
+    ///
+    /// Wall time around `launch_*`, which is a command buffer's worth
+    /// of HOST cost -- an output allocation, an activation upload, a
+    /// commit and a wait -- plus the kernel. On the small shapes that
+    /// host cost is most of the number: the `64x512` row is almost
+    /// entirely it, which is why it is measured FIRST and subtracted
+    /// from the rest as `net`.
+    ///
+    /// Even net, this is one matvec in isolation and the production
+    /// path reads 65 GB/s on the same matrices where this reads 21. So
+    /// the ONLY sound use of these numbers is comparing one variant of
+    /// the kernel against another in the same run. Three kernel
+    /// hypotheses were aimed at the raw figure before that was
+    /// understood (`docs/plans/gdn-resident-state.md`), which is the
+    /// reason for this comment.
     #[test]
     #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
     fn ptq1_0_matvec_bandwidth_probe() {
+        // The fixed per-launch cost, measured in THIS run on a shape
+        // whose kernel is negligible, so the rows below can be reported
+        // net of it.
+        let mut fixed = 0.0f64;
         for &(rows, cols) in &[
             (64usize, 512usize),
             (17408usize, 5120usize),
@@ -9278,12 +9299,26 @@ mod tests {
                 launch_q4_0_matvec(&q4, &x, rows, q4_row_bytes).expect("kernel");
             }
             let per_q4 = t.elapsed().as_secs_f64() / n as f64;
+            if rows == 64 {
+                // The smallest shape IS the per-launch cost.
+                fixed = per.min(per_q4);
+                eprintln!(
+                    "ptq1_0 per-launch host cost: {:.3} ms (subtracted below)",
+                    fixed * 1e3
+                );
+                continue;
+            }
+            let net = (per - fixed).max(1e-9);
+            let net_q4 = (per_q4 - fixed).max(1e-9);
             eprintln!(
-                "ptq1_0 {rows}x{cols}: {:.3} ms, {:.1} GB/s | q4_0 same shape: {:.3} ms, {:.1} GB/s",
+                "ptq1_0 {rows}x{cols}: {:.3} ms raw, {:.3} net, {:.1} GB/s | q4_0: {:.3} raw, \
+                 {:.3} net, {:.1} GB/s",
                 per * 1e3,
-                (rows * row_bytes) as f64 / per / 1e9,
+                net * 1e3,
+                (rows * row_bytes) as f64 / net / 1e9,
                 per_q4 * 1e3,
-                (rows * q4_row_bytes) as f64 / per_q4 / 1e9
+                net_q4 * 1e3,
+                (rows * q4_row_bytes) as f64 / net_q4 / 1e9
             );
         }
     }

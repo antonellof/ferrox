@@ -532,7 +532,37 @@ back NEUTRAL:
 - **Eight rows per threadgroup instead of four**, halving the activation
   re-reads, which the arithmetic said were 4.6x the weight traffic
   (every threadgroup reads the whole 20 KB activation, 4352 times for
-  `ffn_gate`). 0.943 to 0.941 ms.
+  `ffn_gate`). 0.943 to 0.941 ms raw -- and REVERTED later, see below.
+  Sixteen and thirty-two rows are worse still (0.822 and 0.911 net),
+  which is register spill.
+
+### The probe, fixed, and still not predictive
+
+Those three were measured against a raw wall-clock number that includes
+a command buffer's worth of host cost. The probe now measures that cost
+on a shape whose kernel is negligible (`64x512`, 0.20 ms) and reports
+every other row NET of it, which changes what it says:
+
+| shape | PTQ1_0 net | Q4_0 net |
+|---|---|---|
+| `17408x5120` (`ffn_gate`, `ffn_up`) | 0.785 ms | 0.707 |
+| `5120x17408` (`ffn_down`) | 0.371 | 0.742 |
+| `248320x5120` (the head) | 3.417 | 3.943 |
+
+So PTQ1_0 BEATS Q4_0 on two shapes of three and loses only on the tall
+one, where it reads 2.6x fewer bytes and still takes longer. And at
+four rows a threadgroup the FFN's three matrices sum to 1.941 ms
+against eight rows' 2.093 -- **7% better**, the opposite of what the
+raw number said, which is why the row count is back to four (the
+reference's own geometry, and fewer registers).
+
+**And end to end that 7% is worth nothing: 10.14 to 10.16 tok/s either
+way.** Even net, one matvec in isolation does not predict a matvec
+inside a command buffer with resident weights and neighbours. Eight
+kernel and schedule experiments have now been run against this probe
+and it has failed to predict production every time. It is good for
+correctness and for nothing else; the next kernel attempt needs a GPU
+capture or per-dispatch timestamps, not this.
 
 Together they are +2% end to end (9.99 to 10.20 tok/s, measured
 interleaved), which is worth keeping and is not what the probe implied.

@@ -210,7 +210,7 @@ kernel void ptq1_0_matvec(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr uint NR = 8u;
+    constexpr uint NR = 4u;
     constexpr uint NSG = 1u;
     const uint first_row = (tgpig * NSG + sg) * NR;
     if (first_row >= n_rows) return;
