@@ -98,18 +98,32 @@ impl OutputPosture {
         Self::resolve_with(ReasoningFormat::infer(model_name), model_name, prompt)
     }
 
-    /// The posture with the reasoning format decided elsewhere
-    /// (`PromptTemplate::reasoning_format`, which also reads the
-    /// template); the tool-call format still comes from the name.
+    /// The posture with the reasoning format decided elsewhere and the
+    /// tool-call format taken from the NAME. Tests and the
+    /// no-template paths; the serving path uses
+    /// [`Self::resolve_full`].
     pub(crate) fn resolve_with(
         reasoning: Option<ReasoningFormat>,
         model_name: &str,
         prompt: &str,
     ) -> Self {
+        Self::resolve_full(reasoning, ToolCallFormat::infer(model_name), prompt)
+    }
+
+    /// The posture with BOTH formats decided elsewhere
+    /// (`PromptTemplate::reasoning_format` and
+    /// `PromptTemplate::tool_call_format`, each of which also reads the
+    /// template). The serving path takes this one: a served name comes
+    /// from `--alias` and cannot be trusted to name the family.
+    pub(crate) fn resolve_full(
+        reasoning: Option<ReasoningFormat>,
+        tools: ToolCallFormat,
+        prompt: &str,
+    ) -> Self {
         OutputPosture {
             reasoning,
             reasoning_open: reasoning.is_some_and(|f| f.prompt_opens_reasoning(prompt)),
-            tools: ToolCallFormat::infer(model_name),
+            tools,
         }
     }
 

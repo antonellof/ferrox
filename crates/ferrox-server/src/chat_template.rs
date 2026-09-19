@@ -91,6 +91,7 @@ struct Inner {
     /// picked from the name alone left `<think>` prose in `content`
     /// with `reasoning_content` empty on exactly those checkpoints.
     implied_reasoning: Option<crate::policy::parser::ReasoningFormat>,
+    implied_tools: Option<crate::policy::parser::ToolCallFormat>,
 }
 
 impl std::fmt::Debug for PromptTemplate {
@@ -154,6 +155,7 @@ impl PromptTemplate {
         );
         let handles_tools = probe_tools_consumed(&template, bos, eos);
         let implied_reasoning = probe_implied_reasoning(probe_render(&template, bos, eos));
+        let implied_tools = probe_implied_tool_format(&template, bos, eos);
         Self {
             inner: Arc::new(Inner {
                 // A terminator that IS the EOS adds nothing to the stop
@@ -168,6 +170,7 @@ impl PromptTemplate {
                 thinking,
                 handles_tools,
                 implied_reasoning,
+                implied_tools,
             }),
         }
     }
@@ -184,6 +187,23 @@ impl PromptTemplate {
         served_model: &str,
     ) -> Option<crate::policy::parser::ReasoningFormat> {
         crate::policy::parser::ReasoningFormat::infer(served_model).or(self.inner.implied_reasoning)
+    }
+
+    /// The tool-call grammar for a checkpoint served under
+    /// `served_model`: what the TEMPLATE asks for when it asks for
+    /// anything, else the name's family.
+    ///
+    /// Template first, which is the opposite of `reasoning_format`'s
+    /// order and deliberate: a served name comes from `--alias` and can
+    /// be anything, while a template that prints `<function=` has
+    /// stated the grammar it will emit.
+    pub(crate) fn tool_call_format(
+        &self,
+        served_model: &str,
+    ) -> crate::policy::parser::ToolCallFormat {
+        self.inner
+            .implied_tools
+            .unwrap_or_else(|| crate::policy::parser::ToolCallFormat::infer(served_model))
     }
 
     /// Short human-readable identity, for the load-time log line.
@@ -406,6 +426,71 @@ fn probe_tools_consumed(
     }
 }
 
+/// Which tool-call grammar the TEMPLATE itself asks for, rendered with
+/// a tool in hand, or `None` when it names none.
+///
+/// The served name is a guess and the template is a statement. A
+/// checkpoint served under `--alias bonsai-2-27b` is a Qwen3.5 file
+/// whose template prints, verbatim, `<tool_call>\n<function=…>\n
+/// <parameter=…>`; `ToolCallFormat::infer` sees a name with no "qwen"
+/// in it and falls through to the Llama 3 fallback, which reads none
+/// of those calls. Every call the model made then reached the client
+/// as raw markup in `content` with `tool_calls` null, which is exactly
+/// the failure that file's own comment records for Gemma 4.
+///
+/// Order is load-bearing for the same reason it is in `infer`: the
+/// specific families have to be tested before the general ones they
+/// look like. `<function=` is Qwen3-Coder's and appears INSIDE a
+/// `<tool_call>`, so plain `<tool_call>` means Hermes JSON only once
+/// that has been ruled out.
+fn probe_implied_tool_format(
+    template: &JinjaTemplate,
+    bos_token: Option<&str>,
+    eos_token: Option<&str>,
+) -> Option<crate::policy::parser::ToolCallFormat> {
+    use crate::policy::parser::ToolCallFormat as F;
+    let messages = vec![json!({"role": "user", "content": "probe"})];
+    let probe = json!({
+        "type": "function",
+        "function": {
+            "name": "ferrox_probe_tool",
+            "description": "No-op probe tool.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    });
+    let text = template
+        .render(
+            &messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                bos_token: bos_token.map(str::to_string),
+                eos_token: eos_token.map(str::to_string),
+                tools: vec![probe],
+                extra: Map::new(),
+            },
+        )
+        .ok()?;
+    let has = |needle: &str| text.contains(needle);
+    let format = if has("]<]minimax[>[") {
+        F::MiniMaxM3
+    } else if has("<minimax:tool_call>") {
+        F::MiniMax
+    } else if has("<arg_key>") {
+        F::Glm47
+    } else if has("<function=") && has("<parameter=") {
+        F::Qwen3Coder
+    } else if has("[TOOL_CALLS]") {
+        F::Mistral
+    } else if has("<|python_tag|>") {
+        F::Llama3
+    } else if has("<tool_call>") {
+        F::Qwen25
+    } else {
+        return None;
+    };
+    Some(format)
+}
+
 /// One render closure over a fixed probe conversation.
 ///
 /// Both probes take the same shape -- vary one thing, render, compare
@@ -524,6 +609,56 @@ mod tests {
     /// The whole reason this module was rewritten: `[INST] … [/INST]`
     /// matches none of the old sniffer's markers, so a real Mistral
     /// checkpoint was served role-labeled lines it has never seen.
+    /// The TEMPLATE decides the tool-call grammar, because the served
+    /// name is whatever `--alias` said.
+    ///
+    /// Bonsai is the case that found this: a Qwen3.5 file served as
+    /// `bonsai-2-27b`, whose template prints
+    /// `<tool_call><function=…><parameter=…>` while
+    /// `ToolCallFormat::infer` sees no "qwen" in the name and falls
+    /// through to the Llama 3 fallback, which reads none of those
+    /// calls. Every call reached the client as raw markup in `content`
+    /// with `tool_calls` null.
+    #[test]
+    fn the_template_decides_the_tool_call_grammar_not_the_served_name() {
+        use crate::policy::parser::ToolCallFormat;
+
+        let qwen3_coder = "{% for m in messages %}{{ m.content }}{% endfor %}\
+             {% if tools %}If you call a function reply as:\n<tool_call>\n\
+             <function=name>\n<parameter=arg>\nvalue\n</parameter>\n\
+             </function>\n</tool_call>{% endif %}";
+        let tmpl =
+            PromptTemplate::from_gguf_metadata(Some(qwen3_coder), None, false, true, None, None);
+        // The name says nothing; the template says everything.
+        assert_eq!(
+            tmpl.tool_call_format("bonsai-2-27b"),
+            ToolCallFormat::Qwen3Coder,
+            "an alias that names no family must not decide the grammar"
+        );
+        assert_eq!(
+            ToolCallFormat::infer("bonsai-2-27b"),
+            ToolCallFormat::Llama3,
+            "and the name alone really does resolve to the wrong one"
+        );
+
+        // Hermes JSON: a `<tool_call>` with no `<function=` inside it.
+        let hermes = "{% for m in messages %}{{ m.content }}{% endfor %}\
+             {% if tools %}Reply with <tool_call>{\"name\": …}</tool_call>{% endif %}";
+        let tmpl = PromptTemplate::from_gguf_metadata(Some(hermes), None, false, true, None, None);
+        assert_eq!(
+            tmpl.tool_call_format("bonsai-2-27b"),
+            ToolCallFormat::Qwen25
+        );
+
+        // A template that names no grammar leaves the name to decide.
+        let silent = "{% for m in messages %}{{ m.content }}{% endfor %}";
+        let tmpl = PromptTemplate::from_gguf_metadata(Some(silent), None, false, true, None, None);
+        assert_eq!(
+            tmpl.tool_call_format("Qwen3-Coder-30B"),
+            ToolCallFormat::Qwen3Coder
+        );
+    }
+
     #[test]
     fn a_template_the_old_sniffer_could_not_recognise_now_renders_correctly() {
         let mistral = "{% for m in messages %}{% if m.role == 'user' %}[INST] {{ m.content }} [/INST]{% else %}{{ m.content }}</s>{% endif %}{% endfor %}";
