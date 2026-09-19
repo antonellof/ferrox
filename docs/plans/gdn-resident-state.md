@@ -358,6 +358,28 @@ inverted, every layer declined, and the ledger showed no `attn-tail`
 label at all -- which is the only reason it was caught, because the
 fallback is correct and the model ran fine.
 
+## The decode attention was serial
+
+`causal_gqa_attention_row` looped `for h in 0..n_heads` on one core.
+On a hybrid that loop is the WHOLE of what a decode token still does on
+the host -- sixteen attention layers of twenty-four heads each -- and
+the heads share nothing: each reads its own slice of `q`, its own KV
+group, and writes its own slice of `out`. It is `crate::par::chunks_mut`
+over `out` in `v_head_dim` runs now.
+
+Interleaved at a 300-token context, which is where a decode actually
+lives:
+
+    parallel  10.19 / 10.19 tok/s
+    serial     9.44
+
+**+7.9%**, and the gap grows with the context, because the loop's work
+is linear in `seq_len` while the fork is not. At `tg32` -- 33 keys a
+head, the smallest context anyone measures -- it reads 10.33 against
+10.59, which is inside this box's spread and the wrong shape to tune
+for: a tg32 token spends more time forking than attending, and a real
+one does not.
+
 ## The limit, which is not where this plan assumed
 
 Our GPU time for a decode token is **88.8 ms**. The reference's WHOLE

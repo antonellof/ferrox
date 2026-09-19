@@ -958,12 +958,26 @@ pub fn causal_gqa_attention_row(
     // ALiBi: the query is the last cached position, key `t` is
     // `(seq_len - 1) - t` behind it, and the bias is `-slope * distance`.
     let q_pos = seq_len as f32 - 1.0;
-    for h in 0..n_heads {
+    // Over HEADS, because they share nothing: each reads its own slice
+    // of `q` and its own KV group and writes its own slice of `out`.
+    //
+    // This loop was serial, and on a hybrid model it is the whole of
+    // what a decode token still does on the host -- 6.8 ms of a 94 ms
+    // Bonsai token across sixteen attention layers of twenty-four heads
+    // each, while six cores sat idle
+    // (`docs/plans/gdn-resident-state.md`).
+    //
+    // `min_len` is 1 because a head is already a real unit of work
+    // (`seq_len` keys against `head_dim`), and the scheduler's own
+    // published-work rule decides whether to fork at all: a short
+    // prompt's tiny region stays on one core through
+    // `crate::par::backend`, which is exactly the case a hard-coded
+    // threshold here would have had to guess at.
+    crate::par::chunks_mut(&mut out, v_head_dim, 1, |h, out_h| {
         let kv_h = h / group_size.max(1);
         let q_h = &q[h * head_dim..(h + 1) * head_dim];
         let sink = sinks.map(|s| s[h]);
         let slope = alibi.map_or(0.0, |s| s[h]);
-        let out_h = &mut out[h * v_head_dim..(h + 1) * v_head_dim];
         online_attn_accumulate(q_h, scale, out_h, attn_softcap, sink, |visit| {
             for t in start..seq_len {
                 let k_t = &k_cache
@@ -973,7 +987,7 @@ pub fn causal_gqa_attention_row(
                 visit(k_t, v_t, slope * (t as f32 - q_pos));
             }
         });
-    }
+    });
 
     out
 }
