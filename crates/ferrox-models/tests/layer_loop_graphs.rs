@@ -262,7 +262,7 @@ fn the_loader_resolves_the_row_the_way_llama_cpp_does() {
     let d = load_graph_fixture(LOOPED);
     assert_eq!(
         d.config.layer_loops,
-        Some(LayerLoops {
+        Some(LayerLoops::Repeat {
             n_phys: 2,
             n_loops: 2,
             skip_loop_final_norm: false,
@@ -279,13 +279,35 @@ fn the_loader_resolves_the_row_the_way_llama_cpp_does() {
         );
     }
     let skip = load_graph_fixture(SKIPNORM);
-    assert!(skip.config.layer_loops.unwrap().skip_loop_final_norm);
+    assert!(matches!(
+        skip.config.layer_loops,
+        Some(LayerLoops::Repeat {
+            skip_loop_final_norm: true,
+            ..
+        })
+    ));
     let one = load_graph_fixture(LOOP1);
     assert_eq!(
         one.config.layer_loops, None,
         "num_loops = 1 is a plain model"
     );
     assert_eq!(one.config.n_layers, 2);
+}
+
+/// The same schedule with the loop norm flipped, for the sabotages
+/// below. A helper rather than a record update, because `LayerLoops`
+/// is an enum since `hrm_text` joined it.
+fn with_skip(loops: LayerLoops, skip: bool) -> LayerLoops {
+    match loops {
+        LayerLoops::Repeat {
+            n_phys, n_loops, ..
+        } => LayerLoops::Repeat {
+            n_phys,
+            n_loops,
+            skip_loop_final_norm: skip,
+        },
+        other => other,
+    }
 }
 
 /// Skipping the loop norm on the file that has it diverges from
@@ -295,20 +317,14 @@ fn the_loader_resolves_the_row_the_way_llama_cpp_does() {
 #[test]
 fn the_loop_norm_and_the_second_pass_are_each_visible() {
     let mut d = load_graph_fixture(LOOPED);
-    d.config.layer_loops = Some(LayerLoops {
-        skip_loop_final_norm: true,
-        ..d.config.layer_loops.unwrap()
-    });
+    d.config.layer_loops = Some(with_skip(d.config.layer_loops.unwrap(), true));
     assert!(
         decode_worst(&d, &NANBEIGE_GOLDEN) > 100.0 * GRAPH_TOL,
         "loop norm skipped"
     );
 
     let mut d = load_graph_fixture(SKIPNORM);
-    d.config.layer_loops = Some(LayerLoops {
-        skip_loop_final_norm: false,
-        ..d.config.layer_loops.unwrap()
-    });
+    d.config.layer_loops = Some(with_skip(d.config.layer_loops.unwrap(), false));
     assert!(
         decode_worst(&d, &NANBEIGE_SKIPNORM_GOLDEN) > 100.0 * GRAPH_TOL,
         "loop norm applied where the file skips it"

@@ -161,6 +161,20 @@ pub const ATTN_GATE_ARCHS: &[(&str, AttnGateSpec)] = &[
     // multiplies it in per head, which is `step35`'s corner of the two
     // axes with the presence flipped. Nothing else in that graph was
     // new (`tests/gated_attention_graphs.rs`).
+    // `hrm-text.cpp:77-78` creates the tensor REQUIRED at
+    // `{n_embd, n_head * head_dim}` and `:113-134` sigmoid it and
+    // multiply it into the attention output PER ELEMENT before `wo`;
+    // its own comment calls it "the same shape as qwen3next attention
+    // layers", which is `afmoe`'s corner here.
+    (
+        "hrm_text",
+        AttnGateSpec {
+            act: GateAct::Sigmoid,
+            widths: &[GateWidth::PerElement],
+            presence: GatePresence::Required,
+            lines: "src/models/hrm-text.cpp:77-78,113-134",
+        },
+    ),
     // `muse-glimmer.cpp:46` creates the tensor REQUIRED at
     // `{n_embd, n_head * head_dim}` and `:100-135` sigmoid it and
     // multiply it into the attention output PER ELEMENT before `wo`,
@@ -480,15 +494,23 @@ mod tests {
     /// The table is keyed by architecture, every row cites its lines,
     /// and the three GDN rows that share the tensor NAME are not in it.
     ///
-    /// Five rows since 2026-09-19: `spark2_5` and `muse-glimmer` both
-    /// landed upstream after the 2026-08-04 pin, the first `step35`'s
-    /// pair with the tensor required, the second `afmoe`'s.
+    /// Six rows since 2026-09-19: `spark2_5`, `muse-glimmer` and
+    /// `hrm_text` all landed upstream after the 2026-08-04 pin -- the
+    /// first is `step35`'s pair with the tensor required and the other
+    /// two are `afmoe`'s.
     #[test]
     fn the_table_covers_the_softmax_gates_and_excludes_the_gdn_z_gates() {
         let names: Vec<&str> = ATTN_GATE_ARCHS.iter().map(|(n, _)| *n).collect();
         assert_eq!(
             names,
-            ["afmoe", "laguna", "step35", "muse-glimmer", "spark2_5"]
+            [
+                "afmoe",
+                "laguna",
+                "step35",
+                "hrm_text",
+                "muse-glimmer",
+                "spark2_5"
+            ]
         );
         for (arch, spec) in ATTN_GATE_ARCHS {
             assert!(spec.lines.contains(".cpp:"), "`{arch}` cites no line");

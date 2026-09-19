@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 6,
+        n, 5,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -428,7 +428,7 @@ fn the_remaining_work_is_counted() {
         .count();
     // 2 before the 2026-09-19 pin move (`grovemoe`, `phi4`), plus the
     // eight upstream architectures it brought in.
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 6);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 5);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -1201,7 +1201,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 5, 1),
+        (0, 0, 4, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. BOTH cheap classes were ZERO between \
          2026-09-12 and 2026-09-19 -- `gemma` was the last FIXTURE-AWAY row and `chatglm` \
@@ -1299,7 +1299,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 6);
+    assert_eq!(fixture + arm + new_code + unknown, 5);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

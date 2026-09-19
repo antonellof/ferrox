@@ -48,6 +48,7 @@ pub mod grammar;
 pub mod grammar_sampler;
 pub mod hadamard_fold;
 pub mod hf_pull;
+pub mod hrm;
 #[cfg(feature = "hub")]
 pub mod hub;
 pub mod hybrid_engine;

@@ -60,6 +60,33 @@ are the ones worth reading twice.
   reference's own approximation, measured rather than assumed
   (`tests/gated_attention_graphs.rs`).
 
+- **`hrm_text` runs (DFM Mimir 1B)**, the fifth row closed against the
+  moved pin and the first decoder here that is not a walk down ONE
+  residual stream. `src/models/hrm-text.cpp:183-196` runs `h_cycles`
+  cycles of `l_cycles` LOW stacks and one HIGH stack, every stack
+  reading `zH + zL` and replacing one of the two; `zH` starts as the
+  embeddings, `zL` as the learned `hrm.z_l_init` row, and the lm_head
+  reads `zH` with no final norm because every stack ends with its own
+  weightless RMS (`norm_sites::NO_OUTPUT_NORM`). The stacks are
+  ALIASES: the file holds `2 * layers_per_stack` blocks while
+  `block_count` is the expanded slot count (`:22-23` asserts it), and
+  each slot keeps its own KV.
+
+  `layer_loops::LayerLoops` is an enum now -- `Repeat` (nanbeige's one
+  stream) and `Hrm` -- so the physical mapping, the pass norm and the
+  stream schedule are one value the four host bodies ask, and
+  `ferrox_models::hrm` is the two-stream state: one type with two
+  methods rather than four copies of "hold two vectors and add them
+  here". Two fixtures, because the alternating schedule (LOW HIGH LOW
+  HIGH) never reaches the case where the LOW stack runs twice in a
+  row: the first matches EXACTLY and the deep one at 1.6e-4, which
+  three measured depths show is weightless renormalisations amplifying
+  f32 reduction order and not a structural difference: two stacks are
+  exact, three measure 3.5e-5 and six 1.6e-4 on arm64, and the
+  six-stack file measured 1.1e-3 on x86_64 CI -- which is why the deep
+  fixture is the THREE-stack schedule, the shallowest one that runs
+  the LOW stack twice in a row (`tests/hrm_text_graphs.rs`).
+
 - **`muse-glimmer` runs**, the fourth row closed against the moved pin
   and two norm facts nothing else upstream has.
   `src/models/muse-glimmer.cpp:69` norms the EMBEDDINGS with a

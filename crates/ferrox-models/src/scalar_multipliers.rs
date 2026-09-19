@@ -462,6 +462,15 @@ impl MultiplierSupport {
     /// MULTIPLIED onto the logits (`:153-154`); every export writes it
     /// (`conversion/command_r.py:27`, `0.25` for Command-R7B). None of
     /// the other three keys is read.
+    /// An `embedding_scale` and nothing else: `hrm-text.cpp:8`.
+    pub const EMBEDDING_ONLY: Self = Self {
+        embedding: true,
+        residual: false,
+        logit: LogitScaleUse::NotApplied,
+        attention: AttentionScaleKey::NotRead,
+        defaults: MultiplierDefaults::FromFileOnly,
+    };
+
     pub const COHERE2: Self = Self {
         embedding: false,
         residual: false,
@@ -502,6 +511,9 @@ const MULTIPLIER_ARCHITECTURES: &[(&str, MultiplierSupport)] = &[
     // MULTIPLIES by it, which is `cohere2`'s shape rather than
     // Granite's divide.
     ("muse-glimmer", MultiplierSupport::COHERE2),
+    // `hrm-text.cpp:8` reads `embedding_scale` OPTIONAL and
+    // `build_inp_embd` applies it; the other three it never reads.
+    ("hrm_text", MultiplierSupport::EMBEDDING_ONLY),
     // `cohere2moe.cpp:14,287-289`: the same REQUIRED key, multiplied
     // when nonzero.
     ("cohere2moe", MultiplierSupport::COHERE2),

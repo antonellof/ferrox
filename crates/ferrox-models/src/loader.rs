@@ -785,7 +785,15 @@ impl ModelConfig {
             expert_ffn_dim,
             recurrent_layers.as_deref(),
         )?
-        .replicated(layer_loops.map_or(1, |l| l.n_loops));
+        // `nanbeige.cpp:24-26` copies each physical layer's shape
+        // arrays to every logical slot; HRM-Text's two stacks are
+        // uniform and its arrays are scalars, so the replication is
+        // spelled for the one schedule that needs it rather than
+        // divided out of the other's counts.
+        .replicated(match layer_loops {
+            Some(crate::layer_loops::LayerLoops::Repeat { n_loops, .. }) => n_loops,
+            _ => 1,
+        });
         // The OTHER half of llama.cpp's dense-vs-MoE rule.
         // `ModelConfig::layer_is_dense` implements the leading-dense
         // prefix and not the `(il + 1) % n_moe_layer_step == 0` at
@@ -2724,7 +2732,7 @@ impl Decoder {
         // than this, and they run these same weights.
         let n_physical = config
             .layer_loops
-            .map_or(config.n_layers, |loops| loops.n_phys);
+            .map_or(config.n_layers, |loops| loops.physical_layers());
         let mut layers = Vec::with_capacity(n_physical);
         let mut refined_qk_norm = config.qk_norm_style;
         for l in 0..n_physical {
@@ -3301,7 +3309,16 @@ impl Decoder {
         // `:128-130` norms the final hidden state with a null weight, so
         // asking for the tensor would refuse every real OLMo-1 file;
         // the table's function decides whether the read happens.
-        let final_norm = norm_sites.load_pre_norm(Some(norm_sites.output), &file, None)?;
+        let final_norm = norm_sites.load_pre_norm(norm_sites.output, &file, None)?;
+        // `hrm-text.cpp:46` creates `hrm_z_l_init` REQUIRED, and only
+        // that graph does (`crate::hrm`): the learned LOW stream, one
+        // `[n_embd]` row broadcast over the tokens at `:182`.
+        let hrm_z_l_init = match config.layer_loops {
+            Some(crate::layer_loops::LayerLoops::Hrm { .. }) => {
+                Some(load_f32_vec(&file, "hrm.z_l_init")?)
+            }
+            _ => None,
+        };
         // The embedding norm (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`),
         // `NormOp::None` where the site is absent.
         // Two answers, one field: a STORED embedding norm (`bloom`) or
@@ -3379,6 +3396,10 @@ impl Decoder {
             embedding,
             position_embd,
             embedding_norm,
+            // `hrm-text.cpp:46` creates it REQUIRED, and only that
+            // graph does (`crate::hrm`); the loader reads it for the
+            // architecture whose schedule needs it and for no other.
+            hrm_z_l_init,
             alibi_slopes,
             layers,
             final_norm,
