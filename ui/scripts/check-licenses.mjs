@@ -1,6 +1,6 @@
 // Refuse a copyleft dependency before it reaches a shipped asset.
 //
-// ferrox is Apache-2.0 and this app is distributed as built JavaScript,
+// frink is Apache-2.0 and this app is distributed as built JavaScript,
 // so an AGPL or GPL package in `node_modules` would not merely sit in a
 // lockfile — its code would be bundled into `dist/app.js` and handed to
 // every viewer. This walks the installed tree and exits non-zero on

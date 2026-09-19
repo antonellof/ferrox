@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `nemotron_h` GGUFs used by ferrox's
-Nemotron-H coverage test (`crates/ferrox-models/tests/nemotron_h_graphs.rs`).
+"""Generate the tiny synthetic `nemotron_h` GGUFs used by frink's
+Nemotron-H coverage test (`crates/frink-models/tests/nemotron_h_graphs.rs`).
 
 `nemotron_h` is NVIDIA's Nemotron-H (8B / 47B / 56B) and Nemotron-3
 Nano dense: a hybrid whose every layer is ONE block with one residual
@@ -17,7 +17,7 @@ the converter (`conversion/nemotron.py:196-256`, a `GraniteHybridModel`)
 writes `head_count` as a scalar, `head_count_kv` as an array with 0 off
 the attention layers and `feed_forward_length` as an array with 0 off
 the MLP layers. So the three kinds are `(kv > 0, ff 0)`, `(kv 0, ff 0)`
-and `(kv 0, ff > 0)`, and on ferrox's generic layer they are "attention
+and `(kv 0, ff > 0)`, and on frink's generic layer they are "attention
 with no FFN", "Mamba-2 with no FFN" and "no attention, an FFN" -- the
 FFN-only layer's pre-norm being `attn_norm` (`:52`, "all blocks use the
 attn norm"). The attention layer has NO RoPE (`:181-193` never calls
@@ -27,7 +27,7 @@ UNGATED ReLU-squared `down(relu(up(x))^2)` (`:227-231`) with optional
 `ffn_up.bias` / `ffn_down.bias` (`:96-97`). The Mamba-2 block is
 `build_mamba2_layer` with `ssm_norm` REQUIRED (`:61`) and
 `ssm_conv1d.bias` optional-to-the-loader (`:56`; the graph adds it
-unconditionally, so ferrox requires it).
+unconditionally, so frink requires it).
 
 Layers (four): mamba, attention, mlp, mamba (`hybrid_override_pattern
 "M*-M"`).
@@ -108,7 +108,7 @@ def main(out_path: str, biases: bool, separate_output: bool, moe: bool) -> None:
 
     arch = MOE_ARCH if moe else ARCH
     w = gguf.GGUFWriter(out_path, arch)
-    w.add_name(f"ferrox-{arch}-fixture")
+    w.add_name(f"frink-{arch}-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

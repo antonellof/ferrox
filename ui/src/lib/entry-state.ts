@@ -124,7 +124,7 @@ export function describeAway(ms: number | null): string {
 // fall out of it.
 // ---------------------------------------------------------------------
 
-const ACTIVE_AT_KEY = "ferrox.studio.tabActiveAt";
+const ACTIVE_AT_KEY = "frink.studio.tabActiveAt";
 
 export function readTabActiveAt(): number | null {
   try {

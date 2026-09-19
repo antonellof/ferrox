@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `step35` GGUF used by ferrox's per-layer
+"""Generate the tiny synthetic `step35` GGUF used by frink's per-layer
 SwiGLU-clamp and two-valued rotary-width coverage test.
 
 `step35` (StepFun Step-3.5-Flash, 196B-A11B) was triaged NEW CODE on two
@@ -120,7 +120,7 @@ def main(out_path: str, variant: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name(f"ferrox-step35-fixture{variant.replace('--', '-') if variant else ''}")
+    w.add_name(f"frink-step35-fixture{variant.replace('--', '-') if variant else ''}")
     w.add_block_count(n_layer_all)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

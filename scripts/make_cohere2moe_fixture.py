@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `cohere2moe` GGUFs used by ferrox's Cohere2
-MoE coverage test (`crates/ferrox-models/tests/cohere2moe_graphs.rs`).
+"""Generate the tiny synthetic `cohere2moe` GGUFs used by frink's Cohere2
+MoE coverage test (`crates/frink-models/tests/cohere2moe_graphs.rs`).
 
 `cohere2moe.cpp` is `cohere2.cpp` (the shared-norm PARALLEL residual, a
 REQUIRED window and `logit_scale`, NORM RoPE) with routed experts:
@@ -91,7 +91,7 @@ def main(out_path: str, rms: bool, mtp: bool, norm_w: bool) -> None:
 
     n_blocks = N_LAYER + (1 if mtp else 0)
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-cohere2moe-fixture")
+    w.add_name("frink-cohere2moe-fixture")
     w.add_block_count(n_blocks)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

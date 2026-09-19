@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `nanbeige` GGUFs used by ferrox's
+"""Generate the tiny synthetic `nanbeige` GGUFs used by frink's
 layer-loop coverage test.
 
 `nanbeige` refused as UNAUDITED, triaged NEW CODE, on one thing no other
@@ -21,7 +21,7 @@ graph has: it RUNS THE SAME PHYSICAL LAYERS MORE THAN ONCE
   * Everything inside a pass is plain Llama (`:52-63`, `:106-155`),
     which is what makes the tensor set look generic.
 
-`crates/ferrox-models/src/layer_loops.rs` is the seam. Reach, measured:
+`crates/frink-models/src/layer_loops.rs` is the seam. Reach, measured:
 `grep -l 'n_loops\\|n_layer_phys' src/models/*.cpp` over all 140 graphs
 is `nanbeige.cpp`.
 
@@ -78,7 +78,7 @@ def main(out_path: str, loops: int, skip_loop_norm: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-nanbeige-fixture")
+    w.add_name("frink-nanbeige-fixture")
     # block_count is the PHYSICAL count; the logical count is derived.
     w.add_block_count(N_LAYER_PHYS)
     w.add_context_length(CTX)

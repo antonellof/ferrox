@@ -1,4 +1,4 @@
-// The bridge between assistant-ui's thread runtime and ferrox's public
+// The bridge between assistant-ui's thread runtime and frink's public
 // `/v1/chat/completions`.
 //
 // assistant-ui owns the transcript, the composer, autoscroll, branching
@@ -287,7 +287,7 @@ function makeAdapter(deps: ChatDeps): ChatModelAdapter {
 
       const task = streamChat(
         {
-          model: deps.modelId() || "ferrox",
+          model: deps.modelId() || "frink",
           messages: wire,
           ...samplingToWire(sampling),
           ...(resume ? { continue_final_message: true } : {}),
@@ -464,7 +464,7 @@ if (typeof window !== "undefined") {
   });
 }
 
-export function useFerroxRuntime(deps: ChatDeps) {
+export function useFrinkRuntime(deps: ChatDeps) {
   // The adapter is built once and reads its inputs through a latest-value
   // box, so a sampling change mid-conversation applies to the next send
   // without tearing down the runtime (which would drop the transcript).

@@ -1,6 +1,6 @@
 # Parity audit, 2026-09-19: llama.cpp AND vLLM
 
-What this is: a re-measurement of the two engines ferrox is read
+What this is: a re-measurement of the two engines frink is read
 against, done on the day 0.25.0 shipped, so the next work is chosen
 from numbers rather than from the last audit's memory.
 
@@ -23,16 +23,16 @@ clamps the gate BEFORE the SiLU).
 
 The seams that landed with them, each a census of one or two graphs:
 `RopeLayers::FileMask` (the first upstream graph that lets the FILE say
-which layers rotate), `ferrox_moe::ClampForm`,
+which layers rotate), `frink_moe::ClampForm`,
 `norm_sites::WEIGHTLESS_EMBEDDING_NORM`,
 `norm::POST_NORM_EPS_LITERAL`.
 
 Two defects came out of the same work, both in the class this repo
 calls silent-wrong: `expert_used_count` and
 `expert_feed_forward_length` are read with `get_key_or_arr` upstream
-for EVERY architecture, and ferrox read each as a scalar -- so the
+for EVERY architecture, and frink read each as a scalar -- so the
 array spelling that `conversion/nemotron.py` writes for Nemotron-H
-Puzzle, an architecture ferrox serves, fell into a default (top-2, and
+Puzzle, an architecture frink serves, fell into a default (top-2, and
 `feed_forward_length / n_experts_used`). Both are honoured when uniform
 and refused by name when they vary.
 
@@ -50,7 +50,7 @@ which is the honest reason the cheap ones went first.
 Two more rows closed the same day, and they are the cheapest of the
 eight because they are not on the decoder at all: `nomic-bert`
 (nomic-embed-text v1 / v1.5) and `jina-bert-v3` (jina-embeddings-v3)
-embed, on the BERT encoder ferrox has had since before this audit.
+embed, on the BERT encoder frink has had since before this audit.
 
 **This document's section 1.2 was imprecise about them.** It counted
 eleven "deferred encoder/embedding" rows as gaps; `bert` was already
@@ -64,7 +64,7 @@ What the two rows cost: one line each of
 `bert_gguf_loader::ENCODER_ARCHS`, plus `BertFfn` and
 `BertHparams::rope_theta` for the two facts that differ across the
 family, plus a fixture each. `bert.cpp`'s graph serves several
-architectures and the ones ferrox builds differ from `bert` in two
+architectures and the ones frink builds differ from `bert` in two
 lines of it and nothing else:
 
 | arch | rotation | FFN |
@@ -80,7 +80,7 @@ verdict read from a graph's BRANCHES rather than from the
 architecture's own loader names blockers it does not have.
 
 And one open question, recorded rather than answered: on an F32
-fixture ferrox and libllama agree EXACTLY with the attention output
+fixture frink and libllama agree EXACTLY with the attention output
 switched off and differ by ~3e-4 with it on. That is not the Q8_0
 activation-quantization story `tests/bert_llama_cpp_parity.rs` tells
 about the real checkpoint, and two obvious explanations are measured
@@ -93,12 +93,12 @@ gate+up), `neo-bert` (its own graph), `modern-bert` (alternating
 local/global attention), `eurobert` (its own graph), `nomic-bert-moe`
 (a second FFN shape on its MoE layers), `t5encoder`, and the two
 decoder-embedding rows. `jina-bert-v2` is the next cheapest and needs
-ALiBi on the encoder's attention, which `ferrox_core::alibi` already
+ALiBi on the encoder's attention, which `frink_core::alibi` already
 computes for the decoder.
 
 ## 0. The one-line answer
 
-Against the llama.cpp this repo PINS, ferrox serves **every text
+Against the llama.cpp this repo PINS, frink serves **every text
 generation architecture that has a graph**. Against llama.cpp's
 `master` as of today it serves 116 of 130, because the pin is six
 weeks and **792 commits** stale and fourteen architectures landed in
@@ -127,7 +127,7 @@ $ git show HEAD:src/llama-arch.cpp | ... > /tmp/pin.txt  # 139 names
 $ comm -13 /tmp/pin.txt /tmp/up.txt
 ```
 
-| arch | graph | lines | what it is, and what ferrox would need |
+| arch | graph | lines | what it is, and what frink would need |
 |---|---|---|---|
 | `spark2_5` | `spark2-5.cpp` | 146 | **CLOSED 2026-09-19**: one `attn_gate` row (sigmoid, per head) and three tables that each gained a name |
 | `maple` | `maple.cpp` | 150 | **CLOSED 2026-09-19**: one `rope_layers` row (`SlidingOnly`) plus `ClampForm::BeforeSilu`, which `maple.cpp` does not show -- `llama-graph.cpp:2228` decides it |
@@ -145,7 +145,7 @@ $ comm -13 /tmp/pin.txt /tmp/up.txt
 | `qwen3tts` | `qwen3tts.cpp` | 3 | TTS shim |
 
 Twelve of the fourteen are text generation. Two of those twelve
-(`granite_swa`, `maple`) read only keys and ops ferrox already serves,
+(`granite_swa`, `maple`) read only keys and ops frink already serves,
 which is the cheapest class this repo has -- and the lesson from
 `minimax-m2` is that a row in that class costs a fixture and an hour,
 so it should not sit in a table for a week.
@@ -157,7 +157,7 @@ that has closed nine rows in two weeks.
 ### 1.2 Against the pin, the text-generation gap is zero
 
 ```
-$ ./target/release/ferrox archs | awk -F'|' 'NF>4{print $6}' | sort | uniq -c
+$ ./target/release/frink archs | awk -F'|' 'NF>4{print $6}' | sort | uniq -c
    95 generic-gqa   21 dedicated   31 deferred   3 test-fixture
 $ ... | awk -F'|' 'NF>4{print $3}' | sort | uniq -c
   119 TextGeneration  11 DeferredEncoderEmbedding  10 DeferredMultimodal
@@ -174,7 +174,7 @@ population justifies:
 
 1. **encoder / embedding (11)**: `bert`, `nomic-bert`, `nomic-bert-moe`,
    `jina-bert-v2`, `jina-bert-v3`, `modern-bert`, `neo-bert`,
-   `eurobert`, `gemma-embedding`, `llama-embed`, `t5encoder`. ferrox
+   `eurobert`, `gemma-embedding`, `llama-embed`, `t5encoder`. frink
    already serves `/v1/embeddings` and `/v1/rerank` -- from a decoder.
    These are the models people actually embed with, and `bert` alone
    is most of that population.
@@ -185,7 +185,7 @@ population justifies:
 ### 1.3 What this means for the pin
 
 Updating the pin is not a chore here, it is the measurement: every
-capability table in `ferrox-models` is derived from a census over
+capability table in `frink-models` is derived from a census over
 `src/models/*.cpp`, and a census over a six-week-old tree can be
 wrong in the direction that matters (a graph that started reading a
 key). The pin bump and the census re-run belong in one PR, before any
@@ -203,24 +203,24 @@ _TEXT_GENERATION_MODELS 137   _EMBEDDING_MODELS 37   _MULTIMODAL_MODELS ~225 ent
 Those are HF `*ForCausalLM` class names, several of which map to one
 GGUF architecture string (`LlamaForCausalLM`, `MistralForCausalLM`,
 `YiForCausalLM` are all `llama` in GGUF, which this repo learned the
-hard way on 2026-09-10). Counting them against ferrox's 116 would be
+hard way on 2026-09-10). Counting them against frink's 116 would be
 comparing two different things. The honest statement is that the
 text-generation OVERLAP is close to complete, and vLLM's advantage is
-in three scopes ferrox defers: multimodal, pooling/embedding models,
+in three scopes frink defers: multimodal, pooling/embedding models,
 and encoder-decoder.
 
 ### 2.2 Feature parity, measured against this tree
 
 vLLM's own `docs/features/README.md` matrix rows, each checked against
-ferrox by grep rather than by memory:
+frink by grep rather than by memory:
 
-| vLLM feature | ferrox | evidence |
+| vLLM feature | frink | evidence |
 |---|---|---|
-| chunked prefill (CP) | **yes** | `ferrox-server/src/generate.rs` |
+| chunked prefill (CP) | **yes** | `frink-server/src/generate.rs` |
 | automatic prefix caching (APC) | **yes** | `policy/radix`, over paged KV |
-| LoRA, per request | **yes** | `ferrox-server/src/lora.rs`, with a reader/writer gate llama.cpp does not have |
-| speculative decoding (SD) | **in the engine, NOT in the server** | `ferrox_models::speculative` + `draft_model`; the only caller is `ferrox-cli/src/main.rs:1468` |
-| structured outputs | **yes** | `grammar_request.rs`, `json_mode.rs`, `tool_grammar/`, `ferrox_models::grammar` |
+| LoRA, per request | **yes** | `frink-server/src/lora.rs`, with a reader/writer gate llama.cpp does not have |
+| speculative decoding (SD) | **in the engine, NOT in the server** | `frink_models::speculative` + `draft_model`; the only caller is `frink-cli/src/main.rs:1468` |
+| structured outputs | **yes** | `grammar_request.rs`, `json_mode.rs`, `tool_grammar/`, `frink_models::grammar` |
 | tool calling | **yes** | and 0.25.0 fixed the format being chosen by the served NAME |
 | reasoning outputs | **yes** | `reasoning_tokens.rs`, `reasoning_budget.rs` |
 | pooling / embeddings | **partial** | `/v1/embeddings`, `/v1/rerank` from a decoder; no BERT-family encoder |
@@ -245,9 +245,9 @@ structures that must agree, with nothing enforcing it. The evidence is
 not an opinion --
 
 ```
-$ grep -rn 'speculat' crates/ferrox-server/src --include=*.rs -l
-crates/ferrox-server/src/stats/requests.rs
-$ grep -rn 'with_speculation' crates/ferrox-server/src | grep -v test
+$ grep -rn 'speculat' crates/frink-server/src --include=*.rs -l
+crates/frink-server/src/stats/requests.rs
+$ grep -rn 'with_speculation' crates/frink-server/src | grep -v test
 (nothing)
 ```
 
@@ -256,13 +256,13 @@ reaches the admin ring, and NO producer for it. A metrics column that
 no code path can fill reads as coverage, which is the same defect
 class as a gate that cannot fire.
 
-`ferrox_models::speculative` is lossless by construction (the
+`frink_models::speculative` is lossless by construction (the
 Leviathan / Chen rejection rule, with `accept_or_resample` pinned by
 tests), `PromptLookupSpeculator` needs no second checkpoint and no
 GPU, and `draft_model.rs` already exists for the `--model-draft` case.
 So the whole of vLLM's `n_gram` and `draft_model` spec-decode arms are
 one wiring job away over the API, and the `mtp` arm is one `Drafter`
-impl away for the seventeen architectures whose MTP blocks ferrox
+impl away for the seventeen architectures whose MTP blocks frink
 already SKIPS by name (`crate::mtp_blocks::NEXTN_READERS`).
 
 ## 3. Ranked, against the north star
@@ -277,14 +277,14 @@ gap of the same size.
    of this repo's tables are derived from a grep over it.
 2. **Speculative decoding in the server.** Built, tested, lossless,
    unreachable; the metric for it already exists. Both engines have
-   it; only ferrox has it and cannot serve it.
+   it; only frink has it and cannot serve it.
 3. ~~**`granite_swa` and `maple`**~~ -- `maple` closed on 2026-09-19
    with `spark2_5`; `granite_swa` is left and needs two small per-layer
    tables (an `expert_used_count` array, which the loader now reads,
    and `attention.rope_pattern`, the first upstream graph that lets the
    FILE decide which layers rotate).
 4. **`bert` and the encoder/embedding family.** Eleven llama.cpp rows
-   and vLLM's whole pooling scope in one seam, and ferrox already has
+   and vLLM's whole pooling scope in one seam, and frink already has
    the two routes that would serve them.
 5. **`minimax-01`**, the new hybrid recurrent row, on the seam that has
    closed nine rows in two weeks.

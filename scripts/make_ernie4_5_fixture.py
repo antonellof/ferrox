@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `ernie4_5` GGUF used by ferrox's ERNIE 4.5
+"""Generate the tiny synthetic `ernie4_5` GGUF used by frink's ERNIE 4.5
 coverage test.
 
 `ernie4_5` is Baidu's dense ERNIE-4.5 (the MoE sibling tags
 `ernie4_5-moe` and is a different, still-refusing row: its layers
-interleave dense and MoE on a step ferrox does not read). It sat on
-ferrox's generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY.
+interleave dense and MoE on a step frink does not read). It sat on
+frink's generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY.
 
 `.scratch/llama.cpp/src/models/ernie4-5.cpp`, dense branch:
 
@@ -24,7 +24,7 @@ ferrox's generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY.
   * RoPE is **NORM** (`LLM_ARCH_ERNIE4_5` in `llama_model_rope_type`'s
     NORM group, llama-model.cpp:2602). The test sabotages exactly that.
 
-DELIBERATELY ABSENT: the OPTIONAL `attn_output.bias` at :45. ferrox has
+DELIBERATELY ABSENT: the OPTIONAL `attn_output.bias` at :45. frink has
 no slot for an output-projection bias outside the gpt-oss path, and a
 checkpoint carrying one is refused BY NAME by
 `assert_every_tensor_consumed` rather than run unbiased -- which is the
@@ -79,7 +79,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-ernie4-5-fixture")
+    w.add_name("frink-ernie4-5-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

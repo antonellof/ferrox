@@ -434,199 +434,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrox-api"
-version = "0.25.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ferrox-cli"
-version = "0.25.0"
-dependencies = [
- "anyhow",
- "byteorder",
- "clap",
- "ferrox-core",
- "ferrox-cuda",
- "ferrox-gguf",
- "ferrox-metal",
- "ferrox-models",
- "ferrox-quant",
- "ferrox-safetensors",
- "ferrox-server",
- "half",
- "libc",
- "rayon",
- "serde_json",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ferrox-core"
-version = "0.25.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "ferrox-cuda",
- "ferrox-gguf",
- "ferrox-metal",
- "ferrox-quant",
- "ferrox-vulkan",
- "libc",
- "memmap2",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
-]
-
-[[package]]
-name = "ferrox-cuda"
-version = "0.25.0"
-dependencies = [
- "cudarc",
- "ferrox-quant",
- "half",
- "thiserror",
-]
-
-[[package]]
-name = "ferrox-gguf"
-version = "0.25.0"
-dependencies = [
- "anyhow",
- "byteorder",
- "memmap2",
- "thiserror",
-]
-
-[[package]]
-name = "ferrox-inference"
-version = "0.25.0"
-dependencies = [
- "ferrox-api",
- "ferrox-core",
- "ferrox-gguf",
- "ferrox-models",
- "ferrox-moe",
- "ferrox-quant",
- "ferrox-safetensors",
-]
-
-[[package]]
-name = "ferrox-metal"
-version = "0.25.0"
-dependencies = [
- "ferrox-quant",
- "half",
- "memmap2",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "thiserror",
-]
-
-[[package]]
-name = "ferrox-models"
-version = "0.25.0"
-dependencies = [
- "anyhow",
- "base64 0.23.0",
- "byteorder",
- "fancy-regex",
- "ferrox-core",
- "ferrox-cuda",
- "ferrox-gguf",
- "ferrox-metal",
- "ferrox-moe",
- "ferrox-quant",
- "ferrox-safetensors",
- "half",
- "minijinja",
- "rayon",
- "regex",
- "serde",
- "serde_json",
- "thiserror",
- "ureq",
-]
-
-[[package]]
-name = "ferrox-moe"
-version = "0.25.0"
-dependencies = [
- "anyhow",
- "ferrox-core",
- "ferrox-quant",
- "rayon",
-]
-
-[[package]]
-name = "ferrox-quant"
-version = "0.25.0"
-dependencies = [
- "half",
- "thiserror",
-]
-
-[[package]]
-name = "ferrox-safetensors"
-version = "0.25.0"
-dependencies = [
- "byteorder",
- "memmap2",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "ferrox-server"
-version = "0.25.0"
-dependencies = [
- "anyhow",
- "axum",
- "axum-server",
- "base64 0.23.0",
- "clap",
- "ferrox-api",
- "ferrox-core",
- "ferrox-cuda",
- "ferrox-gguf",
- "ferrox-metal",
- "ferrox-models",
- "ferrox-moe",
- "ferrox-safetensors",
- "futures-util",
- "http-body-util",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "ureq",
-]
-
-[[package]]
-name = "ferrox-vulkan"
-version = "0.25.0"
-dependencies = [
- "ash",
- "ferrox-quant",
- "half",
- "thiserror",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -645,6 +452,199 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "frink-api"
+version = "0.25.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "frink-cli"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "clap",
+ "frink-core",
+ "frink-cuda",
+ "frink-gguf",
+ "frink-metal",
+ "frink-models",
+ "frink-quant",
+ "frink-safetensors",
+ "frink-server",
+ "half",
+ "libc",
+ "rayon",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "frink-core"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "frink-cuda",
+ "frink-gguf",
+ "frink-metal",
+ "frink-quant",
+ "frink-vulkan",
+ "libc",
+ "memmap2",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "frink-cuda"
+version = "0.25.0"
+dependencies = [
+ "cudarc",
+ "frink-quant",
+ "half",
+ "thiserror",
+]
+
+[[package]]
+name = "frink-gguf"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "memmap2",
+ "thiserror",
+]
+
+[[package]]
+name = "frink-inference"
+version = "0.25.0"
+dependencies = [
+ "frink-api",
+ "frink-core",
+ "frink-gguf",
+ "frink-models",
+ "frink-moe",
+ "frink-quant",
+ "frink-safetensors",
+]
+
+[[package]]
+name = "frink-metal"
+version = "0.25.0"
+dependencies = [
+ "frink-quant",
+ "half",
+ "memmap2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "thiserror",
+]
+
+[[package]]
+name = "frink-models"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.0",
+ "byteorder",
+ "fancy-regex",
+ "frink-core",
+ "frink-cuda",
+ "frink-gguf",
+ "frink-metal",
+ "frink-moe",
+ "frink-quant",
+ "frink-safetensors",
+ "half",
+ "minijinja",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
+name = "frink-moe"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "frink-core",
+ "frink-quant",
+ "rayon",
+]
+
+[[package]]
+name = "frink-quant"
+version = "0.25.0"
+dependencies = [
+ "half",
+ "thiserror",
+]
+
+[[package]]
+name = "frink-safetensors"
+version = "0.25.0"
+dependencies = [
+ "byteorder",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "frink-server"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "axum-server",
+ "base64 0.23.0",
+ "clap",
+ "frink-api",
+ "frink-core",
+ "frink-cuda",
+ "frink-gguf",
+ "frink-metal",
+ "frink-models",
+ "frink-moe",
+ "frink-safetensors",
+ "futures-util",
+ "http-body-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
+name = "frink-vulkan"
+version = "0.25.0"
+dependencies = [
+ "ash",
+ "frink-quant",
+ "half",
+ "thiserror",
 ]
 
 [[package]]

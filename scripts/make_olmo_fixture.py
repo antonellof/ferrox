@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `olmo` GGUFs used by ferrox's OLMo-1
+"""Generate the tiny synthetic `olmo` GGUFs used by frink's OLMo-1
 coverage test.
 
-`olmo` is AI2's OLMo-1, and it is NOT `olmo2`. It sat on ferrox's
+`olmo` is AI2's OLMo-1, and it is NOT `olmo2`. It sat on frink's
 generic GQA path refusing as UNAUDITED, triaged NEW CODE, and the
 blocker is the norm FUNCTION rather than the residual wiring:
 
@@ -47,13 +47,13 @@ What this fixture pins beyond that, each against the C:
     `n_embd / n_head` and not free.
   * The epsilon comes from `LLM_KV_ATTENTION_LAYERNORM_EPS` (:4), NOT
     the RMS one, and `conversion/olmo.py:22` writes it as
-    `olmo.attention.layer_norm_epsilon`. ferrox reads either spelling
+    `olmo.attention.layer_norm_epsilon`. frink reads either spelling
     into one field, so this file writes the LayerNorm spelling and
     nothing else.
 
-**`--clamp` writes the one thing ferrox refuses.** `olmo.cpp:5` reads an
+**`--clamp` writes the one thing frink refuses.** `olmo.cpp:5` reads an
 optional `{arch}.attention.clamp_kqv` and `llama-graph.cpp:1611-1652`
-clamps Q, K and V by it inside `build_qkv`. ferrox clamps no projection
+clamps Q, K and V by it inside `build_qkv`. frink clamps no projection
 on any path and stops instead of running unclamped -- see
 `crate::clamp_kqv`. The gate is REACHABLE from real checkpoints, not
 only from a hand-written file: `conversion/olmo.py:23-25` writes the key
@@ -115,7 +115,7 @@ def main(out_path: str, clamp: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-olmo-fixture")
+    w.add_name("frink-olmo-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """Rewrite a quantized GGUF as ALL_F32, tensor by tensor, metadata copied.
 
-The arbiter for a `ferrox parity` WRONG on a quantized file. `parity`
+The arbiter for a `frink parity` WRONG on a quantized file. `parity`
 measures the distance between two points and cannot say which moved:
 llama.cpp quantizes ACTIVATIONS to 8 bits for its quantized matmuls and
-ferrox keeps them in f32, so on a graph that amplifies that loss the
-two disagree while ferrox is the closer of the two to the f32 answer
+frink keeps them in f32, so on a graph that amplifies that loss the
+two disagree while frink is the closer of the two to the f32 answer
 (`docs/plans/llama-cpp-gap-inventory.md` section 10). Running both
 engines on the dequantized file removes the quantized matmuls from both
 sides; then
 
-    KL(llama_f32 || ferrox_f32)   is the graph
+    KL(llama_f32 || frink_f32)   is the graph
     KL(llama_f32 || llama_q)      is llama.cpp's own quantization loss
-    KL(llama_f32 || ferrox_q)     is ferrox's
+    KL(llama_f32 || frink_q)     is frink's
 
-which `ferrox parity --dump-logits PREFIX` on each file and a few lines
+which `frink parity --dump-logits PREFIX` on each file and a few lines
 of numpy give. Measured first on PLM-1.8B-Instruct Q8_0 (2026-09-12):
 parity 3.54e-2 WRONG; against the dequantized file the graph is 4.5e-5,
-ferrox's Q8_0 loss 4.5e-5 (2.8e-9 from its own f32), llama.cpp's 3.7e-2.
+frink's Q8_0 loss 4.5e-5 (2.8e-9 from its own f32), llama.cpp's 3.7e-2.
 The whole verdict was the reference's quantization.
 
 The output is `4 * parameters` bytes (PLM-1.8B: 6.8 GiB); write it to

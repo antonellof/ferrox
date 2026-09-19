@@ -1,4 +1,4 @@
-// Reference dumper for `ferrox parity`: llama.cpp's own answers for a
+// Reference dumper for `frink parity`: llama.cpp's own answers for a
 // GGUF, in two modes.
 //
 //   logits    llama.cpp's last-position logits for an EXPLICIT token-id
@@ -8,7 +8,7 @@
 //   embed     llama.cpp's POOLED EMBEDDING for one raw text, printed as
 //             one f32 per line.
 //
-// Why the logits mode takes token ids and not text: `ferrox` and
+// Why the logits mode takes token ids and not text: `frink` and
 // llama.cpp were once compared by greedy text, and it proved nothing —
 // the two tokenizers had to agree first, and once they did the sequences
 // still diverged after ~3 tokens from ordinary numeric drift flipping a
@@ -40,7 +40,7 @@
 // with the model's own `pooling_type`), so the comparison covers the
 // pooling rule and not only the graph. It takes TEXT rather than ids,
 // unlike the logits mode, because a BERT checkpoint's `[CLS]`/`[SEP]`
-// wrapping is part of what is being checked; ferrox's tokenizer is
+// wrapping is part of what is being checked; frink's tokenizer is
 // already held to this same library by the tokenize mode above, so the
 // tokenizer is not an uncontrolled variable here.
 //
@@ -78,15 +78,15 @@
 //
 //           Every case is tokenized TWICE, once per parse_special
 //           setting, because the two are different questions and
-//           ferrox has to answer both. Version 1 dumped only the
+//           frink has to answer both. Version 1 dumped only the
 //           parse_special=true answer, and that hid a real defect:
-//           ferrox parsed special-token markers unconditionally, so a
+//           frink parsed special-token markers unconditionally, so a
 //           document that MENTIONED `<|im_end|>` in prose was off by
 //           one token against llama.cpp's default, and the only
 //           reference the oracle had was the one setting on which the
 //           two agreed.
 //
-// CPU only (n_gpu_layers = 0) in the logits mode: the ferrox side of the
+// CPU only (n_gpu_layers = 0) in the logits mode: the frink side of the
 // comparison is its CPU path, which is the one cross-validated against
 // NumPy. Comparing a GPU reference against a CPU candidate would
 // confound two differences. The tokenize mode loads vocab_only, so it
@@ -112,14 +112,14 @@
 
 // Exit code for "llama.cpp itself cannot load this checkpoint". Kept
 // distinct from the generic failure code because it is not evidence
-// about ferrox: a reference with no answer has no verdict, and a caller
+// about frink: a reference with no answer has no verdict, and a caller
 // that cannot tell the two apart has to either ignore real failures or
 // report a missing reference as a defect.
 #define EXIT_MODEL_UNSUPPORTED 3
 
 // Prints WHICH libllama actually answered, as `libllama <path>`.
 //
-// A parity verdict is not a property of ferrox alone: the same
+// A parity verdict is not a property of frink alone: the same
 // checkpoint scored DRIFT against one libllama and WRONG against
 // another, and the printed report said nothing that distinguished the
 // two runs (issue #102). The two builds turned out to differ in the

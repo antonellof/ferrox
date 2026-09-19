@@ -1,20 +1,20 @@
 # llama.cpp full parity audit (2026-09-02)
 
-**Companion to** [`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md) (evidence-backed differential) and [`llama-cpp-parity-review-2026-09-02.md`](llama-cpp-parity-review-2026-09-02.md) (prioritized actions). This document is the **complete audit run**: file-by-file C++→Rust mapping, live `ferrox parity` sweep on all local checkpoints, and a ranked priority plan.
+**Companion to** [`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md) (evidence-backed differential) and [`llama-cpp-parity-review-2026-09-02.md`](llama-cpp-parity-review-2026-09-02.md) (prioritized actions). This document is the **complete audit run**: file-by-file C++→Rust mapping, live `frink parity` sweep on all local checkpoints, and a ranked priority plan.
 
 **North star:** same GGUF, same command shapes, same or better performance on hardware people own ([`north-star.md`](north-star.md)).
 
 **Evidence sources:**
 - llama.cpp checkout: `.scratch/llama.cpp` (947 source files under `src/`, `ggml/src/`, `common/`, `tools/`)
-- ferrox: `main` branch, 2026-09-02 evening
-- Parity run: `.scratch/parity-run-2026-09-02/` (19 local GGUFs, CPU-only, `FERROX_METAL=0 FERROX_CUDA=0`)
+- frink: `main` branch, 2026-09-02 evening
+- Parity run: `.scratch/parity-run-2026-09-02/` (19 local GGUFs, CPU-only, `FRINK_METAL=0 FRINK_CUDA=0`)
 - File map: `scripts/llama_cpp_file_map.py` → `.scratch/parity-run-2026-09-02/file_map.json`
 
 ---
 
 ## Executive summary
 
-| Dimension | llama.cpp | ferrox | Gap severity |
+| Dimension | llama.cpp | frink | Gap severity |
 |-----------|-----------|--------|--------------|
 | Source files (C++/CUDA/Metal) | **1,103** mapped | **308** Rust files, **~230k** lines | Structural: 140 per-arch graphs vs 1 decoder |
 | Architecture graphs | **140** hand-written | **16** audited + 4 dedicated engines | **P0** — 124 graphs unported |
@@ -42,7 +42,7 @@
 | BGE-small, ms-marco MiniLM | DIVERGES (emoji) | N/A | Encoder-only; BERT emoji tokenization |
 | BGE/ms-marco load | — | REFUSE | Expected: embedding scope |
 
-**Actionable from sweep:** DeepSeek-R1-Distill and Phi-4-mini need layer-divergence investigation (`ferrox layer-divergence`). K-quant DRIFT is documented and expected (§10 of gap inventory). Rebuild reference from `.scratch/llama.cpp` for gemma-4 parity.
+**Actionable from sweep:** DeepSeek-R1-Distill and Phi-4-mini need layer-divergence investigation (`frink layer-divergence`). K-quant DRIFT is documented and expected (§10 of gap inventory). Rebuild reference from `.scratch/llama.cpp` for gemma-4 parity.
 
 ---
 
@@ -53,29 +53,29 @@
 | Tree | Files | Lines (approx) | Organization |
 |------|-------|----------------|--------------|
 | llama.cpp `src/` + `ggml/src/` + `common/` + `tools/` | 1,103 | ~350k+ | Per-arch graphs, ggml tensor IR, 18 backends |
-| ferrox `crates/` | 308 `.rs` | 229,785 | Hand-written decode graph, 2.5 backends |
+| frink `crates/` | 308 `.rs` | 229,785 | Hand-written decode graph, 2.5 backends |
 
 ### 1.2 Core library mapping
 
-| llama.cpp (C++) | ferrox (Rust) | Status | Notes |
+| llama.cpp (C++) | frink (Rust) | Status | Notes |
 |-----------------|---------------|--------|-------|
-| `src/llama.cpp` | `ferrox-models/src/lib.rs` | partial | No libllama C API |
-| `src/llama-model.cpp` | `ferrox-models/src/loader.rs` (2k+ lines) | partial | One loader vs per-arch wiring |
-| `src/llama-model-loader.cpp` | `ferrox-gguf/src/lib.rs` | **ported** | GGUF mmap |
-| `src/llama-model-saver.cpp` | `ferrox-gguf/src/writer.rs` | partial | Write header/tensors; no full export |
-| `src/llama-arch.cpp` | `ferrox-models/src/capability.rs` (2.3k lines) | partial | 150 catalog rows; 16 audited |
-| `src/llama-hparams.cpp` | `ferrox-models/src/config.rs` | partial | Hyperparameter parsing |
-| `src/llama-vocab.cpp` | `ferrox-models/src/tokenizer.rs` | partial | 19-case parity; BERT emoji edge |
-| `src/llama-context.cpp` | `ferrox-models/src/decoder.rs` (6,702 lines) | partial | Contiguous + paged paths |
-| `src/llama-batch.cpp` | `ferrox-server/src/serving/batch/` | partial | CB landed; incremental stream gap |
+| `src/llama.cpp` | `frink-models/src/lib.rs` | partial | No libllama C API |
+| `src/llama-model.cpp` | `frink-models/src/loader.rs` (2k+ lines) | partial | One loader vs per-arch wiring |
+| `src/llama-model-loader.cpp` | `frink-gguf/src/lib.rs` | **ported** | GGUF mmap |
+| `src/llama-model-saver.cpp` | `frink-gguf/src/writer.rs` | partial | Write header/tensors; no full export |
+| `src/llama-arch.cpp` | `frink-models/src/capability.rs` (2.3k lines) | partial | 150 catalog rows; 16 audited |
+| `src/llama-hparams.cpp` | `frink-models/src/config.rs` | partial | Hyperparameter parsing |
+| `src/llama-vocab.cpp` | `frink-models/src/tokenizer.rs` | partial | 19-case parity; BERT emoji edge |
+| `src/llama-context.cpp` | `frink-models/src/decoder.rs` (6,702 lines) | partial | Contiguous + paged paths |
+| `src/llama-batch.cpp` | `frink-server/src/serving/batch/` | partial | CB landed; incremental stream gap |
 | `src/llama-graph.cpp` | `decoder.rs` + `attn_block.rs` | partial | No ggml graph abstraction |
-| `src/llama-sampler.cpp` (4,106 lines) | `ferrox-models/src/sampling.rs` (834 lines) | partial | Missing: dry, xtc, typ_p, top_n_sigma, mirostat |
-| `src/llama-grammar.cpp` (1,522 lines) | `ferrox-models/src/grammar/` | partial | GBNF + JSON schema landed |
-| `src/llama-chat.cpp` | `ferrox-server/src/completion/` | partial | Template rendering |
-| `src/llama-kv-cache*.cpp` (6 variants) | `ferrox-core/src/cache.rs`, `kv_budget.rs` | partial | Standard GQA only; no DSA/ISWA/MSA |
-| `src/llama-memory*.cpp` (5 variants) | `ferrox-core/expert_cache.rs`, `residency` | partial | Policy exists; not executed on Metal/RAM |
-| `src/llama-mmap.cpp` | `ferrox-gguf/src/lib.rs` | **ported** | |
-| `src/llama-quant.cpp` | `ferrox-quant/src/` | partial | Read all; write Q8_0; K-encoders in progress |
+| `src/llama-sampler.cpp` (4,106 lines) | `frink-models/src/sampling.rs` (834 lines) | partial | Missing: dry, xtc, typ_p, top_n_sigma, mirostat |
+| `src/llama-grammar.cpp` (1,522 lines) | `frink-models/src/grammar/` | partial | GBNF + JSON schema landed |
+| `src/llama-chat.cpp` | `frink-server/src/completion/` | partial | Template rendering |
+| `src/llama-kv-cache*.cpp` (6 variants) | `frink-core/src/cache.rs`, `kv_budget.rs` | partial | Standard GQA only; no DSA/ISWA/MSA |
+| `src/llama-memory*.cpp` (5 variants) | `frink-core/expert_cache.rs`, `residency` | partial | Policy exists; not executed on Metal/RAM |
+| `src/llama-mmap.cpp` | `frink-gguf/src/lib.rs` | **ported** | |
+| `src/llama-quant.cpp` | `frink-quant/src/` | partial | Read all; write Q8_0; K-encoders in progress |
 | `src/llama-adapter.cpp` | — | **missing** | LoRA adapters |
 | `src/unicode*.cpp` | `tokenizer/unicode.rs` | partial | Normalization |
 
@@ -83,7 +83,7 @@
 
 llama.cpp: `src/models/*.cpp` — one file per architecture, ~50–200 lines each.
 
-ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
+frink: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 
 | Engine | Architectures | llama.cpp counterpart |
 |--------|---------------|----------------------|
@@ -99,12 +99,12 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 
 ### 1.4 ggml backends
 
-| llama.cpp backend | Files | ferrox | Status |
+| llama.cpp backend | Files | frink | Status |
 |-------------------|-------|--------|--------|
-| `ggml-cpu/` | 64 | `ferrox-quant` + `ferrox-core` | partial — AVX2/NEON/i8mm; no AVX512/SVE/AMX |
-| `ggml-cuda/` | 274 | `ferrox-cuda` (5 files, ~2.6k lines) | partial — 8 kernels; **no GEMM, no MoE FA** |
-| `ggml-metal/` | 10 | `ferrox-metal` (8 files, ~20k lines) | partial — competitive MoE; missing sinks/ALiBi |
-| `ggml-vulkan/` | 145 | `ferrox-vulkan` | partial — Q8_0 beachhead only (verdict GO) |
+| `ggml-cpu/` | 64 | `frink-quant` + `frink-core` | partial — AVX2/NEON/i8mm; no AVX512/SVE/AMX |
+| `ggml-cuda/` | 274 | `frink-cuda` (5 files, ~2.6k lines) | partial — 8 kernels; **no GEMM, no MoE FA** |
+| `ggml-metal/` | 10 | `frink-metal` (8 files, ~20k lines) | partial — competitive MoE; missing sinks/ALiBi |
+| `ggml-vulkan/` | 145 | `frink-vulkan` | partial — Q8_0 beachhead only (verdict GO) |
 | `ggml-sycl/` | 157 | — | **missing** |
 | `ggml-hip/` | shim | — | **missing** (falls from CUDA) |
 | `ggml-opencl/` | 172 | — | **missing** |
@@ -114,17 +114,17 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 
 ### 1.5 Tools mapping
 
-| llama.cpp tool | ferrox command | Status |
+| llama.cpp tool | frink command | Status |
 |----------------|----------------|--------|
-| `llama-cli` | `ferrox run` | partial — flag parity mostly done |
-| `llama-server` | `ferrox serve` | partial — slot save/restore present, `GET /slots` / `/props` / `/infill` absent |
-| `llama-bench` | `ferrox bench` | **ported** |
-| `llama-quantize` | `ferrox quantize` | partial — Q8_0, Q4_K_S/M, Q5_K_S/M, Q6_K byte-identical, with and without `--imatrix`; Q2_K/Q3_K, IQ tiers, MXFP4 refused by name |
-| `llama-perplexity` | `ferrox perplexity` | partial — corpus ppl; no HellaSwag |
-| `llama-tokenize` | via `ferrox parity` tokenizer sweep | partial |
-| `llama-gguf-split` | `ferrox gguf-split` | **ported**: split by tensors or size, merge, `--no-tensor-first-split`, `--dry-run` |
-| `llama-imatrix` | `ferrox imatrix` | **ported** (2026-09-11): same file format both ways, GGUF and legacy `.dat`; sums agree to the forward pass's precision, not bit for bit (see `docs/CLI.md`) |
-| `llama-batched-bench` | `ferrox batched-bench` | **ported** (2026-09-11): same sweep, same ten columns and JSONL keys, drives `forward_multi_seq` directly; `-b`, `-kvu`, `-fa`, `-tb` refused by name |
+| `llama-cli` | `frink run` | partial — flag parity mostly done |
+| `llama-server` | `frink serve` | partial — slot save/restore present, `GET /slots` / `/props` / `/infill` absent |
+| `llama-bench` | `frink bench` | **ported** |
+| `llama-quantize` | `frink quantize` | partial — Q8_0, Q4_K_S/M, Q5_K_S/M, Q6_K byte-identical, with and without `--imatrix`; Q2_K/Q3_K, IQ tiers, MXFP4 refused by name |
+| `llama-perplexity` | `frink perplexity` | partial — corpus ppl; no HellaSwag |
+| `llama-tokenize` | via `frink parity` tokenizer sweep | partial |
+| `llama-gguf-split` | `frink gguf-split` | **ported**: split by tensors or size, merge, `--no-tensor-first-split`, `--dry-run` |
+| `llama-imatrix` | `frink imatrix` | **ported** (2026-09-11): same file format both ways, GGUF and legacy `.dat`; sums agree to the forward pass's precision, not bit for bit (see `docs/CLI.md`) |
+| `llama-batched-bench` | `frink batched-bench` | **ported** (2026-09-11): same sweep, same ten columns and JSONL keys, drives `forward_multi_seq` directly; `-b`, `-kvu`, `-fa`, `-tb` refused by name |
 | `llama-mtmd` (multimodal) | — | **missing** |
 | `llama-tts` | — | **missing** |
 | `llama-rpc` | — | **missing** |
@@ -132,23 +132,23 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 | `llama-cvector-generator` | — | **missing** |
 | `llama-fit-params` | — | **missing** |
 
-### 1.6 ferrox crate → llama.cpp responsibility
+### 1.6 frink crate → llama.cpp responsibility
 
 | Crate | Lines | llama.cpp equivalent |
 |-------|-------|---------------------|
-| `ferrox-models` | ~45k | `src/llama-*.cpp` + `src/models/` |
-| `ferrox-quant` | ~8k | `ggml-quants.c`, `llama-quant.cpp`, CPU SIMD |
-| `ferrox-core` | ~15k | `ggml-cpu`, weight ops, KV, kernel registry |
-| `ferrox-metal` | ~20k | `ggml-metal/` |
-| `ferrox-cuda` | ~2.6k | `ggml-cuda/` (5% coverage) |
-| `ferrox-server` | ~10k | `tools/server/` |
-| `ferrox-cli` | ~8k | `tools/cli/`, `common/arg.cpp` |
-| `ferrox-gguf` | ~2k | `llama-model-loader.cpp`, mmap |
-| `ferrox-moe` | ~3k | MoE routing scattered in llama graphs |
-| `ferrox-vulkan` | ~1k | `ggml-vulkan/` beachhead |
-| `ferrox-api` | ~1k | Server wire DTOs |
-| `ferrox-safetensors` | ~2k | Kimi/DS4 safetensors loaders |
-| `ferrox-inference` | ~1k | Shared inference types |
+| `frink-models` | ~45k | `src/llama-*.cpp` + `src/models/` |
+| `frink-quant` | ~8k | `ggml-quants.c`, `llama-quant.cpp`, CPU SIMD |
+| `frink-core` | ~15k | `ggml-cpu`, weight ops, KV, kernel registry |
+| `frink-metal` | ~20k | `ggml-metal/` |
+| `frink-cuda` | ~2.6k | `ggml-cuda/` (5% coverage) |
+| `frink-server` | ~10k | `tools/server/` |
+| `frink-cli` | ~8k | `tools/cli/`, `common/arg.cpp` |
+| `frink-gguf` | ~2k | `llama-model-loader.cpp`, mmap |
+| `frink-moe` | ~3k | MoE routing scattered in llama graphs |
+| `frink-vulkan` | ~1k | `ggml-vulkan/` beachhead |
+| `frink-api` | ~1k | Server wire DTOs |
+| `frink-safetensors` | ~2k | Kimi/DS4 safetensors loaders |
+| `frink-inference` | ~1k | Shared inference types |
 
 ---
 
@@ -163,7 +163,7 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 
 ### 2.2 Architecture coverage (P0)
 
-- **124 of 140** llama.cpp graphs have no audited ferrox path
+- **124 of 140** llama.cpp graphs have no audited frink path
 - **41** refuse as unaudited (triaged queue in `capability.rs`)
 - **58 dedicated** + **32 deferred** refuse by name
 - Prerequisite: [`model-layer-reorg.md`](model-layer-reorg.md) — split `decoder.rs` so adding an arch is a new file, not a 6700-line edit
@@ -181,15 +181,15 @@ ferrox: `decoder.rs` + `engine_factory.rs` + 4 dedicated engines:
 
 ### 2.4 Serving & CLI (P1)
 
-| Gap | llama.cpp | ferrox |
+| Gap | llama.cpp | frink |
 |-----|-----------|--------|
 | Slot save/load | yes | **`POST /slots/{id}?action=save\|restore`** (2026-09-11), gated on `--slot-save-path`, restoring into the prefix cache; the file carries a checkpoint fingerprint and a mismatch is refused by name. `erase` refused by name, `GET /slots` absent |
-| `-np` / `--parallel` | yes | wired (was already; the row was stale). Read back as `ferrox_scheduler_max_seqs` on `/metrics` since 2026-09-11 |
-| `-b` / `-ub` batch flags | yes | **wired** (2026-09-11), one number on both decode paths, read back as `ferrox_scheduler_prefill_chunk` |
+| `-np` / `--parallel` | yes | wired (was already; the row was stale). Read back as `frink_scheduler_max_seqs` on `/metrics` since 2026-09-11 |
+| `-b` / `-ub` batch flags | yes | **wired** (2026-09-11), one number on both decode paths, read back as `frink_scheduler_prefill_chunk` |
 | Partial `-ngl` | yes | all-or-nothing |
 | Streamed CB output | token stream | buffers full completion |
-| gguf-split merge/split | yes | **`ferrox gguf-split`**, both directions |
-| imatrix | yes | **`ferrox imatrix`** + `ferrox quantize --imatrix`, byte-identical output |
+| gguf-split merge/split | yes | **`frink gguf-split`**, both directions |
+| imatrix | yes | **`frink imatrix`** + `frink quantize --imatrix`, byte-identical output |
 
 ### 2.5 Sampling (mostly closed)
 
@@ -220,7 +220,7 @@ Ranked per [`north-star.md`](north-star.md) and [`roadmap.md`](roadmap.md).
 
 | # | Item | Effort | Evidence |
 |---|------|--------|----------|
-| 1 | **Investigate DeepSeek-R1-Distill + Phi-4-mini WRONG** | S | `ferrox layer-divergence -m …` on both |
+| 1 | **Investigate DeepSeek-R1-Distill + Phi-4-mini WRONG** | S | `frink layer-divergence -m …` on both |
 | 2 | **Rebuild llama_logits from `.scratch/llama.cpp`** | S | Unblocks gemma-4 parity |
 | 3 | **Execute fixture-away triage queue** (9 archs) | M | bailingmoe2, minimax-m2, olmo2, … — one fixture each |
 | 4 | **Close remaining one-match-arm rows** (2) | S | Named in `unaudited_triage.rs` |
@@ -230,11 +230,11 @@ Ranked per [`north-star.md`](north-star.md) and [`roadmap.md`](roadmap.md).
 | # | Item | Effort | Blocks |
 |---|------|--------|--------|
 | 5 | **Model layer reorg phase 1** — extract `attn_block`, `rope`, per-arch trait | L | Everything below |
-| 6 | **K-quant encoders** (#70) — Q4_K_M write parity | L | `ferrox quantize` usefulness |
+| 6 | **K-quant encoders** (#70) — Q4_K_M write parity | L | `frink quantize` usefulness |
 | 7 | **CUDA mul_mm + mmvq** — port from Metal `mul_mm_sg_impl` | L | CUDA prefill |
 | 8 | **Server: ~~`-np`~~, ~~slot save/load~~, streamed CB** | M | Serving parity. `-np` was already wired; slot save/restore and `-b`/`-ub` landed 2026-09-11. Streamed CB output remains |
 | 9 | **Embedding model path** — WordPiece + BERT loader | L | BGE/E5/nomic-embed |
-| ~~10~~ | ~~**gguf-split utility**~~ | S | **done 2026-09-09**: `ferrox gguf-split` |
+| ~~10~~ | ~~**gguf-split utility**~~ | S | **done 2026-09-09**: `frink gguf-split` |
 
 ### P2 — Hardware reach (this quarter)
 
@@ -261,12 +261,12 @@ Each slice ships something a user can verify:
 
 ### Slice A: "Fix the two WRONG models" (1–2 days)
 ```bash
-FERROX_METAL=0 FERROX_CUDA=0 ferrox layer-divergence \
+FRINK_METAL=0 FRINK_CUDA=0 frink layer-divergence \
   -m models/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf
-FERROX_METAL=0 FERROX_CUDA=0 ferrox layer-divergence \
+FRINK_METAL=0 FRINK_CUDA=0 frink layer-divergence \
   -m models/Phi-4-mini-instruct-Q4_K_M.gguf
 ```
-Close when both return MATCH on `ferrox parity`.
+Close when both return MATCH on `frink parity`.
 
 ### Slice B: "Reference from scratch" (half day)
 ```bash
@@ -276,7 +276,7 @@ cmake -B /tmp/llamabuild -DCMAKE_BUILD_TYPE=Release \
   .scratch/llama.cpp
 cmake --build /tmp/llamabuild --target llama -j8
 LLAMA_CPP_PREFIX=/tmp/llamabuild bash tools/build_llama_logits.sh
-ferrox parity -m models/gemma-4-E2B-it-Q4_K_M.gguf
+frink parity -m models/gemma-4-E2B-it-Q4_K_M.gguf
 ```
 
 ### Slice C: "Fixture-away batch" (1 week)
@@ -284,7 +284,7 @@ For each of the 9 fixture-away architectures in `unaudited_triage.rs`:
 1. `scripts/make_*_fixture.py` (synthetic GGUF, kilobytes)
 2. libllama golden logits in `tests/`
 3. Add to `AUDITED_GENERIC_GQA`
-4. `ferrox parity` on fixture
+4. `frink parity` on fixture
 
 ### Slice D: "Model layer reorg phase 1" (2–3 weeks)
 Per [`model-layer-reorg.md`](model-layer-reorg.md):
@@ -301,10 +301,10 @@ Full logs: `.scratch/parity-run-2026-09-02/*.log`
 Regenerate:
 ```bash
 git checkout main
-cargo build -p ferrox-cli --release
+cargo build -p frink-cli --release
 bash tools/build_llama_logits.sh
-export FERROX_METAL=0 FERROX_CUDA=0
-for f in models/*.gguf; do ferrox parity -m "$f"; done
+export FRINK_METAL=0 FRINK_CUDA=0
+for f in models/*.gguf; do frink parity -m "$f"; done
 ```
 
 ## Appendix B: File map regeneration
@@ -316,7 +316,7 @@ python3 scripts/llama_cpp_file_map.py > .scratch/parity-run-2026-09-02/file_map.
 ## Appendix C: Architecture manifest
 
 ```bash
-ferrox archs --write docs/manifests/architecture_manifest.md
+frink archs --write docs/manifests/architecture_manifest.md
 ```
 
 ---

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `granitehybrid` GGUFs used by ferrox's
-Granite-4.0 coverage test (`crates/ferrox-models/tests/granite_hybrid_graphs.rs`).
+"""Generate the tiny synthetic `granitehybrid` GGUFs used by frink's
+Granite-4.0 coverage test (`crates/frink-models/tests/granite_hybrid_graphs.rs`).
 
 `granitehybrid` is IBM Granite 4.0 (H-Micro 3B dense, H-Tiny 7B-A1B and
 H-Small 32B-A9B MoE): `granite.cpp`'s four scalar multipliers and
@@ -39,7 +39,7 @@ Variants:
   * `--no-conv-bias` omits `ssm_conv1d.bias`. `granite-hybrid.cpp:63`
                    creates it `TENSOR_NOT_REQUIRED` and
                    `mamba-base.cpp:222` then `ggml_add`s the NULL:
-                   libllama SEGFAULTS on this file (measured), so ferrox
+                   libllama SEGFAULTS on this file (measured), so frink
                    REQUIRES the tensor and the variant is not a fixture
 
 Weights are pseudo-random from a fixed seed so the files are byte-stable.
@@ -104,7 +104,7 @@ def main(out_path: str, rope: bool, moe: bool, conv_bias: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-granitehybrid-fixture")
+    w.add_name("frink-granitehybrid-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,8 +1,8 @@
-# Ferrox Studio
+# Frink Studio
 
-The web frontend for `ferrox-server`: Chat, Models, Activity, Connect.
+The web frontend for `frink-server`: Chat, Models, Activity, Connect.
 
-It is a **standalone app**. `ferrox-server` serves the HTTP API and
+It is a **standalone app**. `frink-server` serves the HTTP API and
 nothing else, `GET /` on it is a 404, and this app reaches that API the
 same way an editor would. That rule earns its keep. Every screen here
 goes through the public API, so the API cannot rot without a screen
@@ -10,7 +10,7 @@ breaking first and showing you.
 
 ## Screens
 
-Captured in the dark theme at 2160 by 1350 from a real `ferrox-server` on Apple Metal,
+Captured in the dark theme at 2160 by 1350 from a real `frink-server` on Apple Metal,
 serving Llama-3.2-3B-Instruct Q4_K_M. Nothing is mocked; the timings
 under each answer are the server's own usage numbers.
 
@@ -42,17 +42,17 @@ now.
 npm install
 
 # Terminal 1, the real backend, no UI flag, nothing special
-cargo run -p ferrox-server -- -m models/some-model.gguf
+cargo run -p frink-server -- -m models/some-model.gguf
 
 # Terminal 2, Vite on :5173
 npm run dev
 ```
 
-`npm run dev` talks to a real `ferrox-server`, not a mock. Point it
-somewhere other than `127.0.0.1:8383` with `FERROX_BACKEND`:
+`npm run dev` talks to a real `frink-server`, not a mock. Point it
+somewhere other than `127.0.0.1:8383` with `FRINK_BACKEND`:
 
 ```bash
-FERROX_BACKEND=http://127.0.0.1:9001 npm run dev
+FRINK_BACKEND=http://127.0.0.1:9001 npm run dev
 ```
 
 ```bash
@@ -111,13 +111,13 @@ rules apply. Two answers are supported:
   configuration is needed. The app's API base URL stays empty and every
   request goes out as a same-origin path.
 - **A different origin.** Set the API base URL on the **Connect**
-  screen (or `VITE_FERROX_BASE_URL` at build time), and start the server
-  with `FERROX_CORS_ORIGINS` set to **this app's exact origin**. A `*`
+  screen (or `VITE_FRINK_BASE_URL` at build time), and start the server
+  with `FRINK_CORS_ORIGINS` set to **this app's exact origin**. A `*`
   wildcard is a startup error, enforced in
-  `crates/ferrox-server/src/security.rs`, because a wildcard beside a
+  `crates/frink-server/src/security.rs`, because a wildcard beside a
   bearer token is a credential-leak shape.
 
-The Connect screen also holds the `FERROX_API_KEY` bearer token, stored
+The Connect screen also holds the `FRINK_API_KEY` bearer token, stored
 in `localStorage` and sent as an `Authorization` header, never in a
 URL.
 

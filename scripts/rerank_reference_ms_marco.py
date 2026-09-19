@@ -3,10 +3,10 @@
 
 Prints the relevance scores that `cross-encoder/ms-marco-MiniLM-L6-v2`
 gives for the query/document pairs in
-`crates/ferrox-models/tests/rerank_cross_encoder_ordering.rs`, so the
+`crates/frink-models/tests/rerank_cross_encoder_ordering.rs`, so the
 golden values that test asserts against are reproducible rather than
-recorded from ferrox itself (which would only prove ferrox agrees with
-ferrox).
+recorded from frink itself (which would only prove frink agrees with
+frink).
 
 It is a transcription of HuggingFace `BertForSequenceClassification`
 straight from the safetensors -- no `transformers` model classes, no
@@ -19,16 +19,16 @@ Only `numpy`, `safetensors` and `huggingface_hub` are needed.
 
     hf      pooler + segment ids 0/1        the reference the checkpoint
                                             was trained to produce
-    ferrox  no pooler + segment ids 0/1     what ferrox computes today
-    seg0    no pooler + all segments 0      what ferrox and llama.cpp
+    frink  no pooler + segment ids 0/1     what frink computes today
+    seg0    no pooler + all segments 0      what frink and llama.cpp
                                             both computed before #44
 
-`ferrox` is missing the pooler because llama.cpp's converter DROPS
+`frink` is missing the pooler because llama.cpp's converter DROPS
 `bert.pooler.dense` -- `conversion/bert.py`, "we are only using BERT for
 embeddings so we don't need the pooling layer" -- so the GGUF simply
 does not carry it, and no engine can apply a tensor that is not in the
 file. That flattens the score range (about +-0.2 instead of about +-11)
-and it is why the test asserts on the ORDER and on the `ferrox` column,
+and it is why the test asserts on the ORDER and on the `frink` column,
 not on the `hf` column.
 
 `seg0` is the one that was wrong: it puts the RELEVANT document LAST in
@@ -40,9 +40,9 @@ three of these four rankings.
         models/ms-marco-MiniLM-L6-v2-pooler.bin
 
 writes `bert.pooler.dense.{weight,bias}` as raw little-endian float32
-behind an eight-byte magic and two u32 dimensions. ferrox cannot invent
+behind an eight-byte magic and two u32 dimensions. frink cannot invent
 that tensor, but it CAN run one that is present (issue #82, route 1),
-and `crates/ferrox-models/tests/rerank_cross_encoder_ordering.rs`
+and `crates/frink-models/tests/rerank_cross_encoder_ordering.rs`
 splices this file into a head-only GGUF to prove it reproduces the `hf`
 column above rather than merely running. The dump is the checkpoint's
 own weights, not a re-derivation, so the Rust side is still checked
@@ -216,7 +216,7 @@ def score(query, document, pooler, segment_ids):
 
 VARIANTS = [
     ("hf    ", dict(pooler=True, segment_ids=True)),
-    ("ferrox", dict(pooler=False, segment_ids=True)),
+    ("frink", dict(pooler=False, segment_ids=True)),
     ("seg0  ", dict(pooler=False, segment_ids=False)),
 ]
 

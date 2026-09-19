@@ -15,7 +15,7 @@
 // Two attribution columns, and they are worth different amounts. `key`
 // is a fingerprint of the bearer token that actually authenticated the
 // request — real, checked, and never the token itself. `client` is what
-// the caller SAID it was; this app sends `ferrox-studio` and so could
+// the caller SAID it was; this app sends `frink-studio` and so could
 // anything else. The screen labels the second one as self-declared
 // rather than dressing it up as identity, because a monitor that
 // overstates what it knows is worse than one that shows less.
@@ -171,14 +171,14 @@ const columns = [
       c.getValue() ? (
         <span
           className="font-mono"
-          title="Self-declared by the caller (X-Ferrox-Client). Nothing authenticates it."
+          title="Self-declared by the caller (X-Frink-Client). Nothing authenticates it."
         >
           {c.getValue()}
         </span>
       ) : (
         <span
           className="text-faint"
-          title="This caller did not name itself. Ferrox Studio always does, so this request came from something else."
+          title="This caller did not name itself. Frink Studio always does, so this request came from something else."
         >
           —
         </span>
@@ -198,7 +198,7 @@ const columns = [
       ) : (
         <span
           className="text-faint"
-          title="No Authorization header was presented. On a server started without FERROX_API_KEY that is every request."
+          title="No Authorization header was presented. On a server started without FRINK_API_KEY that is every request."
         >
           —
         </span>
@@ -490,7 +490,7 @@ export function ActivityScreen() {
           token, and comparable only between rows of this server run.{" "}
           <strong className="font-semibold text-muted">client</strong> is{" "}
           <em>self-declared</em>: this app sends{" "}
-          <code className="font-mono">ferrox-studio</code> and any other caller
+          <code className="font-mono">frink-studio</code> and any other caller
           could send the same thing, so read it as a label, not as identity.
         </CardFooter>
       </Card>

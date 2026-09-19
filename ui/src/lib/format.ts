@@ -2,7 +2,7 @@
 //
 // Every one of these answers "unknown" as an em dash rather than as a
 // zero. The API is deliberate about `null` meaning "not established"
-// (see ferrox-api's admin module); printing `0 B/s` for a rate the
+// (see frink-api's admin module); printing `0 B/s` for a rate the
 // server refused to estimate would undo that on the last hop.
 
 export const UNKNOWN = "—";

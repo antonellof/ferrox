@@ -115,7 +115,7 @@ export async function listConversations(): Promise<ConversationSummary[]> {
  * re-read without polling the store on a timer. Every write goes
  * through the three functions below; there is no other writer.
  */
-export const CONVERSATIONS_CHANGED = "ferrox:conversations-changed";
+export const CONVERSATIONS_CHANGED = "frink:conversations-changed";
 
 function notifyChanged<T>(value: T): T {
   if (typeof window !== "undefined") {

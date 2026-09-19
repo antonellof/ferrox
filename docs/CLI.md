@@ -1,15 +1,15 @@
 # CLI
 
-`ferrox` accepts common [llama.cpp](https://github.com/ggerganov/llama.cpp)
+`frink` accepts common [llama.cpp](https://github.com/ggerganov/llama.cpp)
 completion flags. Top-level `-m` / `-p` work without typing `run`
-(rewritten to `ferrox run …`).
+(rewritten to `frink run …`).
 
 ```bash
-cargo build --release -p ferrox-cli --features metal   # macOS Metal + CPU
-cargo build --release -p ferrox-cli                    # CPU only
+cargo build --release -p frink-cli --features metal   # macOS Metal + CPU
+cargo build --release -p frink-cli                    # CPU only
 ```
 
-Binary: `./target/release/ferrox`. One executable covers every backend
+Binary: `./target/release/frink`. One executable covers every backend
 compiled into it. Pick one at runtime with `-dev` / `-ngl`.
 
 ## Completion (`run`)
@@ -18,38 +18,38 @@ compiled into it. Pick one at runtime with `-dev` / `-ngl`.
 
 ```bash
 # Greedy completion (raw prompt)
-./target/release/ferrox -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+./target/release/frink -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   -p "The capital of France is" -n 32 --temp 0 --no-cnv
 
 # Chat-tuned wrap (default when GGUF has tokenizer.chat_template)
-./target/release/ferrox -m models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf \
+./target/release/frink -m models/hf_test/SmolLM2-135M-Instruct-Q8_0.gguf \
   -p "What is 2+2?" -n 64 --temp 0 \
   --system "Answer briefly."
 
 # Prompt from file + escapes
-./target/release/ferrox -m model.gguf -f prompt.txt -e -n 128
+./target/release/frink -m model.gguf -f prompt.txt -e -n 128
 
 # Sampling
-./target/release/ferrox -m model.gguf -p "Once upon a time" \
+./target/release/frink -m model.gguf -p "Once upon a time" \
   -n 256 --temp 0.8 --top-k 40 --top-p 0.95 --repeat-penalty 1.1 -s 42
 
 # Threads + context
-./target/release/ferrox -m model.gguf -p "Hi" -n 64 -t 8 -c 4096
+./target/release/frink -m model.gguf -p "Hi" -n 64 -t 8 -c 4096
 
 # Largest context that fits, chosen before the weights load. The
 # arithmetic behind the number is printed to stderr.
-./target/release/ferrox -m model.gguf -p "Hi" -n 64 -c auto
+./target/release/frink -m model.gguf -p "Hi" -n 64 -c auto
 
 # List devices, then select Metal (requires a --features metal build)
-./target/release/ferrox --list-devices
-./target/release/ferrox -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+./target/release/frink --list-devices
+./target/release/frink -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
   -p "Hello" -n 64 --temp 0 -dev metal -ngl all
 
 # Force CPU with the same Metal-capable executable
-./target/release/ferrox -m model.gguf -p "Hello" -n 64 -dev none -ngl 0
+./target/release/frink -m model.gguf -p "Hello" -n 64 -dev none -ngl 0
 ```
 
-Same via explicit subcommand: `ferrox run -m …`.
+Same via explicit subcommand: `frink run -m …`.
 
 ### Completion flags
 
@@ -82,14 +82,14 @@ Same via explicit subcommand: `ferrox run -m …`.
 | `--dry-penalty-last-n` | How many recent tokens DRY scans. `0` = off, `-1` = the context size (default) |
 | `--dry-sequence-breaker` | Repeatable. A string DRY refuses to look past. Giving any CLEARS llama.cpp's defaults (`\n`, `:`, `"`, `*`), and the literal `none` clears them outright |
 | `-s` / `--seed` | `-1` = time-based |
-| `--samplers` / `--sampler-seq` | Order the chain runs in, semicolon-separated. A sampler ferrox lacks is refused by name, see below |
+| `--samplers` / `--sampler-seq` | Order the chain runs in, semicolon-separated. A sampler frink lacks is refused by name, see below |
 | `--grammar` | Constrain generation to a GBNF grammar, llama.cpp's `--grammar` |
 | `--grammar-file` | Read the GBNF grammar from a file, llama.cpp's `--grammar-file` |
 | `-j` / `--json-schema` | Constrain generation to a JSON Schema, converted to GBNF. llama.cpp's `-j` |
 | `-dev` / `--device` | `auto`, `none`, `cpu`, `metal`, or `cuda` |
 | `--list-devices` | Print compiled, detected devices and exit |
 | `-ngl` / `--gpu-layers` / `--n-gpu-layers` | `0`, `auto`, `all`, or a count at/above the layer count. A *partial* count is refused, see below |
-| `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4`, `turbo3` (falls back). **Metal only**, see below. Sets `FERROX_CTK` |
+| `--ctk` | KV dtype: `f16` (default), `q8_0`/`turbo8`/`fp8`/`turbo4`, `turbo3` (falls back). **Metal only**, see below. Sets `FRINK_CTK` |
 | `--lora FILE` | A LoRA adapter GGUF (what `convert_lora_to_gguf.py` writes), applied at scale 1. Repeatable; comma-separated as llama.cpp accepts it. See below |
 | `--lora-scaled FILE:SCALE` | The same with a scale. Adapters are numbered in the order given, every `--lora` before every `--lora-scaled` |
 | `--system` | Chat mode only |
@@ -115,7 +115,7 @@ selectable dtype. On CPU and CUDA the KV cache is the host `Vec<f32>`,
 so `--ctk f16` there is accepted, ignored, and reported as ignored by
 the startup banner. That matters for memory: f32 doubles the KV bytes
 per token, which is why a model that fits at its full context on Metal
-can need `--ctx-size auto` on CPU. `ferrox inspect-plan` prices both.
+can need `--ctx-size auto` on CPU. `frink inspect-plan` prices both.
 
 `--samplers` (llama.cpp's, also `--sampler-seq`) chooses the ORDER, as a
 semicolon-separated list. The default is llama.cpp's own default chain,
@@ -124,7 +124,7 @@ spelled out:
 llama.cpp's aliases parse, so `top-k`, `nucleus`, `temp` and `typical`
 all work, and an upstream command line pastes in unchanged.
 
-A sampler ferrox does not implement is **refused by name with the
+A sampler frink does not implement is **refused by name with the
 reason**, never skipped. That is now only `mirostat` and `infill`:
 `mirostat` REPLACES the chain upstream rather than joining it, so there
 is no position in this order that would honour it, and `infill` needs
@@ -141,20 +141,20 @@ had already reshaped.
 
 **The sampler chain is llama.cpp's, in llama.cpp's order.** Penalties,
 DRY, top-n-sigma, top-k, typical-p, top-p, min-p, XTC, and
-**temperature last** (`common/common.h:259-269`; ferrox
-`crates/ferrox-models/src/sampling.rs`'s `filtered_distribution`). Every
+**temperature last** (`common/common.h:259-269`; frink
+`crates/frink-models/src/sampling.rs`'s `filtered_distribution`). Every
 one of those nine runs by default, and the four with no OpenAI
 equivalent sit at neutral values that make them exact no-ops, so a
 command line that does not name them samples what it always did.
-Ferrox used to divide by the temperature first and filter afterwards,
+Frink used to divide by the temperature first and filter afterwards,
 which keeps a different candidate set for the same flags: top-p selects
 the smallest set summing to `p`, and temperature changes the
 probabilities being summed. The repetition penalty is applied **once per
 candidate**, not once per occurrence in the history, so a token seen `n`
 times is no longer scaled by `penalty^n`. Both were live on every
-`ferrox run` at the defaults above.
+`frink run` at the defaults above.
 
-**Speculative decoding:** `ferrox speculative` is a prompt-lookup demo.
+**Speculative decoding:** `frink speculative` is a prompt-lookup demo.
 It matches n-grams against the history, there is no draft model, and it
 runs on synthetic random weights, so the hit rate it prints tells you
 nothing about a real drafter. What it does report honestly is acceptance
@@ -162,7 +162,7 @@ length and the per-position accept rate alongside the call counts.
 
 Verification uses the speculative-sampling rejection rule, so it stays
 lossless at any temperature rather than only at `--temp 0`. Real drafters
-plug in through the `Drafter` trait in `ferrox_models::speculative`.
+plug in through the `Drafter` trait in `frink_models::speculative`.
 `--mtp` is reserved for MiniMax/GLM MTP draft heads
 (`num_nextn_predict_layers`) and errors today.
 
@@ -172,7 +172,7 @@ model's layer count enable all supported ops on the selected backend.
 
 **A partial `-ngl` is refused, deliberately.** llama.cpp's `-ngl N` puts
 exactly `N` layers in VRAM and runs the rest on the CPU, which is how
-you fit a model that does not otherwise fit. ferrox has no partial layer
+you fit a model that does not otherwise fit. frink has no partial layer
 placement, and it used to accept the count and then offload *everything*:
 same flag, same value, no error, and an out-of-memory on exactly the
 machine the flag existed to accommodate. It now stops and says so. Use
@@ -182,7 +182,7 @@ machine the flag existed to accommodate. It now stops and says so. Use
 
 - **Default:** the prompt is rendered through the GGUF's own
   `tokenizer.chat_template`, evaluated as Jinja2 by the same evaluator
-  `ferrox-server` uses, so the CLI and `/v1/chat/completions` frame a
+  `frink-server` uses, so the CLI and `/v1/chat/completions` frame a
   conversation identically. A checkpoint that ships no template falls
   back to ChatML (matching llama.cpp `--jinja`), or to role-labeled
   lines for a byte tokenizer. A template that does not compile is an
@@ -194,11 +194,11 @@ machine the flag existed to accommodate. It now stops and says so. Use
   TinyLlama's does not, and with the flags off every turn gained blank
   lines. 15 real templates are pinned byte-for-byte against goldens
   generated by jinja2 itself
-  (`cargo test -p ferrox-models --test chat_template_real_gguf`,
+  (`cargo test -p frink-models --test chat_template_real_gguf`,
   regenerate with `python3 scripts/chat_template_goldens.py`).
 - **One disclosed deviation:** `{{ x | tojson }}` sorts object keys.
   That is stock jinja2's policy, but transformers and llama.cpp both
-  preserve the author's order. Ferrox cannot: `serde_json::Map` is a
+  preserve the author's order. Frink cannot: `serde_json::Map` is a
   `BTreeMap` here, so the order is gone before the filter runs. It
   changes the order of keys inside a `<tools>` block, nothing else.
 - **`--no-cnv`:** raw prompt (classic completion). BOS is still added under the
@@ -208,8 +208,8 @@ machine the flag existed to accommodate. It now stops and says so. Use
 
 **The chat template owns BOS when it prints one. Otherwise the loader
 owns it.** Which of the two applies is a property of the individual
-checkpoint, not of the model family, so ferrox adds the id
-*idempotently* (`ferrox_models::tokenizer::prepend_bos`) rather than
+checkpoint, not of the model family, so frink adds the id
+*idempotently* (`frink_models::tokenizer::prepend_bos`) rather than
 picking a side:
 
 - Most upstream templates open with `{{ bos_token }}`: gemma-2/3/4
@@ -228,7 +228,7 @@ Qwen2 ships a `bos_token_id` of `<|endoftext|>` that it never prepends, and
 prepending it poisons greedy decode.
 
 Measured over every local checkpoint by
-`cargo test -p ferrox-models --test bos_policy -- --ignored --nocapture`,
+`cargo test -p frink-models --test bos_policy -- --ignored --nocapture`,
 which renders each GGUF's own template, encodes it with that GGUF's own
 tokenizer, and asserts at most one leading BOS id.
 
@@ -240,43 +240,43 @@ text is on llama.cpp's literal EOG list (`<|eot_id|>`, `<end_of_turn>`,
 `<|im_end|>`, `<turn|>`, …). A Llama-3 checkpoint's `eos_token_id` is
 `<|end_of_text|>` while its turns end with `<|eot_id|>`. Stop on the
 metadata EOS alone and the model runs past its own turn, then starts
-interviewing itself. `--ignore-eos` disables all of it. `ferrox-server`
+interviewing itself. `--ignore-eos` disables all of it. `frink-server`
 uses the same set.
 
 ## Other commands
 
 ```bash
-./target/release/ferrox inspect models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
-./target/release/ferrox inspect-plan models/olmoe-1b-7b-0924-q4_0.gguf --strict
+./target/release/frink inspect models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+./target/release/frink inspect-plan models/olmoe-1b-7b-0924-q4_0.gguf --strict
 # Plan against a backend's real memory budget (Metal
 # recommendedMaxWorkingSetSize / free VRAM / host RAM minus a reserve).
 # Always reports the largest context that fits and the arithmetic:
-./target/release/ferrox inspect-plan model.gguf --backend metal --ctk f16
-./target/release/ferrox caps
-./target/release/ferrox archs
-./target/release/ferrox presets
-./target/release/ferrox smoke glm-5.2
+./target/release/frink inspect-plan model.gguf --backend metal --ctk f16
+./target/release/frink caps
+./target/release/frink archs
+./target/release/frink presets
+./target/release/frink smoke glm-5.2
 
 # Kimi K3 safetensors directory (large checkpoint, see MODELS.md)
-./target/release/ferrox run-kimi /path/to/kimi --prompt "Hi" --max-new-tokens 32
+./target/release/frink run-kimi /path/to/kimi --prompt "Hi" --max-new-tokens 32
 ```
 
 ## Serving benchmark (`serve-bench`)
 
-`ferrox bench` is single-stream and HTTP-free: it measures kernels
-against `llama-bench`. `ferrox serve-bench` answers the other question:
-what a running `ferrox-server` does under concurrency.
+`frink bench` is single-stream and HTTP-free: it measures kernels
+against `llama-bench`. `frink serve-bench` answers the other question:
+what a running `frink-server` does under concurrency.
 
 ```bash
 # Start the server first.
-FERROX_MODEL_PATH=model.gguf ./target/release/ferrox-server &
+FRINK_MODEL_PATH=model.gguf ./target/release/frink-server &
 
-./target/release/ferrox serve-bench --requests 64 --concurrency 8 --output-len 128
-./target/release/ferrox serve-bench --concurrency 16 --json
+./target/release/frink serve-bench --requests 64 --concurrency 8 --output-len 128
+./target/release/frink serve-bench --concurrency 16 --json
 ```
 
 Four rules decide whether the numbers mean anything, and all four are
-in `ferrox_edge::bench_client` with no socket in them, so each is
+in `frink_edge::bench_client` with no socket in them, so each is
 covered by a test rather than inferred from a live run:
 
 - **Every request does exactly the requested work.** Temperature 0,
@@ -304,18 +304,18 @@ blank rather than invented.
 
 ## Bandwidth profile (`bench-bw`)
 
-`ferrox-core`'s `qstar` decides how much of a MoE layer to fetch across
+`frink-core`'s `qstar` decides how much of a MoE layer to fetch across
 the link and how much to compute on the CPU. Without a measured
 profile it falls back to an unbenchmarked default of one fetch per layer
 per step, so every deployment gets a split nobody measured.
 
 ```bash
-cargo build --release -p ferrox-cli --features cuda
-./target/release/ferrox bench-bw --format q4_k
-./target/release/ferrox bench-bw --dry-run          # measure, write nothing
+cargo build --release -p frink-cli --features cuda
+./target/release/frink bench-bw --format q4_k
+./target/release/frink bench-bw --dry-run          # measure, write nothing
 ```
 
-It writes `$XDG_CACHE_HOME/ferrox/benchbw/<gpu-uuid>.json`, which the
+It writes `$XDG_CACHE_HOME/frink/benchbw/<gpu-uuid>.json`, which the
 loader finds on its own. A profile is keyed to the card it was taken
 on: another machine's split is worse than no split, so a profile whose
 recorded GPU name disagrees is ignored rather than approximated.
@@ -345,16 +345,16 @@ run together.
 Two different questions, and only the second one involves llama.cpp.
 
 ```bash
-# Do ferrox's own backends agree? (CPU reference vs Metal/CUDA)
-./target/release/ferrox verify -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+# Do frink's own backends agree? (CPU reference vs Metal/CUDA)
+./target/release/frink verify -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   --backend metal --prompt-tokens 64
 
-# Does ferrox agree with llama.cpp? (first-token distribution, CPU vs CPU)
-./target/release/ferrox parity -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+# Does frink agree with llama.cpp? (first-token distribution, CPU vs CPU)
+./target/release/frink parity -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   --prompt-tokens 64
 ```
 
-`verify` greedy-decodes the same prompt on two ferrox backends and diffs
+`verify` greedy-decodes the same prompt on two frink backends and diffs
 the token ids. It cannot catch a bug both backends share.
 
 `parity` runs **two** comparisons against llama.cpp on the same GGUF: the
@@ -362,7 +362,7 @@ tokenizer first, then the graph.
 
 ### The tokenizer half
 
-Ferrox's token ids against llama.cpp's, for a fixed 19-case corpus, on
+Frink's token ids against llama.cpp's, for a fixed 19-case corpus, on
 the same file. It prints one line per checkpoint and, for each case that
 diverges, the token index, the approximate byte offset, the input either
 side of that offset, and both engines' ids and decoded pieces in a
@@ -370,13 +370,13 @@ window around it:
 
 ```
 tokenizer Phi-4-mini-instruct-Q4_K_M: DIVERGES (19 cases / 350 tokens, pre=gpt-4o, ...)
-  vocab  llama 200064 / ferrox 200064     add_bos  llama false / ferrox false
+  vocab  llama 200064 / frink 200064     add_bos  llama false / frink false
   7/19 cases diverge:
 
-  [digit-runs] token 2 of 23 (llama) / 35 (ferrox), byte ~6 of 61
+  [digit-runs] token 2 of 23 (llama) / 35 (frink), byte ~6 of 61
       input around it: "Build " >|< "1234567 of 89 took 10000"
       llama  12893:"Build" 220:" " *7633:"123" 19354:"456" 22:"7" 328:" of"
-      ferrox 12893:"Build" 220:" " *16:"1" 17:"2" 18:"3" 19:"4"
+      frink 12893:"Build" 220:" " *16:"1" 17:"2" 18:"3" 19:"4"
 ```
 
 The corpus is built out of the clauses llama.cpp's pre-tokenizer regexes
@@ -404,7 +404,7 @@ logit numbers underneath were computed from two different prompts.
 against llama.cpp's, feeding **the same token ids to both** so the
 tokenizer is not part of *that* experiment. It reports KL in both
 directions, total variation, max |delta p|, top-k overlap, and where
-llama's top-1 ranks for ferrox, then gives one of four verdicts:
+llama's top-1 ranks for frink, then gives one of four verdicts:
 
 | Verdict | Meaning |
 |---|---|
@@ -419,18 +419,18 @@ tell `TIE-FLIP` from `WRONG`.
 
 A `WRONG` on a quantized file is a distance between two points and does
 not say which one moved. llama.cpp quantizes activations to 8 bits for
-its quantized matmuls and ferrox keeps them in f32, and on a graph that
-amplifies that loss the two disagree while ferrox is the closer of the
+its quantized matmuls and frink keeps them in f32, and on a graph that
+amplifies that loss the two disagree while frink is the closer of the
 two to the f32 answer -- PLM-1.8B Q8_0 reads `WRONG` at 3.5e-2 for
 exactly that reason (`docs/plans/llama-cpp-gap-inventory.md` §10.1).
 The arbiter is the dequantized file:
 
 ```bash
 PYTHONPATH=$LLAMA/gguf-py python3 scripts/dequantize_gguf.py model-Q8_0.gguf /tmp/model-f32.gguf
-./target/release/ferrox parity -m /tmp/model-f32.gguf   --dumper target/llama_logits --dump-logits /tmp/f32
-./target/release/ferrox parity -m model-Q8_0.gguf       --dumper target/llama_logits --dump-logits /tmp/q8
+./target/release/frink parity -m /tmp/model-f32.gguf   --dumper target/llama_logits --dump-logits /tmp/f32
+./target/release/frink parity -m model-Q8_0.gguf       --dumper target/llama_logits --dump-logits /tmp/q8
 # KL(f32.llama || q8.llama) is the reference's own quantization loss;
-# KL(f32.llama || q8.ferrox) is ferrox's; KL(f32.llama || f32.ferrox) is the graph.
+# KL(f32.llama || q8.frink) is frink's; KL(f32.llama || f32.frink) is the graph.
 ```
 
 `LLAMA_LOGITS_FLASH_ATTN=0` keeps the reference off its flash-attention
@@ -449,7 +449,7 @@ LLAMA_CPP_PREFIX=/path/to/llama.cpp ./tools/build_llama_logits.sh
 ```
 
 It lands in `target/`, so `cargo clean` removes it; rebuild rather than
-assuming `parity` broke. Point `--dumper` or `FERROX_LLAMA_LOGITS` at it
+assuming `parity` broke. Point `--dumper` or `FRINK_LLAMA_LOGITS` at it
 if you build it elsewhere. A dumper built before the tokenizer half
 existed has no `--tokenize` mode, and `parity` says so and names the
 rebuild.
@@ -459,7 +459,7 @@ without running any prefill:
 
 ```bash
 ./tools/build_llama_logits.sh
-cargo test -p ferrox-cli -- --ignored ferrox_and_llama_cpp_tokenize_the_corpus_identically --nocapture
+cargo test -p frink-cli -- --ignored frink_and_llama_cpp_tokenize_the_corpus_identically --nocapture
 ```
 
 That test is `#[ignore]`d because it needs the dumper and real
@@ -473,7 +473,7 @@ is not a verdict either way.
 `layer-divergence` says *which layer*.
 
 ```bash
-./target/release/ferrox layer-divergence -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+./target/release/frink layer-divergence -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
   --backend metal --prompt-tokens 16
 ```
 
@@ -499,7 +499,7 @@ between the two backends' expert-selection histograms. `no counts` there
 means one side never recorded a selection, which is not agreement.
 
 ```bash
-./target/release/ferrox quant-sensitivity -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+./target/release/frink quant-sensitivity -m models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
   --candidate q4_0 --prompt-tokens 16 --top 10
 ```
 
@@ -518,21 +518,21 @@ spend bits. The rollup at the bottom gives each tensor family's share of
 the total measured KL, which is what a static quant rule is guessing at.
 
 It runs on CPU by construction and refuses to start with
-`FERROX_CPU_INT_DOT=1`, whose repack cache is keyed by buffer address
+`FRINK_CPU_INT_DOT=1`, whose repack cache is keyed by buffer address
 and would hand a swapped-in tensor another tensor's repacked bytes.
 Cost is one forward pass per tensor: about two minutes for a 1B model's
 112 tensors at 16 prompt tokens. `--layers 0:4` restricts the sweep.
 
-## Perplexity (`ferrox perplexity`)
+## Perplexity (`frink perplexity`)
 
 Corpus evaluation, llama.cpp's `perplexity` tool.
 
 ```bash
-ferrox perplexity -m model.gguf -f corpus.txt --ctx-size 512
+frink perplexity -m model.gguf -f corpus.txt --ctx-size 512
 ```
 
-This is the quality axis the project did not have. `ferrox parity`
-compares first-token distributions and `ferrox bench` measures speed;
+This is the quality axis the project did not have. `frink parity`
+compares first-token distributions and `frink bench` measures speed;
 neither answers "is this quantization worse, and by how much". It is
 also the acceptance test the quantizer needs, because a bad K-quant
 encoder produces a file that loads fine and generates measurably worse
@@ -541,7 +541,7 @@ text.
 **Measured against `llama-perplexity` on the same corpus and
 checkpoint**, both engines on CPU:
 
-| Checkpoint | ferrox | llama.cpp | Gap |
+| Checkpoint | frink | llama.cpp | Gap |
 |---|---|---|---|
 | SmolLM2-135M Q8_0 | 14.7284 | 14.7529 | -0.17% |
 | SmolLM2-135M Q4_K_M | 15.0896 | 15.1274 | -0.25% |
@@ -554,13 +554,13 @@ running estimates track window for window, which is what says
 tokenization and chunking agree.
 
 **The gaps are not noise, and their shape is the interesting part.**
-ferrox sits below llama.cpp on every quantized checkpoint and the gap
+frink sits below llama.cpp on every quantized checkpoint and the gap
 widens as the quant coarsens. That is the `vec_dot_type` difference this
 repo already documents
 ([`plans/llama-cpp-gap-inventory.md`](plans/llama-cpp-gap-inventory.md)
 §10) showing up on a second axis, with the sign it should have:
 llama.cpp quantizes the activation to the weight's vec_dot type and
-ferrox keeps it in f32, so ferrox is slightly less surprised. Qwen3 is
+frink keeps it in f32, so frink is slightly less surprised. Qwen3 is
 the control, straddling zero. A difference in METHOD would not produce a
 gap that is monotone in the quant.
 
@@ -583,16 +583,16 @@ KL-divergence are not implemented.
 Every number above is CPU on both sides. Metal and CUDA perplexity is
 unevidenced.
 
-## Quantize (`ferrox quantize`)
+## Quantize (`frink quantize`)
 
 Writes a `Q8_0`, `Q4_K_S`, `Q4_K_M`, `Q5_K_S`, `Q5_K_M` or `Q6_K` GGUF
 from an F32/F16/BF16 one, **byte-identical to `llama-quantize`'s**,
 and refuses every other target by name.
 
 ```bash
-ferrox quantize model-f16.gguf model-q4_k_m.gguf --type q4_k_m
-ferrox quantize model-f16.gguf model-q4_k_m.gguf --type q4_k_m --imatrix imatrix.gguf
-ferrox quantize model-f16.gguf model-q4_k.gguf   --type q4_k_m --pure   # no per-tensor mix
+frink quantize model-f16.gguf model-q4_k_m.gguf --type q4_k_m
+frink quantize model-f16.gguf model-q4_k_m.gguf --type q4_k_m --imatrix imatrix.gguf
+frink quantize model-f16.gguf model-q4_k.gguf   --type q4_k_m --pure   # no per-tensor mix
 ```
 
 The refusal is the point rather than a limitation to apologise for.
@@ -637,7 +637,7 @@ model rather than a fixture:
 And with an importance matrix (`--imatrix`, below), against
 `llama-quantize --imatrix` b7650 over a BF16 Qwen3-0.6B with
 `llama-imatrix`'s own file, so the weighted fit is measured on
-llama.cpp's input and not on ferrox's:
+llama.cpp's input and not on frink's:
 
 | Target | Tensors identical | Super-blocks differing |
 |---|---|---|
@@ -649,7 +649,7 @@ llama.cpp's input and not on ferrox's:
 
 The metadata matches too, including the four `quantize.imatrix.*` keys
 llama.cpp records; the only difference between the files is the order
-of the header's key-value pairs, which ferrox writes sorted.
+of the header's key-value pairs, which frink writes sorted.
 
 Two things that discipline needs. Goldens must come from the
 **installed** binary: a local release build of the same b7650 source
@@ -676,7 +676,7 @@ the 6-bit scales and mins are fitted by `make_qp_quants` (`:899`), a
 weighted grid search with a greedy per-code refinement, instead of
 `63/max`. Q6_K's change is one argument: the raw imatrix slice goes to
 `make_qx_quants` as its `qw`. Q8_0 discards the imatrix (`:2089`). All
-of that lives in `ferrox-quant`'s `encode/fit.rs` and `encode/qp_quants.rs`
+of that lives in `frink-quant`'s `encode/fit.rs` and `encode/qp_quants.rs`
 as a parameter on the SAME super-block fit the plain path uses, not a
 second transcription.
 
@@ -690,24 +690,24 @@ writes, or the legacy `.dat` binary older builds wrote.
 
 One refusal to know about: a tensor whose row width is not a multiple of
 256 stops the run. llama.cpp answers that case by changing the tensor's
-TYPE, to Q5_0 or F16, and ferrox has neither encoder; padding the row
+TYPE, to Q5_0 or F16, and frink has neither encoder; padding the row
 would shift every following row on decode. SmolLM2-135M cannot be Q4_K
 quantized here for that reason, its embedding being 576 wide.
 
-## Importance matrix (`ferrox imatrix`)
+## Importance matrix (`frink imatrix`)
 
 llama.cpp's `llama-imatrix`: runs a calibration text through the model
 and writes, per weight, the per-column sum of squared activations that
 the quantizer above weights its fit by. Same flags where they exist on
-both, same file format in both directions: a ferrox file feeds
-`llama-quantize --imatrix` and a `llama-imatrix` file feeds `ferrox
+both, same file format in both directions: a frink file feeds
+`llama-quantize --imatrix` and a `llama-imatrix` file feeds `frink
 quantize --imatrix`.
 
 ```bash
-ferrox imatrix -m model-bf16.gguf -f calibration.txt -o imatrix.gguf
-ferrox imatrix -m model-bf16.gguf -f calibration.txt -o imatrix.dat --output-format dat
-ferrox imatrix -m model-bf16.gguf -f calibration.txt --chunks 64 -c 512 --process-output
-ferrox imatrix -m model-bf16.gguf -f calibration.txt -o mine.gguf --compare theirs.gguf
+frink imatrix -m model-bf16.gguf -f calibration.txt -o imatrix.gguf
+frink imatrix -m model-bf16.gguf -f calibration.txt -o imatrix.dat --output-format dat
+frink imatrix -m model-bf16.gguf -f calibration.txt --chunks 64 -c 512 --process-output
+frink imatrix -m model-bf16.gguf -f calibration.txt -o mine.gguf --compare theirs.gguf
 ```
 
 The method is `tools/imatrix/imatrix.cpp` at b7650, cited line by line
@@ -726,12 +726,12 @@ cache, at least two chunks' worth of tokens required. The file
 `[1, n_mat]`, names sorted, trailing unit dimensions trimmed as ggml
 trims them.
 
-ferrox has no compute graph to hang a callback on, so the activations
+frink has no compute graph to hang a callback on, so the activations
 are observed at the two functions every projection goes through
-(`ferrox_core::activation_tap`), keyed by the weight's address and
+(`frink_core::activation_tap`), keyed by the weight's address and
 named by walking the decoder's public weight fields against the GGUF's
 tensor names. That seam exists on the CPU path only, so the run pins
-the CPU backend the way `ferrox bench --n-gpu-layers 0` does, and
+the CPU backend the way `frink bench --n-gpu-layers 0` does, and
 after the run every dense entry's row count is checked against the
 token count: a weight whose decoder path bypassed the tap, or was
 observed twice, is a refusal rather than a wrong file. An expert the
@@ -741,21 +741,21 @@ it.
 Deviations, all stated: one chunk per forward pass where `llama-imatrix`
 folds `n_batch / n_ctx` chunks into one batch as separate sequences
 (same rows in the same order, so the same sums); no perplexity printed,
-because `ferrox perplexity` already computes that number by llama.cpp's
+because `frink perplexity` already computes that number by llama.cpp's
 method; no `--in-file` combining of earlier matrices; and
 expert streaming (`Stored` experts) is refused because a streamed
 expert's weight view has no stable identity.
 
 **What matches llama.cpp's file and what does not, measured.** The
 names, the counts, the shapes and the accumulation rule are the same,
-so the files are interchangeable and `ferrox quantize --imatrix` on a
+so the files are interchangeable and `frink quantize --imatrix` on a
 `llama-imatrix` file is byte-identical to `llama-quantize` (table
 above). The sums are NOT bit-identical, because the activations are
 not, and `--compare` prints the gap per entry. On Qwen3-0.6B (BF16 and
 an F32 copy, same result), 8 chunks of 512 tokens of plain prose on
 which both tokenizers agree exactly:
 
-| Where | ferrox vs `llama-imatrix`, per entry |
+| Where | frink vs `llama-imatrix`, per entry |
 |---|---|
 | layer 0 `attn_q/k/v` input (RMSNorm of the embedding, no matmul yet) | max per-column relative 7e-6 |
 | layer 0 `attn_output` input (after the first attention) | 3e-3 |
@@ -768,7 +768,7 @@ the accumulation: it is unchanged by `llama-imatrix -ctk f32 -ctv f32`
 and by BF16 versus F32 weights (llama.cpp's own two runs are
 byte-identical to each other), which rules out the KV cache type and
 the `vec_dot_type` rounding as the cause on this checkpoint. Where the
-attention arithmetic diverges is a `ferrox parity` question, not an
+attention arithmetic diverges is a `frink parity` question, not an
 imatrix one; on a K-quant checkpoint the documented Q8_K activation
 rounding would add to whatever it is. Percent-level differences in an
 importance weight are far below what moves a quantized super-block --
@@ -777,21 +777,21 @@ statement about the effect, not a claim the files match.
 
 Two things to check before trusting a comparison. The text must
 tokenize identically, and it once did not: on the repo's own markdown
-docs ferrox's Qwen2-style BPE produced 17208 tokens where
+docs frink's Qwen2-style BPE produced 17208 tokens where
 `llama-tokenize --no-escape` produced 17209, one fewer at each
 mention of `<s>` -- Qwen2.5's vocabulary carries `<s>` as an ordinary
-entry that llama.cpp never treats as special, and ferrox promoted it
-on its shape. That is fixed, and `ferrox imatrix` now tokenizes its
+entry that llama.cpp never treats as special, and frink promoted it
+on its shape. That is fixed, and `frink imatrix` now tokenizes its
 text with special-token markers left as text, which is
 `llama-imatrix`'s own default (`parse_special = false`); a doc that
-mentions `<|im_end|>` is six characters on both engines. `ferrox
+mentions `<|im_end|>` is six characters on both engines. `frink
 parity`'s tokenizer sweep carries a case of markers-as-prose under
 both `parse_special` settings so the class stays closed. Either kind
 of difference shifts every chunk boundary and turns a 1e-3 comparison
 into a 1e-1 one. And it must be the same text through the same number
 of chunks, since a chunk count is a token count.
 
-## Split and merge GGUF (`ferrox gguf-split`)
+## Split and merge GGUF (`frink gguf-split`)
 
 llama.cpp's `llama-gguf-split`, same flags, same shard names, same
 metadata keys. Splitting is the default operation; `--merge` is the
@@ -799,26 +799,26 @@ other direction.
 
 ```bash
 # By tensor count (llama.cpp's default limit is 128)
-ferrox gguf-split --split-max-tensors 128 model.gguf out/model
+frink gguf-split --split-max-tensors 128 model.gguf out/model
 
 # By size. Units are DECIMAL, as in llama.cpp: 4G is 4,000,000,000
-ferrox gguf-split --split-max-size 4G model.gguf out/model
+frink gguf-split --split-max-size 4G model.gguf out/model
 
 # Metadata-only first shard, the layout most published checkpoints use
-ferrox gguf-split --split-max-size 4G --no-tensor-first-split model.gguf out/model
+frink gguf-split --split-max-size 4G --no-tensor-first-split model.gguf out/model
 
 # Plan only: shard count, tensors and bytes per shard, nothing written
-ferrox gguf-split --split-max-size 4G --dry-run model.gguf out/model
+frink gguf-split --split-max-size 4G --dry-run model.gguf out/model
 
 # Back to one file. The input is the FIRST shard
-ferrox gguf-split --merge out/model-00001-of-00003.gguf model.gguf
+frink gguf-split --merge out/model-00001-of-00003.gguf model.gguf
 ```
 
 Shards are named `<prefix>-NNNNN-of-MMMMM.gguf`, 1-based, and carry
 llama.cpp's three keys with llama.cpp's types: `split.no` (u16, 0-based),
 `split.count` (u16) and `split.tensors.count` (i32, the total across the
 whole set). The first shard holds the complete source metadata and the
-rest hold only those three, so a set written here is one `ferrox run -m
+rest hold only those three, so a set written here is one `frink run -m
 out/model-00001-of-00003.gguf` away from running, and one llama.cpp
 reads too.
 
@@ -852,10 +852,10 @@ Cross-checked against the installed `llama-gguf-split` (build 7650, 68b4d516c) o
 came out the identical SIZE, byte for byte, and differ only where the
 metadata keys are ordered: 54 bytes on each later shard (the three
 `split.*` keys) and 754 on the first (the whole header). Both directions
-work across the two tools: llama.cpp merges a set ferrox split, and
-ferrox merges a set llama.cpp split, each producing a 24,032-byte file.
+work across the two tools: llama.cpp merges a set frink split, and
+frink merges a set llama.cpp split, each producing a 24,032-byte file.
 
-## Put a reranker's pooler back (`ferrox splice-pooler`)
+## Put a reranker's pooler back (`frink splice-pooler`)
 
 Every `BertForSequenceClassification` reranker GGUF in circulation is
 missing its pooler: llama.cpp's converter deletes `bert.pooler.dense`
@@ -868,17 +868,17 @@ times narrower, so a threshold copied from the model card never fires
 (issue #82). This writes a GGUF that carries the tensor.
 
 ```bash
-ferrox download cross-encoder/ms-marco-MiniLM-L6-v2 model.safetensors --local-dir models/ms-marco-MiniLM-L6-v2
-ferrox splice-pooler -m models/ms-marco-MiniLM-L6-v2-Q8_0.gguf \
+frink download cross-encoder/ms-marco-MiniLM-L6-v2 model.safetensors --local-dir models/ms-marco-MiniLM-L6-v2
+frink splice-pooler -m models/ms-marco-MiniLM-L6-v2-Q8_0.gguf \
     --safetensors models/ms-marco-MiniLM-L6-v2/model.safetensors \
     -o models/ms-marco-MiniLM-L6-v2-Q8_0-pooled.gguf
 ```
 
 The output is the input, every key and every tensor byte for byte, plus
 `cls.weight` / `cls.bias` (F32, under llama.cpp's own names) and one
-provenance key, `ferrox.rerank.pooler_source`. ferrox loads it with no
+provenance key, `frink.rerank.pooler_source`. frink loads it with no
 further change and `/v1/rerank` reports
-`ferrox_score_head: classifier(tanh(pooler(cls)))`; llama.cpp loads it
+`frink_score_head: classifier(tanh(pooler(cls)))`; llama.cpp loads it
 too, and its `build_pooling` RANK arm runs the pooler as well.
 
 **The pooler is tied to the checkpoint by the classifier, not by a
@@ -921,8 +921,8 @@ toolchain.
 straight away, so nothing has to be downloaded by hand first:
 
 ```bash
-ferrox serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
-ferrox -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -p "Hi" -n 64
+frink serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
+frink -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -p "Hi" -n 64
 ```
 
 The tag after the colon is a **quant label, not a git revision**, which
@@ -933,18 +933,18 @@ publish is refused with the list of quants it does publish, since you
 cannot see a repo's file list from a command line.
 
 `-hf` is one token in llama.cpp's hand-written parser, and clap reads
-`-hf` as `-h` followed by `f`. Both ferrox binaries rewrite `-hf` and
+`-hf` as `-h` followed by `f`. Both frink binaries rewrite `-hf` and
 `-hff` before parsing, so the llama.cpp spelling works; `--hf-repo` is
 the same flag.
 
-Downloads land in the ferrox cache, not in `./models`: a model fetched
+Downloads land in the frink cache, not in `./models`: a model fetched
 by `-hf` is not part of the project directory you happen to be standing
-in. `FERROX_CACHE`, else `$XDG_CACHE_HOME/ferrox`, else
-`~/.cache/ferrox`, under `hub/<owner>__<repo>/`. A second run says
+in. `FRINK_CACHE`, else `$XDG_CACHE_HOME/frink`, else
+`~/.cache/frink`, under `hub/<owner>__<repo>/`. A second run says
 `using cached` instead of fetching again, and an interrupted download
 resumes by byte range rather than starting over.
 
-`ferrox download` takes the same `repo:QUANT` shape and puts the file
+`frink download` takes the same `repo:QUANT` shape and puts the file
 where you ask instead of in the cache. Before that it sent the whole
 string to the Hub as a repo id and returned a bare `401`, which reads
 like an auth problem and is not one.
@@ -953,7 +953,7 @@ like an auth problem and is not one.
 command copied off a model card runs unchanged:
 
 ```bash
-ferrox download bartowski/Llama-3.2-3B-Instruct-GGUF \
+frink download bartowski/Llama-3.2-3B-Instruct-GGUF \
   Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models
 ```
 
@@ -961,11 +961,11 @@ ferrox download bartowski/Llama-3.2-3B-Instruct-GGUF \
 substituted into another command:
 
 ```bash
-ferrox pull org/model --file '*.gguf'
-ferrox -m org/model      # downloads when the path is missing
+frink pull org/model --file '*.gguf'
+frink -m org/model      # downloads when the path is missing
 ```
 
-Cache default for `pull`: `~/.cache/ferrox/hf/<org--model>/`.
+Cache default for `pull`: `~/.cache/frink/hf/<org--model>/`.
 `download` defaults to `models/`.
 
 | Variable | Effect |
@@ -985,11 +985,11 @@ the pattern matches more than one file, it says so instead of picking.
 
 ## Interactive chat (`chat`)
 
-Multi-turn REPL against a running `ferrox-server` (reuses chat-template + SSE):
+Multi-turn REPL against a running `frink-server` (reuses chat-template + SSE):
 
 ```bash
-FERROX_MODEL_PATH=model.gguf FERROX_ADDR=127.0.0.1:8383 ./target/release/ferrox-server
-./target/release/ferrox chat --url http://127.0.0.1:8383 --system "Be brief."
+FRINK_MODEL_PATH=model.gguf FRINK_ADDR=127.0.0.1:8383 ./target/release/frink-server
+./target/release/frink chat --url http://127.0.0.1:8383 --system "Be brief."
 # Commands: /quit  /clear
 ```
 
@@ -1002,9 +1002,9 @@ FERROX_MODEL_PATH=model.gguf FERROX_ADDR=127.0.0.1:8383 ./target/release/ferrox-
 
 ## Server
 
-Two ways to start the same server. `ferrox serve` is a subcommand of the
+Two ways to start the same server. `frink serve` is a subcommand of the
 main binary and needs the optional `serve` feature at build time.
-`ferrox-server` is that same server as its own executable, and both
+`frink-server` is that same server as its own executable, and both
 parse identical arguments through the same code.
 
 ### LoRA adapters
@@ -1046,20 +1046,20 @@ have.
 |---|---|
 | `-m` / `--model` | GGUF path or Kimi directory |
 | `-hf` / `--hf-repo`, `--hf-file` | Fetch from the Hub, see above |
-| `-c` / `--ctx-size` | Positions any one request may ask for. Sets `FERROX_CB_MAX_CONTEXT`. Unset means the ceiling is derived at load from weights and per-token KV against the device budget, capped at the model's trained context |
+| `-c` / `--ctx-size` | Positions any one request may ask for. Sets `FRINK_CB_MAX_CONTEXT`. Unset means the ceiling is derived at load from weights and per-token KV against the device budget, capped at the model's trained context |
 | `--api-key`, `--api-key-file` | Require `Authorization: Bearer`. Also gates `/admin`. Prefer the file form on a shared host: an argument is visible in `ps` to every user on the machine. An empty key file is refused rather than leaving every route open |
 | `--alias` | What the model is called in `/v1/models` and in every response's `model` field |
 | `--ctk` / `--cache-type-k` | KV dtype. **Metal only**, the CPU and CUDA cache is the host `Vec<f32>` |
 | `--host`, `--port` | `--port 0` asks the kernel for a free one and announces it on stdout |
 | `-t`, `-ngl`, `-dev` | Threads, GPU layers, device |
-| `-cb` / `--cont-batching`, `-np` / `--parallel` | Continuous batching and its sequence cap. Read back as `ferrox_scheduler_max_seqs` on `GET /metrics` |
-| `-b` / `--batch-size`, `-ub` / `--ubatch-size` | Prompt tokens per forward pass, on both decode paths. Resolved to one number the way llama.cpp does (the smaller of whichever was named); read back as `ferrox_scheduler_prefill_chunk` |
-| `--slot-save-path DIR` | Directory for `POST /slots/{id}?action=save\|restore`. Refused at startup when it is not a directory; without it the route answers 501 naming this flag, as llama.cpp does. Slots restore into the prefix cache, so `FERROX_PREFIX_CACHE_ENTRIES` must be set too |
-| `--lora FILE`, `--lora-scaled FILE:SCALE` | LoRA adapters, as on the completion side (above). Sets `FERROX_LORA`; every model load, including `/admin/models/load`, attaches the same adapters or refuses the checkpoint by name. `GET /lora-adapters` lists them, `POST /lora-adapters` and a request's `lora` field set their scales, see [`API.md`](API.md#lora-adapters) |
-| `--lora-init-without-apply` | Load the adapters at scale 0 until a `POST /lora-adapters` sets them. Sets `FERROX_LORA_INIT_WITHOUT_APPLY` |
-| `--reasoning-budget N` | Token budget for thinking, llama.cpp's flag and range: `-1` unrestricted (default), `0` immediate end, `N>0` a budget. The server default a request's `reasoning_budget_tokens` falls back to when absent or `-1`. Enforced in the sampler: after N tokens of thought the closing tag is forced, so the answer still arrives. Sets `FERROX_REASONING_BUDGET` |
-| `--prefill-assistant` / `--no-prefill-assistant` | Whether a trailing assistant message is continued rather than closed, llama.cpp's flag; on by default. A request's own `continue_final_message` (including `false`) still wins. Sets `FERROX_PREFILL_ASSISTANT` |
-| `--jinja` | Accepted, and already the default: ferrox always compiles and evaluates the GGUF's own `tokenizer.chat_template` |
+| `-cb` / `--cont-batching`, `-np` / `--parallel` | Continuous batching and its sequence cap. Read back as `frink_scheduler_max_seqs` on `GET /metrics` |
+| `-b` / `--batch-size`, `-ub` / `--ubatch-size` | Prompt tokens per forward pass, on both decode paths. Resolved to one number the way llama.cpp does (the smaller of whichever was named); read back as `frink_scheduler_prefill_chunk` |
+| `--slot-save-path DIR` | Directory for `POST /slots/{id}?action=save\|restore`. Refused at startup when it is not a directory; without it the route answers 501 naming this flag, as llama.cpp does. Slots restore into the prefix cache, so `FRINK_PREFIX_CACHE_ENTRIES` must be set too |
+| `--lora FILE`, `--lora-scaled FILE:SCALE` | LoRA adapters, as on the completion side (above). Sets `FRINK_LORA`; every model load, including `/admin/models/load`, attaches the same adapters or refuses the checkpoint by name. `GET /lora-adapters` lists them, `POST /lora-adapters` and a request's `lora` field set their scales, see [`API.md`](API.md#lora-adapters) |
+| `--lora-init-without-apply` | Load the adapters at scale 0 until a `POST /lora-adapters` sets them. Sets `FRINK_LORA_INIT_WITHOUT_APPLY` |
+| `--reasoning-budget N` | Token budget for thinking, llama.cpp's flag and range: `-1` unrestricted (default), `0` immediate end, `N>0` a budget. The server default a request's `reasoning_budget_tokens` falls back to when absent or `-1`. Enforced in the sampler: after N tokens of thought the closing tag is forced, so the answer still arrives. Sets `FRINK_REASONING_BUDGET` |
+| `--prefill-assistant` / `--no-prefill-assistant` | Whether a trailing assistant message is continued rather than closed, llama.cpp's flag; on by default. A request's own `continue_final_message` (including `false`) still wins. Sets `FRINK_PREFILL_ASSISTANT` |
+| `--jinja` | Accepted, and already the default: frink always compiles and evaluates the GGUF's own `tokenizer.chat_template` |
 | `--no-warmup` | Accepted; there is no warm-up pass to skip |
 | `--flash-attn` / `-fa` | Accepted. Fused attention is a backend property here, not a per-run switch |
 
@@ -1069,14 +1069,14 @@ would change the answer without saying so:
 - `--no-jinja`. There is no template-free mode to fall back to, and a
   prompt framed by a guess instead of the checkpoint's own template
   reads as a model-quality problem rather than a flag that was dropped.
-- `--flash-attn off`. Set `FERROX_METAL_ATTN=0` or `--device cpu`.
+- `--flash-attn off`. Set `FRINK_METAL_ATTN=0` or `--device cpu`.
 
-`serve` is on by default, so a stock `cargo install ferrox-cli` has it:
+`serve` is on by default, so a stock `cargo install frink-cli` has it:
 
 ```bash
-cargo build --release -p ferrox-cli --features "serve metal"
+cargo build --release -p frink-cli --features "serve metal"
 
-./target/release/ferrox serve \
+./target/release/frink serve \
   -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   --host 127.0.0.1 --port 8383 -dev metal -ngl all -cb -np 4
 ```
@@ -1086,19 +1086,19 @@ On Metal, continuous batching turns on by default when compatible; use
 cap) to set it explicitly. `--no-cont-batching` keeps the private
 decode loop (Metal serializes concurrent requests on that path).
 
-Without the feature, `ferrox serve` still exists and explains itself
+Without the feature, `frink serve` still exists and explains itself
 rather than reporting an unknown subcommand, since a compiled-out
 feature and a missing one look identical from the outside otherwise.
 
 The standalone binary takes the same flags:
 
 ```bash
-./target/release/ferrox-server \
+./target/release/frink-server \
   -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   --host 127.0.0.1 --port 8383 -dev metal -ngl all
 
 # MCP config (metadata under GET /v1/models, invocation is not wired up)
-./target/release/ferrox-server -m model.gguf --mcp-config mcp.json
+./target/release/frink-server -m model.gguf --mcp-config mcp.json
 
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -H 'content-type: application/json' \
@@ -1109,8 +1109,8 @@ curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
 
 ```bash
 # The kernel picks the port. The bound address is announced on stdout.
-./target/release/ferrox-server -m model.gguf --port 0 --exit-on-stdin-close
-{"event":"ferrox.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.15.2"}
+./target/release/frink-server -m model.gguf --port 0 --exit-on-stdin-close
+{"event":"frink.server.ready","addr":"127.0.0.1:52091","port":52091,"scheme":"http","pid":4242,"version":"0.15.2"}
 ```
 
 `--port 0` plus that one line saves a parent process from probing
@@ -1119,7 +1119,7 @@ a stale copy of itself or a stranger's server. Read stdout line by line
 and ignore anything that is not the ready event. The tracing subscriber
 shares the stream.
 
-`--exit-on-stdin-close` (or `FERROX_EXIT_ON_STDIN_CLOSE=1`) exits when
+`--exit-on-stdin-close` (or `FRINK_EXIT_ON_STDIN_CLOSE=1`) exits when
 stdin reaches EOF, which is the one orphan-prevention mechanism that
 behaves identically on macOS, Windows and Linux and survives a parent
 that dies rather than exiting cleanly. It is **opt-in**: a server
@@ -1133,15 +1133,15 @@ The server accepts `-m/--model`, `--host`, `--port`, `-t/--threads`,
 `-ub` / `--ubatch-size N`, `--slot-save-path DIR`, `--reasoning-budget N`,
 `--prefill-assistant` / `--no-prefill-assistant`, `--exit-on-stdin-close`,
 and `--list-devices`. Existing
-`FERROX_MODEL_PATH`, `FERROX_ADDR`, and the backend environment
+`FRINK_MODEL_PATH`, `FRINK_ADDR`, and the backend environment
 variables all still work. Command-line values win over them. Keep
-secrets such as `FERROX_API_KEY` in the environment.
+secrets such as `FRINK_API_KEY` in the environment.
 
 The web UI is a separate app. See [`ui/`](../ui) and
-[`crates/ferrox-server/README.md`](../crates/ferrox-server/README.md).
+[`crates/frink-server/README.md`](../crates/frink-server/README.md).
 `GET /` on this server is a 404 like any other unknown path.
 
-## Benchmark (`ferrox bench`)
+## Benchmark (`frink bench`)
 
 With `-m`, `bench` works like [`llama-bench`](https://github.com/ggerganov/llama.cpp/tree/master/tools/llama-bench).
 Same workload names (`pp<N>` batched prefill, `tg<N>` decode), same
@@ -1151,15 +1151,15 @@ line up.
 
 ```bash
 # one GGUF (CPU). Prints the exact llama-bench command to compare against.
-./target/release/ferrox bench -m model.gguf -p 512 -n 128 -r 3 --compare
+./target/release/frink bench -m model.gguf -p 512 -n 128 -r 3 --compare
 
 # Metal
-./target/release/ferrox bench -m model.gguf --n-gpu-layers 99 -p 512 -n 128 --compare
+./target/release/frink bench -m model.gguf --n-gpu-layers 99 -p 512 -n 128 --compare
 
 # multi-model suite (same models list as benchmarks/suite.json)
-./target/release/ferrox bench --suite --fit-host --skip-missing
-./target/release/ferrox bench --suite --id tinyllama_q8 --backend metal
-./target/release/ferrox bench --render
+./target/release/frink bench --suite --fit-host --skip-missing
+./target/release/frink bench --suite --id tinyllama_q8 --backend metal
+./target/release/frink bench --render
 ```
 
 | Flag | Meaning |
@@ -1184,7 +1184,7 @@ limited, or short enough on free memory that the weights would page to
 disk. [`benchmarks/README.md`](../benchmarks/README.md) has each check,
 what it reads, and what `--max-load 0` waives.
 
-## Batched benchmark (`ferrox batched-bench`)
+## Batched benchmark (`frink batched-bench`)
 
 Throughput as a function of batch size, like
 [`llama-batched-bench`](https://github.com/ggerganov/llama.cpp/tree/master/tools/batched-bench):
@@ -1196,9 +1196,9 @@ tables paste side by side; `--output-format jsonl` prints one object
 per row with upstream's per-row keys.
 
 ```bash
-./target/release/ferrox batched-bench -m model.gguf -c 2048 -npp 128,256,512 -ntg 128,256 -npl 1,2,4,8,16,32
-./target/release/ferrox batched-bench -m model.gguf -c 2048 -npp 512 -ntg 128 -npl 1,4,16 -pps      # shared prompt
-./target/release/ferrox batched-bench -m model.gguf -ngl 99 -npp 128 -ntg 128 -npl 8 --output-format jsonl
+./target/release/frink batched-bench -m model.gguf -c 2048 -npp 128,256,512 -ntg 128,256 -npl 1,2,4,8,16,32
+./target/release/frink batched-bench -m model.gguf -c 2048 -npp 512 -ntg 128 -npl 1,4,16 -pps      # shared prompt
+./target/release/frink batched-bench -m model.gguf -ngl 99 -npp 128 -ntg 128 -npl 8 --output-format jsonl
 # the llama.cpp line to put beside it
 llama-batched-bench -m model.gguf -c 2048 -npp 128,256,512 -ntg 128,256 -npl 1,2,4,8,16,32
 ```
@@ -1219,13 +1219,13 @@ What it drives is the continuous batcher's own engine seams, without
 the server around them: each prompt goes through
 `Decoder::forward_batch_last_host_kv` in `-ub` chunks, and every decode
 step is one `Decoder::forward_multi_seq` call across the `B` sequences,
-the same call `ferrox-server` makes per tick under
-`FERROX_CONTINUOUS_BATCHING=1`. Two honest differences from upstream:
-ferrox has no cross-sequence prefill, so `B` prompts are `B` calls
+the same call `frink-server` makes per tick under
+`FRINK_CONTINUOUS_BATCHING=1`. Two honest differences from upstream:
+frink has no cross-sequence prefill, so `B` prompts are `B` calls
 rather than one batch (the number reported is still the time to
 prefill all of them); and the batched decode attends on the host on
 every backend, so `-ngl` offloads the projections and not the
-attention. `ferrox serve-bench` measures the same batcher over HTTP.
+attention. `frink serve-bench` measures the same batcher over HTTP.
 
 | Flag | Meaning |
 |---|---|
@@ -1235,13 +1235,13 @@ attention. `ferrox serve-bench` measures the same batcher over HTTP.
 | `-tgs` | Decode each sequence to completion in turn instead of one step across all of them per call (`:189-223`) |
 | `-c` | `n_kv_max`; a combination needing more is skipped, and the skip is printed rather than silent. `0` = the GGUF's `{arch}.context_length` |
 | `-ub` | Prompt tokens per forward call (default 512, upstream's `n_ubatch`) |
-| `-t`, `-ngl` | As `ferrox bench` |
+| `-t`, `-ngl` | As `frink bench` |
 | `--output-format` | `md` (default) or `jsonl` |
 | `--receipt`, `--backend-label` | Write a JSON receipt; the label must name the backend that ran or the receipt is refused, before the sweep and again at write time |
-| `--max-load` | The same quiet-host bar as `ferrox bench`, waiving the thermal and free-memory checks with it at `0`. The free-memory check counts the largest row's KV on top of the weights |
+| `--max-load` | The same quiet-host bar as `frink bench`, waiving the thermal and free-memory checks with it at `0`. The free-memory check counts the largest row's KV on top of the weights |
 
 Flags `llama-batched-bench` takes that this tool **refuses by name**
-rather than accepting and ignoring: `-b` (`n_batch`; ferrox has no
+rather than accepting and ignoring: `-b` (`n_batch`; frink has no
 logical batch distinct from `-ub`), `-kvu` (every sequence has its own
 cache here, so `N_KV` is `B*(PP+TG)` with or without `-pps`), `-fa`
 (no flash-attention switch to honour) and `-tb` (one thread pool).
@@ -1250,7 +1250,7 @@ For the same reason the JSONL rows omit `n_batch`, `flash_attn` and
 
 Every row runs twice: one discarded warmup pass and one timed pass,
 and the two must have fed the same tokens and produced the same greedy
-picks, per sequence, for prompt and decode. That is `ferrox bench`'s
+picks, per sequence, for prompt and decode. That is `frink bench`'s
 determinism check, and it is the reason each row costs two passes
 where upstream pays one global 16-token warmup. The other `bench_guard`
 checks run too: cold caches per pass, prompt and decode lengths
@@ -1260,23 +1260,23 @@ re-read from every sequence's KV afterwards (the copied caches under
 ### One model at a time
 
 Every command that loads weights (`run`, `bench`, `verify`, `smoke`,
-`run-kimi`, and `ferrox-server`) registers itself, and **stops with an
-error when another ferrox process is already holding a model**:
+`run-kimi`, and `frink-server`) registers itself, and **stops with an
+error when another frink process is already holding a model**:
 
 ```
-$ ferrox -m model.gguf -p "hi"
-Error: 1 ferrox instance(s) are already running a model on this host:
+$ frink -m model.gguf -p "hi"
+Error: 1 frink instance(s) are already running a model on this host:
   - server pid 59667, metal, models/SmolLM2-135M-Instruct-Q8_0.gguf
 Running several models at once does not share the machine -- it thrashes
 it, and any timing either process reports is noise. Stop the other
 instance, or pass --allow-multiple-instances (or set
-FERROX_ALLOW_MULTIPLE_INSTANCES=1) to start anyway.
+FRINK_ALLOW_MULTIPLE_INSTANCES=1) to start anyway.
 ```
 
 Prefill is a dense GEMM across every core, and the decode pool spins.
 Two instances do not run at half speed each. They fight over the same
 cores. Pass `--allow-multiple-instances` (or set
-`FERROX_ALLOW_MULTIPLE_INSTANCES=1`) when you want them anyway.
+`FRINK_ALLOW_MULTIPLE_INSTANCES=1`) when you want them anyway.
 
 Header-only commands (`inspect`, `inspect-plan`, `presets`, `archs`,
 `caps`), the HTTP client (`chat`), the downloader (`pull`) and
@@ -1285,7 +1285,7 @@ memory, and `--suite` is a supervisor whose children each register on
 their own.
 
 The registry is a directory of one small file per live process
-(`$FERROX_INSTANCE_DIR`, default `~/.cache/ferrox/instances`). When a
+(`$FRINK_INSTANCE_DIR`, default `~/.cache/frink/instances`). When a
 process is gone, after a `kill -9` or a crash, the next run prunes its
 entry instead of being blocked by it. This is **advisory, not a lock**.
 Two processes starting in the same instant each see the other and both

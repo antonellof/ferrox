@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `orion` GGUF used by ferrox's biased-LayerNorm
+"""Generate the tiny synthetic `orion` GGUF used by frink's biased-LayerNorm
 coverage test.
 
 `orion` (Orion-14B) refused as a `dedicated` row because its every norm
@@ -25,7 +25,7 @@ skipped moves the logits by far more than the tolerance; the
 projections are drawn at half the scale the other fixtures use,
 because with the norm's gain on top of a x4 draw the SwiGLU's
 activations were large enough that ggml's vectorised `expf` and
-ferrox's `exp` disagreed at 9e-5 in the logits (KL 5.5e-10) -- noise,
+frink's `exp` disagreed at 9e-5 in the logits (KL 5.5e-10) -- noise,
 and above the 1e-5 line the suite holds every fixture to.
 
 Usage:
@@ -68,7 +68,7 @@ def main(out_path: str) -> None:
         return (0.5 + rng.standard_normal(N_EMBD) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-orion-fixture")
+    w.add_name("frink-orion-fixture")
     # conversion/orion.py:27-37, and nothing about RoPE.
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

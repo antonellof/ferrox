@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate the tiny `llama` base GGUF and the two LoRA adapter GGUFs
-used by ferrox's LoRA coverage test.
+used by frink's LoRA coverage test.
 
 The adapters are NOT written by this script. It writes a PEFT adapter
 directory (`adapter_config.json` + `adapter_model.safetensors`, the
@@ -10,7 +10,7 @@ adapter GGUFs carry upstream's format -- `general.type = "adapter"`,
 `adapter.type = "lora"`, `adapter.lora.alpha`, `<base>.lora_a` /
 `<base>.lora_b` with the converter's own transposes and the llama
 Q/K permutation applied to `lora_b` -- and not a spelling of it that
-ferrox's loader and ferrox's fixture happen to agree on.
+frink's loader and frink's fixture happen to agree on.
 
 Two adapters, because `--lora` is repeatable and the server's
 per-request `lora: [{id, scale}]` list addresses them by index:
@@ -31,7 +31,7 @@ would make the adapter invisible and the test unable to fail).
 
 Usage:
     python3 scripts/make_lora_fixture.py \\
-        crates/ferrox-models/tests/fixtures $LLAMA
+        crates/frink-models/tests/fixtures $LLAMA
 
 (`$LLAMA/gguf-py` is put on `sys.path` from the second argument, so no
 `PYTHONPATH` is needed.)
@@ -77,7 +77,7 @@ def write_base(out_path: str, tied: bool = False) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-lora-base-fixture")
+    w.add_name("frink-lora-base-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
@@ -197,7 +197,7 @@ def write_peft_adapter(dir_path: str, seed: int, rank: int, alpha: float, target
     save_file(tensors, os.path.join(dir_path, "adapter_model.safetensors"))
     config = {
         "peft_type": "LORA",
-        "base_model_name_or_path": "ferrox-lora-base-fixture",
+        "base_model_name_or_path": "frink-lora-base-fixture",
         "r": rank,
         "lora_alpha": alpha,
         "lora_dropout": 0.0,

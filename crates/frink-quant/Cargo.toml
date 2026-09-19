@@ -1,0 +1,15 @@
+[package]
+name = "frink-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Quantized weight formats and fused dequant kernels for Frink"
+readme = "README.md"
+keywords = ["quantization", "llm", "simd", "gguf", "frink"]
+categories = ["algorithms", "encoding"]
+
+[dependencies]
+half = { workspace = true }
+thiserror = { workspace = true }

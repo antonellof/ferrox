@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `laguna` GGUFs used by ferrox's
+"""Generate the tiny synthetic `laguna` GGUFs used by frink's
 gated-attention coverage test: one per gate width.
 
 `laguna` refused as UNAUDITED, triaged NEW CODE, on the learned
@@ -30,7 +30,7 @@ dense layers in the real model (one here), sigmoid-routed MoE with
 which `crate::layer_shapes` carries), a per-HEAD gate sized by that
 layer's own count (`:110`), and a `rope.freq_base_swa` of its own
 (`:49`). FOUR LAYERS so that layers 1-3 slide and layer 0 does not.
-Deliberately WITHOUT the two things real XS.2 has that ferrox refuses
+Deliberately WITHOUT the two things real XS.2 has that frink refuses
 by name -- `rope.dimension_count_swa` differing from
 `rope.dimension_count` (`:50`) and a YaRN scaling that `:48,184-192`
 switch off on the sliding layers -- so that what the golden evidences
@@ -91,7 +91,7 @@ def main(out_path: str, variant: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name(f"ferrox-laguna-fixture{'-swa' if swa else ''}")
+    w.add_name(f"frink-laguna-fixture{'-swa' if swa else ''}")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

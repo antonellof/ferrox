@@ -1,0 +1,79 @@
+[package]
+name = "frink-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core tensor ops, RoPE, GQA, and KV cache for Frink"
+readme = "README.md"
+keywords = ["llm", "inference", "attention", "kv-cache", "frink"]
+categories = ["algorithms", "science"]
+
+[dependencies]
+frink-gguf = { workspace = true }
+frink-quant = { workspace = true }
+# NOT optional, and that is the point. Without the `cuda` feature this
+# crate is `thiserror` and two tables of CUDA C text -- no `cudarc`, no
+# toolkit, no link step. Making it unconditional lets `Cuda::matvec_kernel`
+# and `Cuda::gemm_supported` DERIVE from `frink_cuda`'s own kernel
+# tables instead of restating them, on every build. They were restated
+# for exactly one reason: this dependency used to be optional and the
+# capability report is compiled unconditionally. Two tables that must
+# agree about one set, with only a `#[cfg(feature = "cuda")]` test
+# between them, is this repo's dominant bug shape; it is now one table.
+frink-cuda = { workspace = true }
+frink-metal = { workspace = true, optional = true }
+frink-vulkan = { workspace = true, optional = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+# `qstar::BandwidthProfile` is read back from the profile `frink bench
+# --bw` writes, so the shape the policy reads and the shape the bench
+# writes are one type rather than two that can drift.
+serde = { workspace = true }
+# `bench_profile` reads and writes the JSON profile `frink bench --bw`
+# leaves on disk; the reader and the writer are one module so the shape
+# cannot drift between them.
+serde_json = { workspace = true }
+
+# `expert_pool::CudaExpertPool` is the CUDA side of the `SlotDevice`
+# seam. It lives here rather than in frink-cuda because frink-core
+# already depends on frink-cuda, so the reverse edge would be a cycle,
+# and because the Metal pool the out-of-core plan calls for belongs
+# beside it. Same pin as frink-cuda's: see that crate's comment for
+# why 0.11.9.
+cudarc = { version = "=0.11.9", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cuda-11080",
+] }
+
+# `statvfs` for kv_disk's free-space budget. Unix only; elsewhere the
+# probe reports "unknown" and the configured byte budget is the only
+# ceiling.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[features]
+default = []
+# Propagates to frink-cuda's own `cuda` feature (real NVRTC-compiled
+# kernel dispatch, dynamic-loaded -- builds fine without a CUDA
+# toolkit/GPU present, see frink-cuda's Cargo.toml comment).
+cuda = ["frink-cuda/cuda", "dep:cudarc"]
+# Propagates to frink-metal's `metal` feature (Apple Silicon only;
+# see frink-metal's Cargo.toml). Shares WeightMatrix::apply_gpu with CUDA.
+metal = ["dep:frink-metal", "frink-metal/metal"]
+# Propagates to frink-vulkan's `vulkan` feature, which pulls in `ash`
+# with its `loaded` feature: `libvulkan` is opened with dlopen at
+# RUNTIME, so this builds on a machine with no driver, no Vulkan SDK
+# and no C++ toolchain -- the same shape the `cuda` feature has.
+#
+# The backend this enables is ONE kernel wide: Q8_0 matvec, and nothing
+# else. `Vulkan::matvec_kernel` says so, `Vulkan::gemm_supported` is
+# false for every kind, and the guard tests in `gpu_backend` fail if
+# either stops being true. See `docs/plans/vulkan-beachhead-verdict.md`.
+vulkan = ["dep:frink-vulkan", "frink-vulkan/vulkan"]

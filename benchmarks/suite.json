@@ -3,7 +3,7 @@
   "reps": 3,
   "n_prompt": 512,
   "n_gen": 128,
-  "workload": "ferrox bench vs llama-bench: pp512 + tg128 (median \u00b1 stddev, one warmup discarded)",
+  "workload": "frink bench vs llama-bench: pp512 + tg128 (median \u00b1 stddev, one warmup discarded)",
   "host_ram_gb": 32,
   "models": [
     {
@@ -235,5 +235,5 @@
       "notes": "Second point in the 7-8B tier, which rested on Mistral-7B alone. The CPU gap scales inversely with size, so the large end needs more than one model"
     }
   ],
-  "threads_note": "Not forced. Each engine picks its own default; llama.cpp uses performance cores and degrades 2-4x above them, so pinning both to one count flatters ferrox. Override with ferrox bench -t N / llama-bench -t N."
+  "threads_note": "Not forced. Each engine picks its own default; llama.cpp uses performance cores and degrades 2-4x above them, so pinning both to one count flatters frink. Override with frink bench -t N / llama-bench -t N."
 }

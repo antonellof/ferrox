@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `glm4moe` GGUFs used by ferrox's GLM-4.5-MoE
+"""Generate the tiny synthetic `glm4moe` GGUFs used by frink's GLM-4.5-MoE
 coverage test.
 
-`glm4moe` is what GLM-4.5, GLM-4.5-Air and GLM-4.6 tag. ferrox refused
+`glm4moe` is what GLM-4.5, GLM-4.5-Air and GLM-4.6 tag. frink refused
 it until 2026-09-12, and the refusal had two lives: first "use
-`ferrox_models::glm52_decoder` / `glm52_gguf_loader`" -- and that loader
+`frink_models::glm52_decoder` / `glm52_gguf_loader`" -- and that loader
 cannot read a `glm4moe` file at all: `read_glm52_hparams` requires
 `{arch}.attention.q_lora_rank`, `kv_lora_rank`, `qk_nope_head_dim` and
 `qk_rope_head_dim`, and **GLM-4.5 is not an MLA model**. This fixture is
@@ -29,7 +29,7 @@ decides where it can and cannot run:
   * required Q/K/V biases via `create_tensor_qkv`, and no output bias.
   * a leading dense block, a shared expert, `exp_probs_b.bias`, sigmoid
     gating and `expert_weights_scale` -- the DeepSeek-V3-shaped routing
-    ferrox already validates on `dots1`.
+    frink already validates on `dots1`.
   * partial RoPE: `rope.dimension_count` is half `head_dim`, GLM's
     `partial_rotary_factor = 0.5`.
 
@@ -37,7 +37,7 @@ decides where it can and cannot run:
 GLM-4.5V text tower carries (`conversion/glm.py` writes the sections for
 the multimodal exports); `glm4-moe.cpp:6,145,188` then rotate with
 `ggml_rope_multi` in `LLAMA_ROPE_TYPE_MROPE` (llama-model.cpp:2700),
-which ferrox does not implement and REFUSES by name. libllama runs the
+which frink does not implement and REFUSES by name. libllama runs the
 file with text positions (measured), so the variant pins a refusal, not
 a golden.
 
@@ -87,7 +87,7 @@ def main(out_path: str, qk_norm: bool, mrope: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-glm4moe-fixture")
+    w.add_name("frink-glm4moe-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

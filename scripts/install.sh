@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Install ferrox + ferrox-server from a GitHub release.
+# Install frink + frink-server from a GitHub release.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/antonellof/frink/main/scripts/install.sh | bash
 #
 # Env:
-#   FERROX_VERSION      tag to install (default: latest release)
-#   FERROX_INSTALL_DIR  install directory (default: ~/.local/bin)
-#   FERROX_REPO         owner/repo (default: antonellof/ferrox)
+#   FRINK_VERSION      tag to install (default: latest release)
+#   FRINK_INSTALL_DIR  install directory (default: ~/.local/bin)
+#   FRINK_REPO         owner/repo (default: antonellof/frink)
 set -euo pipefail
 
-REPO="${FERROX_REPO:-antonellof/ferrox}"
-INSTALL_DIR="${FERROX_INSTALL_DIR:-${HOME}/.local/bin}"
+REPO="${FRINK_REPO:-antonellof/frink}"
+INSTALL_DIR="${FRINK_INSTALL_DIR:-${HOME}/.local/bin}"
 API="https://api.github.com/repos/${REPO}"
 DOWNLOAD_BASE="https://github.com/${REPO}/releases/download"
 
@@ -58,8 +58,8 @@ case "${platform}-${arch}" in
     ;;
 esac
 
-if [[ -n "${FERROX_VERSION:-}" ]]; then
-  tag="${FERROX_VERSION}"
+if [[ -n "${FRINK_VERSION:-}" ]]; then
+  tag="${FRINK_VERSION}"
 else
   tag="$(
     curl -fsSL "${API}/releases/latest" |
@@ -72,7 +72,7 @@ else
   fi
 fi
 
-asset="ferrox-${tag}-${platform}-${arch}.tar.gz"
+asset="frink-${tag}-${platform}-${arch}.tar.gz"
 url="${DOWNLOAD_BASE}/${tag}/${asset}"
 
 tmpdir="$(mktemp -d)"
@@ -88,11 +88,11 @@ fi
 tar -xzf "${tmpdir}/${asset}" -C "${tmpdir}"
 
 mkdir -p "${INSTALL_DIR}"
-for bin in ferrox ferrox-server; do
+for bin in frink frink-server; do
   src=""
   for candidate in \
     "${tmpdir}/${bin}" \
-    "${tmpdir}/ferrox-${tag}-${platform}-${arch}/${bin}"; do
+    "${tmpdir}/frink-${tag}-${platform}-${arch}/${bin}"; do
     if [[ -f "${candidate}" ]]; then
       src="${candidate}"
       break
@@ -118,4 +118,4 @@ case ":${PATH}:" in
 esac
 
 echo
-echo "Done. Try: ferrox --help"
+echo "Done. Try: frink --help"

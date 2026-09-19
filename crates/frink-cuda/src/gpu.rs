@@ -1,0 +1,2125 @@
+//! CUDA execution path via `cudarc` 0.11.9 (pinned to this version
+//! because newer `cudarc`/`libloading` releases require a rustc newer
+//! than the 1.75 available in an earlier development environment for
+//! this project -- see Cargo.toml's comment). Uses dynamic loading so
+//! this compiles without a CUDA toolkit installed.
+//!
+//! # Verified on real GPU hardware
+//!
+//! Five of the six matvec kernels (`launch_q8_0_matvec`,
+//! `launch_q4_0_matvec`, `launch_q4_k_matvec`, `launch_q5_k_matvec`,
+//! `launch_q6_k_matvec`) have
+//! been compiled by NVRTC and executed on real NVIDIA GPUs (RTX 3060s,
+//! rented on vast.ai), with their output cross-checked against
+//! `frink_quant`'s scalar reference for real, non-trivial quantized test
+//! data -- not just "the launch didn't error." Run this verification
+//! yourself with:
+//!   cargo test -p frink-cuda --features cuda -- --ignored
+//!
+//! Real bugs caught and fixed by actually running this on hardware
+//! (none were visible from reading the code):
+//! - The Q4_0 test's own fixture-generation code built one 18-byte Q4_0
+//!   block per row regardless of the test's `cols` value, so for a
+//!   64-column test matrix (2 blocks/row) the weight buffer ended up
+//!   half the size the test's own indexing expected -- an out-of-bounds
+//!   panic in the test harness itself, not the kernel.
+//! - Q4_K/Q5_K/Q6_K failed a fixed absolute tolerance (`1e-2`) against
+//!   reference values in the 1e7-1e8 range (small, single-digit-to-tens
+//!   diffs) -- root-caused against llama.cpp's real CUDA K-quant kernel
+//!   design (integer `dp4a` dot product, converting to float only once
+//!   per block, specifically to avoid GPU/CPU float non-associativity)
+//!   and its own test convention (`max_nmse_err()`, a relative metric,
+//!   never exact equality) -- not a kernel bug. Fixed by switching to a
+//!   relative-error assertion (`assert_close_relative`).
+//! - That same relative-tolerance assertion then hit a second, narrower
+//!   bug on real hardware: `GPU=NaN CPU reference=NaN` for a Q6_K row
+//!   whose pseudo-random test bytes happened to decode as a NaN/Inf f16
+//!   scale (garbage in, garbage out, identically on both backends) --
+//!   `(got - want).abs() <= tol` is always false for NaN under IEEE754,
+//!   so two backends that correctly *agreed* (both NaN) still failed the
+//!   assertion. Fixed by treating NaN==NaN as agreement explicitly.
+//!
+//! Q8_0/Q4_0/Q4_K/Q5_K all pass on real hardware as of 2026-07-31; Q6_K's
+//! NaN-comparison fix has not yet been re-run on hardware (see that
+//! test's own `#[ignore]` message).
+//!
+//! **`launch_q5_0_matvec` is the sixth, and NO GPU HAS RUN IT.** It
+//! landed 2026-09-05 (`docs/plans/cpu-cuda-parity.md` §6) and is a
+//! transcription of `frink-metal`'s Q5_0 matvec, which is itself
+//! `ggml`'s `dequantize_row_q5_0`. Nothing above applies to it: the
+//! only checks it has are that the CUDA C names the entry point its
+//! table row claims and strides by `Q5_0_BLOCK_BYTES`. Until
+//! `cargo test -p frink-cuda --features cuda -- --ignored` has run
+//! `launch_q5_0_matvec_matches_cpu_reference` on a device and the
+//! result is written down, CUDA Q5_0 is a claim, not a capability.
+//!
+//! The device-probe path (`probe()`) was already verified earlier
+//! (tested to degrade correctly with no GPU present -- including a real
+//! bug found and fixed in `cudarc`'s panic-instead-of-`Result::Err`
+//! behavior when no CUDA library exists at all). A second real bug in
+//! that same test surfaced the first time it actually ran *with* a real
+//! GPU present (full workspace suite on rented hardware, 2026-07-31):
+//! the test hard-coded "no CUDA device here," true on the
+//! no-GPU sandbox it was written on but false on real rented hardware --
+//! fixed to check both real outcomes instead of assuming one.
+//!
+//! `WeightMatrix::apply_gpu`-dispatched real MoE generation (a real
+//! third-party checkpoint, OLMoE-1B-7B-0924, `FRINK_GPU_VRAM_BUDGET_BYTES`
+//! enabled) has been measured end to end: 16.345s for 64 tokens on a
+//! rented RTX 3060, correct output, after fixing the per-call CUDA
+//! context/recompilation overhead (`shared_device`/`ensure_module_loaded`
+//! below) that made the same request take 15+ minutes (never completing)
+//! before that fix -- see `docs/MODELS.md` for the full comparison.
+//!
+//! Not yet verified: a full FFN (multiple fused matvecs) rather than one
+//! projection at a time, and behavior on GPUs other than the RTX 3060s
+//! this was tested against.
+
+/// What `probe()` found on the host, if anything.
+pub struct CudaInfo {
+    pub device_count: usize,
+    pub first_device_name: Option<String>,
+    pub total_vram_bytes: u64,
+    /// Currently *free* device memory, the second half of
+    /// `cuMemGetInfo`. This is what an admission check should divide
+    /// up, not `total_vram_bytes`: another process (or another
+    /// framework in this one) may already hold most of the card. It is
+    /// a snapshot -- true when probed, not a reservation.
+    pub free_vram_bytes: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CudaError {
+    #[error("cudarc driver initialization failed: {0:?}")]
+    DriverInit(String),
+    #[error("NVRTC kernel compilation failed: {0:?}")]
+    KernelCompile(String),
+    #[error("kernel launch failed: {0:?}")]
+    Launch(String),
+    /// A shape or format this CUDA path does not implement. Distinct
+    /// from `Launch` on purpose: the caller must fall back to a path
+    /// that can compute it, never compute something else.
+    #[error("unsupported on the CUDA path: {0}")]
+    Unsupported(String),
+}
+
+/// Probes for CUDA devices. Returns `None` on any failure to load the
+/// driver or find a device -- which, on this development sandbox (no
+/// GPU, likely no NVIDIA driver at all), is the correct and expected
+/// result every time, and is exactly what's tested.
+///
+/// Real finding from actually running this in the sandbox: `cudarc`
+/// 0.11.9's dynamic-loading path does not return a clean `Result::Err`
+/// when the `libcuda`/`libnvcuda` shared library itself cannot be
+/// found at all -- it panics
+/// (`cudarc::panic_no_lib_found`/`driver::sys::lib`). That is a
+/// meaningfully different failure mode than "library loaded, but no
+/// device present," and this function has to catch it explicitly with
+/// `catch_unwind` or a CPU-only host would crash the whole process
+/// just from calling this probe. This is exactly the kind of bug that
+/// only surfaces by actually running code against a real (lack of)
+/// environment, not by reading API docs.
+pub fn probe() -> Option<CudaInfo> {
+    // Temporarily silence the default panic hook: on a host with no
+    // CUDA shared library at all, the catch_unwind below is expected
+    // to trigger on every single call (e.g. every process start that
+    // checks capabilities), and printing a full Rust panic backtrace
+    // for an anticipated, handled condition would be noise, not a bug
+    // report. The previous hook is always restored, even if the
+    // probed closure panics.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(|| {
+        let dev = cudarc::driver::CudaDevice::new(0).ok()?;
+        let name = dev.name().ok();
+        let (free, total) = cudarc::driver::result::mem_get_info().ok()?;
+        Some(CudaInfo {
+            device_count: 1,
+            first_device_name: name,
+            total_vram_bytes: total as u64,
+            free_vram_bytes: free as u64,
+        })
+    });
+    std::panic::set_hook(previous_hook);
+    result.unwrap_or(None)
+}
+
+/// CUDA C source for a fused Q4_K dequant+dot kernel: mirrors
+/// `frink_quant::dot_q4_k_f32_scalar`'s exact math (144-byte
+/// super-blocks of 256 elements: 2-byte f16 `d` + 2-byte f16 `dmin` +
+/// 12 bytes of packed 6-bit scale/min pairs + 128 bytes of packed
+/// 4-bit values, 4 sub-blocks of 64 elements each). `q4_k_scale_min`
+/// is the same bit-unpacking `frink_quant::q4_k_scale_min` does.
+///
+/// Verified: compiled by NVRTC and executed on a real GPU, matching
+/// the CPU reference exactly -- see the module doc comment.
+/// Q4_K matvec with a COALESCED access pattern.
+///
+/// The kernel this replaces walks whole 144-byte super-blocks per
+/// thread (`blk += blockDim.x`), so adjacent lanes read addresses 144
+/// bytes apart and every lane in a warp touches a different cache
+/// line. Measured consequence on an RTX 3060: 19.0 GB/s of weight
+/// traffic, **5.3%** of the card's 360 GB/s, where llama.cpp reaches
+/// 60.4%. A decode matvec is a streaming read of the weights, so that
+/// percentage IS the gap, and the inner arithmetic is irrelevant while
+/// it holds (a `dp4a` port measured under 1%, #142).
+///
+/// Here one warp takes one super-block at a time and lane `l` reads
+/// `qs[4l .. 4l+4)`. Thirty-two lanes then cover the 128 quantized
+/// bytes as one contiguous run instead of 32 scattered ones.
+///
+/// The activation stays f32 on purpose. Quantizing it to int8 is what
+/// llama.cpp does, and on a real checkpoint it diverges from the CPU
+/// reference at token 4, which `frink verify` refuses. This change is
+/// meant to be token-identical.
+///
+/// Lane to data mapping, which is the part to get right:
+///   off = 4*l           byte offset into the 128 qs bytes
+///   oi  = l/8           which 32-byte group, so which sub-block PAIR
+///   low nibbles  -> activations at blk*256 + oi*64 + (off%32)
+///   high nibbles -> the same, plus 32
+/// The 32 bytes of a group carry the first 32 activations in their low
+/// nibbles and the next 32 in their high nibbles, so a lane that pairs
+/// byte `i` with activation `i` for both halves reads the wrong place.
+/// Q6_K matvec with a coalesced access pattern.
+///
+/// The kernel this replaces gives each thread a whole 210-byte
+/// super-block, so a warp's 32 loads land 210 bytes apart. Here the
+/// warp takes one super-block and lane `l` takes the index the old
+/// inner loop iterated, which makes `ql[l]`, `ql[l+32]` and `qh[l]`
+/// each contiguous across the warp.
+///
+/// Q6_K is worth doing right after Q4_K because a `Q4_K_M` checkpoint
+/// is not all Q4_K: its output tensor is usually Q6_K, so this kernel
+/// runs every token too.
+///
+/// Same arithmetic and same f32 activations as before, so it stays
+/// token-identical.
+/// CUDA C for the coalesced Q5_K matvec: one warp per row, lane `l`
+/// owning element `l` of each 32-element group, so the warp's loads of
+/// `qs`, `qh` and the activations are each contiguous.
+///
+/// Q5_K adds a fifth bit per weight over Q4_K, held in `qh` as one
+/// BIT-PLANE per group: bit `2*oi` for the group's low nibbles and bit
+/// `2*oi + 1` for its high ones. `q5_k_matvec_coalesced_row` in
+/// `coalesced_twin.rs` is the scalar twin that pins that down.
+pub const Q5_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float frink_f16_to_f32_q5co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+__device__ __forceinline__ void frink_q4_k_scale_min_q5co(
+    int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
+) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *m = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        *m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+
+extern "C" __global__ void q5_k_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 176;
+        const float d = frink_f16_to_f32_q5co(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+        const float dmin = frink_f16_to_f32_q5co(
+            (unsigned short)block[2] | ((unsigned short)block[3] << 8));
+        const unsigned char* scales = block + 4;
+        const unsigned char* qh = block + 16;
+        const unsigned char* qs = block + 48;
+        const int x_base = blk * 256;
+        const unsigned char h = qh[lane];
+
+        #pragma unroll
+        for (int oi = 0; oi < 4; ++oi) {
+            unsigned char sc1, m1, sc2, m2;
+            frink_q4_k_scale_min_q5co(2 * oi, scales, &sc1, &m1);
+            frink_q4_k_scale_min_q5co(2 * oi + 1, scales, &sc2, &m2);
+            const float d1 = d * (float)sc1, min1 = dmin * (float)m1;
+            const float d2 = d * (float)sc2, min2 = dmin * (float)m2;
+            const unsigned char ql = qs[oi * 32 + lane];
+            const unsigned char u1 = (unsigned char)(1u << (2 * oi));
+            const unsigned char u2 = (unsigned char)(2u << (2 * oi));
+            const int xb = x_base + oi * 64;
+            const int hi1 = (h & u1) ? 16 : 0;
+            const int hi2 = (h & u2) ? 16 : 0;
+            acc += (d1 * (float)((ql & 0x0F) + hi1) - min1) * x[xb + lane];
+            acc += (d2 * (float)((ql >> 4) + hi2) - min2) * x[xb + 32 + lane];
+        }
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
+/// CUDA C for the coalesced Q8_0 matvec. A Q8_0 block holds exactly 32
+/// quants, so a warp maps onto one block with no leftovers: lane `l`
+/// takes byte `l` and the warp's load is 32 contiguous bytes, against
+/// the 1088-byte stride the one-thread-per-block kernel used.
+///
+/// The quants are SIGNED; the twin has a test that fails on an
+/// unsigned read.
+pub const Q8_0_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float frink_f16_to_f32_q8co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+extern "C" __global__ void q8_0_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 34;
+        const float d = frink_f16_to_f32_q8co(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+        const signed char q = (signed char)block[2 + lane];
+        acc += d * (float)q * x[blk * 32 + lane];
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
+pub const Q6_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float frink_f16_to_f32_q6co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+extern "C" __global__ void q6_k_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    const int is = lane / 16;
+    float acc = 0.0f;
+
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 210;
+        const float d = frink_f16_to_f32_q6co(
+            (unsigned short)block[208] | ((unsigned short)block[209] << 8));
+        const int x_base = blk * 256;
+
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const unsigned char* ql = block + half * 64;
+            const unsigned char* qh = block + 128 + half * 32;
+            const signed char* sc = (const signed char*)(block + 192 + half * 8);
+            const int xh = x_base + half * 128;
+
+            const int q1 = (int)((ql[lane] & 0x0F) | ((qh[lane] & 0x03) << 4)) - 32;
+            const int q2 = (int)((ql[lane + 32] & 0x0F) | (((qh[lane] >> 2) & 0x03) << 4)) - 32;
+            const int q3 = (int)((ql[lane] >> 4) | (((qh[lane] >> 4) & 0x03) << 4)) - 32;
+            const int q4 = (int)((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 0x03) << 4)) - 32;
+
+            acc += d * (float)sc[is] * (float)q1 * x[xh + lane];
+            acc += d * (float)sc[is + 2] * (float)q2 * x[xh + lane + 32];
+            acc += d * (float)sc[is + 4] * (float)q3 * x[xh + lane + 64];
+            acc += d * (float)sc[is + 6] * (float)q4 * x[xh + lane + 96];
+        }
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
+pub const Q4_K_MATVEC_COALESCED_KERNEL_SRC: &str = r#"
+__device__ __forceinline__ float frink_f16_to_f32_co(unsigned short bits) {
+    unsigned int sign = (bits >> 15) & 0x1u;
+    unsigned int exp = (bits >> 10) & 0x1Fu;
+    unsigned int mant = bits & 0x3FFu;
+    float scale;
+    if (exp == 0) {
+        scale = ldexpf((float)mant, -24);
+    } else if (exp == 31) {
+        scale = mant ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        scale = ldexpf((float)(mant | 0x400), (int)exp - 25);
+    }
+    return sign ? -scale : scale;
+}
+
+__device__ __forceinline__ void frink_q4_k_scale_min_co(
+    int j, const unsigned char* scales, unsigned char* sc, unsigned char* m
+) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *m = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        *m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+
+extern "C" __global__ void q4_k_matvec_coalesced(
+    const unsigned char* weights,
+    const float* x,
+    float* out,
+    int rows,
+    int row_bytes,
+    int n_blocks_per_row
+) {
+    const int warps = blockDim.x / 32;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+
+    const unsigned char* row_ptr = weights + (size_t)row * row_bytes;
+    const int off = 4 * lane;
+    const int oi = lane / 8;
+    const int within = off % 32;
+
+    float acc = 0.0f;
+    for (int blk = 0; blk < n_blocks_per_row; ++blk) {
+        const unsigned char* block = row_ptr + (size_t)blk * 144;
+        const float d = frink_f16_to_f32_co(
+            (unsigned short)block[0] | ((unsigned short)block[1] << 8));
+        const float dmin = frink_f16_to_f32_co(
+            (unsigned short)block[2] | ((unsigned short)block[3] << 8));
+        const unsigned char* scales = block + 4;
+        const unsigned char* qs = block + 16;
+
+        unsigned char sc1, m1, sc2, m2;
+        frink_q4_k_scale_min_co(2 * oi, scales, &sc1, &m1);
+        frink_q4_k_scale_min_co(2 * oi + 1, scales, &sc2, &m2);
+        const float d1 = d * (float)sc1, min1 = dmin * (float)m1;
+        const float d2 = d * (float)sc2, min2 = dmin * (float)m2;
+
+        // The whole warp's 32 loads cover qs[0..128) contiguously.
+        const uchar4 w = *(const uchar4*)(qs + off);
+        const int xb = blk * 256 + oi * 64 + within;
+        const unsigned char wb[4] = { w.x, w.y, w.z, w.w };
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            acc += (d1 * (float)(wb[i] & 0x0F) - min1) * x[xb + i];
+            acc += (d2 * (float)(wb[i] >> 4) - min2) * x[xb + 32 + i];
+        }
+    }
+
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, s);
+    }
+    if (lane == 0) out[row] = acc;
+}
+"#;
+
+/// Process-wide CUDA device handle, created once and reused for every
+/// kernel launch. Before this existed, `launch_matvec` called
+/// `CudaDevice::new(0)` on *every single call* -- a fresh CUDA context
+/// per matvec, real-hardware-measured (via the OLMoE end-to-end stall
+/// documented in `docs/MODELS.md`) to make GPU-dispatched MoE
+/// generation impractically slow: up to ~384 individual expert-tensor
+/// dispatches per token (16 layers x 8 active experts x 3 tensors) each
+/// paying full context-creation + NVRTC-recompilation overhead. A
+/// `Mutex<Option<Arc<CudaDevice>>>` rather than `OnceLock` because
+/// `OnceLock::get_or_try_init` (needed to propagate a `DriverError` on
+/// first-call failure) is not available on this project's pinned
+/// minimum rustc (1.75, see Cargo.toml); this only locks briefly to
+/// clone the `Arc` or initialize once, never for the actual kernel work.
+static CUDA_DEVICE: std::sync::Mutex<Option<std::sync::Arc<cudarc::driver::CudaDevice>>> =
+    std::sync::Mutex::new(None);
+
+/// The shared device's compute capability major, asked once. `0` when
+/// the query fails, which no capability gate treats as "new enough".
+pub(crate) fn compute_capability_major(dev: &std::sync::Arc<cudarc::driver::CudaDevice>) -> i32 {
+    static CC_MAJOR: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *CC_MAJOR.get_or_init(|| {
+        dev.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+        .unwrap_or(0)
+    })
+}
+
+pub(crate) fn shared_device() -> Result<std::sync::Arc<cudarc::driver::CudaDevice>, CudaError> {
+    let mut guard = CUDA_DEVICE.lock().unwrap();
+    if let Some(dev) = guard.as_ref() {
+        return Ok(dev.clone());
+    }
+    let dev =
+        cudarc::driver::CudaDevice::new(0).map_err(|e| CudaError::DriverInit(format!("{e:?}")))?;
+    *guard = Some(dev.clone());
+    Ok(dev)
+}
+
+/// Which `module_name`s have already been NVRTC-compiled and
+/// `load_ptx`'d onto the shared device -- `CudaDevice::load_ptx` always
+/// recompiles and overwrites on every call (verified directly against
+/// `cudarc` 0.11.9's own source: `modules.insert(module_name.into(),
+/// module)` with no existing-key check), so skipping a repeat call for
+/// an already-loaded kernel has to be tracked here, not assumed.
+static LOADED_MODULES: std::sync::Mutex<Option<std::collections::HashSet<&'static str>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn ensure_module_loaded(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    kernel_src: &str,
+    module_name: &'static str,
+    fn_name: &'static str,
+) -> Result<(), CudaError> {
+    ensure_module_loaded_lazy(dev, module_name, fn_name, || kernel_src.to_string())
+}
+
+/// The same load-once cache, for a kernel whose source is *generated*
+/// rather than a `&'static str` literal (`mul_mm`'s per-quant-kind
+/// bodies). `src` is called only on a cache miss, so a per-token launch
+/// does not re-format a translation unit it will not compile.
+pub(crate) fn ensure_module_loaded_lazy(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    module_name: &'static str,
+    fn_name: &'static str,
+    src: impl FnOnce() -> String,
+) -> Result<(), CudaError> {
+    ensure_module_loaded_lazy_for_arch(dev, module_name, fn_name, None, src)
+}
+
+/// [`ensure_module_loaded_lazy`] with an explicit NVRTC target, for a
+/// kernel whose instructions need one (`mma.sync.m16n8k16` is
+/// `compute_80`); `None` is NVRTC's default target, which every other
+/// kernel here compiles for.
+pub(crate) fn ensure_module_loaded_lazy_for_arch(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    module_name: &'static str,
+    fn_name: &'static str,
+    arch: Option<&'static str>,
+    src: impl FnOnce() -> String,
+) -> Result<(), CudaError> {
+    let mut guard = LOADED_MODULES.lock().unwrap();
+    let set = guard.get_or_insert_with(std::collections::HashSet::new);
+    if set.contains(module_name) {
+        return Ok(());
+    }
+    let opts = cudarc::nvrtc::CompileOptions {
+        arch,
+        ..Default::default()
+    };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(src(), opts)
+        .map_err(|e| CudaError::KernelCompile(format!("{e:?}")))?;
+    dev.load_ptx(ptx, module_name, &[fn_name])
+        .map_err(|e| CudaError::KernelCompile(format!("{e:?}")))?;
+    set.insert(module_name);
+    Ok(())
+}
+
+/// Compiles (once) and launches a matvec kernel from `kernel_src`/`fn_name`
+/// (either `Q8_0_MATVEC_KERNEL_SRC`/`"q8_0_matvec"` or
+/// `Q4_0_MATVEC_KERNEL_SRC`/`"q4_0_matvec"` -- both share the same
+/// launch config and buffer shapes, only the per-block unpack differs),
+/// using cudarc 0.11.9's actual API (`CudaDevice::load_ptx` /
+/// `get_func` / `htod_copy` / `alloc_zeros` / `dtoh_sync_copy` / the
+/// `LaunchAsync` trait). Verified on real GPU hardware -- see the
+/// module doc comment. The CUDA context and compiled kernel are now
+/// process-wide and persistent (see `shared_device`/`ensure_module_loaded`) --
+/// quantized weight buffers are also cached by host pointer+length
+/// (`resident_cuda_weights`) so decode does not re-upload multi-GB
+/// matrices every token. Activations still upload per call, and that is
+/// deliberate: keeping them device-resident between matmuls was tried
+/// (PR #136) and measured 22% SLOWER on a GTX 1080, because decode is
+/// kernel-bound at ~90% utilization rather than host-bound. See
+/// `docs/plans/cpu-cuda-parity.md` step 2.
+#[allow(clippy::too_many_arguments)] // shared internal launch plumbing; each parameter is a distinct, clearly-named buffer/shape value, not something worth bundling into a struct for one private callee.
+fn launch_matvec(
+    kernel_src: &'static str,
+    module_name: &'static str,
+    fn_name: &'static str,
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    // Which kernel actually runs is `enqueue_matvec`'s decision, so
+    // every caller gets the same one -- see `matvec_launch_plan`.
+    let dev = shared_device()?;
+    let d_x = dev
+        .htod_copy(x.to_vec())
+        .map_err(|e| CudaError::Launch(format!("{e:?}")))?;
+    let launch = MatvecLaunch {
+        kernel_src,
+        module_name,
+        fn_name,
+        weights,
+        rows,
+        row_bytes,
+        n_blocks_per_row,
+    };
+    // `_weights` holds the resident-weight Arc alive until the DtoH sync.
+    let (d_out, _weights) = enqueue_matvec(&dev, &launch, &d_x)?;
+    dev.dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("{e:?}")))
+}
+
+/// Enqueues one matvec kernel on the shared device's default stream:
+/// ensures the module is compiled/loaded, fetches the function, pins
+/// the (process-resident) weight buffer, allocates the output, and
+/// launches — **without** any host synchronization. `d_x` is an
+/// already-on-device activation slice (uploaded once by the caller and
+/// reused across chained matvecs, e.g. the fused dense FFN), so no
+/// per-call HtoD of the activation happens here. Returns the device
+/// output slice plus the resident-weight `Arc`, which the caller must
+/// keep alive until it syncs (the kernel reads that buffer
+/// asynchronously). This is the single per-launch primitive shared by
+/// [`launch_matvec`], [`launch_matvec_multi`] and
+/// [`launch_dense_ffn_swiglu`].
+/// The coalesced matvec kernel for `fn_name`, or `None` if that quant
+/// kind still runs the old one-thread-per-super-block kernel.
+///
+/// This is the ONLY place a coalesced kernel is named. Four launchers
+/// that each hard-coded one kind is exactly the shape this repo keeps
+/// getting bitten by: structures that must agree with nothing enforcing
+/// it. `every_coalesced_kernel_is_reachable_from_the_table` fails if a
+/// kernel const is added and this table is not updated, so a kernel
+/// cannot sit in the file unreachable.
+fn coalesced_matvec_kernel(fn_name: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match fn_name {
+        "q4_k_matvec" => Some((
+            Q4_K_MATVEC_COALESCED_KERNEL_SRC,
+            "frink_q4_k_coalesced",
+            "q4_k_matvec_coalesced",
+        )),
+        "q5_k_matvec" => Some((
+            Q5_K_MATVEC_COALESCED_KERNEL_SRC,
+            "frink_q5_k_coalesced",
+            "q5_k_matvec_coalesced",
+        )),
+        "q6_k_matvec" => Some((
+            Q6_K_MATVEC_COALESCED_KERNEL_SRC,
+            "frink_q6_k_coalesced",
+            "q6_k_matvec_coalesced",
+        )),
+        "q8_0_matvec" => Some((
+            Q8_0_MATVEC_COALESCED_KERNEL_SRC,
+            "frink_q8_0_coalesced",
+            "q8_0_matvec_coalesced",
+        )),
+        _ => None,
+    }
+}
+
+/// How many warps a coalesced matvec block carries. Eight keeps enough
+/// rows in flight per SM to hold loads outstanding, which is the thing
+/// those kernels exist to fix.
+const COALESCED_WARPS_PER_BLOCK: usize = 8;
+
+/// Which kernel a matvec actually runs, and the geometry that kernel
+/// needs.
+///
+/// The two must agree: a coalesced kernel launched with the
+/// block-per-row geometry computes one row per BLOCK while indexing as
+/// if it had one row per WARP, and returns wrong numbers rather than
+/// failing. That is the repo's dominant bug shape, so the choice is
+/// made once, here, by the only function that decides it, and
+/// `the_plan_pairs_each_kernel_with_its_own_geometry` checks the
+/// pairing on the host.
+///
+/// This lives in `enqueue_matvec` rather than in `launch_matvec`
+/// because the fused dense FFN and `launch_matvec_multi` enqueue
+/// directly. Routing at the `launch_matvec` level left the FFN --
+/// gate, up and down, about 83% of the weight bytes a Llama-3.2-3B
+/// decode step reads -- on the uncoalesced kernels while the
+/// benchmarks said "coalesced".
+fn matvec_launch_plan(
+    fn_name: &'static str,
+    kernel_src: &'static str,
+    module_name: &'static str,
+    rows: usize,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    cudarc::driver::LaunchConfig,
+) {
+    match coalesced_matvec_kernel(fn_name) {
+        Some((src, module, entry)) => (
+            src,
+            module,
+            entry,
+            cudarc::driver::LaunchConfig {
+                grid_dim: (rows.div_ceil(COALESCED_WARPS_PER_BLOCK) as u32, 1, 1),
+                block_dim: ((COALESCED_WARPS_PER_BLOCK * 32) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        ),
+        None => (
+            kernel_src,
+            module_name,
+            fn_name,
+            cudarc::driver::LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+            },
+        ),
+    }
+}
+
+fn enqueue_matvec(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    launch: &MatvecLaunch<'_>,
+    d_x: &cudarc::driver::CudaSlice<f32>,
+) -> Result<
+    (
+        cudarc::driver::CudaSlice<f32>,
+        std::sync::Arc<ResidentCudaWeights>,
+    ),
+    CudaError,
+> {
+    use cudarc::driver::LaunchAsync;
+
+    let (src, module, entry, cfg) = matvec_launch_plan(
+        launch.fn_name,
+        launch.kernel_src,
+        launch.module_name,
+        launch.rows,
+    );
+
+    ensure_module_loaded(dev, src, module, entry)?;
+    let func = dev.get_func(module, entry).ok_or_else(|| {
+        CudaError::KernelCompile(format!("function '{entry}' not found after load_ptx"))
+    })?;
+
+    let d_weights = resident_cuda_weights(dev, launch.weights)?;
+    let mut d_out = dev
+        .alloc_zeros::<f32>(launch.rows)
+        .map_err(|e| CudaError::Launch(format!("output alloc: {e:?}")))?;
+
+    unsafe {
+        func.launch(
+            cfg,
+            (
+                &d_weights.slice,
+                d_x,
+                &mut d_out,
+                launch.rows as i32,
+                launch.row_bytes as i32,
+                launch.n_blocks_per_row as i32,
+            ),
+        )
+        .map_err(|e| CudaError::Launch(format!("kernel {entry}: {e:?}")))?;
+    }
+
+    Ok((d_out, d_weights))
+}
+
+pub(crate) struct ResidentCudaWeights {
+    pub(crate) slice: cudarc::driver::CudaSlice<u8>,
+    #[allow(dead_code)] // Kept for diagnostics / future eviction logic.
+    nbytes: usize,
+    /// What the bytes at the key looked like when they were uploaded.
+    /// A host buffer can be freed and its address handed to a different
+    /// buffer of the same length, and `(pointer, len)` cannot tell the
+    /// two apart: the tensor-core `mul_mm` hardware test multiplied one
+    /// fixture's weights by another fixture's activations for exactly
+    /// that reason (2026-09-17), and a merged LoRA or any other
+    /// short-lived matrix could do the same in a server. Production
+    /// weights are one mmap for the life of the process, which is why
+    /// nothing had noticed. This is the same identity hazard
+    /// `frink-metal/src/resident_act.rs` (#166) closed for
+    /// activations, closed the cheap way for weights: a sample of the
+    /// bytes, compared on every hit.
+    fingerprint: WeightFingerprint,
+}
+
+/// A cheap sample of a weight buffer: its first and last 64 bytes and
+/// 64 from the middle. Not a hash of the whole tensor (that is
+/// gigabytes per token); enough that a different buffer at the same
+/// address is caught unless it agrees on 192 sampled bytes.
+#[derive(PartialEq, Eq, Clone, Debug)]
+struct WeightFingerprint {
+    head: [u8; 64],
+    mid: [u8; 64],
+    tail: [u8; 64],
+}
+
+impl WeightFingerprint {
+    fn of(bytes: &[u8]) -> Self {
+        fn take(bytes: &[u8], at: usize) -> [u8; 64] {
+            let mut out = [0u8; 64];
+            let at = at.min(bytes.len());
+            let n = (bytes.len() - at).min(64);
+            out[..n].copy_from_slice(&bytes[at..at + n]);
+            out
+        }
+        Self {
+            head: take(bytes, 0),
+            mid: take(bytes, bytes.len() / 2),
+            tail: take(bytes, bytes.len().saturating_sub(64)),
+        }
+    }
+}
+
+// SAFETY: slices live on the process-wide shared CudaDevice and are
+// only read by kernels; same sharing model as Metal's ResidentWeightBuffer.
+unsafe impl Send for ResidentCudaWeights {}
+unsafe impl Sync for ResidentCudaWeights {}
+
+type CudaWeightCacheKey = (usize, usize);
+type CudaWeightCacheMap =
+    std::collections::HashMap<CudaWeightCacheKey, std::sync::Arc<ResidentCudaWeights>>;
+
+static CUDA_WEIGHT_CACHE: std::sync::Mutex<Option<CudaWeightCacheMap>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn resident_cuda_weights(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    weights: &[u8],
+) -> Result<std::sync::Arc<ResidentCudaWeights>, CudaError> {
+    let key = (weights.as_ptr() as usize, weights.len());
+    let fingerprint = WeightFingerprint::of(weights);
+    let mut guard = CUDA_WEIGHT_CACHE.lock().unwrap();
+    let cache = guard.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(cached) = cache.get(&key) {
+        if cached.fingerprint == fingerprint {
+            return Ok(cached.clone());
+        }
+        // Same address and length, different bytes: the buffer this
+        // entry was uploaded from is gone. Re-upload rather than serve
+        // another tensor's weights.
+        cache.remove(&key);
+    }
+    let slice = dev
+        .htod_copy(weights.to_vec())
+        .map_err(|e| CudaError::Launch(format!("{e:?}")))?;
+    let cached = std::sync::Arc::new(ResidentCudaWeights {
+        slice,
+        nbytes: weights.len(),
+        fingerprint,
+    });
+    cache.insert(key, cached.clone());
+    Ok(cached)
+}
+
+// The kernel TEXT moved to `matvec_kinds`, one module per format
+// family; `gpu.rs` keeps the device plumbing. Re-exported so every
+// existing path still resolves -- a refactor that moves a definition
+// should not move a public name.
+pub use crate::matvec_kinds::codebook::{
+    IQ4_NL_MATVEC_KERNEL_SRC, IQ4_XS_MATVEC_KERNEL_SRC, MXFP4_MATVEC_KERNEL_SRC,
+};
+pub use crate::matvec_kinds::kquant::{
+    Q2_K_MATVEC_KERNEL_SRC, Q3_K_MATVEC_KERNEL_SRC, Q4_K_MATVEC_KERNEL_SRC, Q5_K_MATVEC_KERNEL_SRC,
+    Q6_K_MATVEC_KERNEL_SRC,
+};
+pub use crate::matvec_kinds::legacy::{
+    Q4_0_MATVEC_KERNEL_SRC, Q5_0_MATVEC_KERNEL_SRC, Q8_0_MATVEC_KERNEL_SRC,
+};
+
+/// The per-kind matvec table, keyed by GGUF quant name: source, NVRTC
+/// module cache key, entry point. `None` means CUDA has no matvec for
+/// that format and the caller must fall back and say so.
+///
+/// This is the SINGLE holder of those three strings. It was not: the
+/// same five-row table was written out twice more, inline in
+/// `frink-core`'s `apply_gpu_multi` and `apply_gpu_dense_ffn_swiglu`,
+/// and a kind added to one and not the others silently lost the fused
+/// launch while the capability report kept saying GPU. That is the
+/// shape `frink-metal`'s `matvec_launch_meta` already exists to
+/// prevent, and this is its CUDA counterpart -- keyed the same way, by
+/// `QuantKind::name()`, so `frink-core` can ask for a kind without
+/// depending on a CUDA type.
+pub fn matvec_launch_meta(kind_name: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    crate::matvec_kinds::kind_by_name(kind_name).map(|k| (k.src, k.module_name, k.fn_name))
+}
+
+/// Looks a kind up in [`matvec_launch_meta`] and launches it. Every
+/// `launch_q*_matvec` below is this call with its name filled in, so
+/// the launchers cannot name a module or entry point the table does
+/// not.
+fn launch_matvec_by_kind(
+    kind_name: &str,
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    let (kernel_src, module_name, fn_name) = matvec_launch_meta(kind_name)
+        .ok_or_else(|| CudaError::Unsupported(format!("no CUDA matvec kernel for {kind_name}")))?;
+    launch_matvec(
+        kernel_src,
+        module_name,
+        fn_name,
+        weights,
+        x,
+        rows,
+        row_bytes,
+        n_blocks_per_row,
+    )
+}
+
+/// Launches the Q8_0 matvec kernel. Verified on real GPU hardware -- see module docs.
+pub fn launch_q8_0_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q8_0", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q4_0 matvec kernel. Verified on real GPU hardware -- see module docs.
+pub fn launch_q4_0_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q4_0", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q5_0 matvec kernel. **NEVER RUN ON A GPU** -- see
+/// `Q5_0_MATVEC_KERNEL_SRC`'s doc comment for what is and is not
+/// established about it.
+pub fn launch_q5_0_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q5_0", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q2_K matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::kquant`] for what is and is not established.
+pub fn launch_q2_k_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q2_K", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q3_K matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::kquant`] for what is and is not established.
+pub fn launch_q3_k_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q3_K", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the IQ4_NL matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::codebook`] for what is and is not established.
+pub fn launch_iq4_nl_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("IQ4_NL", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the IQ4_XS matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::codebook`] for what is and is not established.
+pub fn launch_iq4_xs_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("IQ4_XS", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the MXFP4 matvec kernel. **NEVER RUN ON A GPU** -- see
+/// [`crate::matvec_kinds::codebook`] for what is and is not established.
+pub fn launch_mxfp4_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("MXFP4", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q4_K matvec kernel. Verified on real GPU hardware -- see module docs.
+pub fn launch_q4_k_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q4_K", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q5_K matvec kernel. Verified on real GPU hardware -- see module docs.
+pub fn launch_q5_k_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q5_K", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Launches the Q6_K matvec kernel. NOT yet re-verified on real GPU
+/// hardware since the signed-scale fix -- see `Q6_K_MATVEC_KERNEL_SRC`'s
+/// doc comment.
+pub fn launch_q6_k_matvec(
+    weights: &[u8],
+    x: &[f32],
+    rows: usize,
+    row_bytes: usize,
+    n_blocks_per_row: usize,
+) -> Result<Vec<f32>, CudaError> {
+    launch_matvec_by_kind("Q6_K", weights, x, rows, row_bytes, n_blocks_per_row)
+}
+
+/// Metadata for a single matvec launch in a multi-matvec batch (shared
+/// activation upload). Each describes one weight matrix to dispatch
+/// against the same `x`.
+///
+/// `weights` must be a stable host slice (mmap / owned matrix storage) —
+/// never a temporary `to_vec()` copy. [`resident_cuda_weights`] keys by
+/// pointer+length; a per-call clone would miss the cache and re-upload
+/// multi-GB matrices every QKV fuse (the Vast ~2 tok/s failure mode).
+pub struct MatvecLaunch<'a> {
+    pub kernel_src: &'static str,
+    pub module_name: &'static str,
+    pub fn_name: &'static str,
+    pub weights: &'a [u8],
+    pub rows: usize,
+    pub row_bytes: usize,
+    pub n_blocks_per_row: usize,
+}
+
+/// Uploads `x` once, enqueues N matvec kernels (resident weights), then
+/// downloads N outputs. Mirrors ggml-cuda's "enqueue on stream, sync at
+/// the edge" discipline as far as cudarc 0.11.9 allows without a full
+/// device-resident graph: one HtoD for `x`, N kernel launches, then N
+/// DtoH. Used by `WeightMatrix::apply_gpu_multi` for Q/K/V and gate+up.
+pub fn launch_matvec_multi(
+    x: &[f32],
+    launches: &[MatvecLaunch<'_>],
+) -> Result<Vec<Vec<f32>>, CudaError> {
+    if launches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let dev = shared_device()?;
+
+    let d_x = dev
+        .htod_copy(x.to_vec())
+        .map_err(|e| CudaError::Launch(format!("x upload: {e:?}")))?;
+
+    // Hold weight Arcs + device outs until after all launches so kernels
+    // can overlap before any host sync (llama: sync only at graph edge).
+    let mut weight_arcs = Vec::with_capacity(launches.len());
+    let mut d_outs = Vec::with_capacity(launches.len());
+
+    for launch in launches {
+        let (d_out, d_weights) = enqueue_matvec(&dev, launch, &d_x)?;
+        weight_arcs.push(d_weights);
+        d_outs.push(d_out);
+    }
+    drop(weight_arcs);
+
+    let mut results = Vec::with_capacity(d_outs.len());
+    for (i, d_out) in d_outs.into_iter().enumerate() {
+        let out = dev.dtoh_sync_copy(&d_out).map_err(|e| {
+            CudaError::Launch(format!("output download {}: {e:?}", launches[i].fn_name))
+        })?;
+        results.push(out);
+    }
+
+    Ok(results)
+}
+
+/// CUDA C source for an elementwise SwiGLU pair fuse:
+/// `out[i] = silu(gate[i]) * up[i]`, `silu(x) = x / (1 + exp(-x))`.
+/// Mirrors `frink_core::matmul::swiglu` (which is `silu(gate)*up`) and
+/// `frink-metal/src/elem.rs`'s `silu_mul_f32` kernel exactly, so the
+/// fused dense-FFN path keeps activations on-device between the
+/// gate/up matvecs and the down matvec instead of downloading two
+/// vectors, computing SwiGLU on the host, and re-uploading.
+pub const SILU_MUL_KERNEL_SRC: &str = r#"
+extern "C" __global__ void silu_mul_f32(
+    const float* gate,
+    const float* up,
+    float* out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        out[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+}
+"#;
+
+/// Enqueues the elementwise `silu(gate)*up` kernel on the shared
+/// device's default stream (no host sync), returning the device output
+/// slice. `gate`/`up` are device slices of length `n` produced by the
+/// two FFN input matvecs; the result feeds straight into the down
+/// matvec without ever touching host memory.
+pub(crate) fn silu_mul_device(
+    dev: &std::sync::Arc<cudarc::driver::CudaDevice>,
+    gate: &cudarc::driver::CudaSlice<f32>,
+    up: &cudarc::driver::CudaSlice<f32>,
+    n: usize,
+) -> Result<cudarc::driver::CudaSlice<f32>, CudaError> {
+    use cudarc::driver::LaunchAsync;
+
+    ensure_module_loaded(dev, SILU_MUL_KERNEL_SRC, "frink_silu_mul", "silu_mul_f32")?;
+    let func = dev
+        .get_func("frink_silu_mul", "silu_mul_f32")
+        .ok_or_else(|| {
+            CudaError::KernelCompile("function 'silu_mul_f32' not found after load_ptx".to_string())
+        })?;
+    let mut d_out = dev
+        .alloc_zeros::<f32>(n)
+        .map_err(|e| CudaError::Launch(format!("silu_mul out alloc: {e:?}")))?;
+    let block = 256u32;
+    let grid = (n as u32).div_ceil(block);
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid.max(1), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        func.launch(cfg, (gate, up, &mut d_out, n as i32))
+            .map_err(|e| CudaError::Launch(format!("silu_mul launch: {e:?}")))?;
+    }
+    Ok(d_out)
+}
+
+/// CUDA C source for a fused residual add + RMSNorm:
+/// `out[i] = (x[i] + residual[i]) / sqrt(mean((x+residual)^2) + eps) * weight[i]`.
+/// Mirrors `frink_core::matmul::rms_norm` applied to `x + residual` and
+/// `frink-metal/src/elem.rs`'s `rms_norm_f32` kernel (add is fused in
+/// the first pass over elements instead of a separate vec-add launch).
+pub const FUSED_ADD_RMSNORM_KERNEL_SRC: &str = r#"
+extern "C" __global__ void fused_add_rmsnorm_f32(
+    const float* x,
+    const float* residual,
+    const float* weight,
+    float* out,
+    int n,
+    float eps
+) {
+    __shared__ float partial[256];
+    int tid = threadIdx.x;
+    int tg = blockDim.x;
+    float acc = 0.0f;
+    for (int i = tid; i < n; i += tg) {
+        float v = x[i] + residual[i];
+        acc += v * v;
+    }
+    partial[tid] = acc;
+    __syncthreads();
+    for (int stride = tg / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(partial[0] / (float)n + eps);
+    for (int i = tid; i < n; i += tg) {
+        float v = x[i] + residual[i];
+        out[i] = v * inv_rms * weight[i];
+    }
+}
+"#;
+
+/// Computes `rms_norm(x + residual, weight, eps)` on the device: one
+/// HtoD upload each for `x`, `residual`, and `weight`, one DtoH for the
+/// result. Fuses the elementwise add with the RMSNorm reduction so the
+/// sum never materializes on the host.
+pub fn launch_fused_add_rmsnorm(
+    x: &[f32],
+    residual: &[f32],
+    weight: &[f32],
+    eps: f32,
+) -> Result<Vec<f32>, CudaError> {
+    use cudarc::driver::LaunchAsync;
+
+    assert_eq!(x.len(), residual.len());
+    assert_eq!(x.len(), weight.len());
+    let n = x.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let dev = shared_device()?;
+    ensure_module_loaded(
+        &dev,
+        FUSED_ADD_RMSNORM_KERNEL_SRC,
+        "frink_fused_add_rmsnorm",
+        "fused_add_rmsnorm_f32",
+    )?;
+    let func = dev
+        .get_func("frink_fused_add_rmsnorm", "fused_add_rmsnorm_f32")
+        .ok_or_else(|| {
+            CudaError::KernelCompile(
+                "function 'fused_add_rmsnorm_f32' not found after load_ptx".to_string(),
+            )
+        })?;
+
+    let d_x = dev
+        .htod_copy(x.to_vec())
+        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm x upload: {e:?}")))?;
+    let d_residual = dev
+        .htod_copy(residual.to_vec())
+        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm residual upload: {e:?}")))?;
+    let d_weight = dev
+        .htod_copy(weight.to_vec())
+        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm weight upload: {e:?}")))?;
+    let mut d_out = dev
+        .alloc_zeros::<f32>(n)
+        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm out alloc: {e:?}")))?;
+
+    let block = 256u32;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+    };
+    unsafe {
+        func.launch(
+            cfg,
+            (&d_x, &d_residual, &d_weight, &mut d_out, n as i32, eps),
+        )
+        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm launch: {e:?}")))?;
+    }
+
+    dev.dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("fused_add_rmsnorm download: {e:?}")))
+}
+
+/// Fused dense SwiGLU FFN entirely on-device: uploads `x` once, runs
+/// the gate and up matvecs (device-resident weights), fuses
+/// `silu(gate)*up` in a kernel, runs the down matvec, and downloads the
+/// result once. This replaces the previous "3× `WeightMatrix::apply`
+/// with an HtoD+DtoH per matvec plus a host-side SwiGLU" pattern for
+/// dense/shared experts, cutting the activation traffic from six host↔
+/// device transfers to one up + one down. Weight buffers are already
+/// process-resident (see `resident_cuda_weights`); only the single
+/// activation upload and single result download cross the bus.
+///
+/// `gate`/`up` must have the same output row count (the FFN hidden dim)
+/// and the same input `cols` as `x`; `down`'s input `cols` must equal
+/// that FFN hidden dim (its `n_blocks_per_row` covers the SwiGLU output
+/// length). The caller (`frink-core`) guarantees this by construction
+/// from the expert's gate/up/down shapes.
+pub fn launch_dense_ffn_swiglu(
+    gate: &MatvecLaunch<'_>,
+    up: &MatvecLaunch<'_>,
+    down: &MatvecLaunch<'_>,
+    x: &[f32],
+) -> Result<Vec<f32>, CudaError> {
+    let dev = shared_device()?;
+
+    let d_x = dev
+        .htod_copy(x.to_vec())
+        .map_err(|e| CudaError::Launch(format!("ffn x upload: {e:?}")))?;
+
+    // Bind the resident-weight Arcs (`_wg`/`_wu`/`_wd`) for the whole
+    // function so every kernel's weight buffer outlives the final sync.
+    let (d_gate, _wg) = enqueue_matvec(&dev, gate, &d_x)?;
+    let (d_up, _wu) = enqueue_matvec(&dev, up, &d_x)?;
+    let d_act = silu_mul_device(&dev, &d_gate, &d_up, gate.rows)?;
+    let (d_out, _wd) = enqueue_matvec(&dev, down, &d_act)?;
+
+    dev.dtoh_sync_copy(&d_out)
+        .map_err(|e| CudaError::Launch(format!("ffn out download: {e:?}")))
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::WeightFingerprint;
+
+    #[test]
+    fn a_buffer_that_differs_anywhere_sampled_has_a_different_fingerprint() {
+        let base: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+        let f = WeightFingerprint::of(&base);
+        assert_eq!(f, WeightFingerprint::of(&base.clone()));
+        for at in [0usize, 63, 500, 531, 936, 999] {
+            let mut other = base.clone();
+            other[at] ^= 0xff;
+            assert_ne!(f, WeightFingerprint::of(&other), "byte {at} is sampled");
+        }
+        // Short buffers are sampled whole.
+        let short = vec![1u8, 2, 3];
+        assert_ne!(
+            WeightFingerprint::of(&short),
+            WeightFingerprint::of(&[1u8, 2, 4])
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_degrades_cleanly_regardless_of_real_hardware_presence() {
+        // This assertion used to hard-code "no CUDA device here," true
+        // on the sandbox this was written on but false the first time
+        // this actually ran on rented GPU hardware
+        // (real RTX 3060, 2026-07-31) --
+        // caught a real test bug, not a probe() bug: a CI-style test
+        // that only passes in one specific environment isn't testing
+        // the real invariant (probe() never panics and reports
+        // something sane either way), it's testing "this machine has no
+        // GPU," which isn't frink's to assert. Check both real outcomes
+        // instead of assuming one.
+        match probe() {
+            None => {} // no device present -- also correct, nothing further to check
+            Some(info) => {
+                assert!(
+                    info.device_count >= 1,
+                    "reported a device but device_count=0"
+                );
+                assert!(
+                    info.total_vram_bytes > 0,
+                    "reported a device but total_vram_bytes=0"
+                );
+                assert!(
+                    info.free_vram_bytes <= info.total_vram_bytes,
+                    "free VRAM ({}) cannot exceed total ({})",
+                    info.free_vram_bytes,
+                    info.total_vram_bytes
+                );
+            }
+        }
+    }
+
+    /// Builds `rows` real, non-trivial Q8_0-quantized rows (not all-
+    /// zero weights, which would pass trivially even with a broken
+    /// kernel) using `frink_quant::quantize_q8_0`, so the ignored GPU
+    /// tests below check actual numerical agreement with the CPU
+    /// reference, not just "the launch didn't error."
+    fn real_q8_0_test_matrix(rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+        let mut weights = Vec::new();
+        let mut all_rows_f32 = Vec::new();
+        for r in 0..rows {
+            let row: Vec<f32> = (0..cols)
+                .map(|i| (((r * cols + i) as f32) * 0.037).sin())
+                .collect();
+            weights.extend(frink_quant::quantize_q8_0(&row));
+            all_rows_f32.push(row);
+        }
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.019).cos()).collect();
+        let expected: Vec<f32> = all_rows_f32
+            .iter()
+            .map(|row| frink_quant::dot_q8_0_f32_scalar(&frink_quant::quantize_q8_0(row), &x))
+            .collect();
+        (weights, x, expected)
+    }
+
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verified passing on an RTX 3060 (vast.ai); run with --ignored on a CUDA-capable machine to re-verify"]
+    fn launch_q8_0_matvec_matches_cpu_reference() {
+        // Run manually on a machine with an actual CUDA device:
+        //   cargo test -p frink-cuda --features cuda -- --ignored
+        let rows = 4;
+        let cols = 64;
+        let row_bytes = (cols / frink_quant::Q8_0_BLOCK_ELEMS) * frink_quant::Q8_0_BLOCK_BYTES;
+        let (weights, x, expected) = real_q8_0_test_matrix(rows, cols);
+
+        let result = launch_q8_0_matvec(
+            &weights,
+            &x,
+            rows,
+            row_bytes,
+            cols / frink_quant::Q8_0_BLOCK_ELEMS,
+        )
+        .expect("kernel launch must succeed on real CUDA hardware");
+        assert_eq!(result.len(), expected.len());
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-2,
+                "row {i}: GPU={got} CPU reference={want}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verified passing on an RTX 3060 (vast.ai); run with --ignored on a CUDA-capable machine to re-verify"]
+    fn launch_q4_0_matvec_matches_cpu_reference() {
+        // Run manually on a machine with an actual CUDA device:
+        //   cargo test -p frink-cuda --features cuda -- --ignored
+        let rows = 4;
+        let cols = 64;
+        let blocks_per_row = cols / frink_quant::Q4_0_BLOCK_ELEMS;
+        let row_bytes = blocks_per_row * frink_quant::Q4_0_BLOCK_BYTES;
+
+        // Regression note: an earlier version of this test built exactly
+        // one 18-byte Q4_0 block per row regardless of `cols`, so for
+        // cols=64 (2 blocks/row, row_bytes=36) the `weights` buffer ended
+        // up 72 bytes instead of the 144 bytes `row_bytes_slice` below
+        // actually indexes into -- caught by a real out-of-bounds panic
+        // the first time this test ran on real GPU hardware. Fixed by
+        // building `blocks_per_row` blocks per row, matching `cols`.
+        let mut weights = Vec::new();
+        for r in 0..rows {
+            for b in 0..blocks_per_row {
+                weights.extend_from_slice(
+                    &half::f16::from_f32(0.05 + (r * blocks_per_row + b) as f32 * 0.01)
+                        .to_le_bytes(),
+                );
+                for i in 0..16u8 {
+                    let lo = (i + r as u8 + b as u8) % 16;
+                    let hi = (15 - i + r as u8 + b as u8) % 16;
+                    weights.push(lo | (hi << 4));
+                }
+            }
+        }
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.09).sin()).collect();
+        let expected: Vec<f32> = (0..rows)
+            .map(|r| {
+                let row_bytes_slice = &weights[r * row_bytes..(r + 1) * row_bytes];
+                frink_quant::dot_q4_0_f32_scalar(row_bytes_slice, &x)
+            })
+            .collect();
+
+        let result = launch_q4_0_matvec(
+            &weights,
+            &x,
+            rows,
+            row_bytes,
+            cols / frink_quant::Q4_0_BLOCK_ELEMS,
+        )
+        .expect("kernel launch must succeed on real CUDA hardware");
+        assert_eq!(result.len(), expected.len());
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-2,
+                "row {i}: GPU={got} CPU reference={want}"
+            );
+        }
+    }
+
+    /// Every row of the matvec table has to be launchable through
+    /// [`matvec_launch_meta`], and the meta lookup has to be the table
+    /// rather than a second copy of it.
+    ///
+    /// This used to spell six kind names and six negatives. It is
+    /// driven by [`crate::matvec_kinds::KINDS`] now, so a format added
+    /// to the table is covered here the moment it exists, and the
+    /// negatives moved to `matvec_kinds`'s own
+    /// `a_kind_with_no_matvec_does_not_resolve` -- where the table is.
+    /// Naming three kinds that "must not resolve" beside a table that
+    /// decides it is exactly the pair of structures this repo keeps
+    /// paying for: IQ4_XS was on that negative list until it got a
+    /// kernel, and moving it meant remembering two files.
+    #[test]
+    fn matvec_launch_meta_is_the_matvec_table() {
+        for k in crate::matvec_kinds::KINDS {
+            let (src, module, func) = matvec_launch_meta(k.name)
+                .unwrap_or_else(|| panic!("{}: in the table but not launchable", k.name));
+            assert_eq!(module, k.module_name, "{}", k.name);
+            assert_eq!(func, k.fn_name, "{}", k.name);
+            assert!(
+                src.contains(&format!("void {func}(")),
+                "{}: the source in {module} does not define {func}",
+                k.name
+            );
+        }
+        assert!(
+            matvec_launch_meta("Q4_1").is_none(),
+            "a kind with no kernel resolved to a CUDA matvec"
+        );
+    }
+
+    /// The Q5_0 kernel's block stride and element stride are literals in
+    /// CUDA C, so nothing but this holds them to the format's real
+    /// geometry. A wrong stride walks the row past the first block and
+    /// every value after it is garbage -- and `nl` is 2 here, not the
+    /// K-quants' 16, which is the assumption easiest to carry over by
+    /// mistake.
+    #[test]
+    fn the_q5_0_matvec_strides_by_the_real_block_geometry() {
+        assert_eq!(frink_quant::Q5_0_BLOCK_BYTES, 22);
+        assert_eq!(frink_quant::Q5_0_BLOCK_ELEMS, 32);
+        assert!(
+            Q5_0_MATVEC_KERNEL_SRC.contains("(size_t)b * 22"),
+            "the Q5_0 matvec does not stride by Q5_0_BLOCK_BYTES"
+        );
+        assert!(
+            Q5_0_MATVEC_KERNEL_SRC.contains("int base = b * 32;"),
+            "the Q5_0 matvec does not step the activation by Q5_0_BLOCK_ELEMS"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires real CUDA hardware -- NEVER RUN: the Q5_0 matvec has never executed on a GPU. Run with --ignored on a CUDA-capable machine and record the result before any doc claims CUDA Q5_0 works"]
+    fn launch_q5_0_matvec_matches_cpu_reference() {
+        // Run manually on a machine with an actual CUDA device:
+        //   cargo test -p frink-cuda --features cuda -- --ignored
+        let rows = 4;
+        let cols = 64;
+        let blocks_per_row = cols / frink_quant::Q5_0_BLOCK_ELEMS;
+        let row_bytes = blocks_per_row * frink_quant::Q5_0_BLOCK_BYTES;
+
+        // `frink_quant` has no Q5_0 quantizer (the format is load-only
+        // here), so the fixture is built byte by byte. The scale is
+        // pinned finite -- a random f16 is NaN or Inf often enough to
+        // be the usual outcome -- while `qh` is deliberately varied, so
+        // both the low half's fifth bit (`qh` bit j) and the high
+        // half's (`qh` bit j + 16) are set on some elements and clear
+        // on others. A kernel that dropped `qh` entirely would still
+        // produce plausible numbers against a fixture where it is zero.
+        let mut weights = Vec::with_capacity(rows * row_bytes);
+        for r in 0..rows {
+            for b in 0..blocks_per_row {
+                let idx = (r * blocks_per_row + b) as u32;
+                weights.extend_from_slice(
+                    &half::f16::from_f32(0.05 + idx as f32 * 0.01).to_le_bytes(),
+                );
+                let qh = 0x9E3D_7A51u32.wrapping_mul(idx + 1);
+                weights.extend_from_slice(&qh.to_le_bytes());
+                for i in 0..16u8 {
+                    let lo = (i + r as u8 + b as u8) % 16;
+                    let hi = (15 - i + r as u8 + b as u8) % 16;
+                    weights.push(lo | (hi << 4));
+                }
+            }
+        }
+        assert_eq!(weights.len(), rows * row_bytes);
+
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.09).sin()).collect();
+        let expected: Vec<f32> = (0..rows)
+            .map(|r| {
+                frink_quant::dot_q5_0_f32_scalar(&weights[r * row_bytes..(r + 1) * row_bytes], &x)
+            })
+            .collect();
+
+        let result = launch_q5_0_matvec(&weights, &x, rows, row_bytes, blocks_per_row)
+            .expect("kernel launch must succeed on real CUDA hardware");
+        assert_eq!(result.len(), expected.len());
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            // Absolute, like the Q8_0/Q4_0 tests and unlike the K-quant
+            // ones: Q5_0 accumulates an exact integer dot per block and
+            // applies the scale once, so there is no per-element
+            // scale multiply for an FMA to reassociate.
+            assert!(
+                (got - want).abs() < 1e-2,
+                "row {i}: GPU={got} CPU reference={want}"
+            );
+        }
+    }
+
+    /// Deterministic pseudo-random byte generator for building real,
+    /// non-trivial K-quant block bytes (no `quantize_qX_k` producer
+    /// exists in `frink_quant` -- these formats are load-only, never
+    /// produced by frink -- so tests build arbitrary-but-valid-shaped
+    /// bytes directly, the same convention `frink-core::weight_matrix`'s
+    /// and `frink-models::kimi_loader`'s own MXFP4 tests already use).
+    fn pseudo_bytes(seed: u32, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2654435761).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                (state >> 16) as u8
+            })
+            .collect()
+    }
+
+    /// GPU-vs-CPU agreement check for the K-quant kernels below, using a
+    /// *relative* error bound instead of the fixed absolute `1e-2` the
+    /// Q8_0/Q4_0 tests above use. The K-quant kernels apply each block's
+    /// scale/min *inside* a per-element `acc += (d1 * q - min1) * x[i]`
+    /// accumulation (hundreds of float multiply-adds per row), unlike
+    /// Q8_0/Q4_0's structure (accumulate an exact integer dot product
+    /// first, multiply by scale once at the end) -- so K-quant results are
+    /// exposed to per-element GPU-vs-CPU float rounding differences
+    /// (nvcc/NVRTC contracts `a*b+c`-shaped expressions into a single-
+    /// rounding `fma` instruction by default; plain Rust `f32` arithmetic
+    /// does not auto-contract). Real hardware run (RTX 3060, 2026-07-31)
+    /// measured relative errors around 1e-7 (e.g. diff=40 against a
+    /// ~97,454,420-magnitude reference) -- consistent with float32
+    /// machine epsilon times a handful of differently-ordered rounding
+    /// steps, not a logic bug. This is exactly why llama.cpp's own real
+    /// CUDA K-quant kernels (`vec_dot_q6_K_q8_1_impl_mmvq`,
+    /// `ggml/src/ggml-cuda/vecdotq.cuh`) quantize activations to int8 too
+    /// and reduce via an *integer* `dp4a` dot product, converting to
+    /// float only once per block for the final scale multiply --
+    /// deliberately avoiding this exact class of divergence -- and why
+    /// llama.cpp's own backend-comparison tests
+    /// (`tests/test-backend-ops.cpp`) check `max_nmse_err()` (a relative
+    /// error metric), never exact/absolute equality, for quantized ops.
+    fn assert_close_relative(got: f32, want: f32, row: usize) {
+        // Real hardware run (RTX 3060, 2026-07-31) hit `GPU=NaN CPU
+        // reference=NaN` for Q6_K row 1: `real_k_quant_test_matrix`'s
+        // pseudo-random block bytes aren't pinned to safe values (unlike
+        // some other tests here), so by chance a row's raw `d`/scale
+        // bytes decoded as an f16 NaN/Inf bit pattern -- garbage in,
+        // garbage out, identically on both backends. GPU and CPU *agree*
+        // in that case (both NaN from the same degenerate input), which
+        // is a real pass, not a failure to paper over; plain `(got -
+        // want).abs() <= tol` fails to see that because IEEE754 NaN
+        // comparisons are always false. Only a mismatched
+        // NaN-vs-non-NaN pairing is a genuine disagreement.
+        if want.is_nan() {
+            assert!(
+                got.is_nan(),
+                "row {row}: CPU reference is NaN but GPU={got} is not"
+            );
+            return;
+        }
+        let tol = 1e-4 * want.abs().max(1.0);
+        assert!(
+            (got - want).abs() <= tol,
+            "row {row}: GPU={got} CPU reference={want} (relative tolerance {tol})"
+        );
+    }
+
+    /// Builds `rows` real (non-zero, non-trivial) blocks of `block_bytes`
+    /// each for a K-quant format, and the matching `expected` output via
+    /// `scalar_dot` (`frink_quant::dot_q{4,5,6}_k_f32_scalar` -- already
+    /// independently verified elsewhere in this workspace), so the
+    /// ignored GPU tests below check real numerical agreement with that
+    /// trusted CPU reference, not just "the launch didn't error."
+    fn real_k_quant_test_matrix(
+        rows: usize,
+        cols: usize,
+        block_bytes: usize,
+        scalar_dot: impl Fn(&[u8], &[f32]) -> f32,
+    ) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+        let n_blocks_per_row = cols / 256;
+        let row_bytes = n_blocks_per_row * block_bytes;
+        let mut weights = Vec::with_capacity(rows * row_bytes);
+        for r in 0..rows {
+            weights.extend(pseudo_bytes(r as u32 + 1, row_bytes));
+        }
+        let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.021).sin()).collect();
+        let expected: Vec<f32> = (0..rows)
+            .map(|r| scalar_dot(&weights[r * row_bytes..(r + 1) * row_bytes], &x))
+            .collect();
+        (weights, x, expected)
+    }
+
+    /// Every coalesced kernel against its scalar twin, on a real
+    /// device. The twins prove the lane mapping without a GPU; this
+    /// proves the CUDA C, the vector loads and the warp-shuffle
+    /// reduction, none of which a twin covers.
+    ///
+    /// One test over the table rather than one test per kind, so a new
+    /// kind cannot be added with its hardware check quietly left out.
+    ///
+    ///   cargo test -p frink-cuda --features cuda -- --ignored
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verifies every coalesced matvec against its scalar twin"]
+    fn every_coalesced_matvec_matches_its_twin() {
+        type Twin = fn(&[u8], &[f32], usize) -> f32;
+        let cases: &[(&str, usize, usize, u32, Twin)] = &[
+            (
+                "Q4_K",
+                144,
+                256,
+                7,
+                crate::coalesced_twin::q4_k_matvec_coalesced_row,
+            ),
+            (
+                "Q5_K",
+                176,
+                256,
+                17,
+                crate::coalesced_twin::q5_k_matvec_coalesced_row,
+            ),
+            (
+                "Q6_K",
+                210,
+                256,
+                11,
+                crate::coalesced_twin::q6_k_matvec_coalesced_row,
+            ),
+            (
+                "Q8_0",
+                34,
+                32,
+                23,
+                crate::coalesced_twin::q8_0_matvec_coalesced_row,
+            ),
+        ];
+        let rows = 37usize; // not a multiple of the warps per block
+        let n_blocks_per_row = 3usize;
+        for (kind, block_bytes, per_block, seed, twin) in cases {
+            let row_bytes = n_blocks_per_row * block_bytes;
+            let cols = n_blocks_per_row * per_block;
+            let weights = pseudo_bytes(*seed, rows * row_bytes);
+            let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.021).sin()).collect();
+            // Enter through the ordinary kernel identity, not the
+            // coalesced one, so this exercises the ROUTING too: if
+            // `matvec_launch_plan` stopped substituting the coalesced
+            // kernel, the result would match a dequantize-then-dot
+            // reference but not the coalesced twin's lane order.
+            let (src, module, fn_name) = super::matvec_launch_meta(kind)
+                .unwrap_or_else(|| panic!("{kind} has no matvec kernel"));
+            let got = super::launch_matvec(
+                src,
+                module,
+                fn_name,
+                &weights,
+                &x,
+                rows,
+                row_bytes,
+                n_blocks_per_row,
+            )
+            .unwrap_or_else(|e| panic!("{kind}: {e:?}"));
+            assert_eq!(got.len(), rows, "{kind}");
+            for r in 0..rows {
+                let row = &weights[r * row_bytes..(r + 1) * row_bytes];
+                let want = twin(row, &x, n_blocks_per_row);
+                assert!(
+                    !(want.is_nan() ^ got[r].is_nan()),
+                    "{kind} row {r}: GPU={} twin={want}",
+                    got[r]
+                );
+                assert_close_relative(got[r], want, r);
+            }
+        }
+    }
+
+    /// A coalesced kernel launched with the block-per-row geometry
+    /// indexes as if it had one row per warp while getting one row per
+    /// block, and returns wrong numbers rather than failing. So the
+    /// kernel and its geometry are chosen together, and this checks
+    /// they stay that way -- on the host, with no GPU.
+    #[test]
+    fn the_plan_pairs_each_kernel_with_its_own_geometry() {
+        let rows = 37usize; // not a multiple of the warps per block
+
+        for kind in ["Q4_K", "Q5_K", "Q6_K", "Q8_0"] {
+            let (src, module, fn_name) = super::matvec_launch_meta(kind).expect("kernel");
+            let (plan_src, plan_module, entry, cfg) =
+                super::matvec_launch_plan(fn_name, src, module, rows);
+            assert!(
+                entry.ends_with("_coalesced"),
+                "{kind}: plan chose {entry}, not the coalesced kernel"
+            );
+            assert!(
+                plan_src.contains(entry) && plan_module.ends_with("_coalesced"),
+                "{kind}: plan's source and module do not match {entry}"
+            );
+            let warps = super::COALESCED_WARPS_PER_BLOCK as u32;
+            assert_eq!(cfg.block_dim, (warps * 32, 1, 1), "{kind}: block_dim");
+            assert_eq!(cfg.shared_mem_bytes, 0, "{kind}: needs no shared memory");
+            // Every row must land in some warp, including the tail.
+            assert!(
+                cfg.grid_dim.0 * warps >= rows as u32,
+                "{kind}: {} blocks x {warps} warps does not cover {rows} rows",
+                cfg.grid_dim.0
+            );
+            assert!(
+                (cfg.grid_dim.0 - 1) * warps < rows as u32,
+                "{kind}: {} blocks is more than the tail needs",
+                cfg.grid_dim.0
+            );
+        }
+
+        // A kind with no coalesced kernel keeps the old geometry, and
+        // keeps its own kernel rather than silently getting another's.
+        let (src, module, fn_name) = super::matvec_launch_meta("Q4_0").expect("kernel");
+        let (plan_src, plan_module, entry, cfg) =
+            super::matvec_launch_plan(fn_name, src, module, rows);
+        assert_eq!(entry, fn_name);
+        assert!(std::ptr::eq(plan_src, src) && std::ptr::eq(plan_module, module));
+        assert_eq!(cfg.grid_dim, (rows as u32, 1, 1), "one block per row");
+        assert_eq!(cfg.block_dim, (256, 1, 1));
+        assert!(
+            cfg.shared_mem_bytes > 0,
+            "the block-per-row kernels reduce through shared memory"
+        );
+    }
+
+    /// A coalesced kernel the table does not name is dead code that
+    /// reads as coverage. The entry points are derived from this file,
+    /// not restated, so adding a kernel without routing it fails here.
+    #[test]
+    fn every_coalesced_kernel_is_reachable_from_the_table() {
+        let src = include_str!("gpu.rs");
+        let mut found = 0usize;
+        for line in src.lines() {
+            let Some(rest) = line.strip_prefix(r#"extern "C" __global__ void "#) else {
+                continue;
+            };
+            let Some(entry) = rest.split('(').next() else {
+                continue;
+            };
+            let Some(base) = entry.strip_suffix("_coalesced") else {
+                continue;
+            };
+            found += 1;
+            let routed = super::coalesced_matvec_kernel(base).unwrap_or_else(|| {
+                panic!("kernel {entry} is not reachable: no table row for {base}")
+            });
+            assert_eq!(
+                routed.2, entry,
+                "table row for {base} names the wrong entry point"
+            );
+            assert!(
+                routed.0.contains(entry),
+                "table row for {base} points at a source that does not define {entry}"
+            );
+        }
+        assert!(
+            found >= 4,
+            "expected at least four coalesced kernels, found {found}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verified passing on an RTX 3060 (vast.ai, 2026-07-31) with the relative-tolerance fix; run with --ignored on a CUDA-capable machine to re-verify"]
+    fn launch_q4_k_matvec_matches_cpu_reference() {
+        let rows = 3;
+        let cols = 256; // 1 Q4_K super-block per row
+        let (weights, x, expected) = real_k_quant_test_matrix(
+            rows,
+            cols,
+            frink_quant::Q4_K_BLOCK_BYTES,
+            frink_quant::dot_q4_k_f32_scalar,
+        );
+
+        let result = launch_q4_k_matvec(&weights, &x, rows, frink_quant::Q4_K_BLOCK_BYTES, 1)
+            .expect("kernel launch must succeed on real CUDA hardware");
+        assert_eq!(result.len(), expected.len());
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert_close_relative(*got, *want, i);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verified passing on an RTX 3060 (vast.ai, 2026-07-31) with the relative-tolerance fix; run with --ignored on a CUDA-capable machine to re-verify"]
+    fn launch_q5_k_matvec_matches_cpu_reference() {
+        let rows = 3;
+        let cols = 256; // 1 Q5_K super-block per row
+        let (weights, x, expected) = real_k_quant_test_matrix(
+            rows,
+            cols,
+            frink_quant::Q5_K_BLOCK_BYTES,
+            frink_quant::dot_q5_k_f32_scalar,
+        );
+
+        let result = launch_q5_k_matvec(&weights, &x, rows, frink_quant::Q5_K_BLOCK_BYTES, 1)
+            .expect("kernel launch must succeed on real CUDA hardware");
+        assert_eq!(result.len(), expected.len());
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert_close_relative(*got, *want, i);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires real CUDA hardware -- 2026-07-31 real RTX 3060 run failed on row 1 with GPU=NaN CPU reference=NaN (assert_close_relative didn't treat NaN==NaN as agreement; fixed, but not yet re-verified on hardware); run with --ignored on a CUDA-capable machine to re-verify"]
+    fn launch_q6_k_matvec_matches_cpu_reference() {
+        let rows = 3;
+        let cols = 512; // 2 Q6_K super-blocks per row
+        let (weights, x, expected) = real_k_quant_test_matrix(
+            rows,
+            cols,
+            frink_quant::Q6_K_BLOCK_BYTES,
+            frink_quant::dot_q6_k_f32_scalar,
+        );
+
+        let result = launch_q6_k_matvec(&weights, &x, rows, frink_quant::Q6_K_BLOCK_BYTES * 2, 2)
+            .expect("kernel launch must succeed on real CUDA hardware");
+        assert_eq!(result.len(), expected.len());
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert_close_relative(*got, *want, i);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires real CUDA hardware -- verifies that launch_matvec_multi (shared x upload) matches N sequential single-matvec launches; run with --ignored on a CUDA-capable machine"]
+    fn launch_matvec_multi_matches_sequential() {
+        // Build three Q4_K matrices (different shapes) that share the same
+        // activation dimension.
+        let cols = 256;
+        let rows_a = 2;
+        let rows_b = 3;
+        let rows_c = 4;
+        let (weights_a, x, expected_a) = real_k_quant_test_matrix(
+            rows_a,
+            cols,
+            frink_quant::Q4_K_BLOCK_BYTES,
+            frink_quant::dot_q4_k_f32_scalar,
+        );
+        let (weights_b, _, expected_b) = real_k_quant_test_matrix(
+            rows_b,
+            cols,
+            frink_quant::Q4_K_BLOCK_BYTES,
+            frink_quant::dot_q4_k_f32_scalar,
+        );
+        let (weights_c, _, expected_c) = real_k_quant_test_matrix(
+            rows_c,
+            cols,
+            frink_quant::Q4_K_BLOCK_BYTES,
+            frink_quant::dot_q4_k_f32_scalar,
+        );
+
+        let launches = [
+            MatvecLaunch {
+                kernel_src: Q4_K_MATVEC_KERNEL_SRC,
+                module_name: "frink_q4_k",
+                fn_name: "q4_k_matvec",
+                weights: weights_a.as_slice(),
+                rows: rows_a,
+                row_bytes: frink_quant::Q4_K_BLOCK_BYTES,
+                n_blocks_per_row: 1,
+            },
+            MatvecLaunch {
+                kernel_src: Q4_K_MATVEC_KERNEL_SRC,
+                module_name: "frink_q4_k",
+                fn_name: "q4_k_matvec",
+                weights: weights_b.as_slice(),
+                rows: rows_b,
+                row_bytes: frink_quant::Q4_K_BLOCK_BYTES,
+                n_blocks_per_row: 1,
+            },
+            MatvecLaunch {
+                kernel_src: Q4_K_MATVEC_KERNEL_SRC,
+                module_name: "frink_q4_k",
+                fn_name: "q4_k_matvec",
+                weights: weights_c.as_slice(),
+                rows: rows_c,
+                row_bytes: frink_quant::Q4_K_BLOCK_BYTES,
+                n_blocks_per_row: 1,
+            },
+        ];
+
+        let results = launch_matvec_multi(&x, &launches)
+            .expect("multi-matvec must succeed on real CUDA hardware");
+        assert_eq!(results.len(), 3);
+
+        // Check first matrix output.
+        assert_eq!(results[0].len(), expected_a.len());
+        for (i, (got, want)) in results[0].iter().zip(expected_a.iter()).enumerate() {
+            assert_close_relative(*got, *want, i);
+        }
+
+        // Check second matrix output.
+        assert_eq!(results[1].len(), expected_b.len());
+        for (i, (got, want)) in results[1].iter().zip(expected_b.iter()).enumerate() {
+            assert_close_relative(*got, *want, i);
+        }
+
+        // Check third matrix output.
+        assert_eq!(results[2].len(), expected_c.len());
+        for (i, (got, want)) in results[2].iter().zip(expected_c.iter()).enumerate() {
+            assert_close_relative(*got, *want, i);
+        }
+    }
+
+    /// The fused on-device dense SwiGLU FFN
+    /// (`launch_dense_ffn_swiglu`: one `x` upload → gate matvec → up
+    /// matvec → `silu(gate)*up` kernel → down matvec → one download)
+    /// must produce the same result as running the three matvecs
+    /// separately on the CPU reference and doing SwiGLU on the host.
+    /// This proves the device-resident activation chaining (no per-
+    /// matvec DtoH/HtoD) and the `silu_mul_f32` kernel are correct, not
+    /// just that the launches didn't error. Q8_0 is used because
+    /// `frink_quant::quantize_q8_0` gives an exact producer/consumer
+    /// pair, keeping this a real numerical-agreement check.
+    #[test]
+    #[ignore = "requires real CUDA hardware -- run with --ignored on a CUDA-capable machine to verify the fused dense-FFN activation-residency path"]
+    fn launch_dense_ffn_swiglu_matches_sequential_cpu() {
+        let hidden_dim = 64; // 2 Q8_0 blocks per row
+        let ffn_dim = 96; // 3 Q8_0 blocks per row; gate/up output length
+
+        let make_row = |cols: usize, seed: f32| -> Vec<f32> {
+            (0..cols)
+                .map(|i| (((i as f32) - (cols as f32) / 2.0) * 0.013 * seed).sin())
+                .collect()
+        };
+        // Build a quantized [rows, cols] matrix plus keep each row's f32
+        // so the CPU reference dots the *same* quantized bytes back.
+        let build = |rows: usize, cols: usize, seed: f32| -> (Vec<u8>, usize) {
+            let mut packed = Vec::new();
+            for r in 0..rows {
+                packed.extend(frink_quant::quantize_q8_0(&make_row(cols, seed + r as f32)));
+            }
+            let row_bytes = (cols / frink_quant::Q8_0_BLOCK_ELEMS) * frink_quant::Q8_0_BLOCK_BYTES;
+            (packed, row_bytes)
+        };
+
+        let (gate_w, gate_rb) = build(ffn_dim, hidden_dim, 1.0);
+        let (up_w, up_rb) = build(ffn_dim, hidden_dim, 2.0);
+        let (down_w, down_rb) = build(hidden_dim, ffn_dim, 3.0);
+        let x = make_row(hidden_dim, 0.7);
+
+        let blk = |cols: usize| cols / frink_quant::Q8_0_BLOCK_ELEMS;
+        let gate = MatvecLaunch {
+            kernel_src: Q8_0_MATVEC_KERNEL_SRC,
+            module_name: "frink_q8_0",
+            fn_name: "q8_0_matvec",
+            weights: gate_w.as_slice(),
+            rows: ffn_dim,
+            row_bytes: gate_rb,
+            n_blocks_per_row: blk(hidden_dim),
+        };
+        let up = MatvecLaunch {
+            kernel_src: Q8_0_MATVEC_KERNEL_SRC,
+            module_name: "frink_q8_0",
+            fn_name: "q8_0_matvec",
+            weights: up_w.as_slice(),
+            rows: ffn_dim,
+            row_bytes: up_rb,
+            n_blocks_per_row: blk(hidden_dim),
+        };
+        let down = MatvecLaunch {
+            kernel_src: Q8_0_MATVEC_KERNEL_SRC,
+            module_name: "frink_q8_0",
+            fn_name: "q8_0_matvec",
+            weights: down_w.as_slice(),
+            rows: hidden_dim,
+            row_bytes: down_rb,
+            n_blocks_per_row: blk(ffn_dim),
+        };
+
+        let gpu = launch_dense_ffn_swiglu(&gate, &up, &down, &x)
+            .expect("fused FFN must launch on real CUDA hardware");
+
+        // CPU reference: gate/up matvecs, host SwiGLU, down matvec.
+        let cpu_matvec = |w: &[u8], row_bytes: usize, rows: usize, act: &[f32]| -> Vec<f32> {
+            (0..rows)
+                .map(|r| {
+                    frink_quant::dot_q8_0_f32_scalar(&w[r * row_bytes..(r + 1) * row_bytes], act)
+                })
+                .collect::<Vec<f32>>()
+        };
+        let g = cpu_matvec(&gate_w, gate_rb, ffn_dim, &x);
+        let u = cpu_matvec(&up_w, up_rb, ffn_dim, &x);
+        let act: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
+            .map(|(gv, uv)| (gv / (1.0 + (-gv).exp())) * uv)
+            .collect();
+        let expected = cpu_matvec(&down_w, down_rb, hidden_dim, &act);
+
+        assert_eq!(gpu.len(), expected.len());
+        for (i, (got, want)) in gpu.iter().zip(expected.iter()).enumerate() {
+            assert_close_relative(*got, *want, i);
+        }
+    }
+
+    /// Fused `rms_norm(x + residual, weight, eps)` on device must agree
+    /// with the CPU reference (`frink_core::matmul::rms_norm` on the
+    /// elementwise sum).
+    #[test]
+    #[ignore = "requires real CUDA hardware -- run with --ignored to verify fused_add_rmsnorm vs CPU rms_norm"]
+    fn launch_fused_add_rmsnorm_matches_cpu_reference() {
+        let n = 128;
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.031).sin()).collect();
+        let residual: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.017).cos()).collect();
+        let weight: Vec<f32> = (0..n).map(|i| 1.0 + ((i as f32) * 0.003).sin()).collect();
+        let eps = 1e-5f32;
+
+        let sum: Vec<f32> = x.iter().zip(residual.iter()).map(|(a, b)| a + b).collect();
+        let mean_sq = sum.iter().map(|v| v * v).sum::<f32>() / n as f32;
+        let scale = 1.0 / (mean_sq + eps).sqrt();
+        let expected: Vec<f32> = sum
+            .iter()
+            .zip(weight.iter())
+            .map(|(v, w)| v * scale * w)
+            .collect();
+
+        let gpu = launch_fused_add_rmsnorm(&x, &residual, &weight, eps)
+            .expect("fused_add_rmsnorm must launch on CUDA hardware");
+
+        assert_eq!(gpu.len(), expected.len());
+        for (i, (got, want)) in gpu.iter().zip(expected.iter()).enumerate() {
+            assert_close_relative(*got, *want, i);
+        }
+    }
+}

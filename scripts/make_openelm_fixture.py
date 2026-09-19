@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `openelm` GGUF used by ferrox's per-layer
+"""Generate the tiny synthetic `openelm` GGUF used by frink's per-layer
 shape coverage test.
 
 `openelm` (Apple OpenELM) was triaged NEW CODE on PER-LAYER SHAPES:
@@ -70,7 +70,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-openelm-fixture")
+    w.add_name("frink-openelm-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

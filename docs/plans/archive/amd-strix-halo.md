@@ -1,24 +1,24 @@
 ---
-name: ferrox on AMD Strix Halo (Ryzen AI Max+)
-overview: "GOAL: ferrox-server runs correctly and defensibly fast on AMD Ryzen AI Max (Strix Halo, gfx1151 / Radeon 8060S / 16C Zen 5 / up to 128 GB unified LPDDR5X). RECOMMENDED PATH: CPU-first on x86_64 Linux (measure, then AVX-512), and Vulkan — NOT HIPIFY of ferrox-cuda — as the eventual GPU backend. Two repo facts decide this and both are cited below: (1) ferrox has ZERO AVX-512 kernels while Strix Halo is the rare mobile-class part with a FULL 512-bit Zen 5 datapath, so the cheapest large win needs no new backend at all; (2) ferrox-cuda has no batched GEMM path whatsoever (`apply_gpu_batch` is `#[cfg(feature = \"metal\")]`-only, weight_matrix.rs:2884) and copies every weight to device memory (gpu.rs:754-756), so hipifying it lands a decode-only, double-footprint backend on a unified-memory box — precisely the two things Strix Halo punishes. The zero-copy UMA residency design ferrox needs ALREADY EXISTS, in ferrox-metal (`register_weight_mmap` / `BytesNoCopy`, gpu.rs:5477-5513), not in ferrox-cuda. HONESTY NOTE: nobody has run ferrox on this hardware, or on ANY x86_64 host in the published ledger (benchmarks/RESULTS.md:3 — Host B is an M2 Pro). Every performance claim in this document about ferrox on Strix Halo is a prediction, not a measurement, and is marked as such."
+name: frink on AMD Strix Halo (Ryzen AI Max+)
+overview: "GOAL: frink-server runs correctly and defensibly fast on AMD Ryzen AI Max (Strix Halo, gfx1151 / Radeon 8060S / 16C Zen 5 / up to 128 GB unified LPDDR5X). RECOMMENDED PATH: CPU-first on x86_64 Linux (measure, then AVX-512), and Vulkan — NOT HIPIFY of frink-cuda — as the eventual GPU backend. Two repo facts decide this and both are cited below: (1) frink has ZERO AVX-512 kernels while Strix Halo is the rare mobile-class part with a FULL 512-bit Zen 5 datapath, so the cheapest large win needs no new backend at all; (2) frink-cuda has no batched GEMM path whatsoever (`apply_gpu_batch` is `#[cfg(feature = \"metal\")]`-only, weight_matrix.rs:2884) and copies every weight to device memory (gpu.rs:754-756), so hipifying it lands a decode-only, double-footprint backend on a unified-memory box — precisely the two things Strix Halo punishes. The zero-copy UMA residency design frink needs ALREADY EXISTS, in frink-metal (`register_weight_mmap` / `BytesNoCopy`, gpu.rs:5477-5513), not in frink-cuda. HONESTY NOTE: nobody has run frink on this hardware, or on ANY x86_64 host in the published ledger (benchmarks/RESULTS.md:3 — Host B is an M2 Pro). Every performance claim in this document about frink on Strix Halo is a prediction, not a measurement, and is marked as such."
 todos:
   - id: x86-first-measurement
-    content: "BLOCKING EVERYTHING: there is no ferrox measurement on any x86_64 host. Build `x86_64-unknown-linux-gnu` (release.yml:32-35 already ships this target) on a Strix Halo box and run `bench --suite --fit-host --skip-missing --compare`. Until this exists every other item here is speculation. Acceptance: a Strix Halo CPU column in benchmarks/RESULTS.md, both engines measured in the same session per the parity plan's measurement contract, `uptime` recorded and below 2.0"
+    content: "BLOCKING EVERYTHING: there is no frink measurement on any x86_64 host. Build `x86_64-unknown-linux-gnu` (release.yml:32-35 already ships this target) on a Strix Halo box and run `bench --suite --fit-host --skip-missing --compare`. Until this exists every other item here is speculation. Acceptance: a Strix Halo CPU column in benchmarks/RESULTS.md, both engines measured in the same session per the parity plan's measurement contract, `uptime` recorded and below 2.0"
     status: pending
   - id: thread-default-x86
     content: "`default_worker_threads()` reads `hw.perflevel0.physicalcpu` on macOS and otherwise falls through to `available_parallelism()` (threads.rs:79-86). On 16C/32T Strix Halo that returns 32 SMT threads where llama.cpp defaults to 16 physical cores. The parity plan already measured CPU decode as a fork-join SCALING problem, not a throughput one (llama-cpp-parity-push.md, `cpu-decode-scaling`), so a 2x-oversubscribed pool is the worst possible starting point. Acceptance: physical-core detection on Linux (/sys/devices/system/cpu/*/topology/thread_siblings_list or /proc/cpuinfo core id), plus an A/B at 8/16/32 threads on one dense and one MoE model"
     status: pending
   - id: strict-kernels-on-x86
-    content: "Run the x86 baseline under FERROX_STRICT_KERNELS=1 (kernel_registry.rs:630-638, seal_or_error kernel_registry.rs:708-714) BEFORE publishing any number. On x86 every aarch64 NEON/i8mm kernel compiles out (the parity plan already lost days to exactly this: 'Phase 1 landed eight kernel changes on x86, where every aarch64-gated kernel is compiled out'). The registry is the tool that turns that into a load-time error instead of a slow benchmark. Acceptance: the strict run either passes or produces an explicit list of quant kinds with no x86 kernel, and that list is what ranks avx512-int-dot"
+    content: "Run the x86 baseline under FRINK_STRICT_KERNELS=1 (kernel_registry.rs:630-638, seal_or_error kernel_registry.rs:708-714) BEFORE publishing any number. On x86 every aarch64 NEON/i8mm kernel compiles out (the parity plan already lost days to exactly this: 'Phase 1 landed eight kernel changes on x86, where every aarch64-gated kernel is compiled out'). The registry is the tool that turns that into a load-time error instead of a slow benchmark. Acceptance: the strict run either passes or produces an explicit list of quant kinds with no x86 kernel, and that list is what ranks avx512-int-dot"
     status: pending
   - id: avx512-int-dot
-    content: "LARGEST LEVER WITH NO NEW BACKEND. `SimdCaps` detects avx512f and the code says so in its own comment: 'avx512f is reported here as detected-but-unused -- no AVX-512 kernel exists yet' (ferrox-cuda/src/capability.rs:56-58). ferrox-quant has 57 aarch64 target_feature sites (neon / neon,dotprod / neon,i8mm) against 30 x86 ones (avx2 / avx2,fma / fma) and zero avx512. Strix Halo has FULL 512-bit Zen 5 FPUs, unlike Strix Point's double-pumped 256-bit (chipsandcheese, URL in body). Port the Q8_0/Q4_0/Q4_K int-dot GEMV+GEMM to AVX-512 + AVX512-VNNI (`_mm512_dpbusd_epi32`), mirroring the NEON dotprod/i8mm structure. Acceptance: bit-exact against the existing scalar/AVX2 kernels on the checked-in fixtures, plus a measured pp512/tg128 A/B on the same host in the same session"
+    content: "LARGEST LEVER WITH NO NEW BACKEND. `SimdCaps` detects avx512f and the code says so in its own comment: 'avx512f is reported here as detected-but-unused -- no AVX-512 kernel exists yet' (frink-cuda/src/capability.rs:56-58). frink-quant has 57 aarch64 target_feature sites (neon / neon,dotprod / neon,i8mm) against 30 x86 ones (avx2 / avx2,fma / fma) and zero avx512. Strix Halo has FULL 512-bit Zen 5 FPUs, unlike Strix Point's double-pumped 256-bit (chipsandcheese, URL in body). Port the Q8_0/Q4_0/Q4_K int-dot GEMV+GEMM to AVX-512 + AVX512-VNNI (`_mm512_dpbusd_epi32`), mirroring the NEON dotprod/i8mm structure. Acceptance: bit-exact against the existing scalar/AVX2 kernels on the checked-in fixtures, plus a measured pp512/tg128 A/B on the same host in the same session"
     status: pending
   - id: uma-residency-semantics
-    content: "`FERROX_GPU_VRAM_BUDGET_BYTES` ('Cap GPU-resident MoE experts', CONFIG.md) and `FERROX_EXPERT_CACHE_BYTES` encode a discrete-GPU model: a small fast pool worth protecting from a large slow one. On Strix Halo there is ONE pool. Decide and document what these mean on UMA (proposal: on a UMA backend the expert-streaming path is disabled by default and the budget knob is a no-op that warns, rather than silently throttling residency for a boundary that does not exist). Acceptance: `ferrox inspect-plan` on a 128 GB Strix Halo reports a plan that does not double-count host and device bytes for the same weight"
+    content: "`FRINK_GPU_VRAM_BUDGET_BYTES` ('Cap GPU-resident MoE experts', CONFIG.md) and `FRINK_EXPERT_CACHE_BYTES` encode a discrete-GPU model: a small fast pool worth protecting from a large slow one. On Strix Halo there is ONE pool. Decide and document what these mean on UMA (proposal: on a UMA backend the expert-streaming path is disabled by default and the budget knob is a no-op that warns, rather than silently throttling residency for a boundary that does not exist). Acceptance: `frink inspect-plan` on a 128 GB Strix Halo reports a plan that does not double-count host and device bytes for the same weight"
     status: pending
   - id: gtt-carveout-doc
-    content: "Document the host-side prerequisite honestly in docs/CONFIG.md or a new docs/STRIX_HALO.md: the iGPU's usable memory is set by BIOS UMA reservation plus the Linux GTT/TTM limit, not by the 128 GB figure on the box. AMD's own guidance is to keep the BIOS reservation minimal and raise TTM instead (rocm.docs.amd.com strixhalo page). This is a documentation item, not code, and it is a prerequisite for any GPU-backend measurement being reproducible. Acceptance: a reader can reproduce a stated ferrox number from the doc alone"
+    content: "Document the host-side prerequisite honestly in docs/CONFIG.md or a new docs/STRIX_HALO.md: the iGPU's usable memory is set by BIOS UMA reservation plus the Linux GTT/TTM limit, not by the 128 GB figure on the box. AMD's own guidance is to keep the BIOS reservation minimal and raise TTM instead (rocm.docs.amd.com strixhalo page). This is a documentation item, not code, and it is a prerequisite for any GPU-backend measurement being reproducible. Acceptance: a reader can reproduce a stated frink number from the doc alone"
     status: pending
   - id: backend-seam-refactor
     content: "PREREQUISITE FOR ANY THIRD BACKEND. There is no backend trait. `kernel_registry::Backend` (kernel_registry.rs:74-78) is observability-only by explicit design ('Observe only. Nothing in this module may change a dispatch decision', kernel_registry.rs:60-64). Dispatch is literal per-backend cfg blocks with per-backend fn-pointer aliases of DIFFERENT ARITY (`CudaMatvecLaunchFn` weight_matrix.rs:385-387 vs `MetalMatvecLaunchFn` weight_matrix.rs:391-393), two non-identical kind tables in one function (weight_matrix.rs:2528-2547 CUDA, 2551-2560 Metal), and 75 backend cfg attributes in decoder.rs alone. Adding a third backend as-is means a third copy of all of it. Do the seam first: one launch-fn signature, one kind-capability table per backend behind a common shape, and the `let gpu = ...; #[cfg(feature = \"x\")] let gpu = gpu || ...;` shadowing idiom (weight_matrix.rs:986-994, decoder.rs:2844-2848) replaced. Acceptance: adding a stub backend touches <= 5 files"
@@ -27,19 +27,19 @@ todos:
     content: "GO/NO-GO GATE, do not skip to a full backend. Smallest honest Vulkan slice: `ash` + one SPIR-V compute shader for Q4_K matvec, host buffers imported zero-copy from the GGUF mmap via VK_EXT_external_memory_host, wired only into `apply_gpu`. Measure decode tok/s on one model against the CPU baseline from x86-first-measurement. Acceptance: a NUMBER, plus a written verdict. If the beachhead does not beat tuned-AVX-512 CPU decode by a margin larger than host spread, the full Vulkan backend is NOT justified and this plan is re-ranked rather than continued"
     status: pending
   - id: vulkan-decode-path
-    content: "Gated on vulkan-beachhead passing. Q8_0/Q4_0/Q4_K/Q5_K/Q6_K matvec + fused QKV + fused SwiGLU FFN + GQA decode attention, i.e. functional parity with what ferrox-cuda has today (5 of 21 QuantKind variants, weight_matrix.rs:2528-2547). Use VK_KHR_shader_integer_dot_product where available. Acceptance: `ferrox verify` greedy-id parity against the CPU reference at 40/128/300-token prompts, on at least 3 models, per the parity plan's length-aware verify discipline"
+    content: "Gated on vulkan-beachhead passing. Q8_0/Q4_0/Q4_K/Q5_K/Q6_K matvec + fused QKV + fused SwiGLU FFN + GQA decode attention, i.e. functional parity with what frink-cuda has today (5 of 21 QuantKind variants, weight_matrix.rs:2528-2547). Use VK_KHR_shader_integer_dot_product where available. Acceptance: `frink verify` greedy-id parity against the CPU reference at 40/128/300-token prompts, on at least 3 models, per the parity plan's length-aware verify discipline"
     status: pending
   - id: vulkan-prefill-gemm
-    content: "The item that decides whether this is worth doing at all. Batched prefill GEMM + prefill attention. NOTE THE ASYMMETRY: on Strix Halo the published HIP-vs-Vulkan split is HIP wins prefill / Vulkan wins decode (URLs in body), so a Vulkan-only backend inherits the WEAKER half on the axis ferrox is already worst at. Budget for subgroup-level tiling, not naive one-thread-per-output-cell. Acceptance: pp512 on the iGPU beats pp512 on the tuned CPU path by more than host spread"
+    content: "The item that decides whether this is worth doing at all. Batched prefill GEMM + prefill attention. NOTE THE ASYMMETRY: on Strix Halo the published HIP-vs-Vulkan split is HIP wins prefill / Vulkan wins decode (URLs in body), so a Vulkan-only backend inherits the WEAKER half on the axis frink is already worst at. Budget for subgroup-level tiling, not naive one-thread-per-output-cell. Acceptance: pp512 on the iGPU beats pp512 on the tuned CPU path by more than host spread"
     status: pending
   - id: ci-x86-and-vulkan
-    content: "CI today builds cuda twice and metal once (ci.yml:32-67) and runs GPU tests never. Add: (a) an x86_64 Linux job that actually EXERCISES the x86 SIMD paths rather than only compiling them; (b) a `--features vulkan` compile-only job mirroring cuda-scaffolding + cuda-feature-chain the moment a vulkan feature exists (shader compilation to SPIR-V is a build-time step and CAN be validated with no GPU — this is strictly more testable than CUDA, where NVRTC compiles at runtime, gpu.rs:596); (c) FERROX_STRICT_KERNELS=1 in the test job, which is currently set nowhere in CI. Acceptance: a missing x86 kernel or a broken shader fails a PR"
+    content: "CI today builds cuda twice and metal once (ci.yml:32-67) and runs GPU tests never. Add: (a) an x86_64 Linux job that actually EXERCISES the x86 SIMD paths rather than only compiling them; (b) a `--features vulkan` compile-only job mirroring cuda-scaffolding + cuda-feature-chain the moment a vulkan feature exists (shader compilation to SPIR-V is a build-time step and CAN be validated with no GPU — this is strictly more testable than CUDA, where NVRTC compiles at runtime, gpu.rs:596); (c) FRINK_STRICT_KERNELS=1 in the test job, which is currently set nowhere in CI. Acceptance: a missing x86 kernel or a broken shader fails a PR"
     status: pending
   - id: bench-suite-on-128gb
-    content: "`--fit-host` on a 128 GB box admits models that have never run under ferrox at all (Mixtral is skipped by --fit-host on the M2 Pro per RESULTS.md:113). Expect this to surface COVERAGE bugs, not speed gaps — and the parity plan's `coverage-fail-closed` item says ~50 archs currently load and emit wrong logits instead of refusing. Run the suite with FERROX_STRICT_KERNELS=1 and treat every new admission as a correctness question first. Acceptance: every newly-admitted model either produces verified-correct output or is refused at load"
+    content: "`--fit-host` on a 128 GB box admits models that have never run under frink at all (Mixtral is skipped by --fit-host on the M2 Pro per RESULTS.md:113). Expect this to surface COVERAGE bugs, not speed gaps — and the parity plan's `coverage-fail-closed` item says ~50 archs currently load and emit wrong logits instead of refusing. Run the suite with FRINK_STRICT_KERNELS=1 and treat every new admission as a correctness question first. Acceptance: every newly-admitted model either produces verified-correct output or is refused at load"
     status: pending
   - id: hip-revisit-gate
-    content: "The HIPIFY path is REJECTED below, not deleted. Reopen it if and only if ALL THREE hold: (1) vulkan-prefill-gemm lands and iGPU prefill is still behind llama.cpp's HIP backend by more than 1.3x on the same host; (2) ferrox has by then grown a real batched-GEMM GPU path so hipifying ferrox-cuda would not just clone its decode-only shape; (3) ROCm's gfx1151 support has stopped being version-fragile (see the rocWMMA contradiction in the body — two 2026 sources give OPPOSITE build flags). Acceptance: this todo is closed by a written re-decision citing measurements, never by preference"
+    content: "The HIPIFY path is REJECTED below, not deleted. Reopen it if and only if ALL THREE hold: (1) vulkan-prefill-gemm lands and iGPU prefill is still behind llama.cpp's HIP backend by more than 1.3x on the same host; (2) frink has by then grown a real batched-GEMM GPU path so hipifying frink-cuda would not just clone its decode-only shape; (3) ROCm's gfx1151 support has stopped being version-fragile (see the rocWMMA contradiction in the body — two 2026 sources give OPPOSITE build flags). Acceptance: this todo is closed by a written re-decision citing measurements, never by preference"
     status: pending
   - id: docs-and-features-honesty
     content: "docs/FEATURES.md says 'Backends: CPU, Apple Metal, and CUDA' and README/ROADMAP make no claim about AMD. Do not add a Strix Halo row to FEATURES.md, MODELS.md or RESULTS.md until x86-first-measurement has produced same-session numbers. The repo's own worst failure mode is publishing a claim ahead of a measurement (llama-cpp-parity-push.md: 'Work that cannot be measured on the host that wrote it is not landed; it is staged'). Acceptance: no AMD claim ships without a receipt in benchmarks/receipts/engine/"
@@ -47,22 +47,22 @@ todos:
 isProject: false
 ---
 
-# ferrox on AMD Strix Halo (Ryzen AI Max+)
+# frink on AMD Strix Halo (Ryzen AI Max+)
 
-> Plan for running `ferrox-server` on AMD Ryzen AI Max / Max+ systems
+> Plan for running `frink-server` on AMD Ryzen AI Max / Max+ systems
 > ("Strix Halo", gfx1151). Written **2026-08-14** from a read-only audit
-> of `ferrox-cuda`, `ferrox-metal`, `ferrox-core`'s dispatch seams and
+> of `frink-cuda`, `frink-metal`, `frink-core`'s dispatch seams and
 > the CI workflows, plus published third-party measurements of
 > llama.cpp on this chip. Every repo claim carries a `file:line`; every
 > hardware claim carries a URL.
 >
-> **This plan was written without access to the hardware.** No ferrox
-> number for Strix Halo exists, and no ferrox number for *any* x86_64
+> **This plan was written without access to the hardware.** No frink
+> number for Strix Halo exists, and no frink number for *any* x86_64
 > host exists in the published ledger — `benchmarks/RESULTS.md:3` names
 > Host B (Apple M2 Pro) as the only host. Read every performance
 > statement below as either (a) a cited third-party llama.cpp
 > measurement, or (b) an explicitly-labelled prediction. There are no
-> ferrox Strix Halo numbers to quote and none are invented here.
+> frink Strix Halo numbers to quote and none are invented here.
 
 ## The target, from primary sources
 
@@ -79,7 +79,7 @@ Two of those rows carry the whole plan.
 
 **The 512-bit FPU row is why CPU-first is not a consolation prize.**
 Strix Halo is the unusual mobile-class part where AVX-512 is real
-silicon rather than two 256-bit passes, and ferrox has no AVX-512
+silicon rather than two 256-bit passes, and frink has no AVX-512
 kernel at all.
 
 **The bandwidth rows are why CPU-first is not the destination either.**
@@ -94,7 +94,7 @@ decode only up to that wall.
 
 ### The NPU is out of scope and should stay out
 
-The 50-TOPS XDNA NPU is not addressable from any path ferrox has or is
+The 50-TOPS XDNA NPU is not addressable from any path frink has or is
 likely to grow: it needs the Ryzen AI / XDNA driver stack and a
 quantization format that is not GGUF. No item below touches it. Say so
 in the docs rather than letting the number on the spec sheet imply a
@@ -160,19 +160,19 @@ with zero ROCm install, and gfx1151 supports `VK_KHR_cooperative_matrix`
 HIPIFY — for the GPU backend.**
 
 One line: *the cheapest large win on this chip needs no backend at all
-(ferrox has zero AVX-512 kernels on a full-512-bit CPU), and the
+(frink has zero AVX-512 kernels on a full-512-bit CPU), and the
 existing CUDA crate is the wrong template to clone onto a unified-memory
-box, because ferrox-metal — not ferrox-cuda — is where ferrox's UMA
+box, because frink-metal — not frink-cuda — is where frink's UMA
 design already lives.*
 
 The evidence, in the order it decided things.
 
-### 1. Hipifying `ferrox-cuda` clones a decode-only backend
+### 1. Hipifying `frink-cuda` clones a decode-only backend
 
-`ferrox-cuda` is 5 source files, ~2,570 Rust lines and **464 lines of
+`frink-cuda` is 5 source files, ~2,570 Rust lines and **464 lines of
 CUDA C** across 8 `__global__` kernels
-(`crates/ferrox-cuda/src/gpu.rs`, `attn.rs`). For contrast,
-`ferrox-metal/src/{gpu.rs,attn.rs}` is 9,163 + 9,205 lines. CUDA is
+(`crates/frink-cuda/src/gpu.rs`, `attn.rs`). For contrast,
+`frink-metal/src/{gpu.rs,attn.rs}` is 9,163 + 9,205 lines. CUDA is
 roughly 5% of the Metal backend, and the ROADMAP says so plainly: CUDA
 kernels "build and run on real hardware but have had no tuning pass"
 (`docs/ROADMAP.md:41-42`).
@@ -197,18 +197,18 @@ Mechanically, HIPIFY would do well on the C:
 So the kernels are cheap. **The kernels are not the problem.**
 
 **Problem A — the host layer is 100% `cudarc`, which has no HIP twin.**
-`cudarc` is pinned `=0.11.9` (`ferrox-cuda/Cargo.toml:32-37`) and
+`cudarc` is pinned `=0.11.9` (`frink-cuda/Cargo.toml:32-37`) and
 appears in every signature: `compile_ptx` (`gpu.rs:596`), `load_ptx`
 (`gpu.rs:598`), `htod_copy`, `alloc_zeros`, `dtoh_sync_copy`,
 `LaunchConfig`, `CudaSlice<T>`, `Arc<CudaDevice>`, plus raw driver-API
 FFI for `cuGraph*` because cudarc exposes no safe wrapper
 (`graph.rs:3-6, 70-144`). HIPIFY does nothing for any of it. Rust HIP
 bindings exist (`cubecl-hip-sys`, `hip-sys`, `rocm-rs`,
-`oxicuda-rocm`), and hipRTC maps well onto ferrox's NVRTC-string design
+`oxicuda-rocm`), and hipRTC maps well onto frink's NVRTC-string design
 — but this is a **rewrite of ~1,200 lines of host glue**, not a
 translation.
 
-**Problem B — and this is the decisive one — `ferrox-cuda` has no
+**Problem B — and this is the decisive one — `frink-cuda` has no
 batched GEMM at all.** `apply_gpu_batch` is
 `#[cfg(feature = "metal")]`-only (`weight_matrix.rs:2884`); the CUDA
 prefill path is a per-position matvec loop
@@ -219,24 +219,24 @@ covers one more, and neither covers the IQ tiers that just landed.
 
 Put those together against the measured Strix Halo split: HIP's
 advantage on this chip is **prefill**, by 20-48%. Hipifying
-`ferrox-cuda` produces a backend that **cannot do batched prefill at
+`frink-cuda` produces a backend that **cannot do batched prefill at
 all**. You would take on a ROCm dependency, a kernel-version floor, an
 unresolved rocWMMA contradiction and a second GPU maintenance burden —
 to acquire the half of the split HIP is worse at.
 
-**Problem C — `ferrox-cuda`'s residency model is wrong for UMA, and
-`ferrox-metal`'s is right.** CUDA uploads every weight with
+**Problem C — `frink-cuda`'s residency model is wrong for UMA, and
+`frink-metal`'s is right.** CUDA uploads every weight with
 `dev.htod_copy(weights.to_vec())` (`gpu.rs:754-756`), cached by
 `(host_ptr, len)` and **never evicted** (`gpu.rs:729-763`, noted at
 `gpu.rs:1152`). On a discrete GPU that is the entire point. On Strix
 Halo, where GPU memory *is* system memory, it **doubles the resident
 footprint of every weight and burns 256 GB/s of shared bandwidth to
-move bytes to where they already are** — and it destroys ferrox's
+move bytes to where they already are** — and it destroys frink's
 stated load path, "GGUF mmap → keep quantized → fused dequant+dot"
 (`CLAUDE.md`).
 
 Metal already solved exactly this. `register_weight_mmap`
-(`ferrox-metal/src/gpu.rs:5477-5513`) wraps an entire GGUF mmap in one
+(`frink-metal/src/gpu.rs:5477-5513`) wraps an entire GGUF mmap in one
 `newBufferWithBytesNoCopy` buffer with page-aligned length and a
 keepalive `Arc<Mmap>` (`ResidentMmapFile`, `gpu.rs:5453-5468`), so
 tensor slices alias the file at offsets instead of copying, degrading
@@ -244,10 +244,10 @@ gracefully to a copy if alignment fails (`gpu.rs:5443-5451`). The
 Vulkan equivalent is `VK_EXT_external_memory_host` importing the same
 host pointer.
 
-**So: ferrox's unified-memory backend design already exists, and it is
+**So: frink's unified-memory backend design already exists, and it is
 the Metal crate.** A Strix Halo backend should be structured after
-`ferrox-metal`, and the crate it should *not* be a copy of is
-`ferrox-cuda`.
+`frink-metal`, and the crate it should *not* be a copy of is
+`frink-cuda`.
 
 ### 2. Why Vulkan, stated with its costs
 
@@ -259,7 +259,7 @@ For:
   iGPUs), so the cost amortizes instead of being Strix-Halo-specific.
 - The published decode advantage on this exact chip (+18-25% over HIP
   across two independent testers) sits on the axis the parity plan
-  calls ferrox's weakest — CPU decode is "the only axis with nothing at
+  calls frink's weakest — CPU decode is "the only axis with nothing at
   parity."
 - Shader compilation to SPIR-V is a **build-time** step, so a
   compile-only CI job genuinely validates the kernels. This is
@@ -274,8 +274,8 @@ Against, stated plainly:
   today's *CUDA* backend is much less, but today's CUDA backend is not
   a useful target (§1, Problem B).
 - **Vulkan inherits the weaker half of the measured split.** A
-  Vulkan-only ferrox backend is choosing the prefill-loser on a chip
-  where ferrox is already prefill-behind. `vulkan-prefill-gemm` is
+  Vulkan-only frink backend is choosing the prefill-loser on a chip
+  where frink is already prefill-behind. `vulkan-prefill-gemm` is
   where this plan is most likely to fail, and it is ranked and
   acceptance-gated accordingly.
 - gfx1151 has `VK_KHR_cooperative_matrix` v1 but not coopmat2, and
@@ -292,22 +292,22 @@ written verdict**, not a phase-one deliverable.
 ### 3. Why CPU-first is first, and where it stops
 
 Not because it is easy — because **nobody knows the number.**
-`benchmarks/RESULTS.md:3` names one host, an M2 Pro. Every ferrox
+`benchmarks/RESULTS.md:3` names one host, an M2 Pro. Every frink
 x86_64 claim in the repo is untested at the performance level. The
 parity plan already burned days on exactly this failure: "Phase 1 (PRs
 #2-#8) landed eight kernel changes on x86, where every aarch64-gated
 kernel is compiled out, so none of them could be measured and none of
 them were."
 
-On x86 today ferrox runs on AVX2+FMA. `SimdCaps` detects `avx512f`
-(`ferrox-cuda/src/capability.rs:34`) and the comment beside it is
+On x86 today frink runs on AVX2+FMA. `SimdCaps` detects `avx512f`
+(`frink-cuda/src/capability.rs:34`) and the comment beside it is
 already the finding:
 
 > `avx512f` is reported here as detected-but-unused -- no AVX-512
 > kernel exists yet
-> — `crates/ferrox-cuda/src/capability.rs:56-58`
+> — `crates/frink-cuda/src/capability.rs:56-58`
 
-The `target_feature` census in `ferrox-quant` confirms the asymmetry:
+The `target_feature` census in `frink-quant` confirms the asymmetry:
 57 aarch64 sites (26 `neon`, 24 `neon,dotprod`, 7 `neon,i8mm`) against
 30 x86 sites (17 `avx2,fma`, 9 `avx2`, 4 `fma`), and **zero** avx512.
 Every kernel the parity push spent Phase 1 building — interleaved
@@ -316,19 +316,19 @@ Q4_Kx8, i8mm SMMLA GEMM, int-dot GEMV — exists only for NEON.
 And a first-day defect that costs nothing to fix:
 `default_worker_threads()` reads `hw.perflevel0.physicalcpu` on macOS
 and otherwise falls through to `available_parallelism()`
-(`ferrox-core/src/threads.rs:79-86`). On 16C/32T Strix Halo that is 32
+(`frink-core/src/threads.rs:79-86`). On 16C/32T Strix Halo that is 32
 SMT threads where llama.cpp uses 16 physical cores — on an engine whose
 measured CPU-decode deficit is *fork-join scaling*, not per-thread
 throughput.
 
 Where CPU-first stops: the >175 GB/s CCD-aggregate ceiling above. State
 that limit in the docs at the same time the CPU numbers are published,
-so nobody reads "ferrox runs on Strix Halo" as "ferrox uses Strix
+so nobody reads "frink runs on Strix Halo" as "frink uses Strix
 Halo."
 
 ## Memory and MoE residency on unified memory
 
-This is where Strix Halo differs most from every host ferrox has run
+This is where Strix Halo differs most from every host frink has run
 on, and where the existing knobs are wrong-shaped rather than
 mis-tuned.
 
@@ -343,22 +343,22 @@ to reach ~96-110 GB
 ([nabe2030](https://github.com/nabe2030/hip-vs-vulkan-evo-x2) ran at 96
 GB VGM). **`amdgpu.gttsize` is deprecated in favour of
 `ttm.pages_limit`** — verify against the running kernel rather than
-copying a blog. None of this is ferrox's code, all of it is ferrox's
+copying a blog. None of this is frink's code, all of it is frink's
 reproducibility problem, hence `gtt-carveout-doc`.
 
 **Copy-based residency is a bug on this box, not a cost.** Restating
 §1 Problem C in memory terms: `resident_cuda_weights` doubles every
-weight's footprint (`ferrox-cuda/src/gpu.rs:754-763`). On a 96 GB
+weight's footprint (`frink-cuda/src/gpu.rs:754-763`). On a 96 GB
 carve-out that halves the largest model that fits, which is the exact
 thing `docs/ROADMAP.md:30-33` ("Run bigger models on the same
 hardware") exists to prevent. Any Strix Halo backend must import the
-mmap, following `ferrox-metal`'s `register_weight_mmap` pattern
+mmap, following `frink-metal`'s `register_weight_mmap` pattern
 (`gpu.rs:5477-5513`).
 
 **MoE expert placement loses its premise.** `ExpertPlacement::{Cpu,
-GpuDevice(u32)}` (`ferrox-moe/src/lib.rs:20-23`),
-`FERROX_GPU_VRAM_BUDGET_BYTES` ("Cap GPU-resident MoE experts", `docs/CONFIG.md`),
-`FERROX_EXPERT_CACHE_BYTES` and `FERROX_SSD_STREAMING` all encode
+GpuDevice(u32)}` (`frink-moe/src/lib.rs:20-23`),
+`FRINK_GPU_VRAM_BUDGET_BYTES` ("Cap GPU-resident MoE experts", `docs/CONFIG.md`),
+`FRINK_EXPERT_CACHE_BYTES` and `FRINK_SSD_STREAMING` all encode
 "small fast pool, large slow pool, decide what crosses." On Strix Halo
 there is no crossing. Two consequences:
 
@@ -385,7 +385,7 @@ Genuinely doable on the M2 Pro or in CI:
 - **All of `backend-seam-refactor`.** It is a pure refactor of existing
   cfg branches, validated by `cargo test --workspace` plus the existing
   Metal and CUDA compile chains. It needs no AMD anything.
-- **All AVX-512 kernel *correctness*.** ferrox's whole test culture
+- **All AVX-512 kernel *correctness*.** frink's whole test culture
   supports this: fixtures and golden values cross-validated against
   independent NumPy references (`CLAUDE.md`), and the IQ-tier work was
   validated by linking llama.cpp's `ggml-quants.c` and asserting
@@ -401,11 +401,11 @@ Genuinely doable on the M2 Pro or in CI:
   (Mesa's llvmpipe Vulkan ICD) runs compute shaders on CPU. It is
   correct and unusably slow — perfect for a correctness harness,
   useless for a number.
-- **The kernel-registry arm, `ferrox caps`, `--list-devices`, config
+- **The kernel-registry arm, `frink caps`, `--list-devices`, config
   parsing, docs.** All CPU-side.
 - **Every UMA design decision**, because the Metal crate already has a
   working zero-copy mmap import to read
-  (`ferrox-metal/src/gpu.rs:5453-5513`).
+  (`frink-metal/src/gpu.rs:5453-5513`).
 
 Absolutely requires the hardware:
 
@@ -433,7 +433,7 @@ CI today (`.github/workflows/ci.yml`) is 5 jobs: fmt, `build + test`
 (ubuntu, no GPU features), `cuda-scaffolding` (`ci.yml:32-39`),
 `cuda-feature-chain` (`ci.yml:41-53`), `metal-feature-chain` on
 macos-latest (`ci.yml:55-67`), and workspace clippy. **No GPU test ever
-runs, and `FERROX_STRICT_KERNELS` is set nowhere in CI.**
+runs, and `FRINK_STRICT_KERNELS` is set nowhere in CI.**
 
 Three specific changes:
 
@@ -447,7 +447,7 @@ Three specific changes:
    correctness only; or, at minimum, a test that **fails loudly** when
    the AVX-512 path was not taken, so a green CI cannot be mistaken for
    coverage.
-2. **`FERROX_STRICT_KERNELS=1` belongs in the test job now**, ahead of
+2. **`FRINK_STRICT_KERNELS=1` belongs in the test job now**, ahead of
    any AMD work. `docs/CONFIG.md` already says to "set this in CI and in
    benchmark harnesses so a number cannot be published for a backend it
    was not taken on." It currently is not.
@@ -470,8 +470,8 @@ line, and `x86-first-measurement` is measuring it.
 Stated explicitly, in the repo's tradition of naming wrong prior
 diagnoses rather than quietly correcting them.
 
-1. **No ferrox measurement exists on any x86_64 host**, let alone this
-   one. Everything in this plan about ferrox's CPU speed on Strix Halo
+1. **No frink measurement exists on any x86_64 host**, let alone this
+   one. Everything in this plan about frink's CPU speed on Strix Halo
    is extrapolated from an M2 Pro ledger and a source-level reading of
    which kernels compile on which arch. It could be wrong in either
    direction.
@@ -487,7 +487,7 @@ diagnoses rather than quietly correcting them.
 4. **Whether `VK_EXT_external_memory_host` import works against a
    `memmap2` mapping on RADV/gfx1151 is unverified.** The entire
    zero-copy residency argument rests on it. If it fails, the Vulkan
-   path inherits `ferrox-cuda`'s copy problem and the recommendation
+   path inherits `frink-cuda`'s copy problem and the recommendation
    weakens materially. **Test this first inside `vulkan-beachhead`,
    before writing a single kernel.**
 5. **The prefill half of the Vulkan path is the plan's biggest
@@ -495,12 +495,12 @@ diagnoses rather than quietly correcting them.
    by 20-48%, gfx1151 has no MFMA, and coopmat2 is unavailable. If
    `vulkan-prefill-gemm` cannot beat the tuned CPU path, this plan's GPU
    half has failed and `hip-revisit-gate` is the honest response.
-6. **`ferrox bench --compare` requires `llama-bench` on the host.** No
+6. **`frink bench --compare` requires `llama-bench` on the host.** No
    one has confirmed the compare harness works against a Vulkan or HIP
    llama.cpp build, or that the backend labels line up. Check before
    promising a comparison table.
 7. **Whether Strix Halo's 128 GB actually surfaces coverage bugs is a
-   guess.** `--fit-host` will admit models never run under ferrox, and
+   guess.** `--fit-host` will admit models never run under frink, and
    the parity plan's `coverage-fail-closed` item says ~50 archs
    currently load and emit wrong logits rather than refusing. It is
    *likely* that a 128 GB host trips this. It is not established.
@@ -509,7 +509,7 @@ diagnoses rather than quietly correcting them.
    host load moved published rows by 25-45% on an M2 Pro. A 120 W-class
    APU in a mini-PC chassis may be worse. Establish this host's spread
    before quoting any gap tighter than it.
-9. **No claim is made about `ferrox-server`'s HTTP/serving layer on this
+9. **No claim is made about `frink-server`'s HTTP/serving layer on this
    platform.** It is portable Rust and should be fine. "Should be fine"
    is not a measurement either.
 
@@ -519,13 +519,13 @@ diagnoses rather than quietly correcting them.
   `llama-cpp-parity-push.md`: both engines in the same session, never in
   parallel, `uptime` below ~2.0, `--suite` + `--render` as the unit of
   truth, no number published from a partial or loaded run.
-- **`FERROX_STRICT_KERNELS=1` on every Strix Halo measurement.** On a
-  host where most of ferrox's fast kernels compile out, a silent CPU
+- **`FRINK_STRICT_KERNELS=1` on every Strix Halo measurement.** On a
+  host where most of frink's fast kernels compile out, a silent CPU
   fallback is the single most likely way to publish a wrong number.
 - **No AMD row in `FEATURES.md` / `MODELS.md` / `RESULTS.md` before a
   receipt exists** in `benchmarks/receipts/engine/`.
-- **`ferrox-metal` is the structural reference for a UMA backend, not
-  `ferrox-cuda`.** When the two crates disagree on a design question,
+- **`frink-metal` is the structural reference for a UMA backend, not
+  `frink-cuda`.** When the two crates disagree on a design question,
   Metal is right for this hardware.
 - **The go/no-go gates are real.** `vulkan-beachhead` and
   `vulkan-prefill-gemm` each carry a numeric acceptance criterion and a

@@ -117,7 +117,7 @@ test("a resumable request asks the server for a replay buffer and names itself",
     "without this the server keeps no buffer and an id would be a promise it cannot keep",
   );
   const sent = calls[0].init.headers as Record<string, string>;
-  assert.equal(sent["X-Ferrox-Client"], "ferrox-studio");
+  assert.equal(sent["X-Frink-Client"], "frink-studio");
   assert.equal(calls.length, 1, "a completed stream needs no recovery");
 });
 

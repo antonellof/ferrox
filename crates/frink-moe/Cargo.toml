@@ -1,0 +1,25 @@
+[package]
+name = "frink-moe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Mixture-of-Experts routing and expert dispatch for Frink"
+readme = "README.md"
+keywords = ["moe", "llm", "inference", "routing", "frink"]
+categories = ["algorithms", "science"]
+
+[dependencies]
+frink-core = { workspace = true }
+frink-quant = { workspace = true }
+rayon = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+frink-quant = { workspace = true }
+
+[features]
+default = []
+cuda = ["frink-core/cuda"]
+metal = ["frink-core/metal"]

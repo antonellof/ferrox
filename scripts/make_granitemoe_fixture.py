@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `granitemoe` GGUF used by ferrox's
+"""Generate the tiny synthetic `granitemoe` GGUF used by frink's
 Granite coverage test -- and, under `--arch`, the byte-for-byte
-equivalent under ferrox's `granite-moe` alias.
+equivalent under frink's `granite-moe` alias.
 
 `granitemoe` is IBM's Granite 3.x MoE decoder (and, with
 `expert_shared_feed_forward_length`, GraniteMoeShared).
@@ -11,7 +11,7 @@ the DENSE row's graph and takes its MoE branch on
 `layers[il].ffn_gate_inp != nullptr` (granite.cpp:246). The two rows
 differ in the FFN and in nothing else -- same four multipliers, same
 residual placement, same `1.0f / f_logit_scale` on the logits -- which is
-why ferrox implements the multipliers once, parameterised, rather than
+why frink implements the multipliers once, parameterised, rather than
 once per architecture.
 
 What this fixture drives beyond `make_granite_fixture.py`:
@@ -22,15 +22,15 @@ What this fixture drives beyond `make_granite_fixture.py`:
     `hparams.expert_weights_scale` -- which `granite-moe.cpp:3-24` never
     reads, so it keeps its `0.0f` default and `llama-graph.cpp:2070`
     treats that as no scaling at all. The fixture therefore writes NO
-    `expert_weights_scale` key and ferrox must default it to 1.0.
+    `expert_weights_scale` key and frink must default it to 1.0.
   * the expert width. granite.cpp:99-102 sizes the expert tensors from
     `n_ff`, NOT from `n_ff_exp`, so this file writes only
-    `feed_forward_length` and ferrox has to size its experts from that.
+    `feed_forward_length` and frink has to size its experts from that.
   * the SHARED expert (granite.cpp:105-110), created only when
     `n_ff_shexp > 0` and added to the routed output UNGATED
     (:280-287) -- unlike qwen2moe, whose shared expert has a sigmoid
     gate. `expert_shared_count` is never written by the Granite
-    converter, so ferrox has to infer one shared expert from
+    converter, so frink has to infer one shared expert from
     `blk.0.ffn_gate_shexp.weight`.
 
 **The `granite-moe` alias.** No llama.cpp GGUF spells the architecture
@@ -94,7 +94,7 @@ def main(out_path: str, arch: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, arch)
-    w.add_name(f"ferrox-{arch}-fixture")
+    w.add_name(f"frink-{arch}-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
@@ -110,7 +110,7 @@ def main(out_path: str, arch: str) -> None:
     w.add_expert_used_count(N_EXPERT_USED)
     # GraniteMoeShared's one extra key (granite-moe.cpp:23).
     # `expert_shared_count` is deliberately absent: the Granite converter
-    # never writes it, so ferrox has to infer the single shared expert
+    # never writes it, so frink has to infer the single shared expert
     # from `blk.0.ffn_gate_shexp.weight`.
     w.add_expert_shared_feed_forward_length(N_FF_SHEXP)
     w.add_file_type(gguf.LlamaFileType.ALL_F32)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `ernie4_5-moe` GGUFs used by ferrox's
+"""Generate the tiny synthetic `ernie4_5-moe` GGUFs used by frink's
 ERNIE-4.5 MoE coverage test.
 
 Two files, because this row has two things to prove:
@@ -9,7 +9,7 @@ Two files, because this row has two things to prove:
 
 The default (`--step 1`) is the fixture the golden logits come from: the
 value both published ERNIE-4.5 MoE checkpoints carry, and the only value
-llama.cpp can load. The `--step 2` file is the one ferrox REFUSES, and it
+llama.cpp can load. The `--step 2` file is the one frink REFUSES, and it
 exists so that the refusal is demonstrably reachable rather than
 decorative.
 
@@ -44,14 +44,14 @@ only where the modulo changes nothing. A converter-produced checkpoint
 puts `blk.N.ffn_gate.weight` on the interleaved dense layers, which is
 exactly what the `--step 2` file below does, and llama.cpp fails to load
 it on the missing `blk.N.ffn_down_exps.weight`. See
-`crates/ferrox-models/src/moe_interleave.rs`.
+`crates/frink-models/src/moe_interleave.rs`.
 
 DELIBERATELY ABSENT from both files: `{arch}.expert_gating_func` and
 `{arch}.expert_weights_norm`. llama.cpp hardcodes both for this
-architecture, so ferrox has to reach SOFTMAX and renormalised top-k
+architecture, so frink has to reach SOFTMAX and renormalised top-k
 through its architecture-name defaults, and a file carrying the keys
 would test the file rather than the defaults. Also absent: the OPTIONAL
-`attn_output.bias` (ernie4-5.cpp:45), which ferrox refuses by name
+`attn_output.bias` (ernie4-5.cpp:45), which frink refuses by name
 outside the gpt-oss path rather than dropping.
 
 Weights are pseudo-random from a fixed seed so the files are
@@ -108,7 +108,7 @@ def main(out_path: str, step: int) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name(f"ferrox-ernie4-5-moe-fixture-step{step}")
+    w.add_name(f"frink-ernie4-5-moe-fixture-step{step}")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

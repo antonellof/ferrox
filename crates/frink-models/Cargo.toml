@@ -1,0 +1,58 @@
+[package]
+name = "frink-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Model loaders and decoder stacks for the Frink inference engine"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "transformer", "frink"]
+categories = ["science", "algorithms"]
+# The golden fixtures are 22 MB of tiny GGUF files, and crates.io
+# refuses an upload over 10 MB: `frink-models` failed to publish for
+# v0.22.0 AND v0.23.0 with `413 Payload Too Large`, which left every
+# crate after it in the chain unpublished and `cargo install
+# frink-cli` pinned to 0.21.0 while two releases shipped tarballs.
+# They are build inputs for `cargo test` in a checkout, never for a
+# consumer of the published crate, so they stay out of the package and
+# the repository keeps them.
+exclude = ["tests/fixtures/**", "tests/data/**"]
+
+[dependencies]
+frink-core = { workspace = true }
+frink-moe = { workspace = true }
+frink-gguf = { workspace = true }
+frink-quant = { workspace = true }
+frink-safetensors = { workspace = true }
+# Not optional: `device_budget` asks both crates what the host offers
+# on every build, and both compile to plain capability structs (with
+# every GPU field honestly zeroed) when their own kernel feature is
+# off. Only the *kernels* are feature-gated, and still are below.
+frink-metal = { workspace = true }
+frink-cuda = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+regex = "1.13.1"
+fancy-regex = "0.18.0"
+base64 = "0.23.0"
+serde_json.workspace = true
+minijinja = { workspace = true }
+rayon = { workspace = true }
+# Only pulled in by the `hub` feature: the Hugging Face downloader needs
+# a TLS stack, and a consumer that loads a local GGUF should not pay for
+# it.
+ureq = { workspace = true, optional = true }
+half = { workspace = true }
+
+[dev-dependencies]
+byteorder = { workspace = true }
+
+[features]
+default = []
+cuda = ["frink-moe/cuda", "frink-cuda/cuda"]
+# The Hugging Face downloader. Optional because it drags a TLS stack in,
+# and a consumer that only loads a local GGUF should not pay for it.
+hub = ["dep:ureq"]
+metal = ["frink-moe/metal", "frink-metal/metal"]

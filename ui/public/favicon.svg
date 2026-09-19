@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- The Ferrox mark. Geometry is owned by src/lib/logo-geometry.ts and
+  <!-- The Frink mark. Geometry is owned by src/lib/logo-geometry.ts and
        asserted against this file by src/lib/logo-geometry.test.ts, because
        nothing else links a static favicon to the React component.
        A favicon cannot inherit currentColor from the page, so the colour is

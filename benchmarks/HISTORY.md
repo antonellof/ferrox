@@ -3,7 +3,7 @@
 The live comparison is [`RESULTS.md`](RESULTS.md), which is generated
 from receipts and holds nothing else. This file holds what a generator
 cannot: measurements taken without a receipt, before/after studies
-against ferrox itself, and the traps that have put a wrong number in
+against frink itself, and the traps that have put a wrong number in
 this directory.
 
 ## Sections that predate the code
@@ -14,9 +14,9 @@ measurement; re-running the suite replaces them.
 
 | Section | Predates | Understated by |
 |---|---|---|
-| CPU, AMD Ryzen 9 7945HX | [#159](https://github.com/antonellof/ferrox/pull/159) (the AVX2 GEMMs) and the Q5_K batch gate fix of 2026-09-15 | prefill, 5x to 8x; the current x86 code is the Ryzen 9 3900X section, measured 2026-09-15 on a different, slower machine, so the two are not comparable row for row and the 7945HX rows are kept as the "before" |
+| CPU, AMD Ryzen 9 7945HX | [#159](https://github.com/antonellof/frink/pull/159) (the AVX2 GEMMs) and the Q5_K batch gate fix of 2026-09-15 | prefill, 5x to 8x; the current x86 code is the Ryzen 9 3900X section, measured 2026-09-15 on a different, slower machine, so the two are not comparable row for row and the 7945HX rows are kept as the "before" |
 
-**Metal was re-measured on 2026-09-09** on ferrox 0.17.1, so it is
+**Metal was re-measured on 2026-09-09** on frink 0.17.1, so it is
 current: it now includes #150, #156 and the merges around them, and the
 16 stale 0.13.3 receipts it replaces were deleted rather than kept
 beside it, because two sections for one machine is not two hosts.
@@ -31,10 +31,10 @@ Two hosts were benchmarked with `bench -m --compare` rather than
 `--suite`, so they wrote no receipt and are absent from the generated
 tables. They are the two most interesting results in this file.
 
-**aarch64 CPU** (rented 20-core Cortex-A725, idle). ferrox is **ahead**
+**aarch64 CPU** (rented 20-core Cortex-A725, idle). frink is **ahead**
 here, and the decode column depends on one switch:
 
-| Model | Test | ferrox | ferrox `spin` | llama.cpp | Gap |
+| Model | Test | frink | frink `spin` | llama.cpp | Gap |
 |---|---|---|---|---|---|
 | Llama-3.2-3B Q4_K_M | pp512 | **132.53** | | 46.40 | 🟢 **0.35×** |
 | Llama-3.2-3B Q4_K_M | tg128 | 10.38 | **23.14** | 17.86 | 🟢 **0.77×** |
@@ -42,19 +42,19 @@ here, and the decode column depends on one switch:
 | Llama-3.1-8B Q4_K_M | tg128 | 6.64 | **12.41** | 9.06 | 🟢 **0.73×** |
 | SmolLM2-135M Q8_0 | tg128 | 14.73 | 9.16 | 120.56 | 🔴 **8.2×** |
 
-`FERROX_CPU_POOL=spin` turns decode from a loss into a win at 3B and
+`FRINK_CPU_POOL=spin` turns decode from a loss into a win at 3B and
 8B, and into a bigger loss at 135M. That is why it was opt-in.
-[#155](https://github.com/antonellof/ferrox/pull/155) replaced the flag
+[#155](https://github.com/antonellof/frink/pull/155) replaced the flag
 with a work-size rule so the scheduler is chosen per operation, and
-`FERROX_CPU_POOL` now only overrides it for A/B. **These rows predate
+`FRINK_CPU_POOL` now only overrides it for A/B. **These rows predate
 that change and have not been re-measured**, so they still describe the
-old flag ([#27](https://github.com/antonellof/ferrox/issues/27)).
+old flag ([#27](https://github.com/antonellof/frink/issues/27)).
 
 **The 8.2x on the 135M row is known to be stale, and is left because
 nothing has re-measured that host.** Two fixes landed after it. #155
 removed a per-matvec repack that fired only on Q8_0 and Q4_0, which is
 what that row is, and was 89% to 90% of decode work.
-[#167](https://github.com/antonellof/ferrox/pull/167) then collapsed
+[#167](https://github.com/antonellof/frink/pull/167) then collapsed
 about 150 cold rayon entries per token into one, worth +29% at 135M as
 an interleaved within-process ratio. On an M2 Pro after both, 135M reads
 roughly **1.9x** rather than 8.2x. That figure is a different machine
@@ -70,9 +70,9 @@ before/after against the same engine, so that stays:
 
 **What coalescing the matvecs bought** (RTX 3070, runs interleaved
 `main, branch, main, branch`; PRs
-[#144](https://github.com/antonellof/ferrox/pull/144),
-[#145](https://github.com/antonellof/ferrox/pull/145),
-[#146](https://github.com/antonellof/ferrox/pull/146)). The old kernels
+[#144](https://github.com/antonellof/frink/pull/144),
+[#145](https://github.com/antonellof/frink/pull/145),
+[#146](https://github.com/antonellof/frink/pull/146)). The old kernels
 gave one thread a whole super-block, so 32 lanes read addresses one
 block apart and every load instruction spread across as many cache
 lines as it had lanes. A warp now takes the super-block and each lane
@@ -98,7 +98,7 @@ was not the last one.
 
 **Metal, what concurrent encode bought** (M2 Pro, interleaved
 `main, branch, main, branch`, `MTLCommandBuffer` GPU-clock, which is
-immune to host load; [#150](https://github.com/antonellof/ferrox/pull/150)).
+immune to host load; [#150](https://github.com/antonellof/frink/pull/150)).
 Gemma-class models were forced onto a serial encoder by a correctness
 fix that outlived its cause, so they ran with no dispatch overlap.
 
@@ -114,14 +114,14 @@ work in #208 the 2026-09-11 re-measurement reads **0.94×**, and no
 Metal decode row is slower than llama.cpp any more.
 
 **Metal, where the rest of the gap is** (quiet host, GPU-clock and wall
-from one process; [#149](https://github.com/antonellof/ferrox/issues/149)).
+from one process; [#149](https://github.com/antonellof/frink/issues/149)).
 
 | Model | wall ms/tok | GPU ms/tok | host | gap | gap if host were 0 |
 |---|---:|---:|---:|---:|---:|
 | Llama-3.2-1B Q4_K_M | 6.53 | **4.82** | 26% | 0.97× | **0.72×** |
 | Gemma-2-2B Q4_K_M | 16.46 | **11.79** | 28% | 1.12× | **0.88×** |
 
-ferrox's Metal kernels already finish faster than llama.cpp's whole
+frink's Metal kernels already finish faster than llama.cpp's whole
 token. The remaining gap is host-side, and injecting dispatches to
 measure the slope directly says it is **not** op count: a dispatch costs
 **0.61 µs** of host time and **5.16 µs** of GPU time, so all ~515 of
@@ -133,7 +133,7 @@ pipelining encode against execution; fusion is a GPU-side lever worth
 than the correction.** "GPU ms/tok" was the GPU time of ONE command
 buffer per token. A sampled decode token has TWO: the dense stack, and
 the lm_head in `launch_matvec_fused`, which had no timing tag. Its GPU
-time was therefore booked as host time. `FERROX_METAL_GPU_TIMING=1` now
+time was therefore booked as host time. `FRINK_METAL_GPU_TIMING=1` now
 clocks every submission's encode phase, GPU phase and submit latency,
 and tags the lm_head. Per token, window means from one process (GPU
 columns load-immune; the host was not quiet, so the wall-derived ones
@@ -163,13 +163,13 @@ And the GPU column changes the ranking: Gemma-2-2B's GPU time alone,
 12.03 + 2.78 = 14.8 ms, already exceeds llama.cpp's 14.74 ms token. The
 worst Metal row is a kernel gap after all, not a host one.
 
-**2026-09-11, which kernels.** `FERROX_METAL_KERNEL_TIMING=1` gives
+**2026-09-11, which kernels.** `FRINK_METAL_KERNEL_TIMING=1` gives
 every op group of the dense decode stack its own timestamp-sampled
 encoder, and beside it `kernel_bench` (an ignored hardware test) times
 each small kernel serialized in one encoder the way `test-backend-ops
 perf` does under `GGML_METAL_CONCURRENCY_DISABLE=1`, so the number sits
 next to a llama.cpp `us/run` for the same op. The matvecs were already
-at parity (Q4_K 2304x9216: 101 us ferrox, 100-103 llama.cpp; Q6_K
+at parity (Q4_K 2304x9216: 101 us frink, 100-103 llama.cpp; Q6_K
 9216x2304: 116 against 122-128); everything small was not, and none of
 it was Gemma-specific fusion. Serialized, per dispatch, M2 Pro, min of 7:
 
@@ -193,7 +193,7 @@ score array, so each key's loads waited on the previous key's
 compile-time tile loops. Gemma-2's other candidates were checked and
 are NOT the gap: the sandwich norms cost the same per dispatch as
 Llama's, GeGLU is 4.5 us against llama.cpp's 6.2, and llama.cpp fuses
-`rms_norm + mul + add` where ferrox fuses `add + rms_norm`, one dispatch
+`rms_norm + mul + add` where frink fuses `add + rms_norm`, one dispatch
 per sublayer either way. The one absent fusion was the final logit
 softcap, 0.65 ms of host `tanh` over 256k logits per sampled token; it
 is an epilogue in the lm_head's command buffer now.
@@ -219,12 +219,12 @@ line is now 0.60× to 0.96× on decode.
 
 | Issue | Gap | What is known |
 |---|---|---|
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA prefill, 22× to 34× | ~4× is tensor cores (`mul_mm` has none), ~5× is undiagnosed kernel efficiency. #148 bought 20–26% and ruled out dequant redundancy and occupancy |
-| [#133](https://github.com/antonellof/ferrox/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing closed 9–19× to 2–5×. What limits the rest is not diagnosed — the access pattern was a real cost and was not the last one |
-| [#149](https://github.com/antonellof/ferrox/issues/149) | Metal decode, **closed**, worst row 0.96× | the "26% host" was an accounting error: the lm_head runs in a second, untimed command buffer, and its GPU time was booked as host. Encoding, argument binding included, is ~2% of wall (three measurements agree), so packing and pipelining are retired unbuilt. The kernel gap was then attributed per kind: RoPE, the norms and d=128/256 attention were 3x to 18x llama.cpp's per-dispatch cost, all memory-latency chains, and are fixed (stack GPU -15.5% on Gemma-2-2B, -9.6% on Llama-3B); the CPU softcap is a GPU epilogue. Left: ~0.2 ms submit latency per command buffer, two per sampled token; the quiet-host re-measure |
-| [#127](https://github.com/antonellof/ferrox/issues/127) | x86 CPU prefill, **1.04× to 1.64×** on the current code (was 6.3× to 10.1×) | was a missing kernel tier. [#159](https://github.com/antonellof/ferrox/pull/159) added AVX2 GEMMs for all five interleaved kinds; measured 2026-09-15 on a rented Ryzen 9 3900X (AVX2, no AVX-512) with `--suite`, receipts committed. The first run of that suite found ONE row still at 8.56× (Llama-3.2-1B Q5_K_M, 44 tok/s) beside Q4_K and Q6_K at 1.2×: the Q5_K batch arm gated its Kx8 path on `cfg!(target_arch = "aarch64")` where the Q4_K and Q6_K arms asked the kernels, so every x86 Q5_K prefill ran the per-row GEMM. One predicate later it is 0.91× on a 5950X and 1.04× on the 3900X, and Phi-4-mini (whose `attn_qkv` is Q5_K) went 3.24× to 1.18×. What is left on x86 prefill: IQ4_XS at **4.45×**, a missing batch kernel (the fallback re-decodes each row per activation with the f32 dot; llama.cpp's `vec_dot_iq4_xs_q8_K` is an int8 dot over Q8_K activations), and the Q8_0 rows at 1.5× to 2.1× that shrink with model size (SmolLM2 2.08×, Qwen 1.5× to 1.6×, TinyLlama 1.5×, 8B 1.2×), which is the per-token / per-op constant of #128 seen from the prefill side. Decode is 1.04× to 1.17× everywhere but SmolLM2 (1.34×) |
-| [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode default | the size rule landed in [#155](https://github.com/antonellof/ferrox/pull/155); the crossover constant is bracketed by the published numbers, not swept, and no before/after on a quiet host has been run. `MIN_TASK_MACS` is still there, which the issue asks to delete |
-| [#128](https://github.com/antonellof/ferrox/issues/128) | CPU decode dispatch, **closed** | The condvar wait was real and the cause was rayon's two-armed `join`: from a non-worker thread it injects and blocks on a mutex, ~150 times per token. [#167](https://github.com/antonellof/ferrox/pull/167) runs a whole forward in one `rayon::scope`. Note the trap: #128 had computed scheduling at 6.7% of a token and ruled it out, against a **stale denominator** taken before #155 removed the repack that inflated the token to 17 ms. At ~5 ms the same fixed cost is a much larger share |
+| [#133](https://github.com/antonellof/frink/issues/133) | CUDA prefill, 22× to 34× | ~4× is tensor cores (`mul_mm` has none), ~5× is undiagnosed kernel efficiency. #148 bought 20–26% and ruled out dequant redundancy and occupancy |
+| [#133](https://github.com/antonellof/frink/issues/133) | CUDA decode, 2.2× to 5.0× | memory-bound: 17–22% of card bandwidth against llama.cpp's ~60%. Coalescing closed 9–19× to 2–5×. What limits the rest is not diagnosed — the access pattern was a real cost and was not the last one |
+| [#149](https://github.com/antonellof/frink/issues/149) | Metal decode, **closed**, worst row 0.96× | the "26% host" was an accounting error: the lm_head runs in a second, untimed command buffer, and its GPU time was booked as host. Encoding, argument binding included, is ~2% of wall (three measurements agree), so packing and pipelining are retired unbuilt. The kernel gap was then attributed per kind: RoPE, the norms and d=128/256 attention were 3x to 18x llama.cpp's per-dispatch cost, all memory-latency chains, and are fixed (stack GPU -15.5% on Gemma-2-2B, -9.6% on Llama-3B); the CPU softcap is a GPU epilogue. Left: ~0.2 ms submit latency per command buffer, two per sampled token; the quiet-host re-measure |
+| [#127](https://github.com/antonellof/frink/issues/127) | x86 CPU prefill, **1.04× to 1.64×** on the current code (was 6.3× to 10.1×) | was a missing kernel tier. [#159](https://github.com/antonellof/frink/pull/159) added AVX2 GEMMs for all five interleaved kinds; measured 2026-09-15 on a rented Ryzen 9 3900X (AVX2, no AVX-512) with `--suite`, receipts committed. The first run of that suite found ONE row still at 8.56× (Llama-3.2-1B Q5_K_M, 44 tok/s) beside Q4_K and Q6_K at 1.2×: the Q5_K batch arm gated its Kx8 path on `cfg!(target_arch = "aarch64")` where the Q4_K and Q6_K arms asked the kernels, so every x86 Q5_K prefill ran the per-row GEMM. One predicate later it is 0.91× on a 5950X and 1.04× on the 3900X, and Phi-4-mini (whose `attn_qkv` is Q5_K) went 3.24× to 1.18×. What is left on x86 prefill: IQ4_XS at **4.45×**, a missing batch kernel (the fallback re-decodes each row per activation with the f32 dot; llama.cpp's `vec_dot_iq4_xs_q8_K` is an int8 dot over Q8_K activations), and the Q8_0 rows at 1.5× to 2.1× that shrink with model size (SmolLM2 2.08×, Qwen 1.5× to 1.6×, TinyLlama 1.5×, 8B 1.2×), which is the per-token / per-op constant of #128 seen from the prefill side. Decode is 1.04× to 1.17× everywhere but SmolLM2 (1.34×) |
+| [#27](https://github.com/antonellof/frink/issues/27) | CPU decode default | the size rule landed in [#155](https://github.com/antonellof/frink/pull/155); the crossover constant is bracketed by the published numbers, not swept, and no before/after on a quiet host has been run. `MIN_TASK_MACS` is still there, which the issue asks to delete |
+| [#128](https://github.com/antonellof/frink/issues/128) | CPU decode dispatch, **closed** | The condvar wait was real and the cause was rayon's two-armed `join`: from a non-worker thread it injects and blocks on a mutex, ~150 times per token. [#167](https://github.com/antonellof/frink/pull/167) runs a whole forward in one `rayon::scope`. Note the trap: #128 had computed scheduling at 6.7% of a token and ruled it out, against a **stale denominator** taken before #155 removed the repack that inflated the token to 17 ms. At ~5 ms the same fixed cost is a much larger share |
 
 ## Method
 
@@ -255,22 +255,22 @@ Four traps, each of which put a wrong number in this file before:
   fusion removing 5% of dispatches was worth ~1.4% of wall against a
   ~1.1% noise floor. "No difference" measured nothing either way.
 
-- **`ferrox bench` does not use the Metal greedy argmax fold, so the
+- **`frink bench` does not use the Metal greedy argmax fold, so the
   fold's eligibility does not move these rows.** Worth stating because
-  [#172](https://github.com/antonellof/ferrox/pull/172) stopped the fold
-  firing in `ferrox run`'s default configuration, which looks like it
+  [#172](https://github.com/antonellof/frink/pull/172) stopped the fold
+  firing in `frink run`'s default configuration, which looks like it
   should have changed the `tg` numbers and did not. The bench path asks
   the engine for full logits and argmaxes them on the host
   (`bench_guard::greedy_pick`), because a row that cannot show which
   token it produced cannot show it computed anything. The fold is opt-in
   through `set_metal_greedy_argmax`, and its thread-local setting
-  defaults to unset. It has **two** non-test callers, `ferrox-cli`'s
-  `run.rs` and `ferrox-server`'s `generate.rs`, and neither is in the
-  bench path. An earlier version of this note said only `ferrox run`
+  defaults to unset. It has **two** non-test callers, `frink-cli`'s
+  `run.rs` and `frink-server`'s `generate.rs`, and neither is in the
+  bench path. An earlier version of this note said only `frink run`
   calls it, which was wrong: the conclusion survives because what matters
   is that no caller is on the bench path, not how many callers exist.
   The two also differ in what the fix changed for them, which is worth
-  knowing: `ferrox run` defaults `--repeat-penalty` to 1.1 so its greedy
+  knowing: `frink run` defaults `--repeat-penalty` to 1.1 so its greedy
   Metal path stops folding, while the server defaults
   `repetition_penalty` to 1.0 so its greedy requests still fold unless a
   client sends a penalty.
@@ -285,7 +285,7 @@ warmup, so their prefill numbers include cold mmap page faults.
   has no `gemma4` arch, so its column is blank.
 - **Mixtral** is skipped by `--fit-host` on the Apple host.
 - **Metal regressions to keep off:** legacy GQA NSG=4, sequential
-  GREEDY argmax, early Multi-CB. `FERROX_METAL_FA_VEC=0` costs ~25.5
+  GREEDY argmax, early Multi-CB. `FRINK_METAL_FA_VEC=0` costs ~25.5
   pred. "float4 elem" used to be on this list from a 2026-08 wall-clock
   wash on a thermally limited host (~22 against ~21 pred, both noisy);
   the NORMS are float4 since 2026-09-11 on GPU-clock, interleaved

@@ -2,7 +2,7 @@
 #
 # The lint gate an Apple-silicon checkout cannot run by itself.
 #
-# Several kernels in ferrox-quant and ferrox-core exist twice: a NEON
+# Several kernels in frink-quant and frink-core exist twice: a NEON
 # path under `#[cfg(target_arch = "aarch64")]` and a portable scalar
 # fallback for everything else. On an M-series laptop `cargo clippy
 # --workspace` never compiles the fallbacks, so a lint that only fires
@@ -18,14 +18,14 @@
 #
 # Usage:
 #   scripts/check-cross-target.sh [target]
-#   FERROX_CROSS_TARGET=x86_64-unknown-linux-gnu scripts/check-cross-target.sh
+#   FRINK_CROSS_TARGET=x86_64-unknown-linux-gnu scripts/check-cross-target.sh
 #
 # To run it on every push, call it from the local pre-push hook. That
 # directory is gitignored and may already hold a hook, so append rather
 # than replace -- see CONTRIBUTING.md.
 set -euo pipefail
 
-TARGET="${1:-${FERROX_CROSS_TARGET:-x86_64-apple-darwin}}"
+TARGET="${1:-${FRINK_CROSS_TARGET:-x86_64-apple-darwin}}"
 HOST="$(rustc -vV | awk '/^host: /{print $2}')"
 
 if [ "$HOST" = "$TARGET" ]; then
@@ -74,7 +74,7 @@ if [ "$TARGET" != "$LINUX_TARGET" ] \
   && rustup target list --installed | grep -qx "$LINUX_TARGET"; then
   echo "cross-target gate: compute crates against ${LINUX_TARGET} (real non-Apple OS)"
   cargo clippy --target "$LINUX_TARGET" --all-targets \
-    -p ferrox-quant -p ferrox-gguf -p ferrox-core -p ferrox-moe -p ferrox-models \
+    -p frink-quant -p frink-gguf -p frink-core -p frink-moe -p frink-models \
     -- -D warnings
   echo "cross-target gate: ok (${LINUX_TARGET}, compute crates)"
 else

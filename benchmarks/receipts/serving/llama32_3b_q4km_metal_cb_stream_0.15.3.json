@@ -2,7 +2,7 @@
   "id": "llama32_3b_q4km",
   "kind": "serving",
   "workload": "stream_sequential",
-  "ferrox_version": "0.15.3",
+  "frink_version": "0.15.3",
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
@@ -26,7 +26,7 @@
   "ttft_ms_max": 120.5,
   "completion_tokens_total": 759,
   "completion_tokens_mean": 94.9,
-  "driver": "pi-agent-tests/ferrox_stream_bench.py",
+  "driver": "pi-agent-tests/frink_stream_bench.py",
   "notes": "Sequential streaming chat/completions over SSE. CB auto-on on Metal. Temperature default (not greedy). Validates 0.15.3 CB prefill fix: all prompts returned distinct, sensible text.",
   "measured_at": "2026-09-02"
 }

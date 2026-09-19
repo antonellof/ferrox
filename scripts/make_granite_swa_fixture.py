@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `granite_swa` GGUF used by ferrox's
+"""Generate the tiny synthetic `granite_swa` GGUF used by frink's
 per-layer-RoPE-pattern coverage test.
 
 `granite_swa` (Granite 4.1) landed upstream after the 2026-08-04
@@ -12,7 +12,7 @@ per-layer tables, of which only one was new here:
     nonzero meaning "this layer rotates" (`llama-hparams.cpp:333-343`,
     `llama_hparams::has_rope`, called at `:212`). It is the FIRST
     upstream graph that lets the FILE decide which layers rotate --
-    every other per-layer RoPE gate in `ferrox_models::rope_layers` is
+    every other per-layer RoPE gate in `frink_models::rope_layers` is
     a rule derived from a literal -- and `grep -rn
     LLM_KV_ATTENTION_ROPE_PATTERN src/models/*.cpp` over the 155 graphs
     is this one line.
@@ -21,13 +21,13 @@ Everything else is a seam that already landed, and this fixture carries
 each rather than assuming it:
 
   * Granite's four scalar multipliers (`:7-10`, `logit_scale` REQUIRED
-    and DIVIDED at `:192`; `ferrox_models::scalar_multipliers`),
+    and DIVIDED at `:192`; `frink_models::scalar_multipliers`),
   * the sliding-window BOOL ARRAY read with `get_arr` (`:17`) and a
     window narrower than the prompt,
   * REQUIRED per-layer attention sinks `{n_head}` (`:81`), which enter
     the softmax as one extra logit per head,
   * the OPTIONAL projection biases (`:79,100-102`,
-    `ferrox_models::proj_bias`): `attn_output.bias` and the three FFN
+    `frink_models::proj_bias`): `attn_output.bias` and the three FFN
     ones, all four carried here,
   * NORM RoPE, and a `kq_scale` that comes from `attention.scale`
     rather than `1/sqrt(head_dim)` (`:231`).
@@ -83,7 +83,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-granite-swa-fixture")
+    w.add_name("frink-granite-swa-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

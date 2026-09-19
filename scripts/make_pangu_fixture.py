@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `pangu-embedded` GGUF used by ferrox's
+"""Generate the tiny synthetic `pangu-embedded` GGUF used by frink's
 openPangu-Embedded coverage test
-(`crates/ferrox-models/tests/pangu_embedded_graphs.rs`).
+(`crates/frink-models/tests/pangu_embedded_graphs.rs`).
 
 `pangu-embedded` is openPangu-Embedded-1B / 7B (Huawei), a DECODER LLM
 (`PanguEmbeddedForCausalLM`; "Embedded" as in edge devices, not an
-embedding model). ferrox had it filed under "embedding variant;
+embedding model). frink had it filed under "embedding variant;
 deferred" and in the embedding loader's not-yet list, which is what
 this fixture corrects. `.scratch/llama.cpp/src/models/pangu-embed.cpp`
 is `llama.cpp`'s graph with ONE difference: a REQUIRED
@@ -58,7 +58,7 @@ def main(out_path: str, fused_qkv: bool, separate_output: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-pangu-embedded-fixture")
+    w.add_name("frink-pangu-embedded-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

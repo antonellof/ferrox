@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `phimoe` GGUFs used by ferrox's Phi-3.5-MoE
+"""Generate the tiny synthetic `phimoe` GGUFs used by frink's Phi-3.5-MoE
 coverage test.
 
 `phimoe` (Phi-3.5-MoE-instruct) refused as a `dedicated` row for its
@@ -88,7 +88,7 @@ def main(out_path: str, no_longrope: bool) -> None:
 
     ctx = ORIG_CTX if no_longrope else CTX
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-phimoe-fixture")
+    w.add_name("frink-phimoe-fixture")
     w.add_context_length(ctx)
     w.add_rope_scaling_orig_ctx_len(ORIG_CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,0 +1,85 @@
+[package]
+name = "frink-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "OpenAI-compatible HTTP server for the Frink inference engine"
+readme = "README.md"
+keywords = ["llm", "openai", "server", "inference", "frink"]
+categories = ["web-programming::http-server", "science"]
+
+# The server is a library with a two-line binary in front of it, not a
+# binary with everything inside `fn main`. frink-cli's optional `serve`
+# feature links this lib, so `frink serve` and `frink-server` run the
+# same code from the same `ServerArgs`.
+[lib]
+name = "frink_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "frink-server"
+path = "src/main.rs"
+
+[dependencies]
+frink-api = { workspace = true }
+frink-core = { workspace = true }
+# For the deterministic receipt id in `policy::outbox`: a retried stop
+# must derive the same id, or it writes a second billing event for work
+# that happened once.
+sha2 = { workspace = true }
+# The ported FreeToken serving policy: the reasoning / tool-call
+# parsers this server's chat path uses, and the withhold rule that
+# `stop::StopMatcher` shares with them.
+frink-models = { workspace = true, features = ["hub"] }
+frink-gguf = { workspace = true }
+frink-safetensors = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+frink-cuda = { workspace = true }
+frink-metal = { workspace = true }
+ureq = { workspace = true }
+futures-util = "0.3"
+# `tls-rustls-no-provider`, not `tls-rustls`: the latter is defined as
+# `["tls-rustls-no-provider", "rustls/aws-lc-rs"]`, and that one feature
+# was the ONLY thing pulling aws-lc-rs (and its C/assembly aws-lc-sys)
+# into the tree. ureq already asks rustls for `ring` with
+# default-features off, so cargo's feature unification was forcing
+# aws-lc-rs onto ureq's rustls too. Selecting the provider here instead
+# means one crypto backend, chosen deliberately, shared by both.
+#
+# The cost of `no-provider` is that rustls has no default provider at
+# runtime, so `main` installs one before serving TLS. That is a real
+# obligation -- forget it and TLS fails at accept time, not at compile
+# time -- so `install_ring_crypto_provider` is called unconditionally at
+# startup and has a test.
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+frink-moe = { workspace = true }
+base64 = "0.23.0"
+
+[features]
+default = []
+# Real NVRTC-compiled CUDA kernel dispatch for GPU-placed routed
+# experts, propagated down through
+# frink-models/frink-moe/frink-core. Builds cleanly without a CUDA
+# toolkit/GPU present (see frink-cuda's Cargo.toml comment); without
+# this feature, FRINK_GPU_VRAM_BUDGET_BYTES still works but every
+# expert always runs on CPU regardless of placement.
+cuda = ["frink-models/cuda"]
+# Apple Silicon Metal kernels through the same WeightMatrix::apply_gpu /
+# ExpertPlacement::GpuDevice path. macOS only.
+metal = ["frink-models/metal"]

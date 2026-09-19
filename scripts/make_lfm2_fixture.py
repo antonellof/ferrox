@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `lfm2` GGUF used by ferrox's LFM2 coverage
-test (`crates/ferrox-models/tests/lfm2_graphs.rs`).
+"""Generate the tiny synthetic `lfm2` GGUF used by frink's LFM2 coverage
+test (`crates/frink-models/tests/lfm2_graphs.rs`).
 
 `lfm2` (LFM2-350M / 700M / 1.2B / 2.6B, LFM2-VL's text tower) is the
 first HYBRID row on the generic path. `.scratch/llama.cpp/src/models/
@@ -48,7 +48,7 @@ Variants:
                      (`create_tensor_qkv`, :78)
   * `--output`       a separate `output.weight`
   * `--window`       `attention.sliding_window 4`, which lfm2.cpp:24-29
-                     honours on the ATTENTION layers only; ferrox refuses
+                     honours on the ATTENTION layers only; frink refuses
                      this file by name (`crate::shortconv`), libllama
                      runs it
 
@@ -101,7 +101,7 @@ def main(
 
     arch = MOE_ARCH if moe else ARCH
     w = gguf.GGUFWriter(out_path, arch)
-    w.add_name(f"ferrox-{arch}-fixture")
+    w.add_name(f"frink-{arch}-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

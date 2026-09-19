@@ -1,13 +1,13 @@
 # Models
 
-What Ferrox runs, and how it compares to llama.cpp on the same host.
+What Frink runs, and how it compares to llama.cpp on the same host.
 Speed table: [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md)
-(`ferrox bench` vs `llama-bench`). Suite list:
+(`frink bench` vs `llama-bench`). Suite list:
 [`benchmarks/suite.json`](../benchmarks/suite.json). Architecture list:
-`ferrox archs` →
+`frink archs` →
 [`manifests/architecture_manifest.md`](manifests/architecture_manifest.md).
 
-**Gap** = `llama / ferrox`. Values below 1.0 mean Ferrox is faster.
+**Gap** = `llama / frink`. Values below 1.0 mean Frink is faster.
 
 Suite policy: keep the **current** generation per family. Llama-3.2, not
 3.1. Gemma-3/4, not Gemma-2. Phi-4, not Phi-3. Older GGUFs still load
@@ -26,19 +26,19 @@ GGUF under `models/`.
 | Gemma-4-E2B-IT Q4_K_M | Dedicated engine + `gemma4` BPE |
 
 ```bash
-./target/release/ferrox -m /path/to/model.gguf \
+./target/release/frink -m /path/to/model.gguf \
   -p "The capital of France is" -n 32 --temp 0 --no-cnv
 
-./target/release/ferrox-server -m /path/to/model.gguf \
+./target/release/frink-server -m /path/to/model.gguf \
   --host 127.0.0.1 --port 8383
 
-./target/release/ferrox chat --url http://127.0.0.1:8383
+./target/release/frink chat --url http://127.0.0.1:8383
 ```
 
 ## Verified (Host B)
 
-Gap = `llama / ferrox` from `ferrox bench` vs `llama-bench` (tg128 unless
-noted). **Bold** = ferrox faster. Neither engine's thread count is forced.
+Gap = `llama / frink` from `frink bench` vs `llama-bench` (tg128 unless
+noted). **Bold** = frink faster. Neither engine's thread count is forced.
 
 | Model | Metal decode | CPU decode |
 |---|---|---|
@@ -71,46 +71,46 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | MiroThinker | Works via `qwen3moe` |
 | Qwen2-MoE / Qwen1.5-MoE | Loads. Not in the current suite (OLMoE is the MoE entry) |
 | Mixtral | In the suite, skipped on 32 GiB Host B (`--fit-host`) |
-| MLA (`deepseek2` / `mistral4` / `plm`) | Dense-lead + MoE-after-dense via `MlaEngine`, checked against libllama. **Real checkpoint: PLM-1.8B-Instruct Q8_0** (`ferrox parity`, through the new MLA arm): tokenizer MATCH, graph 4.5e-5 from llama.cpp on the dequantized f32 file, and the Q8_0 file reads `WRONG` at 3.5e-2 because llama.cpp's own 8-bit activation quantization costs it 3.7e-2 on this graph where ferrox loses 2.8e-9 (`docs/plans/llama-cpp-gap-inventory.md` §10.1). Fixtures: `deepseek2` in BOTH tensor forms -- the split `attn_k_b` / `attn_v_b` every real export carries (the absorbed attention over a latent cache, `ferrox_core::mla_absorbed`; refused until 2026-09-12) and the legacy combined `attn_kv_b` -- KL 2.35e-15 and 3.57e-15 (`tests/deepseek2_graphs.rs`), and `plm` (PLM-1.8B) KL 1.87e-13 (`tests/plm_graphs.rs`). The lite DeepSeek-V2 layer counts take the direct-Q form. YaRN as every real DeepSeek-V2 / V3 export declares it is `ferrox_models::mla_yarn` (the `pe` frequency rewrite, the magnitude, `mscale^2` in `kq_scale`, with `deepseek2.cpp:34-37`'s `/ 0.1` on `yarn_log_multiplier` and `llama-context.cpp:210-213`'s DeepSeek-V2 rule), checked in both generations' shapes and both tensor forms, KL 2.98e-15 / 4.42e-15 / 2.94e-15. Any other scaling type, or `yarn` without `original_context_length`, is refused by name |
-| GLM-4-0414 / GLM-Z1 / GLM-OCR (`glm4`) | **Generic path, audited 2026-09-12** (`tests/glm4_graphs.rs`, KL 9.67e-15). It had been sent to the GLM-5.2 MLA loader for four keys `glm4.cpp` never reads, so a real GLM-4-9B-0414 failed on `q_lora_rank`; the graph is plain GQA with Gemma-2's two post norms in Gemma-2's slots and a fused SwiGLU, all of which the generic decoder already served. A GLM-4.1V text tower's `rope.dimension_sections` is refused by name (`ferrox_models::mrope`): llama.cpp rotates it M-RoPE over converter-permuted weights and its logits differ from the plain file's by 0.72 (measured) |
+| MLA (`deepseek2` / `mistral4` / `plm`) | Dense-lead + MoE-after-dense via `MlaEngine`, checked against libllama. **Real checkpoint: PLM-1.8B-Instruct Q8_0** (`frink parity`, through the new MLA arm): tokenizer MATCH, graph 4.5e-5 from llama.cpp on the dequantized f32 file, and the Q8_0 file reads `WRONG` at 3.5e-2 because llama.cpp's own 8-bit activation quantization costs it 3.7e-2 on this graph where frink loses 2.8e-9 (`docs/plans/llama-cpp-gap-inventory.md` §10.1). Fixtures: `deepseek2` in BOTH tensor forms -- the split `attn_k_b` / `attn_v_b` every real export carries (the absorbed attention over a latent cache, `frink_core::mla_absorbed`; refused until 2026-09-12) and the legacy combined `attn_kv_b` -- KL 2.35e-15 and 3.57e-15 (`tests/deepseek2_graphs.rs`), and `plm` (PLM-1.8B) KL 1.87e-13 (`tests/plm_graphs.rs`). The lite DeepSeek-V2 layer counts take the direct-Q form. YaRN as every real DeepSeek-V2 / V3 export declares it is `frink_models::mla_yarn` (the `pe` frequency rewrite, the magnitude, `mscale^2` in `kq_scale`, with `deepseek2.cpp:34-37`'s `/ 0.1` on `yarn_log_multiplier` and `llama-context.cpp:210-213`'s DeepSeek-V2 rule), checked in both generations' shapes and both tensor forms, KL 2.98e-15 / 4.42e-15 / 2.94e-15. Any other scaling type, or `yarn` without `original_context_length`, is refused by name |
+| GLM-4-0414 / GLM-Z1 / GLM-OCR (`glm4`) | **Generic path, audited 2026-09-12** (`tests/glm4_graphs.rs`, KL 9.67e-15). It had been sent to the GLM-5.2 MLA loader for four keys `glm4.cpp` never reads, so a real GLM-4-9B-0414 failed on `q_lora_rank`; the graph is plain GQA with Gemma-2's two post norms in Gemma-2's slots and a fused SwiGLU, all of which the generic decoder already served. A GLM-4.1V text tower's `rope.dimension_sections` is refused by name (`frink_models::mrope`): llama.cpp rotates it M-RoPE over converter-permuted weights and its logits differ from the plain file's by 0.72 (measured) |
 | GLM-4.5 / 4.5-Air / 4.6 (`glm4moe`) | **Generic path, audited 2026-09-12** (`tests/glm4moe_graphs.rs`, KL 1.51e-15 and 2.41e-15 on the 355B and Air shapes). Its refusal had two lives -- sent to the MLA loader for a `q_lora_rank` it never carries, then named for its pre-FFN norm stored as `post_attention_norm` -- and the second was one row in `norm_sites::PRE_FFN_NORM_IS_POST_ATTENTION_NORM`. A GLM-4.5V text tower's `rope.dimension_sections` rotates NEOX here, and libllama's M-RoPE logits on text positions are byte-identical (measured). No real checkpoint run yet: the smallest export is 106B |
-| Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. **Cross-engine evidence since 2026-09-12**: against a libllama built from `.scratch/llama.cpp` (1269cb1, which has `gemma4.cpp`), `ferrox parity` reads tokenizer MATCH (21 cases x 2) and logits MATCH, KL 5.1e-4 on Q4_K_M with top-10 overlap 10/10 -- the K-quant band, so the graph agrees and the file is not one a WRONG line can be drawn on. |
+| Gemma-4-E2B | Dedicated `Gemma4Engine` + SPM-style `gemma4` BPE tokenizer + `<|turn>` chat wrap. GGUF: `models/gemma-4-E2B-it-Q4_K_M.gguf` (`unsloth/gemma-4-E2B-it-GGUF`). Suite id `gemma4_e2b_q4km`, Homebrew llama may still lack `gemma4` arch. **Cross-engine evidence since 2026-09-12**: against a libllama built from `.scratch/llama.cpp` (1269cb1, which has `gemma4.cpp`), `frink parity` reads tokenizer MATCH (21 cases x 2) and logits MATCH, KL 5.1e-4 on Q4_K_M with top-10 overlap 10/10 -- the K-quant band, so the graph agrees and the file is not one a WRONG line can be drawn on. |
 | gpt-oss | **CPU only.** Attention sinks, alternating sliding-window attention, biased router and the `swiglu_oai` clamp, checked against llama.cpp's own reference logits. Metal stops with an error, because no Metal kernel implements attention sinks. The paged-KV decode path runs it: all three attention arms are bit-identical to their contiguous twins |
 | Cohere2 MoE (`cohere2moe`: the 49-layer 30B-A3B) | **Generic path, audited 2026-09-14** (`tests/cohere2moe_graphs.rs`, KL 1.7e-14 LayerNorm, 1.3e-14 RMSNorm, the MTP-block file byte-identical to the trunk's golden in libllama and here, 6.4e-15 softmax with `norm_w`). The `cohere2` graph with routed experts: a layer rotates when it slides OR sits in the dense prefix (`rope_layers::SlidingOrLeadingDense`), `(moe_out + shexp) * 0.5` on a layer with a shared expert (`parallel_dense_ffn::SHARED_EXPERT_SUM_SCALE`), the norm function from which epsilon key the file carries (`norm::NORM_BY_RMS_EPS_KEY`), the window array at TRUNK length (`swa_layers::ARRAY_AT_TRUNK_LENGTH`) |
-| Llama 4 (`llama4`: Scout 17B-16E, Maverick 17B-128E) | **Generic path, audited 2026-09-14** (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16-expert and 128-expert shapes, and the last of 8200 positions across the 8192-position chunk boundary on both the prefill and the row body). Five seams: the CHUNKED window (`ferrox_models::chunked_swa`, a query sees its own chunk), the literal attention temperature on the unrotated layers (`attn_temperature::LITERAL_ATTN_TEMPERATURE`), a weightless per-head QK norm after RoPE on the rotating layers for every expert count but 128 (`weightless_qk_norm`), the routing weight on the expert's INPUT (`routed_weight_site`, `llama-graph.cpp:1947`) and the interleave step the tensor loader honours (`moe_interleave::INTERLEAVE_STEP_HONOURED_BY_LOADER`). A converter's `sliding_window 0` (all-full-attention MobileLLM) and a zero expert count are refused by name: libllama aborts on the first and refuses the second. CPU only: the fused Metal launches take one window per layer |
-| MiniMax | `minimax-m2` (MiniMax-M2) **runs** on the generic path since 2026-09-14: plain GQA + whole-vector QK norm + partial NEOX RoPE + a sigmoid MoE with `exp_probs_b`, KL 3.4e-15 against libllama on the fixture that had said it was a fixture away (`tests/minimax_m2_graphs.rs`). `minimax-m3` **will not load**: it needs MiniMax Sparse Attention (a per-layer indexer driving its own MSA KV cache), of which ferrox has only the block-selection rule |
-| LFM2 (`lfm2`: LFM2-350M / 700M / 1.2B / 2.6B, LFM2-VL's text tower; `lfm2moe`: LFM2-8B-A1B, 24B-A2B) | **Generic path, audited 2026-09-14** (`tests/lfm2_graphs.rs`, KL 3.2e-12 on the split, fused-QKV and separate-`output` fixtures, 6.0e-13 on the MoE, contiguous, paged and multi-seq). The first hybrid row: `lfm2.cpp:9-11` marks a layer recurrent when `head_count_kv` is 0, and its short convolution (`ferrox_models::shortconv`) runs at the attention site with its state kept as the layer's KV history. `lfm2moe` is the same graph with leading dense layers and a sigmoid MoE with `exp_probs_b`; a file declaring `attention.sliding_window` is refused by name (no export writes it) |
-| Granite 4.0 (`granitehybrid`: H-Micro 3B, H-Tiny 7B-A1B, H-Small 32B-A9B; `granite-hybrid` alias) | **Generic path, audited 2026-09-14** (`tests/granite_hybrid_graphs.rs`, KL 1.9e-13 NoPE dense, 7.9e-13 rotated, 1.0e-13 MoE + shared expert). The first Mamba-2 row: the block runs where attention would be on the zero-KV layers (`ferrox_models::mamba2`), its state as a `RecurrentState` beside the layer's cache. `rope.scaling.finetuned = false` (every real export) rotates nothing. No prefix-cache reuse and no `--model-draft` on such a model: a Mamba state cannot be rolled back to a middle position |
+| Llama 4 (`llama4`: Scout 17B-16E, Maverick 17B-128E) | **Generic path, audited 2026-09-14** (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16-expert and 128-expert shapes, and the last of 8200 positions across the 8192-position chunk boundary on both the prefill and the row body). Five seams: the CHUNKED window (`frink_models::chunked_swa`, a query sees its own chunk), the literal attention temperature on the unrotated layers (`attn_temperature::LITERAL_ATTN_TEMPERATURE`), a weightless per-head QK norm after RoPE on the rotating layers for every expert count but 128 (`weightless_qk_norm`), the routing weight on the expert's INPUT (`routed_weight_site`, `llama-graph.cpp:1947`) and the interleave step the tensor loader honours (`moe_interleave::INTERLEAVE_STEP_HONOURED_BY_LOADER`). A converter's `sliding_window 0` (all-full-attention MobileLLM) and a zero expert count are refused by name: libllama aborts on the first and refuses the second. CPU only: the fused Metal launches take one window per layer |
+| MiniMax | `minimax-m2` (MiniMax-M2) **runs** on the generic path since 2026-09-14: plain GQA + whole-vector QK norm + partial NEOX RoPE + a sigmoid MoE with `exp_probs_b`, KL 3.4e-15 against libllama on the fixture that had said it was a fixture away (`tests/minimax_m2_graphs.rs`). `minimax-m3` **will not load**: it needs MiniMax Sparse Attention (a per-layer indexer driving its own MSA KV cache), of which frink has only the block-selection rule |
+| LFM2 (`lfm2`: LFM2-350M / 700M / 1.2B / 2.6B, LFM2-VL's text tower; `lfm2moe`: LFM2-8B-A1B, 24B-A2B) | **Generic path, audited 2026-09-14** (`tests/lfm2_graphs.rs`, KL 3.2e-12 on the split, fused-QKV and separate-`output` fixtures, 6.0e-13 on the MoE, contiguous, paged and multi-seq). The first hybrid row: `lfm2.cpp:9-11` marks a layer recurrent when `head_count_kv` is 0, and its short convolution (`frink_models::shortconv`) runs at the attention site with its state kept as the layer's KV history. `lfm2moe` is the same graph with leading dense layers and a sigmoid MoE with `exp_probs_b`; a file declaring `attention.sliding_window` is refused by name (no export writes it) |
+| Granite 4.0 (`granitehybrid`: H-Micro 3B, H-Tiny 7B-A1B, H-Small 32B-A9B; `granite-hybrid` alias) | **Generic path, audited 2026-09-14** (`tests/granite_hybrid_graphs.rs`, KL 1.9e-13 NoPE dense, 7.9e-13 rotated, 1.0e-13 MoE + shared expert). The first Mamba-2 row: the block runs where attention would be on the zero-KV layers (`frink_models::mamba2`), its state as a `RecurrentState` beside the layer's cache. `rope.scaling.finetuned = false` (every real export) rotates nothing. No prefix-cache reuse and no `--model-draft` on such a model: a Mamba state cannot be rolled back to a middle position |
 | Nemotron-H (`nemotron_h`: 8B / 47B / 56B, Nemotron-3 Nano dense) | **Generic path, audited 2026-09-14** (`tests/nemotron_h_graphs.rs`, KL 2.0e-13 plain, 1.4e-12 with the three optional biases, 7.5e-14 separate `output`). One block per layer (Mamba-2, NoPE attention, or the ungated ReLU-squared FFN) under one norm; no prefix-cache reuse and no `--model-draft`, as for every Mamba model. `nemotron_h_moe` (Nemotron-3 Nano 30B-A3B) **runs** too (KL 3.6e-13): a sigmoid MoE of ungated ReLU-squared experts with the router bias, plus an ungated shared expert; a file declaring `moe_latent_size` (Nemotron-3 Super) is refused by name |
-| Jamba (`jamba`: AI21 Jamba-v0.1 / 1.5), Mamba (`mamba`: 130M to 2.8B, FalconMamba-7B), Mamba-2 (`mamba2`: Mamba-Codestral-7B) | **Generic path, audited 2026-09-14** (`tests/mamba_graphs.rs`, KL 7.3e-12 / 2.3e-12 / 1.8e-12 with `ssm.dt_b_c_rms` / 3.6e-13). The Mamba-1 block (`ferrox_models::mamba1`) and the pure recurrent models with no attention anywhere; no prefix-cache reuse and no `--model-draft`, as for every Mamba model |
-| Falcon-H1 (`falcon-h1`: 0.5B to 34B) | **Generic path, audited 2026-09-14** (`tests/falcon_h1_graphs.rs`, KL 1.3e-13 plain, 6.2e-13 without `ssm_norm`, 3.2e-13 separate `output`). Attention and Mamba-2 in parallel on every layer (`ferrox_models::mamba2::PARALLEL_WITH_ATTENTION`); no prefix-cache reuse and no `--model-draft`, as for every Mamba model |
+| Jamba (`jamba`: AI21 Jamba-v0.1 / 1.5), Mamba (`mamba`: 130M to 2.8B, FalconMamba-7B), Mamba-2 (`mamba2`: Mamba-Codestral-7B) | **Generic path, audited 2026-09-14** (`tests/mamba_graphs.rs`, KL 7.3e-12 / 2.3e-12 / 1.8e-12 with `ssm.dt_b_c_rms` / 3.6e-13). The Mamba-1 block (`frink_models::mamba1`) and the pure recurrent models with no attention anywhere; no prefix-cache reuse and no `--model-draft`, as for every Mamba model |
+| Falcon-H1 (`falcon-h1`: 0.5B to 34B) | **Generic path, audited 2026-09-14** (`tests/falcon_h1_graphs.rs`, KL 1.3e-13 plain, 6.2e-13 without `ssm_norm`, 3.2e-13 separate `output`). Attention and Mamba-2 in parallel on every layer (`frink_models::mamba2::PARALLEL_WITH_ATTENTION`); no prefix-cache reuse and no `--model-draft`, as for every Mamba model |
 | openPangu-Embedded (`pangu-embedded`: 1B / 7B) | **Generic path, audited 2026-09-14** (`tests/pangu_embedded_graphs.rs`, KL 1.5e-13 on split, fused-QKV and separate-`output` fixtures). A decoder LLM, not an embedding model; `llama.cpp`'s graph plus a required `attn_output.bias` |
-| Qwen3.5 dense (`qwen35`: 0.8B / 2B / 4B / 9B / 27B) | **Generic path, audited 2026-09-14** (`tests/qwen35_graphs.rs`, KL 4.1e-13 / 4.1e-13 (the `attention.recurrent_layers` spelling) / 5.7e-13). The gated delta net where attention would be (`ferrox_models::gdn`, `ferrox_core::gdn`), gated full attention on every fourth layer, partial IMROPE. The old GDN scaffold (`gdn.rs`, `hybrid_gguf_loader.rs`, 1.8k lines that had never met libllama) is deleted. `qwen35moe` (Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B) **runs** too (KL 2.9e-11, `qwen2moe`'s FFN with the sigmoid-gated shared expert); `qwen3next` (Qwen3-Next-80B-A3B) **runs** too (KL 8.7e-12): the same layers with the V heads grouped over the K heads (`HeadMap::Grouped`) and beta / alpha in one `ssm_ba` projection. No prefix-cache reuse and no `--model-draft`, as for every recurrent model |
-| Ternary-Bonsai-2-27B (PrismML; `qwen35` + `PTQ1_0` + folded Hadamard) | **Runs, verified on the real checkpoint 2026-09-18** against PrismML's llama.cpp fork (`ferrox parity`, first-token KL 2.1e-5 on CPU, 2.3e-5 on Metal decode, 2.2e-6 through the Metal GEMM path; tokenizer MATCH on 1198 tokens, `pre=qwen35`). `PTQ1_0` (ggml type 143: 128 trits in 24 + 2 bytes and an f16 scale, `ferrox_quant::ternary`) has a scalar CPU dot, a Metal matvec and a Metal simdgroup GEMM (`ferrox-metal/src/ternary.rs`); `PQ2_0` (142) is recognised and sized, not executed. The `prism.hadamard.*` metadata (block-1024 normalised Walsh-Hadamard with explicit signs, folded into every listed weight; the inverse on `token_embd` rows; the tiled-to-grouped head permutation on `ssm_out`) is `ferrox_models::hadamard_fold` and `WeightMatrix::Folded`, applied to the activation before every launch and to the embedding row after the lookup. Speed on the M2 Pro, back to back on a quiet box: **43.1 prefill / 11.17 decode** against the fork's 66.8 / 11.46 (0.23.1 was 32.7 / 7.7), and decode is FLAT with context -- 11.17 / 11.19 / 11.16 at 32 / 300 / 600 tokens against the fork's 11.46 / 11.50 -- where before 0.25.0 it sloped, because the attention ran on the host and its work grows with `seq_len`. A four-layer group on this hybrid (one attention layer, three recurrent) is ONE Metal submission with no host step inside it: the recurrent layers run end to end on the device and wait once, the attention layer's tail rides in the next group's command buffer and its projections in the previous one's, and the attention itself reads the sequence's own device KV mirror (`KvCache::metal_attn`). That took a decode token from 192 command buffers to 69 to 20. What remains is measured in `docs/plans/gdn-resident-state.md` and is not plumbing: the token's GPU time is 88.8 ms against the fork's whole token of 86.7-87.3, so the last ~3% is inside the PTQ1_0 matvec |
+| Qwen3.5 dense (`qwen35`: 0.8B / 2B / 4B / 9B / 27B) | **Generic path, audited 2026-09-14** (`tests/qwen35_graphs.rs`, KL 4.1e-13 / 4.1e-13 (the `attention.recurrent_layers` spelling) / 5.7e-13). The gated delta net where attention would be (`frink_models::gdn`, `frink_core::gdn`), gated full attention on every fourth layer, partial IMROPE. The old GDN scaffold (`gdn.rs`, `hybrid_gguf_loader.rs`, 1.8k lines that had never met libllama) is deleted. `qwen35moe` (Qwen3.5-35B-A3B, 122B-A10B, 397B-A17B) **runs** too (KL 2.9e-11, `qwen2moe`'s FFN with the sigmoid-gated shared expert); `qwen3next` (Qwen3-Next-80B-A3B) **runs** too (KL 8.7e-12): the same layers with the V heads grouped over the K heads (`HeadMap::Grouped`) and beta / alpha in one `ssm_ba` projection. No prefix-cache reuse and no `--model-draft`, as for every recurrent model |
+| Ternary-Bonsai-2-27B (PrismML; `qwen35` + `PTQ1_0` + folded Hadamard) | **Runs, verified on the real checkpoint 2026-09-18** against PrismML's llama.cpp fork (`frink parity`, first-token KL 2.1e-5 on CPU, 2.3e-5 on Metal decode, 2.2e-6 through the Metal GEMM path; tokenizer MATCH on 1198 tokens, `pre=qwen35`). `PTQ1_0` (ggml type 143: 128 trits in 24 + 2 bytes and an f16 scale, `frink_quant::ternary`) has a scalar CPU dot, a Metal matvec and a Metal simdgroup GEMM (`frink-metal/src/ternary.rs`); `PQ2_0` (142) is recognised and sized, not executed. The `prism.hadamard.*` metadata (block-1024 normalised Walsh-Hadamard with explicit signs, folded into every listed weight; the inverse on `token_embd` rows; the tiled-to-grouped head permutation on `ssm_out`) is `frink_models::hadamard_fold` and `WeightMatrix::Folded`, applied to the activation before every launch and to the embedding row after the lookup. Speed on the M2 Pro, back to back on a quiet box: **43.1 prefill / 11.17 decode** against the fork's 66.8 / 11.46 (0.23.1 was 32.7 / 7.7), and decode is FLAT with context -- 11.17 / 11.19 / 11.16 at 32 / 300 / 600 tokens against the fork's 11.46 / 11.50 -- where before 0.25.0 it sloped, because the attention ran on the host and its work grows with `seq_len`. A four-layer group on this hybrid (one attention layer, three recurrent) is ONE Metal submission with no host step inside it: the recurrent layers run end to end on the device and wait once, the attention layer's tail rides in the next group's command buffer and its projections in the previous one's, and the attention itself reads the sequence's own device KV mirror (`KvCache::metal_attn`). That took a decode token from 192 command buffers to 69 to 20. What remains is measured in `docs/plans/gdn-resident-state.md` and is not plumbing: the token's GPU time is 88.8 ms against the fork's whole token of 86.7-87.3, so the last ~3% is inside the PTQ1_0 matvec |
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders and primitives only. Nothing has been run end to end on a real checkpoint |
 | Vision | Finds an mmproj file and warns about it. An `image_url` in a request returns an error |
-| MTP / speculative | `--mtp` errors by design. `ferrox speculative` is prompt-lookup only (an n-gram match over the history, no draft model) and runs on **synthetic random weights**, so the hit rate it prints is not representative of a real drafter. Plan for a real one: [`docs/plans/on-hold/dflash-speculative-decoding.md`](plans/on-hold/dflash-speculative-decoding.md) |
+| MTP / speculative | `--mtp` errors by design. `frink speculative` is prompt-lookup only (an n-gram match over the history, no draft model) and runs on **synthetic random weights**, so the hit rate it prints is not representative of a real drafter. Plan for a real one: [`docs/plans/on-hold/dflash-speculative-decoding.md`](plans/on-hold/dflash-speculative-decoding.md) |
 | Embeddings | `/v1/embeddings` for a GGUF decoder (mean/last pool), and for the BERT-family ENCODERS `bert`, `nomic-bert` (nomic-embed-text v1 / v1.5) and `jina-bert-v3` (jina-embeddings-v3), each checked against llama.cpp's own pooled embedding (`tests/bert_family_graphs.rs`; the real-checkpoint comparison is `tests/bert_llama_cpp_parity.rs`, `--ignored`). `bert_gguf_loader::ENCODER_ARCHS` is the table: the three differ from each other in a rotation and an FFN and in nothing else. `/v1/rerank` uses the same encoder with a rank head |
 
 ## When a model will not load
 
 Some checkpoints stop with an error instead of running. That is
-deliberate. The alternative is worse: a model whose graph Ferrox only
+deliberate. The alternative is worse: a model whose graph Frink only
 partly implements will load, run fast, and return fluent text computed
 by the wrong maths, and nothing in the output tells you. An error you
 can read beats output you cannot trust.
 
 The error always names the reason. Six things cause it:
 
-1. **Ferrox does not know the architecture.** It is not in the
+1. **Frink does not know the architecture.** It is not in the
    capability registry.
 
-2. **Ferrox knows it and has not implemented it.** `minimax-m3` stops
+2. **Frink knows it and has not implemented it.** `minimax-m3` stops
    with the missing feature named (`llama4` left this list on
    2026-09-14).
    The parallel residual, `x + attn(norm(x)) + ffn(norm(x))`, used to
    be this list's biggest group and is served now
-   (`ferrox_models::parallel_residual`; `gptneox` and `plamo` run on
+   (`frink_models::parallel_residual`; `gptneox` and `plamo` run on
    it, and `command-r`, `falcon`, `phi2`, `cohere2` and `cohere2moe`
    since), so nothing stops for it any more. `minicpm`
    was on this list and no longer is:
@@ -118,17 +118,17 @@ The error always names the reason. Six things cause it:
    applies whether or not the GGUF declares them, and those are
    implemented now (see 4 below).
 
-3. **The file contains weights Ferrox never reads.** The GGUF reader
+3. **The file contains weights Frink never reads.** The GGUF reader
    records every tensor name a loader looks up and stops if any are left
    over: *"checkpoint carries N tensor(s) this build never reads, so its
    graph is not the one this build computes."* Unread weights mean the
-   file describes a model Ferrox is not computing. This catches missing
+   file describes a model Frink is not computing. This catches missing
    graph features automatically rather than one at a time, which is how
    `attn_sinks` and `exp_probs_b` were both found. Tensors for parts
-   Ferrox does not claim to run (`mm.`, `v.`, `mmproj.`, `resampler.`,
+   Frink does not claim to run (`mm.`, `v.`, `mmproj.`, `resampler.`,
    `audio.`) are ignored.
 
-4. **The file declares a scale factor Ferrox does not apply.** These are
+4. **The file declares a scale factor Frink does not apply.** These are
    hyperparameters rather than weights, so the check above cannot see
    them, and a checkpoint declaring one would otherwise load cleanly
    while computing a differently-scaled graph than it was trained as.
@@ -139,8 +139,8 @@ The error always names the reason. Six things cause it:
    **Granite is the exception now, and the refusal list is derived from
    the same table that says so.** `granite`, `granitemoe` and the
    `granite-moe` alias apply all four, checked against llama.cpp's own
-   logits (`crates/ferrox-models/tests/granite_family_graphs.rs`), and
-   `ferrox_models::scalar_multipliers` implements them once for all
+   logits (`crates/frink-models/tests/granite_family_graphs.rs`), and
+   `frink_models::scalar_multipliers` implements them once for all
    three rather than once per architecture. `residual_scale` was the
    expensive half: it multiplies both branch outputs of every layer,
    which meant collapsing eighteen hand-written residual adds in
@@ -161,7 +161,7 @@ The error always names the reason. Six things cause it:
    and the generic decoder had no way to express "unrotated"; it has
    one since `gpt2` closed (`RopeLayers::Never`), and since 2026-09-14
    the file runs unrotated as llama.cpp runs it
-   (`ferrox_models::rope_finetuned`). Every Granite-4.0 hybrid export
+   (`frink_models::rope_finetuned`). Every Granite-4.0 hybrid export
    writes the key false (`conversion/granite.py:253-256`), which is what
    turned the refusal into a row.
 
@@ -177,7 +177,7 @@ The error always names the reason. Six things cause it:
    all: a fixture that declared them would pass with or without the
    hook. A second fixture declares all three and pins that the FILE
    still wins, which one fixture cannot see
-   (`crates/ferrox-models/tests/minicpm_graphs.rs`). MiniCPM reads no
+   (`crates/frink-models/tests/minicpm_graphs.rs`). MiniCPM reads no
    `attention.scale` (`minicpm.cpp:3-24` has no such key), so that one
    is still refused for this row, by the derived list -- measured, too:
    libllama's logits for a file declaring it are byte-identical to the
@@ -195,9 +195,9 @@ The error always names the reason. Six things cause it:
    generic decoder rotates every Q and K head of every layer unless
    `rope_layers` says otherwise. `gpt2` and `starcoder` use a learned
    absolute position table instead, and run since 2026-09-14
-   (`ferrox_models::position_embd`, `RopeLayers::Never`); `mpt`,
+   (`frink_models::position_embd`, `RopeLayers::Never`); `mpt`,
    `refact`, `bloom`, `jais` and Baichuan-13B use ALiBi, and run since
-   the same day (`ferrox_models::alibi`, `ferrox_core::alibi`). This
+   the same day (`frink_models::alibi`, `frink_core::alibi`). This
    was the least visible failure of the five: `bloom` and `refact`
    hardcode their ALiBi slope in llama.cpp's own loader and carry no
    GGUF key at all, and `baichuan` tells its 7B (rotating) from its
@@ -228,7 +228,7 @@ The error always names the reason. Six things cause it:
    The other **2** stop with `UnauditedArchitecture`. (`plm` is not in
    the 54 and not in the 2: it runs on the MLA engine, `DedicatedOnly`,
    with its own golden.)
-   `FERROX_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
+   `FRINK_ALLOW_UNAUDITED_ARCH=1` runs one anyway; compare the output
    against llama.cpp yourself before you trust it.
 
 **Gemma-2-27B, Gemma-3-4B/12B/27B: corrected 2026-09-02.** Those four
@@ -243,7 +243,7 @@ the audited fixture, which is why neither was visible.
 
 The evidence is llama.cpp's source and header-driven loader tests, NOT a
 logit comparison: no checkpoint of those sizes exists on the development
-host. A `ferrox parity` run against one is what would settle it.
+host. A `frink parity` run against one is what would settle it.
 
 A cost came with it and has since been paid back. Gemma-3 4B and up
 briefly left the fused Metal dense stacks, because those took one
@@ -259,8 +259,8 @@ Gemma-3-1B would prove nothing because it declares no rope scaling. The
 Metal tests build a two-layer stack carrying Gemma-3's two answers
 (base 1e6 divided by 8, and base 1e4 divided by 1) and assert the fused
 and per-layer launches agree bit for bit, then re-run the old bug on
-purpose so neither can pass vacuously. `ferrox layer-divergence` on a
-real gemma-3-4b, plus `ferrox parity` at Q8_0, is what would settle it.
+purpose so neither can pass vacuously. `frink layer-divergence` on a
+real gemma-3-4b, plus `frink parity` at Q8_0, is what would settle it.
 
 No published number changes:
 [`benchmarks/RESULTS.md`](../benchmarks/RESULTS.md) carries Gemma-3-1B
@@ -278,14 +278,14 @@ reading nobody has done, and the refusal says which, with the
 
 | Class | Means |
 |---|---|
-| `FIXTURE-AWAY` | Ferrox already computes this graph. What is missing is evidence. |
+| `FIXTURE-AWAY` | Frink already computes this graph. What is missing is evidence. |
 | `ONE MATCH ARM` | One small, named piece: an activation, a norm slot, a routing flag, an ordering. |
 | `NEW CODE` | A different attention or residual structure. Not close. |
 | `UNKNOWN` | Reading both trees did not settle it. The message says what would. |
 
-All 2 have now been read on both sides (`ferrox_models::capability`,
-pinned by `crates/ferrox-models/tests/unaudited_triage.rs`). The
-distribution is the headline answer to "how far is Ferrox from llama.cpp
+All 2 have now been read on both sides (`frink_models::capability`,
+pinned by `crates/frink-models/tests/unaudited_triage.rs`). The
+distribution is the headline answer to "how far is Frink from llama.cpp
 on models":
 
 | Class | Count |
@@ -316,12 +316,12 @@ right reason.
 were admitted with libllama-golden fixtures on 2026-09-03, `gemma`
 followed, and `chatglm` left the class the other way: an attempt to
 build its fixture found the fused `attn_qkv.bias` that every real
-ChatGLM2/3 export carries and ferrox dropped, so it became ONE MATCH
+ChatGLM2/3 export carries and frink dropped, so it became ONE MATCH
 ARM before closing as that.
 
 **One match arm (0).** `chatglm` was the last row here and closed on
 2026-09-10. Its arm was the fused `attn_qkv.bias`: llama.cpp's
-`create_tensor_qkv` puts the bias where the weight is, and ferrox split
+`create_tensor_qkv` puts the bias where the weight is, and frink split
 the fused weight while reading the bias only under the split
 `attn_q.bias` names, so ChatGLM2/3's `add_qkv_bias: true` was dropped
 and all three projections ran unbiased. Both halves now come out of one
@@ -333,7 +333,7 @@ really is shared -- `qwen.cpp:28` marks it REQUIRED, stronger than
 chatglm's optional one -- but building the fixture found that
 `qwen.cpp:33-35` also sizes every FFN matrix at `n_ff / 2`, because
 Qwen-1's `intermediate_size` counts gate and up together. That costs no
-logits (ferrox loads the dense FFN by tensor name and uses each
+logits (frink loads the dense FFN by tensor name and uses each
 matrix's own shape) and still made `expert_ffn_dim` twice the real
 width, which is what every memory estimate prices the FFN from. Both
 rows are audited against libllama now, and a test compares the declared
@@ -351,7 +351,7 @@ than an implementation, because llama.cpp's own tensor loader
 (`ernie4-5.cpp:49`) has no interleave step in it while its graph
 (`ernie4-5-moe.cpp:64`) does, so an interleaved checkpoint cannot be
 loaded by llama.cpp either. The step every published ERNIE-4.5 MoE
-checkpoint carries is 1, and that is what Ferrox runs and pins against
+checkpoint carries is 1, and that is what Frink runs and pins against
 libllama.
 
 **New code (1).** A different attention or residual structure. The
@@ -411,7 +411,7 @@ DeepSeek-V2 without. The seventeenth is a reach measurement coming
 back with TWO: `arctic`'s dense FFN summed with its experts is Grok-2's
 shape too, so one table closed the row and lifted a refusal by name.
 
-`arctic` closed on `ferrox_models::parallel_dense_ffn` and a third
+`arctic` closed on `frink_models::parallel_dense_ffn` and a third
 `RouterInput` variant. `arctic.cpp:118-154` runs a dense SiLU FFN
 sized `{n_embd, n_embd}` (`:38-42`) on `ffn_norm(ffn_inp)`, the router
 AND the experts on `ffn_norm_exps(inpSA)` -- the layer INPUT under a
@@ -445,7 +445,7 @@ moves libllama's own logits by 2.5e-4 and no more; the test pins that
 rather than pretending to see it. Sabotaging the routed operand at the
 row site and at the batch site each turns the golden red.
 
-`plm` closed on `ferrox_models::mla_arch` and `ferrox_models::
+`plm` closed on `frink_models::mla_arch` and `frink_models::
 mla_q_proj`, on the MLA engine. `plm.cpp:84-166` is `deepseek2.cpp`'s
 naive MLA branch line for line: a per-head nope / pe split of Q, the
 compressed KV RMS-normed and re-expanded through `attn_kv_b`, ONE
@@ -465,7 +465,7 @@ gate aliased as the generic loader does for `arcee`, carried ON
 lm_head the graph never reads an `output.weight` for (`:23-24`;
 libllama REFUSES a file carrying one -- `done_getting_tensors: wrong
 number of tensors; expected 30, got 29`, measured on
-`plm_decoy_output_tiny.gguf` -- so ferrox refuses it too rather than
+`plm_decoy_output_tiny.gguf` -- so frink refuses it too rather than
 prefer the decoy). The head widths come from `attention.key_length` /
 `value_length`, because `llama-hparams.cpp:259-265` fall back to them
 when the `_mla` keys are absent and that is what `conversion/plm.py:
@@ -499,13 +499,13 @@ rope" is honoured and unobservable on this shape, unlike hunyuan's
 per-element weights.) The embedding skip stream: the normed embedding
 is kept as `embd_skip` and every layer adds `embd_skip * out_scale`
 after its FFN residual (`:52,123-126`; `blk.N.layer_output_scale`) --
-`ferrox_models::skip_stream`, one `bool` for both halves, the norm at
+`frink_models::skip_stream`, one `bool` for both halves, the norm at
 the ONE embedding site and the add at the end of BOTH FFN bodies,
 through an `Option<SkipStream>` argument so no body can be reached
 with the question unasked. And the two `{1}` companions its converter
 writes on every export (`conversion/talkie.py:26-31`),
 `attn_output.scale` and `ffn_down.scale`: `build_lora_mm` multiplies
-them onto `wo` and `down`, and `ferrox_models::weight_scales` now
+them onto `wo` and `down`, and `frink_models::weight_scales` now
 SERVES exactly those two for any architecture
 (`AttnWeights::o_scale`, `MoeWeights::down_scale`) while still refusing
 the rest by name. `logit_scale` is REQUIRED and multiplied
@@ -518,7 +518,7 @@ which is the measurement that they are applied and not tolerated.
 Zeroing `out_scale` and setting the Q gains to one each diverge;
 sabotaging the skip add turns four tests red.
 
-`nanbeige` closed on `ferrox_models::layer_loops`. `nanbeige.cpp:6-12`
+`nanbeige` closed on `frink_models::layer_loops`. `nanbeige.cpp:6-12`
 read `num_loops` and `skip_loop_final_norm`; with `n_loops > 1`,
 `:19-31` set `n_layer_all = n_phys * n_loops` and copy every per-layer
 array from physical layer `i` to each logical slot `i + j * n_phys`,
@@ -546,7 +546,7 @@ adding it where the file skips it, and running the physical layers
 once each diverge; the batched body agrees with the row body over
 twelve positions; sabotaging the mapping turns four tests red.
 
-`mimo2` closed on `ferrox_models::kv_head_dims`. `conversion/mimo.py:
+`mimo2` closed on `frink_models::kv_head_dims`. `conversion/mimo.py:
 154` writes `attention.value_length` from `v_head_dim` apart from the
 `attention.key_length` the base converter writes from `head_dim` --
 `192` and `128` on MiMo-V2-Flash, the same on V2.5 -- and `mimo2.cpp:
@@ -579,7 +579,7 @@ slot file and the KV block file (one `head_dim` in each header). The
 row's second half is `attention.value_scale` (`:14-17,180-183`;
 `0.707` on every real export), one reader of 155 measured over all of
 `src/`, applied after `wo` in the one attention tail
-(`ferrox_models::attn_value_scale`). Three libllama-golden fixtures
+(`frink_models::attn_value_scale`). Three libllama-golden fixtures
 (`tests/split_kv_head_dim_graphs.rs`), each carrying everything a real
 export carries -- the per-layer `head_count_kv` array, the per-layer
 window array with `rope.freq_base_swa`, sinks on every layer, sigmoid
@@ -596,7 +596,7 @@ in all 155 graphs, three pass the SIGMOID literal (`llama4`, `mimo2`,
 `nemotron-h`), twenty-six SOFTMAX, nineteen the hparam, and the
 loader's `GATING_LITERAL_ARCHITECTURES` carries the one on this
 engine. And the bisection that found the last 2e-3 of KL found a
-generic defect: ferrox honoured `expert_weights_scale` for EVERY
+generic defect: frink honoured `expert_weights_scale` for EVERY
 architecture, while llama.cpp reads the key in twenty per-architecture
 loaders and nowhere else -- the fixture declares `2.5`, `mimo2.cpp`
 never reads it, and libllama's golden is unscaled. `EXPERT_WEIGHTS_
@@ -606,7 +606,7 @@ either key on any other architecture now gets the graph's literal, as
 upstream. No real export of a non-reader writes either key, so no
 published checkpoint changed; a hand-written one would have.
 
-`bitnet` closed on `ferrox_models::sub_norms`. `bitnet.cpp:24,36`
+`bitnet` closed on `frink_models::sub_norms`. `bitnet.cpp:24,36`
 require `attn_sub_norm` `{n_embd}` and `ffn_sub_norm` `{n_ff}`, two
 RMSNorms INSIDE the sublayers where the generic decoder's four sites
 are all outside them: `:101-106` norm the attention output -- the
@@ -622,7 +622,7 @@ model` refuses every fused launch on it, since none has a norm at
 either site; the per-layer fused attention loses its view of the layer
 through the exhaustive destructure in `metal_attn_view` as well. The
 arithmetic landed where the tails already were: `attn_out_to_residual_
-rows`, the one attention tail, and `ferrox_moe::run_expert_sub_normed`,
+rows`, the one attention tail, and `frink_moe::run_expert_sub_normed`,
 which shares its gate/up half with `run_expert` through a new
 `expert_activated` and CANNOT reach the fused on-device SwiGLU, because
 that kernel runs `down` itself with nothing between; `dense_ffn_batch`
@@ -645,16 +645,16 @@ architecture's projections (the NVFP4 converter writes them). The
 current BitNet converter folds the scale into the ternary weights and
 writes none, older exports carry them, and libllama's logits for a
 fixture with seven `2.0` scales differ from the unscaled file's from
-the first value (measured). `ferrox_models::weight_scales` refuses any
+the first value (measured). `frink_models::weight_scales` refuses any
 file carrying either suffix before the unread-tensor gate, which
-`FERROX_ALLOW_UNKNOWN_TENSORS=1` could have talked past into a model
+`FRINK_ALLOW_UNKNOWN_TENSORS=1` could have talked past into a model
 running every projection at the wrong magnitude. What the row does NOT
 give you yet is a real BitNet-b1.58-2B-4T: the published GGUFs are
 `i2_s` (the bitnet.cpp fork's type) or `TQ1_0` / `TQ2_0`, which
-`ferrox-gguf` inspects and refuses at execution; a Q8_0 or F16
+`frink-gguf` inspects and refuses at execution; a Q8_0 or F16
 re-export of the same weights runs.
 
-`smallthinker` closed on `ferrox_models::router_input`, the last of
+`smallthinker` closed on `frink_models::router_input`, the last of
 the three things its verdict named and the one no seam had touched.
 llama.cpp's `build_moe_ffn` (`llama-graph.cpp:1914-1948`) computes the
 router logits from the SAME normed input the experts read unless the
@@ -693,7 +693,7 @@ beside `Honour` and `Drop`, and `swa_disabled_by_arch` is derived from
 it. The fixture declares 3, narrower than its six-token prompt, and
 libllama's logits for that file and the same file declaring 4096 are
 BYTE-IDENTICAL, which is the measurement that the pin is upstream's
-behaviour; honouring the declared value moves ferrox's logits by far
+behaviour; honouring the declared value moves frink's logits by far
 more than the tolerance and a test says so. Three libllama-golden
 fixtures (`tests/router_input_graphs.rs`): KL 1.13e-14 (window
 declared, sigmoid gating, NoPE on layers 0 and 4 -- the FIRST layer of
@@ -710,7 +710,7 @@ prefill body, and the multi-sequence body) onto one
 all of them and they differed by a gpt-oss branch and an FFN-free check
 that were present in one and unreachable in another.
 
-`mistral3` closed on `ferrox_models::attn_temperature`, and the count
+`mistral3` closed on `frink_models::attn_temperature`, and the count
 that mattered was taken before the seam was written: `grep -ln
 'attn_temp\|temperature_scale\|build_inp_attn_scale' src/models/*.cpp`
 over all 155 graphs is `mistral3.cpp`, `llama4.cpp` and
@@ -761,16 +761,16 @@ hparams never set and are read by no line of its graph -- a `mistral3`
 file is a `llama` file with three keys, which is what every real
 Ministral-3 is. And `mistral3.cpp:9` reads
 `rope.scaling.yarn_log_multiplier`, whose only job is to adjust YaRN's
-MAGNITUDE term -- and ferrox did not apply that term for ANY
+MAGNITUDE term -- and frink did not apply that term for ANY
 architecture. `llama-context.cpp:196-231` multiplies
 `rope.scaling.attn_factor` by `get_mscale(factor, 1) /
 get_mscale(factor, log_mul)` (`1 + 0.1 ln factor` with no multiplier)
-on top of ggml's own `rope_yarn` term, which it cancels; ferrox's
+on top of ggml's own `rope_yarn` term, which it cancels; frink's
 `rope_attn_factor` carried the key alone. Every YaRN checkpoint on the
 generic path -- the `*-128K` Qwen3 exports among them -- was roped at
 the right frequencies and the wrong magnitude, both q and k, so
 attention logits low by `(1 + 0.1 ln factor)^2`, 1.30x at factor 4.
-`ferrox_models::yarn_magnitude` folds the term into the same field the
+`frink_models::yarn_magnitude` folds the term into the same field the
 CPU helper and the Metal `mscale` uniform already read, and two
 fixtures with the factor at 4 evidence both arms against libllama:
 KL 9.14e-15 without the multiplier and 3.45e-15 with it at 0.5, where
@@ -797,11 +797,11 @@ read one array and the shared experts AND the leading dense layers read
 the other, because `build_ffn` is both. `grep -l ggml_xielu` over the
 155 graphs is `apertus.cpp` alone; `grep -l LLM_KV_SWIGLU_CLAMP` is
 `step35.cpp`, `deepseek4.cpp` and `dflash.cpp`, the last two on their
-own engine. So: `ferrox_models::act_layers` reads both key families
+own engine. So: `frink_models::act_layers` reads both key families
 the way `get_key_or_arr` does (an array at exactly `n_layer` or a
 scalar broadcast; a wrong length refused naming the key, as upstream);
 `FfnActivation::Xielu` and `::SwigluClamped` CARRY their tables, so the
-kind and the parameters cannot disagree; `ferrox_moe::GluAct` gained
+kind and the parameters cannot disagree; `frink_moe::GluAct` gained
 the two bodies (`Xielu(params)`, `SwigluClamped { limit }`), which cost
 it `Eq` and `Copy`-free `fn` pointers -- `gate_fn() -> fn(f32) -> f32`
 became `combine(gate, up)`, because with the gate aliased to up
@@ -847,7 +847,7 @@ them. Building them corrected one sentence of `apertus`'s verdict:
 `apertus.cpp:50,52` CREATE `attn_q_norm.bias` / `attn_k_norm.bias`
 and `:93,96` pass `NULL` as the bias, so they are loaded and never
 read; a fixture that carries them measures libllama's logits
-byte-identical with and without, and `ferrox_models::unread_tensors`
+byte-identical with and without, and `frink_models::unread_tensors`
 records the slot so `assert_every_tensor_consumed` can tell "ignored
 as llama.cpp ignores it" from "missing".
 
@@ -866,7 +866,7 @@ is the activation (`afmoe.cpp:183` and `step35.cpp:272` sigmoid,
 channel, `step35.cpp:96` one per head broadcast over `head_dim`,
 `laguna.cpp:110-124` either, read off the stored tensor with an abort
 for anything else) and whether the tensor may be absent
-(`step35.cpp:96` `TENSOR_NOT_REQUIRED`). So `ferrox_models::attn_gate`
+(`step35.cpp:96` `TENSOR_NOT_REQUIRED`). So `frink_models::attn_gate`
 has two axes, `GateAct` and `GateWidth`, a per-architecture table that
 pins the activation and the ADMISSIBLE widths, and a loader that reads
 the width off the tensor and refuses one the table does not admit. It
@@ -898,7 +898,7 @@ YaRN off -- the Olmo-3 rule, one table now for `olmo2`, `mellum` and
 `laguna` where it had been `arch == "olmo2"`). The other, a
 `rope.dimension_count_swa` differing from `rope.dimension_count`
 (`llama-hparams.cpp:85-91` gives the sliding layers their own rotary
-width), was refused by `ferrox_models::swa_geometry` for one day and is
+width), was refused by `frink_models::swa_geometry` for one day and is
 SERVED since `step35` closed on the same two-valued width; the two
 `_swa` head-width keys stay refused there for every architecture. Real
 Laguna-M.1 has neither; real Laguna-XS.2 has both and stops at the
@@ -921,7 +921,7 @@ ARRAY, which for this architecture is a per-layer bool even as a scalar
 (`get_key_or_arr(..., is_swa_impl, n_layer)` broadcasts it) and not a
 period. Both closed on 2026-09-11 (below), and the last thing --
 MiMo-V2-Flash's `head_dim` of 192 beside a `v_head_dim` of 128, a V
-width that differs from K's on every layer, which no ferrox KV cache
+width that differs from K's on every layer, which no frink KV cache
 or attention kernel took -- closed on 2026-09-12 (above).
 
 **The per-layer window ARRAY and the NextN blocks** are two seams that
@@ -935,14 +935,14 @@ seeded period (`llama-model-loader.cpp:502-507`; `exaone4.cpp:8`,
 honours it at `block_count` length and BROADCASTS a scalar as a bool
 (`:474-478`; `mimo2.cpp:12`, `step35.cpp:26`, `gemma4`, `dflash`); and
 `mellum.cpp:12-17` / `cohere2moe.cpp:32-36` try the first then the
-second. `ferrox_models::swa_layers` is one enum (`All`, `Period`,
+second. `frink_models::swa_layers` is one enum (`All`, `Period`,
 `PerLayer`) behind the one accessor every backend already asked,
 `ModelConfig::layer_sliding_window(il)`, so the fused Metal stacks did
 not need touching: they ask per layer. Every real EXAONE-4 32B,
 EXAONE-MoE and Olmo-3 export carries the array (`conversion/exaone.py
 :84`, `olmo.py:59-66`) and was refused over a value upstream never
 reads; a fixture with the array INVERTED measures that libllama's
-logits do not move, and ferrox matches both (KL 1.43e-14). `mellum` is
+logits do not move, and frink matches both (KL 1.43e-14). `mellum` is
 the one generic-path graph that honours the array, so it is the row
 that evidences that branch -- its fixture's [T, T, F, T] disagrees with
 the seeded period-4 [T, T, T, F] on two layers, KL 1.02e-14 -- and it
@@ -954,7 +954,7 @@ The NextN blocks: `llama-model.cpp:1092` reads `block_count` into
 `n_layer_all - n_layer_nextn`, `llama-graph.cpp:1433` builds every
 graph over `n_layer()`, and each tensor loader creates the trailing
 blocks `TENSOR_SKIP`. Only the SEVENTEEN graphs that read the key
-subtract (measured; `ferrox_models::mtp_blocks::NEXTN_READERS`); for
+subtract (measured; `frink_models::mtp_blocks::NEXTN_READERS`); for
 any other a nonzero key stays refused, as upstream would fail on the
 unread `nextn.*` tensors. `ModelConfig::n_layers` is the trunk now and
 `n_mtp_blocks` the rest; the loader marks the skipped blocks' tensors
@@ -980,7 +980,7 @@ no `ffn_norm` at all, both sublayers reading the raw residual, each
 branch's output normed before its residual add -- and they closed
 together because reading `olmo2.cpp:45-52,92,160-182` against
 `exaone4.cpp:60-67,118,152-169` showed one graph, not two. One
-implementation (`ferrox_models::norm`), one fixture each
+implementation (`frink_models::norm`), one fixture each
 (`tests/post_norm_only_graphs.rs`). One sub-case stays refused by name:
 an `olmo2` with BOTH a sliding window and a RoPE scaling (Olmo-3) ropes
 its sliding and full layers differently, decided by llama.cpp with no
@@ -997,7 +997,7 @@ similar. `smollm3.cpp:5,69` is a different variant of the same enum,
 `(il + 1) % 4 != 0`, with no window involved. All six architectures
 llama.cpp gates this way (`smallthinker`, `afmoe` and `llama4` are the
 other three; all three closed later, on other seams) sit in ONE table,
-`ferrox_models::rope_layers`, and `ModelConfig::layer_rope` answers
+`frink_models::rope_layers`, and `ModelConfig::layer_rope` answers
 `None` for an unrotated layer -- an `Option` around the base and the
 divisors rather than a `bool` beside them, so no rotation site can take
 the pair without answering the third question. Every site was checked:
@@ -1022,9 +1022,9 @@ was triaged, and closed on that router on 2026-09-12 (above).
 MULTIPLIER trio, and the same story again: `granite-moe.cpp` has no
 graph of its own (`models.h:1583-1591` is
 `using graph = llama_model_granite::graph`), so the two upstream rows
-differ in the FFN and in nothing else, and the third is a ferrox-only
+differ in the FFN and in nothing else, and the third is a frink-only
 alias for the second. One implementation
-(`ferrox_models::scalar_multipliers`), one libllama-golden fixture each
+(`frink_models::scalar_multipliers`), one libllama-golden fixture each
 (`tests/granite_family_graphs.rs`). Half the verdict stayed a refusal --
 see cause 4 above for `rope.scaling.finetuned`, served on 2026-09-14
 when Granite-4.0 needed it.
@@ -1086,10 +1086,10 @@ arithmetically "pre-scale Q, then softcap", i.e. the `attention_scale`
 slot plus the softcap Gemma-2 already uses, so no new attention code.
 The other two keys Grok reads, `router_logit_softcapping` and
 `attention.temperature_length`, are applied NOWHERE in llama.cpp's
-graph (no other reference under `src/`, measured), so ferrox neither
+graph (no other reference under `src/`, measured), so frink neither
 applies nor refuses them. `attn_output_norm` is Grok's POST-attention
 norm -- the same tensor name `dbrx` stores its pre-FFN norm under --
-which is why `ferrox_models::norm_sites` exists: one table for which
+which is why `frink_models::norm_sites` exists: one table for which
 tensor feeds which site, replacing the `if` chain the loader restated
 at every site. Two fixtures, as MiniCPM needed: one declaring NO key
 (the only shape that can tell the hook from its absence) and one
@@ -1097,11 +1097,11 @@ declaring every key at a value far from its default (pinning that the
 file wins; a hook merged the wrong way round agrees with llama.cpp on
 exactly the files that prove it exists). KL 4.7e-10 and 1.6e-10, max
 |delta| 6.3e-5 and 4.0e-5 -- at the GeGLU tolerance, and measured to be
-entirely llama.cpp's f16 GELU table: with ferrox's GELU made to emulate
+entirely llama.cpp's f16 GELU table: with frink's GELU made to emulate
 the table both files agree to 1.0e-7 / 1.5e-7. Grok-2's parallel dense
 FFN (`grok.cpp:171-184`, summed with the experts at `sqrt(2)/2`) was
 refused by name from a fixture that has it until `arctic` closed on
-the same seam (`ferrox_models::parallel_dense_ffn`); it is served and
+the same seam (`frink_models::parallel_dense_ffn`); it is served and
 checked against its own golden now.
 
 `deci` and `openelm` were the PER-LAYER-SHAPE pair. llama.cpp reads
@@ -1114,7 +1114,7 @@ keeps three per-layer arrays, and hands most graphs layer 0 through
 `n_ff(i)`, `n_embd_k_gqa(i)`, `n_embd_v_gqa(i)`, `n_rot(i)` and the
 `_arr` fields, in both the tensor loader and the graph. Twenty-two
 files read a per-layer shape somewhere; seventeen honour one in BOTH
-places, and those are `ferrox_models::layer_shapes::PER_LAYER_SHAPE_ARCHS`
+places, and those are `frink_models::layer_shapes::PER_LAYER_SHAPE_ARCHS`
 with what each still needs: `deci`, `openelm` and `plamo3` on the
 generic path, and `laguna` and `step35` with them since they closed;
 `mimo2` on the generic path, closed on the split K/V head width;
@@ -1124,7 +1124,7 @@ the seven hybrid recurrent rows (`jamba`, `lfm2`, `lfm2moe`,
 `nemotron-h`, `plamo2`, `granite-hybrid`, `kimi-linear`), where
 `n_head_kv(i) == 0` means "this layer is recurrent" -- and since
 2026-09-14 `layer_shapes::ZeroKvLayer` says WHICH recurrent block, with
-`lfm2`'s short convolution served (`ferrox_models::shortconv`). Three things the
+`lfm2`'s short convolution served (`frink_models::shortconv`). Three things the
 scan corrected: `n_rot(il)` is NOT an array upstream
 (`llama-hparams.cpp:85-91` is `is_swa(il) ? n_rot_swa : n_rot_full`),
 so `step35`'s and `laguna`'s "per-layer rotary width" is a two-valued
@@ -1195,33 +1195,33 @@ name, as libllama refuses it (`wrong number of tensors; expected 21, got
 
 | Shape | Architectures |
 |---|---|
-| Per-layer head counts or FFN width | CLOSED (`ferrox_models::layer_shapes`): `deci`, `openelm`, `laguna`, `step35` and `mimo2` run on it |
-| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | CLOSED: `olmo`, `olmo2`, `exaone4`, `dbrx`, `bitnet` and `talkie` were all here; `bitnet`'s two INNER norms are `ferrox_models::sub_norms`, `talkie`'s weightless RMS is `NormOp::RmsNoParams` and its skip stream `ferrox_models::skip_stream`; the LayerNorm WITH a bias is `NormOp::LayerNormBias`, on which `orion` and `nemotron` closed (`tests/biased_layer_norm_graphs.rs`) |
-| Required `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` with no slot on the dense path | CLOSED (`ferrox_models::proj_bias`): `starcoder2`, `codeshell` and `jais2` run on it, a `llama` file with the optional biases runs where it was refused as unread, and gpt-oss's `o_bias` moved onto the same slot; `output.bias` on the LM head is a slot too (`proj_bias::OUTPUT_BIAS_CREATORS`; `phi2` runs on it); `phimoe` runs on both slots and `starcoder` on the same tables with its learned positions; the group is empty |
+| Per-layer head counts or FFN width | CLOSED (`frink_models::layer_shapes`): `deci`, `openelm`, `laguna`, `step35` and `mimo2` run on it |
+| A norm the generic decoder always applies and the model does not have (or a norm it does not have a slot for) | CLOSED: `olmo`, `olmo2`, `exaone4`, `dbrx`, `bitnet` and `talkie` were all here; `bitnet`'s two INNER norms are `frink_models::sub_norms`, `talkie`'s weightless RMS is `NormOp::RmsNoParams` and its skip stream `frink_models::skip_stream`; the LayerNorm WITH a bias is `NormOp::LayerNormBias`, on which `orion` and `nemotron` closed (`tests/biased_layer_norm_graphs.rs`) |
+| Required `attn_output.bias` / `ffn_up.bias` / `ffn_down.bias` with no slot on the dense path | CLOSED (`frink_models::proj_bias`): `starcoder2`, `codeshell` and `jais2` run on it, a `llama` file with the optional biases runs where it was refused as unread, and gpt-oss's `o_bias` moved onto the same slot; `output.bias` on the LM head is a slot too (`proj_bias::OUTPUT_BIAS_CREATORS`; `phi2` runs on it); `phimoe` runs on both slots and `starcoder` on the same tables with its learned positions; the group is empty |
 | LayerNorm rather than RMSNorm | CLOSED for the weightless (`olmo`), weighted (`dbrx`, `command-r`, `cohere2`, `cohere2moe`, whose file picks between LayerNorm and RMS by which epsilon key it carries) and biased (`orion`, `nemotron`, `starcoder2`, `codeshell`, `jais2`, `stablelm`, `gptneox`, `falcon`, `phi2`, `gpt2`, `starcoder`) forms, and for the biased RMSNorm (`phimoe`, `NormOp::RmsBias`) |
-| A learned absolute position table added to the embeddings, no rotation | CLOSED (`ferrox_models::position_embd`, `rope_layers::RopeLayers::Never`): `gpt2` and `starcoder` run on it, and `mpt`'s optional table with its ALiBi |
-| ALiBi: a per-head linear position bias on every score, no rotation | CLOSED (`ferrox_models::alibi`, `ferrox_core::alibi`; the three host kernels take the slopes, every fused GPU path refuses): `refact`, `bloom`, `mpt`, `jais` and Baichuan-13B run on it; `bloom`'s embedding norm is `norm_sites::EMBEDDING_NORM_ARCHITECTURES`, `jais`'s `1/d` attention scale `capability::attention_scale_override`, `mpt`'s `clamp_kqv` served |
-| A parallel residual, `x + attn(norm(x)) + ffn(norm(x))` | CLOSED (`ferrox_models::parallel_residual`): `gptneox` (Pythia; two norms under `use_parallel_residual`, both values matched) and `plamo` (one shared norm) run on it, and the `stablelm` layer without `ffn_norm` matches where it was refused; eight of 155 graphs build the shape in two spellings and the table names each with its deciding rule; `command-r` (Command-R 35B, Aya-23) followed on it with the weighted LayerNorm and its `logit_scale` multiply; `falcon` runs on both arms, Falcon-40B's `attn_norm_2` crossing the two pre-norm slots per layer (`norm_sites::ATTN_NORM_2_FEEDS_ATTENTION`); `phi2` runs on it with the `output.bias` slot (`Decoder::output_bias`); `cohere2` (Command-R7B) runs on it with its sliding-only rotation (`rope_layers::SlidingOnly`); `cohere2moe` runs on it with routed experts, its dense-prefix rotation and the `0.5` on the shared-expert sum (`tests/cohere2moe_graphs.rs`) |
-| A per-head LayerNorm on Q and K with a distinct weight per head (`{n_embd_head_k, n_head}`, `LLM_NORM`) | REFUSED by name (`ferrox_models::qk_layer_norm`), from a `stablelm` fixture libllama runs (8.73); `stablelm` (12B), `command-r` (64 layers), `chameleon` build it |
-| Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all eight (`ferrox_models::rope_layers`; the first census counted six, `cohere2` and `cohere2moe` spell the gate `if (is_swa)`): `exaone-moe`, `smollm3`, EXAONE-4 32B, `afmoe`, `smallthinker`, `cohere2`, `llama4` and `cohere2moe` (`RopeLayers::SlidingOrLeadingDense`) run on it |
-| A branch fed from the raw layer input rather than the post-attention residual | CLOSED (`ferrox_models::router_input`): `smallthinker`'s router reads it raw (`RawLayerInput`); `arctic`'s router AND experts read it under a second norm (`NormedLayerInput`), and its dense FFN summed with the experts is `ferrox_models::parallel_dense_ffn`, Grok-2's shape too |
+| A learned absolute position table added to the embeddings, no rotation | CLOSED (`frink_models::position_embd`, `rope_layers::RopeLayers::Never`): `gpt2` and `starcoder` run on it, and `mpt`'s optional table with its ALiBi |
+| ALiBi: a per-head linear position bias on every score, no rotation | CLOSED (`frink_models::alibi`, `frink_core::alibi`; the three host kernels take the slopes, every fused GPU path refuses): `refact`, `bloom`, `mpt`, `jais` and Baichuan-13B run on it; `bloom`'s embedding norm is `norm_sites::EMBEDDING_NORM_ARCHITECTURES`, `jais`'s `1/d` attention scale `capability::attention_scale_override`, `mpt`'s `clamp_kqv` served |
+| A parallel residual, `x + attn(norm(x)) + ffn(norm(x))` | CLOSED (`frink_models::parallel_residual`): `gptneox` (Pythia; two norms under `use_parallel_residual`, both values matched) and `plamo` (one shared norm) run on it, and the `stablelm` layer without `ffn_norm` matches where it was refused; eight of 155 graphs build the shape in two spellings and the table names each with its deciding rule; `command-r` (Command-R 35B, Aya-23) followed on it with the weighted LayerNorm and its `logit_scale` multiply; `falcon` runs on both arms, Falcon-40B's `attn_norm_2` crossing the two pre-norm slots per layer (`norm_sites::ATTN_NORM_2_FEEDS_ATTENTION`); `phi2` runs on it with the `output.bias` slot (`Decoder::output_bias`); `cohere2` (Command-R7B) runs on it with its sliding-only rotation (`rope_layers::SlidingOnly`); `cohere2moe` runs on it with routed experts, its dense-prefix rotation and the `0.5` on the shared-expert sum (`tests/cohere2moe_graphs.rs`) |
+| A per-head LayerNorm on Q and K with a distinct weight per head (`{n_embd_head_k, n_head}`, `LLM_NORM`) | REFUSED by name (`frink_models::qk_layer_norm`), from a `stablelm` fixture libllama runs (8.73); `stablelm` (12B), `command-r` (64 layers), `chameleon` build it |
+| Unkeyed NoPE layers, RoPE skipped on some layers with no GGUF key | CLOSED for all eight (`frink_models::rope_layers`; the first census counted six, `cohere2` and `cohere2moe` spell the gate `if (is_swa)`): `exaone-moe`, `smollm3`, EXAONE-4 32B, `afmoe`, `smallthinker`, `cohere2`, `llama4` and `cohere2moe` (`RopeLayers::SlidingOrLeadingDense`) run on it |
+| A branch fed from the raw layer input rather than the post-attention residual | CLOSED (`frink_models::router_input`): `smallthinker`'s router reads it raw (`RawLayerInput`); `arctic`'s router AND experts read it under a second norm (`NormedLayerInput`), and its dense FFN summed with the experts is `frink_models::parallel_dense_ffn`, Grok-2's shape too |
 | Hardcoded scales applied even when the GGUF carries no key | none left (`grok` was here and is CLOSED on the MiniCPM defaults hook; `mistral3` was here by mistake -- its scale comes from a key -- and is CLOSED) |
-| A gated attention tensor (`wqkv_gate`) | CLOSED (`ferrox_models::attn_gate`): `afmoe`, `laguna` and `step35` run on it |
+| A gated attention tensor (`wqkv_gate`) | CLOSED (`frink_models::attn_gate`): `afmoe`, `laguna` and `step35` run on it |
 | Attention sinks outside gpt-oss | CLOSED as a tensor-presence fact (`AttnWeights::sinks`, CPU; the fused Metal launches refuse the layer): `mimo2` runs on it |
-| A per-layer sliding-window ARRAY (`is_swa_impl`) | CLOSED (`ferrox_models::swa_layers`): `mellum`, `step35` and `mimo2` run on it and the EXAONE / Olmo-3 over-refusal is lifted |
-| NEXTN/MTP blocks inside `block_count` | CLOSED (`ferrox_models::mtp_blocks`) for the seventeen graphs that read the key, on the generic path and all four dedicated loaders; refused by name elsewhere |
-| A V head width that differs from the K head width | CLOSED (`ferrox_models::kv_head_dims`): `mimo2` runs on it on the host paths; every fused Metal launch, the CUDA resident hook, the slot file and the KV block file refuse a split model |
-| An FFN activation whose PARAMETERS vary by layer (xIELU's four arrays; the SwiGLU clamp arrays by site) | CLOSED (`ferrox_models::act_layers`): `apertus` and `step35` run on it |
-| A second rotary width on the sliding layers (`n_rot(il)`: `rope.dimension_count_swa`, or `step35`'s halved full width) | CLOSED (`ModelConfig::rope_dim_swa`, `ferrox_models::swa_geometry`): `step35` and the Laguna-XS.2 shape run on it; the two `_swa` HEAD-width keys stay refused by name, and two widths with per-band divisors are refused for any architecture but `step35` |
+| A per-layer sliding-window ARRAY (`is_swa_impl`) | CLOSED (`frink_models::swa_layers`): `mellum`, `step35` and `mimo2` run on it and the EXAONE / Olmo-3 over-refusal is lifted |
+| NEXTN/MTP blocks inside `block_count` | CLOSED (`frink_models::mtp_blocks`) for the seventeen graphs that read the key, on the generic path and all four dedicated loaders; refused by name elsewhere |
+| A V head width that differs from the K head width | CLOSED (`frink_models::kv_head_dims`): `mimo2` runs on it on the host paths; every fused Metal launch, the CUDA resident hook, the slot file and the KV block file refuse a split model |
+| An FFN activation whose PARAMETERS vary by layer (xIELU's four arrays; the SwiGLU clamp arrays by site) | CLOSED (`frink_models::act_layers`): `apertus` and `step35` run on it |
+| A second rotary width on the sliding layers (`n_rot(il)`: `rope.dimension_count_swa`, or `step35`'s halved full width) | CLOSED (`ModelConfig::rope_dim_swa`, `frink_models::swa_geometry`): `step35` and the Laguna-XS.2 shape run on it; the two `_swa` HEAD-width keys stay refused by name, and two widths with per-band divisors are refused for any architecture but `step35` |
 | An ungated or non-SwiGLU FFN | CLOSED for the ungated ReLU-squared form (`FfnActivation::ReluSqr`), the gated ReLU form (`FfnActivation::Reglu`) and xIELU (`FfnActivation::Xielu`): `arcee`, `smallthinker` and `apertus` run on them, and `plm` on the MLA engine (`MlaDenseFfn::act`) |
-| A per-position attention temperature | CLOSED (`ferrox_models::attn_temperature`): `mistral3` runs on it from a key and `llama4` from literals on its unrotated layers; `deepseek2` / `mistral4` (Mistral-Large-3) refuse it by name on the MLA engine |
-| A recurrent block at the attention site (`head_count_kv 0`, or the layers `attention.recurrent_layers` / `full_attention_interval` name) | CLOSED for the gated delta net (`ferrox_models::gdn`, `ferrox_core::gdn`, `AttnShape::Gdn`): `qwen35` runs on it, its attention layers' interleaved `wq` gate in `attn_gate::Q_INTERLEAVED_GATE_ARCHS`. CLOSED for the short convolution (`ferrox_models::shortconv`, `layer_shapes::AttnShape::ShortConv`, the state as the layer's KV history on all three backings): `lfm2` and `lfm2moe` run on it. CLOSED for the Mamba-2 block (`ferrox_models::mamba2`, `ferrox_core::mamba2`, `AttnShape::Mamba2`, the state as `ferrox_core::recurrent_state::RecurrentState` beside the cache): `granitehybrid` and `nemotron_h` run on it (the latter's one-block-per-layer topology is `layer_shapes::BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT` plus `norm_sites::ONE_NORM_PER_LAYER`). `falcon-h1` runs attention and Mamba-2 in PARALLEL on every layer (`ModelConfig::parallel_ssm`). CLOSED for the Mamba-1 block (`ferrox_models::mamba1`, `AttnShape::Mamba1`): `jamba` runs on it, `mamba` and `mamba2` run every layer as the block (`layer_shapes::PURE_RECURRENT`). CLOSED for PLaMo-2's own spelling (`ferrox_models::plamo2_ssm`, `AttnShape::Plamo2Ssm`): `plamo2` runs on it, with the per-head-distinct QK norm (`QkNormStyle::PerHeadDistinct`) and the `plamo2` tokenizer |
-| Something structurally new | `grovemoe` (a second expert bank -- and, read against `modeling_grove_moe.py` on 2026-09-12, llama.cpp's graph feeds the chunk experts the routed experts' OUTPUT and gathers their weights at the CHUNK index where the reference does neither, so there is no one graph to match; its verdict says so); `plm` (MLA attention on a dense model) was here and is CLOSED on the MLA engine (`ferrox_models::mla_arch`); `arctic` (a parallel dense + MoE layer) was here and is CLOSED (`ferrox_models::parallel_dense_ffn`); `mellum` was here on "two per-layer RoPE variants", which is the Olmo-3 rule refused by name, and is CLOSED; `mistral3` was here on the temperature and is CLOSED; `nanbeige` was here on running the same layers more than once and is CLOSED (`ferrox_models::layer_loops`) |
+| A per-position attention temperature | CLOSED (`frink_models::attn_temperature`): `mistral3` runs on it from a key and `llama4` from literals on its unrotated layers; `deepseek2` / `mistral4` (Mistral-Large-3) refuse it by name on the MLA engine |
+| A recurrent block at the attention site (`head_count_kv 0`, or the layers `attention.recurrent_layers` / `full_attention_interval` name) | CLOSED for the gated delta net (`frink_models::gdn`, `frink_core::gdn`, `AttnShape::Gdn`): `qwen35` runs on it, its attention layers' interleaved `wq` gate in `attn_gate::Q_INTERLEAVED_GATE_ARCHS`. CLOSED for the short convolution (`frink_models::shortconv`, `layer_shapes::AttnShape::ShortConv`, the state as the layer's KV history on all three backings): `lfm2` and `lfm2moe` run on it. CLOSED for the Mamba-2 block (`frink_models::mamba2`, `frink_core::mamba2`, `AttnShape::Mamba2`, the state as `frink_core::recurrent_state::RecurrentState` beside the cache): `granitehybrid` and `nemotron_h` run on it (the latter's one-block-per-layer topology is `layer_shapes::BLOCK_WITHOUT_FFN_KEEPS_ITS_OUTPUT` plus `norm_sites::ONE_NORM_PER_LAYER`). `falcon-h1` runs attention and Mamba-2 in PARALLEL on every layer (`ModelConfig::parallel_ssm`). CLOSED for the Mamba-1 block (`frink_models::mamba1`, `AttnShape::Mamba1`): `jamba` runs on it, `mamba` and `mamba2` run every layer as the block (`layer_shapes::PURE_RECURRENT`). CLOSED for PLaMo-2's own spelling (`frink_models::plamo2_ssm`, `AttnShape::Plamo2Ssm`): `plamo2` runs on it, with the per-head-distinct QK norm (`QkNormStyle::PerHeadDistinct`) and the `plamo2` tokenizer |
+| Something structurally new | `grovemoe` (a second expert bank -- and, read against `modeling_grove_moe.py` on 2026-09-12, llama.cpp's graph feeds the chunk experts the routed experts' OUTPUT and gathers their weights at the CHUNK index where the reference does neither, so there is no one graph to match; its verdict says so); `plm` (MLA attention on a dense model) was here and is CLOSED on the MLA engine (`frink_models::mla_arch`); `arctic` (a parallel dense + MoE layer) was here and is CLOSED (`frink_models::parallel_dense_ffn`); `mellum` was here on "two per-layer RoPE variants", which is the Olmo-3 rule refused by name, and is CLOSED; `mistral3` was here on the temperature and is CLOSED; `nanbeige` was here on running the same layers more than once and is CLOSED (`frink_models::layer_loops`) |
 
 **Unknown (1).** `phi4` is the only row left here. It is not in
 llama.cpp's `LLM_ARCH_NAMES` -- `src/llama-arch.cpp` carries `phi3` and
 no phi4 entry -- so there is no reference graph to diff against, and
-Ferrox admits it as phi3's fused-QKV / fused gate+up graph on the
+Frink admits it as phi3's fused-QKV / fused gate+up graph on the
 assumption that a file spelling it means the same thing. It refuses
 until a real file settles that, and its message says which tensor in
 `blk.0` would decide it.
@@ -1248,7 +1248,7 @@ wrong pairs of every Q/K head, and the only test that compares RoPE
 layouts could not see it, because a name absent from llama.cpp's table
 is a `continue` there. That skip now has to be declared by name.
 
-`FERROX_ALLOW_UNKNOWN_TENSORS=1` loads the checkpoint anyway and accepts
+`FRINK_ALLOW_UNKNOWN_TENSORS=1` loads the checkpoint anyway and accepts
 whatever comes out. Use it while you debug, not to get past the error
 and carry on.
 
@@ -1260,16 +1260,16 @@ Parsed and executable on CPU: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`,
 `IQ3_XXS`, `IQ3_S`, `MXFP4`, `TQ1_0`, `PTQ1_0`.
 
 "Executable" is not one speed. What a format actually gets, read off
-the kernel tables (`ferrox_quant`'s dispatch functions, and
+the kernel tables (`frink_quant`'s dispatch functions, and
 `metal_matvec_kind_name` / `metal_mul_mm_kind_supported` /
 `cuda_matvec_kind_supported` / `cuda_mul_mm_kind_supported` in
-`ferrox-core`'s `weight_matrix.rs`):
+`frink-core`'s `weight_matrix.rs`):
 
 | Tier | Formats | CPU SIMD | GPU |
 |---|---|---|---|
-| Full | `Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` | AVX2 + NEON, plus the int-dot path (`FERROX_CPU_INT_DOT=1`) | Metal matvec + simdgroup GEMM, CUDA matvec |
+| Full | `Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` | AVX2 + NEON, plus the int-dot path (`FRINK_CPU_INT_DOT=1`) | Metal matvec + simdgroup GEMM, CUDA matvec |
 | Metal only | `IQ4_XS`, `Q5_0` | AVX2 + NEON | Metal matvec + simdgroup GEMM; no CUDA kernel of either kind |
-| Metal only, scalar CPU | `PTQ1_0` (PrismML ternary) | scalar | Metal matvec + simdgroup GEMM (`ferrox-metal/src/ternary.rs`); no CUDA kernel |
+| Metal only, scalar CPU | `PTQ1_0` (PrismML ternary) | scalar | Metal matvec + simdgroup GEMM (`frink-metal/src/ternary.rs`); no CUDA kernel |
 | CPU-vectorized | `Q4_1`, `Q5_1`, `Q8_1`, `Q2_K`, `Q3_K`, `IQ4_NL`, safetensors two-buffer `MXFP4` | AVX2 + NEON | none |
 | AVX2 only | `IQ1_S`, `IQ2_XXS`, `IQ3_XXS` | AVX2; **scalar on ARM** | none |
 | Scalar only | `IQ2_XS`, `IQ2_S`, `IQ3_S`, `IQ1_M`, GGUF-block `MXFP4` | none | none |
@@ -1277,7 +1277,7 @@ the kernel tables (`ferrox_quant`'s dispatch functions, and
 `Q5_0` moved up on 2026-09-01. It had a Metal simdgroup GEMM and no
 matvec, so its prefill ran on the GPU and every decode step fell back to
 the CPU, silently. The matvec now exists
-(`Q5_0_MATVEC_KERNEL_SRC`, `ferrox-metal/src/gpu.rs:439`) and
+(`Q5_0_MATVEC_KERNEL_SRC`, `frink-metal/src/gpu.rs:439`) and
 `metal_matvec_kind_name` / `metal_mul_mm_kind_supported` name the same
 seven kinds. It is **correct by construction and unmeasured**: there is
 no `Q5_0` checkpoint in `benchmarks/suite.json`, so no row in
@@ -1304,10 +1304,10 @@ Three caveats that matter in practice:
   `IQ1_S`, `IQ2_XXS` and `IQ3_XXS` have x86 kernels and no NEON ones, so
   on ARM they run at the same speed as the scalar tier below them.
 - **`I32`, `TQ2_0`, `NVFP4`, `Q1_0`, `Q2_0` and `PQ2_0` are recognized
-  and sized, but nothing executes them.** They parse, `ferrox inspect`
+  and sized, but nothing executes them.** They parse, `frink inspect`
   reports their real footprint, and a checkpoint that needs one stops
   with an error naming the format rather than being quietly skipped or
-  silently mis-measured. `TQ1_0` has the CPU trit dot (`ferrox_quant::
+  silently mis-measured. `TQ1_0` has the CPU trit dot (`frink_quant::
   ternary` is one codec for the two layouts) and no GPU kernel, and no
   real `TQ1_0` checkpoint has been run through it; `PTQ1_0` is the one
   ternary format verified end to end (Bonsai-2-27B, above).
@@ -1321,7 +1321,7 @@ published `UD-*` checkpoint.
 
 | Backend | What it covers |
 |---|---|
-| CPU | Dense and MoE. `FERROX_CPU_INT_DOT=1` (Q4_Kx8 / Q8_0x4 / Q5·Q6 int-dot) on suite runs |
+| CPU | Dense and MoE. `FRINK_CPU_INT_DOT=1` (Q4_Kx8 / Q8_0x4 / Q5·Q6 int-dot) on suite runs |
 | Metal | Dense, MoE, FA-vec, fused MoE encode groups, `mul_mm_id` prefill, quantized KV |
 | CUDA | Matvec + resident weights + FFN fuse. A batched `Q8_0`/`Q4_0` GEMM exists and has never run on a GPU (see below) |
 
@@ -1333,7 +1333,7 @@ A batched quantized GEMM for CUDA (`Q8_0` and `Q4_0` only) is in the
 tree and reachable from a wide prefill, and it has **never executed on a
 GPU**. Its evidence is a thread-by-thread scalar twin plus a host
 harness that compiles and runs the emitted CUDA against a barrier shim
-(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`); the hardware test
+(`crates/frink-cuda/tools/mul_mm_host_check/run.sh`); the hardware test
 is `#[ignore]`d with "NEVER RUN" as its reason. That is not a
 performance claim, and no row in `RESULTS.md` rests on it.
 
@@ -1342,7 +1342,7 @@ attention path there returned fluent wrong tokens. That refusal is
 **lifted**: a Metal prefill left K/V on the device and filled the host
 cache with placeholders that the paged prefill then copied into the page
 store, and the prefill now downloads the real rows for the caller that
-reads them. Pinned on hardware by `cargo test -p ferrox-models --features
+reads them. Pinned on hardware by `cargo test -p frink-models --features
 metal --test paged_metal_parity -- --ignored`, which gets identical
 greedy ids from the paged and contiguous caches on a dense, an MoE and a
 sliding-window model. CUDA carries no equivalent hardware run. See

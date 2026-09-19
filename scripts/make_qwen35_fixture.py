@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `qwen35` GGUFs used by ferrox's Qwen3.5
-coverage test (`crates/ferrox-models/tests/qwen35_graphs.rs`).
+"""Generate the tiny synthetic `qwen35` GGUFs used by frink's Qwen3.5
+coverage test (`crates/frink-models/tests/qwen35_graphs.rs`).
 
 `qwen35` is Qwen3.5 dense (0.8B / 2B / 4B / 9B / 27B): a gated delta-net
 (GDN) block on three layers of four and gated full attention on the
@@ -104,7 +104,7 @@ def main(out_path: str, as_array: bool, separate_output: bool, moe: bool, nxt: b
     arch = NEXT_ARCH if nxt else MOE_ARCH if moe else ARCH
     moe = moe or nxt
     w = gguf.GGUFWriter(out_path, arch)
-    w.add_name(f"ferrox-{arch}-fixture")
+    w.add_name(f"frink-{arch}-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

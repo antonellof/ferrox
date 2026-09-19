@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Map llama.cpp source files to ferrox Rust equivalents.
+"""Map llama.cpp source files to frink Rust equivalents.
 
 Reads .scratch/llama.cpp and crates/ to produce a structured inventory
 for parity planning. Run from repo root:
@@ -21,69 +21,69 @@ LLAMA = ROOT / ".scratch" / "llama.cpp"
 CRATES = ROOT / "crates"
 
 Status = Literal[
-    "ported",       # ferrox has equivalent functionality
+    "ported",       # frink has equivalent functionality
     "partial",      # some of the file's scope exists
-    "missing",      # no ferrox counterpart
+    "missing",      # no frink counterpart
     "out_of_scope", # training, RPC, etc.
     "n/a",          # llama.cpp-specific infra (cmake, CI)
 ]
 
-# Hand-curated mapping: llama.cpp path pattern -> ferrox location + status.
+# Hand-curated mapping: llama.cpp path pattern -> frink location + status.
 # Patterns are matched with startswith or exact match.
 MAPPING: list[tuple[str, str, Status, str]] = [
     # --- Core library ---
-    ("src/llama.cpp", "crates/ferrox-models/src/lib.rs + loader.rs", "partial", "Public API surface; ferrox has no libllama-style C API"),
-    ("src/llama-model.cpp", "crates/ferrox-models/src/loader.rs", "partial", "Model load + tensor wiring; one loader vs per-arch graphs"),
-    ("src/llama-model-loader.cpp", "crates/ferrox-gguf/src/lib.rs", "ported", "GGUF mmap read"),
-    ("src/llama-model-saver.cpp", "crates/ferrox-gguf/src/writer.rs", "partial", "GGUF write; no full model export"),
-    ("src/llama-arch.cpp", "crates/ferrox-models/src/capability.rs", "partial", "150 catalog rows vs 140 graphs; 16 audited"),
-    ("src/llama-hparams.cpp", "crates/ferrox-models/src/config.rs", "partial", "Hyperparameter parsing"),
-    ("src/llama-vocab.cpp", "crates/ferrox-models/src/tokenizer.rs", "partial", "Tokenizer; emoji edge cases diverge on BERT"),
-    ("src/llama-context.cpp", "crates/ferrox-models/src/decoder.rs", "partial", "Decode context; no llama_context C struct"),
-    ("src/llama-batch.cpp", "crates/ferrox-server/src/serving/batch/", "partial", "Continuous batching; incremental stream gap"),
-    ("src/llama-graph.cpp", "crates/ferrox-models/src/decoder.rs", "partial", "Hand-written decode graph, not ggml graph"),
-    ("src/llama-sampler.cpp", "crates/ferrox-models/src/sampling.rs", "partial", "834 lines vs 4106; missing dry/xtc/typ_p/top_n_sigma"),
-    ("src/llama-grammar.cpp", "crates/ferrox-models/src/grammar/", "partial", "GBNF yes; some grammar features missing"),
-    ("src/llama-chat.cpp", "crates/ferrox-server/src/completion/", "partial", "Chat templates via tokenizer config"),
-    ("src/llama-kv-cache", "crates/ferrox-core/src/cache.rs + ferrox-models/src/kv_budget.rs", "partial", "Standard GQA KV; no DSA/ISWA/MSA variants"),
-    ("src/llama-memory", "crates/ferrox-core/src/expert_cache.rs + residency", "partial", "MoE residency policy wired; not executed"),
-    ("src/llama-mmap.cpp", "crates/ferrox-gguf/src/lib.rs", "ported", "mmap GGUF"),
-    ("src/llama-quant.cpp", "crates/ferrox-quant/src/", "partial", "Read all quants; write Q8_0 only; K-quant encoders in progress"),
+    ("src/llama.cpp", "crates/frink-models/src/lib.rs + loader.rs", "partial", "Public API surface; frink has no libllama-style C API"),
+    ("src/llama-model.cpp", "crates/frink-models/src/loader.rs", "partial", "Model load + tensor wiring; one loader vs per-arch graphs"),
+    ("src/llama-model-loader.cpp", "crates/frink-gguf/src/lib.rs", "ported", "GGUF mmap read"),
+    ("src/llama-model-saver.cpp", "crates/frink-gguf/src/writer.rs", "partial", "GGUF write; no full model export"),
+    ("src/llama-arch.cpp", "crates/frink-models/src/capability.rs", "partial", "150 catalog rows vs 140 graphs; 16 audited"),
+    ("src/llama-hparams.cpp", "crates/frink-models/src/config.rs", "partial", "Hyperparameter parsing"),
+    ("src/llama-vocab.cpp", "crates/frink-models/src/tokenizer.rs", "partial", "Tokenizer; emoji edge cases diverge on BERT"),
+    ("src/llama-context.cpp", "crates/frink-models/src/decoder.rs", "partial", "Decode context; no llama_context C struct"),
+    ("src/llama-batch.cpp", "crates/frink-server/src/serving/batch/", "partial", "Continuous batching; incremental stream gap"),
+    ("src/llama-graph.cpp", "crates/frink-models/src/decoder.rs", "partial", "Hand-written decode graph, not ggml graph"),
+    ("src/llama-sampler.cpp", "crates/frink-models/src/sampling.rs", "partial", "834 lines vs 4106; missing dry/xtc/typ_p/top_n_sigma"),
+    ("src/llama-grammar.cpp", "crates/frink-models/src/grammar/", "partial", "GBNF yes; some grammar features missing"),
+    ("src/llama-chat.cpp", "crates/frink-server/src/completion/", "partial", "Chat templates via tokenizer config"),
+    ("src/llama-kv-cache", "crates/frink-core/src/cache.rs + frink-models/src/kv_budget.rs", "partial", "Standard GQA KV; no DSA/ISWA/MSA variants"),
+    ("src/llama-memory", "crates/frink-core/src/expert_cache.rs + residency", "partial", "MoE residency policy wired; not executed"),
+    ("src/llama-mmap.cpp", "crates/frink-gguf/src/lib.rs", "ported", "mmap GGUF"),
+    ("src/llama-quant.cpp", "crates/frink-quant/src/", "partial", "Read all quants; write Q8_0 only; K-quant encoders in progress"),
     ("src/llama-adapter.cpp", "—", "missing", "LoRA adapters"),
-    ("src/unicode", "crates/ferrox-models/src/tokenizer/unicode.rs", "partial", "Unicode normalization"),
+    ("src/unicode", "crates/frink-models/src/tokenizer/unicode.rs", "partial", "Unicode normalization"),
     # --- Per-architecture graphs (140 files) ---
-    ("src/models/", "crates/ferrox-models/src/decoder.rs + engine_factory.rs", "partial", "One 6700-line decoder + 4 dedicated engines vs 140 files"),
+    ("src/models/", "crates/frink-models/src/decoder.rs + engine_factory.rs", "partial", "One 6700-line decoder + 4 dedicated engines vs 140 files"),
     # --- ggml core ---
-    ("ggml/src/ggml.c", "crates/ferrox-core/src/lib.rs", "partial", "No tensor graph IR; direct matmul/attn calls"),
-    ("ggml/src/ggml-quants.c", "crates/ferrox-quant/src/lib.rs", "partial", "21/26 quant types on CPU"),
-    ("ggml/src/ggml-backend.c", "crates/ferrox-core/src/kernel_registry.rs", "partial", "Backend dispatch + seal; no ggml op enum"),
+    ("ggml/src/ggml.c", "crates/frink-core/src/lib.rs", "partial", "No tensor graph IR; direct matmul/attn calls"),
+    ("ggml/src/ggml-quants.c", "crates/frink-quant/src/lib.rs", "partial", "21/26 quant types on CPU"),
+    ("ggml/src/ggml-backend.c", "crates/frink-core/src/kernel_registry.rs", "partial", "Backend dispatch + seal; no ggml op enum"),
     ("ggml/src/ggml-alloc.c", "—", "missing", "Graph allocator"),
     ("ggml/src/ggml-opt.c", "—", "out_of_scope", "Training optimizers"),
     # --- ggml backends ---
-    ("ggml/src/ggml-cpu/", "crates/ferrox-quant/ + ferrox-core/", "partial", "AVX2/NEON/i8mm; no AVX512/SVE/AMX"),
-    ("ggml/src/ggml-cuda/", "crates/ferrox-cuda/src/", "partial", "8 kernels vs 65 op families; no GEMM/MoE FA"),
-    ("ggml/src/ggml-metal/", "crates/ferrox-metal/src/", "partial", "62 kernels vs ~70 ops; competitive MoE stack"),
-    ("ggml/src/ggml-vulkan/", "crates/ferrox-vulkan/src/", "partial", "Q8_0 beachhead only; verdict GO"),
+    ("ggml/src/ggml-cpu/", "crates/frink-quant/ + frink-core/", "partial", "AVX2/NEON/i8mm; no AVX512/SVE/AMX"),
+    ("ggml/src/ggml-cuda/", "crates/frink-cuda/src/", "partial", "8 kernels vs 65 op families; no GEMM/MoE FA"),
+    ("ggml/src/ggml-metal/", "crates/frink-metal/src/", "partial", "62 kernels vs ~70 ops; competitive MoE stack"),
+    ("ggml/src/ggml-vulkan/", "crates/frink-vulkan/src/", "partial", "Q8_0 beachhead only; verdict GO"),
     ("ggml/src/ggml-sycl/", "—", "missing", "Intel SYCL backend"),
     ("ggml/src/ggml-hip/", "—", "missing", "AMD HIP (falls from CUDA port)"),
     ("ggml/src/ggml-opencl/", "—", "missing", "Mobile GPU OpenCL"),
     ("ggml/src/ggml-blas/", "—", "missing", "BLAS bridge"),
     ("ggml/src/ggml-rpc/", "—", "missing", "Remote RPC backend"),
     # --- common/ (shared CLI helpers) ---
-    ("common/arg.cpp", "crates/ferrox-cli/src/main.rs + run.rs", "partial", "CLI flags; gaps in -ngl partial, -b/-ub"),
-    ("common/sampling.cpp", "crates/ferrox-models/src/sampling.rs + sampler_order.rs", "partial", "Sampler chain ordering landed"),
-    ("common/common.cpp", "crates/ferrox-cli/src/", "partial", "Shared CLI utilities"),
-    ("common/json-schema-to-grammar.cpp", "crates/ferrox-models/src/grammar/json_schema/", "partial", "Converter exists; some schema edges"),
-    ("common/ngram-cache.cpp", "crates/ferrox-models/src/speculative.rs", "partial", "Prompt-lookup speculative only"),
+    ("common/arg.cpp", "crates/frink-cli/src/main.rs + run.rs", "partial", "CLI flags; gaps in -ngl partial, -b/-ub"),
+    ("common/sampling.cpp", "crates/frink-models/src/sampling.rs + sampler_order.rs", "partial", "Sampler chain ordering landed"),
+    ("common/common.cpp", "crates/frink-cli/src/", "partial", "Shared CLI utilities"),
+    ("common/json-schema-to-grammar.cpp", "crates/frink-models/src/grammar/json_schema/", "partial", "Converter exists; some schema edges"),
+    ("common/ngram-cache.cpp", "crates/frink-models/src/speculative.rs", "partial", "Prompt-lookup speculative only"),
     # --- tools ---
-    ("tools/cli/", "crates/ferrox-cli/src/run.rs", "partial", "ferrox run; flag parity mostly done"),
-    ("tools/server/", "crates/ferrox-server/src/", "partial", "OpenAI API; slot save/load missing"),
-    ("tools/quantize/", "crates/ferrox-cli/src/quantize.rs", "partial", "Q8_0 write; K-quant encoders missing"),
-    ("tools/perplexity/", "crates/ferrox-cli/src/perplexity.rs", "partial", "Corpus ppl; no HellaSwag sub-tools"),
-    ("tools/llama-bench/", "crates/ferrox-cli/src/bench_model.rs", "ported", "ferrox bench mirrors llama-bench"),
+    ("tools/cli/", "crates/frink-cli/src/run.rs", "partial", "frink run; flag parity mostly done"),
+    ("tools/server/", "crates/frink-server/src/", "partial", "OpenAI API; slot save/load missing"),
+    ("tools/quantize/", "crates/frink-cli/src/quantize.rs", "partial", "Q8_0 write; K-quant encoders missing"),
+    ("tools/perplexity/", "crates/frink-cli/src/perplexity.rs", "partial", "Corpus ppl; no HellaSwag sub-tools"),
+    ("tools/llama-bench/", "crates/frink-cli/src/bench_model.rs", "ported", "frink bench mirrors llama-bench"),
     ("tools/gguf-split/", "—", "missing", "Merge/split utility"),
     ("tools/imatrix/", "—", "missing", "Importance matrix for quant"),
-    ("tools/tokenize/", "crates/ferrox-cli/src/parity/tokenize.rs", "partial", "Via parity tokenizer sweep"),
+    ("tools/tokenize/", "crates/frink-cli/src/parity/tokenize.rs", "partial", "Via parity tokenizer sweep"),
     ("tools/batched-bench/", "—", "missing", "Batched throughput bench"),
     ("tools/mtmd/", "—", "missing", "Multimodal (vision)"),
     ("tools/tts/", "—", "missing", "Text-to-speech"),
@@ -97,7 +97,7 @@ MAPPING: list[tuple[str, str, Status, str]] = [
 @dataclass
 class FileEntry:
     llama_path: str
-    ferrox_path: str
+    frink_path: str
     status: Status
     note: str
     category: str
@@ -126,10 +126,10 @@ def categorize(path: str) -> str:
 
 
 def match_mapping(path: str) -> tuple[str, Status, str]:
-    for pattern, ferrox, status, note in MAPPING:
+    for pattern, frink, status, note in MAPPING:
         if path == pattern or path.startswith(pattern):
-            return ferrox, status, note
-    return "—", "missing", "No mapped ferrox counterpart"
+            return frink, status, note
+    return "—", "missing", "No mapped frink counterpart"
 
 
 def collect_llama_files() -> list[str]:
@@ -150,9 +150,9 @@ def main() -> None:
     category_counts: dict[str, dict[str, int]] = {}
 
     for path in collect_llama_files():
-        ferrox, status, note = match_mapping(path)
+        frink, status, note = match_mapping(path)
         cat = categorize(path)
-        entry = FileEntry(path, ferrox, status, note, cat)
+        entry = FileEntry(path, frink, status, note, cat)
         entries.append(entry)
         status_counts[status] = status_counts.get(status, 0) + 1
         category_counts.setdefault(cat, {})
@@ -175,7 +175,7 @@ def main() -> None:
             st = "missing"
         model_detail.append({"arch": arch, "llama": e.llama_path, "status": st})
 
-    # Ferrox crate inventory
+    # Frink crate inventory
     crate_lines: dict[str, int] = {}
     for crate in sorted(CRATES.iterdir()):
         if not crate.is_dir():
@@ -193,10 +193,10 @@ def main() -> None:
         "category_counts": category_counts,
         "architecture_graphs": {
             "total": len(model_files),
-            "audited_ferrox": len(audited),
+            "audited_frink": len(audited),
             "detail": model_detail,
         },
-        "ferrox_crates_lines": crate_lines,
+        "frink_crates_lines": crate_lines,
         "entries": [asdict(e) for e in entries],
     }
     print(json.dumps(out, indent=2))

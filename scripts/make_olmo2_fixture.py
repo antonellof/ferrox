@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `olmo2` GGUF used by ferrox's OLMo-2
+"""Generate the tiny synthetic `olmo2` GGUF used by frink's OLMo-2
 coverage test.
 
-`olmo2` is AI2's OLMo-2. It sat on ferrox's generic GQA path refusing as
+`olmo2` is AI2's OLMo-2. It sat on frink's generic GQA path refusing as
 UNAUDITED, triaged NEW CODE, and the blocker was the residual topology:
 `src/models/olmo2.cpp` creates **no `attn_norm` and no `ffn_norm` at
 all** (:43-52 is the complete per-layer tensor list) and its graph reads
@@ -10,7 +10,7 @@ the raw residual at both sublayers -- `cur = inpL` before Q/K/V (:92) and
 `build_ffn(ffn_inp, ...)` on the un-normed post-attention residual
 (:169). The two norms it does have are applied to each branch's OUTPUT
 before the residual add (:160-165, :177-182), which is exactly where
-ferrox already applies `post_attn_norm` / `post_ffn_norm`.
+frink already applies `post_attn_norm` / `post_ffn_norm`.
 
 So the layer is:
 
@@ -19,7 +19,7 @@ So the layer is:
 
 `exaone4` is the same shape (`src/models/exaone4.cpp:60-67,118,152-169`)
 and shares one implementation with this row; see
-`crates/ferrox-models/src/norm.rs`.
+`crates/frink-models/src/norm.rs`.
 
 What this fixture pins beyond that topology, each against the C:
 
@@ -27,7 +27,7 @@ What this fixture pins beyond that topology, each against the C:
     `attn_k_norm` `{n_head_kv * n_embd_head}`, and :106-112 applies both
     to the 2-D projections BEFORE `ggml_reshape_3d` (:114-116), so the
     RMS is taken over the whole Q (and whole K) vector, not per head.
-    That is ferrox's `QkNormStyle::WholeVector`, and it is the OPPOSITE
+    That is frink's `QkNormStyle::WholeVector`, and it is the OPPOSITE
     of `exaone4` next door, whose norms are `{n_embd_head_k}` and land
     after `build_qkv` has already reshaped. The two rows share a
     topology and not a QK-norm style, which is why both fixtures exist.
@@ -46,7 +46,7 @@ What this fixture pins beyond that topology, each against the C:
 present and non-zero, and the SWA branch of the graph (:120-134) ropes
 with YaRN switched off -- `freq_scale = 1`, `ext_factor = 0`,
 `attn_factor = 1` -- while the full-attention layers use the model's own
-YaRN. ferrox carries one `attn_factor` for the whole model and cannot
+YaRN. frink carries one `attn_factor` for the whole model and cannot
 express a per-layer one, so an OLMo-3-style `olmo2` checkpoint that has
 BOTH a window and YaRN is refused by name in `loader.rs` rather than
 roped at the wrong magnitude on half its layers. Writing the window into
@@ -97,7 +97,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-olmo2-fixture")
+    w.add_name("frink-olmo2-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the `ferrox parity` reference dumper against an installed
+# Builds the `frink parity` reference dumper against an installed
 # libllama. The dumper is C, not Rust, and is not part of the cargo
 # workspace on purpose: it exists to be llama.cpp's own answer, so it
 # links llama.cpp's own library rather than reimplementing anything.
@@ -9,7 +9,7 @@
 # holding include/llama.h and lib/libllama.*, OR a cmake build dir whose
 # libllama lives under bin/ with headers in LLAMA_CPP_SOURCE).
 #
-# BUILD IT TWICE. `ferrox parity` takes `--dumper` more than once, and
+# BUILD IT TWICE. `frink parity` takes `--dumper` more than once, and
 # the second one is not a nicety: with a single reference it cannot
 # render a WRONG verdict on any K-quant checkpoint at all, because two
 # builds of llama.cpp have been measured 3.5e-2 apart in KL from an
@@ -23,7 +23,7 @@
 #     LLAMA_LOGITS_OUT=target/llama_logits_scratch \
 #     bash tools/build_llama_logits.sh
 #
-#   ferrox parity -m model.gguf \
+#   frink parity -m model.gguf \
 #     --dumper target/llama_logits --dumper target/llama_logits_scratch
 set -euo pipefail
 
@@ -36,20 +36,20 @@ if [[ -z "$PREFIX" ]]; then
 #
 # Homebrew's `llama.cpp` bottle can be months behind `.scratch/llama.cpp`,
 # and a stale reference does not fail loudly -- it disagrees, and the
-# disagreement reads as a ferrox bug. Both known cases were the bottle:
+# disagreement reads as a frink bug. Both known cases were the bottle:
 #
 #   * bottle 7650 predates `BertNormalizer`'s `strip_accents` switch, so
 #     it welds a standalone combining acute into the word and yields
-#     `[UNK]` where current llama.cpp, HuggingFace and ferrox all drop
+#     `[UNK]` where current llama.cpp, HuggingFace and frink all drop
 #     it. That showed up as a WordPiece "divergence" that was not one.
 #   * the same bottle cannot LOAD a gemma-4 checkpoint at all, so
-#     `ferrox parity` skipped that model entirely and its tokenizer went
+#     `frink parity` skipped that model entirely and its tokenizer went
 #     unchecked.
 #   * Qwen2.5-1.5B Q4_K_M parity used to be reference-dependent: DRIFT
 #     against Homebrew (KL ~7.7e-3) but WRONG against a fresh scratch
 #     build (KL ~2.7e-2, same top-1). The verdict no longer moves with
 #     the bottle -- `parity` measures the two builds against EACH OTHER
-#     and judges ferrox against that, which is why you want both
+#     and judges frink against that, which is why you want both
 #     dumpers. But every printed KL still belongs to the reference the
 #     report names, so a NUMBER quoted without its libllama is still
 #     half an experiment.
@@ -106,7 +106,7 @@ fi
 
 echo
 echo "It writes into target/, so 'cargo clean' removes it — rebuild with this"
-echo "script rather than assuming ferrox parity lost its reference."
+echo "script rather than assuming frink parity lost its reference."
 echo "Build it a second time against another libllama (LLAMA_CPP_PREFIX=… "
-echo "LLAMA_LOGITS_OUT=…) and pass both to 'ferrox parity --dumper': with one"
+echo "LLAMA_LOGITS_OUT=…) and pass both to 'frink parity --dumper': with one"
 echo "reference no K-quant checkpoint can be called WRONG (issue #111)."

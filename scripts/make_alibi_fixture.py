@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic ALiBi GGUFs used by ferrox's ALiBi coverage
+"""Generate the tiny synthetic ALiBi GGUFs used by frink's ALiBi coverage
 test: `refact`, `bloom`, `mpt`, `jais`, and `baichuan` at 40 layers.
 
 Five graphs, one bias, three ways of arriving at it (`crate::alibi`):
@@ -77,7 +77,7 @@ def main(out_path: str, arch: str, clamp: bool, pos_embd: bool, no_alibi_key: bo
         return (0.5 + rng.standard_normal(n) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, arch)
-    w.add_name(f"ferrox-{arch}-fixture")
+    w.add_name(f"frink-{arch}-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(n_embd)

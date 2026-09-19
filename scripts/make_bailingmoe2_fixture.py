@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `bailingmoe2` GGUF used by ferrox's
+"""Generate the tiny synthetic `bailingmoe2` GGUF used by frink's
 Ling-2.0 / Ring coverage test.
 
 `bailingmoe2` is what inclusionAI's Ling-2.0 models tag. It is NOT
 `bailingmoe`, which is a separate row, NORM-RoPE, and was admitted
 earlier for a different reason entirely (llama.cpp reads its
 `leading_dense_block_count` and then never branches on it). This one sat
-on ferrox's generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY:
+on frink's generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY:
 every piece it needs is implemented, and only the evidence was missing.
 
 Everything this fixture pins against
 `.scratch/llama.cpp/src/models/bailingmoe2.cpp`:
 
   * A **fused** `attn_qkv` (:49), sized `{n_embd, n_embd + 2*n_embd_gqa}`
-    -- so `n_head * head_dim` must equal `n_embd` here -- which ferrox
+    -- so `n_head * head_dim` must equal `n_embd` here -- which frink
     splits in `load_qkv_projections` by the same
     `n_embd_head * n_head` / `n_embd_head * n_head_kv` arithmetic
     `llm_graph_context::build_qkv` uses (llama-graph.cpp:1598-1622).
@@ -29,7 +29,7 @@ Everything this fixture pins against
     `ffn_gate`/`ffn_up`/`ffn_down` and no experts, and layers 1-2 ship
     experts and no dense FFN. A decoder that ignored the key would die on
     a missing tensor either way round.
-  * **SIGMOID** gating, read from metadata (:11, REQUIRED). ferrox's
+  * **SIGMOID** gating, read from metadata (:11, REQUIRED). frink's
     architecture-name fallback (`SIGMOID_GATING_ARCHITECTURES`) defaults
     to softmax and does NOT list `bailingmoe2`, so the file's own key is
     the only thing that can get this right -- which is exactly why the
@@ -49,7 +49,7 @@ Everything this fixture pins against
     attention scale (:141).
 
 DELIBERATELY ABSENT: `nextn_predict_layers` and the NEXTN/MTP tensors
-(:77-85). ferrox refuses a checkpoint carrying them by name through the
+(:77-85). frink refuses a checkpoint carrying them by name through the
 unread-tensor gate, which is correct and is not what this fixture is
 evidence about.
 
@@ -104,7 +104,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-bailingmoe2-fixture")
+    w.add_name("frink-bailingmoe2-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
@@ -125,7 +125,7 @@ def main(out_path: str) -> None:
     w.add_expert_weights_scale(EXPERT_WEIGHTS_SCALE)
     w.add_expert_weights_norm(True)
     # REQUIRED by bailingmoe2.cpp:11, and the only thing that can tell
-    # ferrox not to use its softmax default.
+    # frink not to use its softmax default.
     w.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
     w.add_file_type(gguf.LlamaFileType.ALL_F32)
 

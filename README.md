@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/ferrox-logo.webp" alt="Ferrox" width="70%" />
+<img src="docs/assets/frink-logo.webp" alt="Frink" width="70%" />
 
 **A pure-Rust GGUF inference engine. Dense and MoE, on CPU, Apple Metal, or CUDA.**
 
@@ -28,7 +28,7 @@
 
 ---
 
-Ferrox loads GGUF checkpoints and runs them on the hardware you already
+Frink loads GGUF checkpoints and runs them on the hardware you already
 own. No llama.cpp bindings, no ggml wrapper. The loader, the quantized
 kernels, attention and expert routing are written here, in Rust.
 
@@ -76,39 +76,39 @@ kernels, attention and expert routing are written here, in Rust.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/antonellof/frink/main/scripts/install.sh | bash
 ```
 
-Installs `ferrox` and `ferrox-server` into `~/.local/bin` (override with
-`FERROX_INSTALL_DIR`, pin with `FERROX_VERSION=v0.17.1`). The downloaded
-`ferrox` is built with `serve`, so one binary runs completions and
-serves the API. `ferrox-server` ships alongside it so an existing one on
+Installs `frink` and `frink-server` into `~/.local/bin` (override with
+`FRINK_INSTALL_DIR`, pin with `FRINK_VERSION=v0.17.1`). The downloaded
+`frink` is built with `serve`, so one binary runs completions and
+serves the API. `frink-server` ships alongside it so an existing one on
 your PATH keeps working. Prebuilts are macOS arm64 with Metal and Linux
 x86_64 with CPU.
 
 From crates.io or source instead:
 
 ```bash
-# One binary, everything: completions, `ferrox serve`, `ferrox download`,
+# One binary, everything: completions, `frink serve`, `frink download`,
 # bench, verify. Use --features cuda on Linux+NVIDIA.
-cargo install ferrox-cli --features metal
+cargo install frink-cli --features metal
 
 # Or the server on its own, if you prefer two binaries.
-cargo install ferrox-server --features metal
+cargo install frink-server --features metal
 
 # From source.
-cargo build --release -p ferrox-cli --features metal
+cargo build --release -p frink-cli --features metal
 ```
 
 **The only flag you need is your GPU.** `--features metal` on Apple
 silicon, `--features cuda` on Linux with an NVIDIA card, nothing on a
-CPU-only machine. Everything else is already in: `ferrox serve`,
-`ferrox download`, `ferrox bench`, `ferrox verify` and completions all
+CPU-only machine. Everything else is already in: `frink serve`,
+`frink download`, `frink bench`, `frink verify` and completions all
 work out of the box.
 
-Using ferrox as a Rust library rather than a command? Depend on
-[`ferrox-inference`](https://crates.io/crates/ferrox-inference), or on
-`ferrox-models` / `ferrox-core` for just the engine. None of them pull
+Using frink as a Rust library rather than a command? Depend on
+[`frink-inference`](https://crates.io/crates/frink-inference), or on
+`frink-models` / `frink-core` for just the engine. None of them pull
 in the CLI or the server.
 
 ## Quick start
@@ -116,40 +116,40 @@ in the CLI or the server.
 ```bash
 # 0. Or skip step 1 entirely: -hf is llama.cpp's, and fetches on first use.
 #    Most llama-server flags work as spelled: -c, --api-key, --alias, --jinja.
-ferrox serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -c 8192 --alias local
+frink serve -hf bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -c 8192 --alias local
 
 # 1. Get a model. No Python, no huggingface_hub: same syntax as `hf download`.
 #    The `:QUANT` tag works here too and picks the file for you.
-ferrox download bartowski/Llama-3.2-3B-Instruct-GGUF \
+frink download bartowski/Llama-3.2-3B-Instruct-GGUF \
   Llama-3.2-3B-Instruct-Q4_K_M.gguf --local-dir models
 
-# 2. Run it. Ferrox evaluates the GGUF's own chat template and wraps your
+# 2. Run it. Frink evaluates the GGUF's own chat template and wraps your
 #    prompt in it. Add --no-cnv for a raw completion.
-ferrox -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+frink -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   -p "Explain quantization in two sentences" -n 128 -dev metal -ngl all
 
 # 3. Or serve it on 127.0.0.1:8383 and point any OpenAI client at /v1.
 #    On Metal, continuous batching is on by default, so several clients can
-#    stream in parallel. `ferrox-server` is the same server standalone.
-ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
+#    stream in parallel. `frink-server` is the same server standalone.
+frink serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
 curl -s -X POST http://127.0.0.1:8383/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"m","messages":[{"role":"user","content":"Hi"}],"max_tokens":64}'
 
 # 4. Check it against llama.cpp on your own machine.
-ferrox bench -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -p 512 -n 128 -r 3 --compare
+frink bench -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -p 512 -n 128 -r 3 --compare
 ```
 
-On `Q8_0` and `IQ4_NL`, ferrox's logits match llama.cpp's. On K-quants
+On `Q8_0` and `IQ4_NL`, frink's logits match llama.cpp's. On K-quants
 they drift, for a
 [known reason](docs/plans/llama-cpp-gap-inventory.md) that is not a
-ferrox bug: llama.cpp quantizes activations to `Q8_K` before the dot
-product and ferrox keeps them in f32.
+frink bug: llama.cpp quantizes activations to `Q8_K` before the dot
+product and frink keeps them in f32.
 
 **`IQ4_XS` is on the drifting side, not the matching one**, which the
 pair of names above makes easy to misread. ggml declares
 `vec_dot_type = Q8_K` for `IQ4_XS` and `Q8_0` for `IQ4_NL`, so they
-behave oppositely here despite the spelling. `ferrox parity` on an
+behave oppositely here despite the spelling. `frink parity` on an
 `IQ4_XS` checkpoint reads `DRIFT` by design and says so in its own
 output. Use whichever quant you would
 use with llama.cpp; if you are comparing the two, `Q8_0` is the one
@@ -157,17 +157,17 @@ that answers the question without that variable in it.
 [docs/MODELS.md](docs/MODELS.md) lists what runs today, and which
 checkpoints stop with an error instead.
 
-## Ferrox Studio
+## Frink Studio
 
 A web UI for the server: chat, the model inventory, live request
 activity, and copy-pasteable connection snippets. It is a separate app
-that talks to `ferrox-server` over the same public API every other
+that talks to `frink-server` over the same public API every other
 client uses, so nothing in it can work that the API does not expose.
 
-<img src="docs/assets/studio-chat.webp" alt="Ferrox Studio chat" width="100%" />
+<img src="docs/assets/studio-chat.webp" alt="Frink Studio chat" width="100%" />
 
 ```bash
-ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -ngl all &
+frink serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -ngl all &
 cd ui && npm install && npm run dev      # http://localhost:5173
 ```
 
@@ -175,18 +175,18 @@ More screenshots and how it is put together: [`ui/README.md`](ui/README.md).
 
 ## Use it as a library
 
-Published as [`ferrox-inference`](https://crates.io/crates/ferrox-inference),
-a facade re-exporting the workspace. The name `ferrox` on crates.io
+Published as [`frink-inference`](https://crates.io/crates/frink-inference),
+a facade re-exporting the workspace. The name `frink` on crates.io
 belongs to an unrelated crate.
 
 ```toml
 [dependencies]
-ferrox-inference = "0.17"
+frink-inference = "0.17"
 ```
 
 ```rust
-use ferrox_inference::gguf::ShardedGguf;
-use ferrox_inference::models::{Decoder, ModelConfig};
+use frink_inference::gguf::ShardedGguf;
+use frink_inference::models::{Decoder, ModelConfig};
 
 let path = "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
 
@@ -202,15 +202,15 @@ let decoder = Decoder::from_gguf(path, config)?;
 
 Features, none on by default: `metal`, `cuda`, `api`. Every layer is
 published separately if you want one rather than the stack:
-[gguf](https://crates.io/crates/ferrox-gguf),
-[quant](https://crates.io/crates/ferrox-quant),
-[safetensors](https://crates.io/crates/ferrox-safetensors),
-[core](https://crates.io/crates/ferrox-core),
-[moe](https://crates.io/crates/ferrox-moe),
-[models](https://crates.io/crates/ferrox-models),
-[api](https://crates.io/crates/ferrox-api),
-[metal](https://crates.io/crates/ferrox-metal),
-[cuda](https://crates.io/crates/ferrox-cuda). All share one version.
+[gguf](https://crates.io/crates/frink-gguf),
+[quant](https://crates.io/crates/frink-quant),
+[safetensors](https://crates.io/crates/frink-safetensors),
+[core](https://crates.io/crates/frink-core),
+[moe](https://crates.io/crates/frink-moe),
+[models](https://crates.io/crates/frink-models),
+[api](https://crates.io/crates/frink-api),
+[metal](https://crates.io/crates/frink-metal),
+[cuda](https://crates.io/crates/frink-cuda). All share one version.
 
 ## AI full disclosure
 
@@ -224,7 +224,7 @@ GGML, largely written by hand.
 
 ## Acknowledgements to llama.cpp and GGML
 
-Ferrox does not link against GGML. It exists because llama.cpp opened
+Frink does not link against GGML. It exists because llama.cpp opened
 the path: the kernels, the quantization formats, the GGUF ecosystem, and
 years of engineering knowledge worked out there in the open. We are
 thankful and indebted to llama.cpp and its contributors. Their
@@ -242,11 +242,11 @@ we are genuinely grateful, we keep the GGML authors' copyright notice in
 Apache-2.0. See [LICENSE](LICENSE) and
 [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).
 
-[ci-badge]: https://github.com/antonellof/ferrox/actions/workflows/ci.yml/badge.svg
-[ci-workflow]: https://github.com/antonellof/ferrox/actions/workflows/ci.yml
-[release-badge]: https://img.shields.io/github/v/release/antonellof/ferrox?display_name=tag
-[latest-release]: https://github.com/antonellof/ferrox/releases/latest
-[crates-badge]: https://img.shields.io/crates/v/ferrox-inference.svg
-[crates-url]: https://crates.io/crates/ferrox-inference
-[docs-badge]: https://docs.rs/ferrox-inference/badge.svg
-[docs-url]: https://docs.rs/ferrox-inference
+[ci-badge]: https://github.com/antonellof/frink/actions/workflows/ci.yml/badge.svg
+[ci-workflow]: https://github.com/antonellof/frink/actions/workflows/ci.yml
+[release-badge]: https://img.shields.io/github/v/release/antonellof/frink?display_name=tag
+[latest-release]: https://github.com/antonellof/frink/releases/latest
+[crates-badge]: https://img.shields.io/crates/v/frink-inference.svg
+[crates-url]: https://crates.io/crates/frink-inference
+[docs-badge]: https://docs.rs/frink-inference/badge.svg
+[docs-url]: https://docs.rs/frink-inference

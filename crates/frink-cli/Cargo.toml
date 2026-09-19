@@ -1,0 +1,66 @@
+[package]
+name = "frink-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "llama.cpp-style CLI for the Frink inference engine"
+readme = "README.md"
+keywords = ["llm", "inference", "cli", "gguf", "frink"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "frink"
+path = "src/main.rs"
+
+[dependencies]
+frink-gguf = { workspace = true }
+frink-quant = { workspace = true }
+frink-cuda = { workspace = true }
+frink-metal = { workspace = true }
+half = { workspace = true }
+frink-core = { workspace = true }
+frink-models = { workspace = true, features = ["hub"] }
+frink-safetensors = { workspace = true }
+# Optional, and off by default -- see the `serve` feature below.
+frink-server = { workspace = true, optional = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rayon = { workspace = true }
+byteorder = { workspace = true }
+# For the SIGINT handler in `frink chat`: Ctrl-C stops the turn rather
+# than the session. No new external dependency -- frink-core already
+# uses it.
+libc = { workspace = true }
+
+[features]
+default = ["serve"]
+# Must forward to frink-models the same way `metal` does, or the CLI
+# links a frink-core built *without* `cuda` -- no `cuda_dense_enabled`,
+# no `apply_gpu` CUDA arm -- and `cargo build -p frink-cli --features
+# cuda` does not compile at all. Only ever caught on a real CUDA host,
+# because CI has none.
+cuda = ["frink-cuda/cuda", "frink-models/cuda", "frink-server?/cuda"]
+# Caps detection + Metal apply_gpu dispatch through frink-models.
+metal = ["frink-metal/metal", "frink-models/metal", "frink-server?/metal"]
+# `frink serve`: the OpenAI-compatible HTTP server, linked in from the
+# frink-server library rather than reimplemented, so both front ends
+# share one `ServerArgs` and one code path.
+#
+# ON BY DEFAULT. `cargo install frink-cli` gives you the whole tool:
+# completions, `frink serve`, `frink download`, bench, verify. One
+# binary that does everything is worth more than a small one that does
+# part of it and makes you discover a feature flag to get the rest.
+#
+# It costs build time and crates (axum, tokio, hyper, rustls), and that
+# is the trade. A library consumer who wants only the model code should
+# depend on frink-models or frink-core directly rather than on the
+# CLI, or pass `default-features = false`.
+#
+# The `?` in the cuda/metal features above still matters: they forward
+# to frink-server only if it is in the graph, never enable it.
+serve = ["dep:frink-server"]

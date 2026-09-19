@@ -49,9 +49,9 @@ import { useLatest } from "@/lib/use-latest";
 // exactly one place below. Local mode has no ids to put in a URL, so it
 // asks the same function with the one slot it has.
 
-const LOCAL_KEY = "ferrox.studio.thread.v3";
+const LOCAL_KEY = "frink.studio.thread.v3";
 /** The shape before the transcript carried its own save time. */
-const LEGACY_LOCAL_KEY = "ferrox.studio.thread.v2";
+const LEGACY_LOCAL_KEY = "frink.studio.thread.v2";
 
 type LocalTranscript = {
   /** When this was written. The entry rule needs an age, and a blob that

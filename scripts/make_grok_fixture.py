@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `grok` GGUFs used by ferrox's Grok-1
+"""Generate the tiny synthetic `grok` GGUFs used by frink's Grok-1
 coverage test.
 
-`grok` sat on ferrox's generic GQA path refusing as UNAUDITED, triaged
+`grok` sat on frink's generic GQA path refusing as UNAUDITED, triaged
 NEW CODE, and its verdict named the MiniCPM shape: defaults assigned
 before the file can override them, so a key-presence gate has nothing
 to see. `.scratch/llama.cpp/src/models/grok.cpp:5-12` seeds SEVEN
@@ -25,7 +25,7 @@ and it is not a nicety -- a hook merged the wrong way round agrees with
 llama.cpp on exactly the files that prove it exists, and every fresh
 export carries the keys (`conversion/grok.py:34-57` writes all of them).
 
-How each seed reaches the graph, against the C, and what ferrox does:
+How each seed reaches the graph, against the C, and what frink does:
 
   * **embedding_scale** -- the shared `build_inp_embd`
     (llama-graph.cpp:2337-2342). `scalar_multipliers`, as for Granite.
@@ -46,7 +46,7 @@ How each seed reaches the graph, against the C, and what ferrox does:
   * **router_logit_softcapping** and **attention.temperature_length**
     -- read at :20 and :23 and applied NOWHERE: no other reference to
     either field exists under `src/` (measured with grep). `--declared`
-    writes both so the test can pin that ferrox neither applies nor
+    writes both so the test can pin that frink neither applies nor
     refuses them.
   * **yarn_beta_fast** -- only reachable through YaRN rope scaling,
     which Grok-1 does not declare; carried in the same defaults variant
@@ -85,7 +85,7 @@ softcap default would be invisible to the test that exists to pin it.
 
 `--dense-ffn` writes the Grok-2 shape: dense `ffn_gate/up/down` beside
 the experts, which :171-184 sums with the MoE and scales by sqrt(2)/2.
-ferrox refuses it by name (`crate::parallel_dense_ffn`); no golden goes
+frink refuses it by name (`crate::parallel_dense_ffn`); no golden goes
 with that file.
 
 Weights are pseudo-random from a fixed seed so the files are byte-stable
@@ -140,7 +140,7 @@ DECLARED_EMBEDDING_SCALE = 40.0
 DECLARED_ATTN_OUTPUT_SCALE = 0.2
 DECLARED_ATTN_SOFTCAP = 10.0
 DECLARED_FINAL_SOFTCAP = 5.0
-# Read and never applied by llama.cpp; written to prove ferrox neither
+# Read and never applied by llama.cpp; written to prove frink neither
 # applies nor refuses them.
 DECLARED_ROUTER_SOFTCAP = 30.0
 DECLARED_ATTN_TEMPERATURE_LENGTH = 4096
@@ -156,7 +156,7 @@ def main(out_path: str, declared: bool, dense_ffn: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-grok-fixture")
+    w.add_name("frink-grok-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
@@ -236,7 +236,7 @@ def main(out_path: str, declared: bool, dense_ffn: bool) -> None:
 
         if dense_ffn:
             # The Grok-2 shape (:66-68 create them optional, :171-184
-            # sum them with the experts). Refused by ferrox.
+            # sum them with the experts). Refused by frink.
             w.add_tensor(p + "ffn_gate.weight", rnd(N_FF, N_EMBD))
             w.add_tensor(p + "ffn_up.weight", rnd(N_FF, N_EMBD))
             w.add_tensor(p + "ffn_down.weight", rnd(N_EMBD, N_FF))

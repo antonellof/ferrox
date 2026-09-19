@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `exaone` GGUF used by ferrox's EXAONE 3.x
+"""Generate the tiny synthetic `exaone` GGUF used by frink's EXAONE 3.x
 coverage test.
 
 `exaone` is LG AI Research's EXAONE-3.0 / 3.5. It is NOT `exaone4`, which
 is a different residual topology (no pre-attention and no pre-FFN norm)
 and stays refusing, nor `exaone-moe`, whose full-attention layers get no
-RoPE at all. This row sat on ferrox's generic GQA path refusing as
+RoPE at all. This row sat on frink's generic GQA path refusing as
 UNAUDITED, triaged FIXTURE-AWAY.
 
 `.scratch/llama.cpp/src/models/exaone.cpp`:
@@ -34,7 +34,7 @@ What the fixture pins:
 DELIBERATELY ABSENT: the optional global `rope_freqs.weight` (:35,
 `LLM_TENSOR_ROPE_FREQS` maps to the un-suffixed name `rope_freqs`,
 llama-arch.cpp:386). It is llama3-style RoPE frequency scaling, which
-EXAONE 3.x does not ship, and ferrox loads it on a shared path already
+EXAONE 3.x does not ship, and frink loads it on a shared path already
 exercised by the Llama-3.x parity runs.
 
 Weights are pseudo-random from a fixed seed so the file is byte-stable.
@@ -78,7 +78,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-exaone-fixture")
+    w.add_name("frink-exaone-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

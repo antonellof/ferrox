@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `arctic` GGUFs used by ferrox's
+"""Generate the tiny synthetic `arctic` GGUFs used by frink's
 parallel-dense-FFN / MoE-branch-input coverage test.
 
 `arctic` refused as UNAUDITED, triaged NEW CODE, on a PARALLEL dense +
@@ -24,14 +24,14 @@ NORM RoPE (llama-model.cpp:2588), `rope.dimension_count = head_dim`
 (`conversion/arctic.py:110`, asserted at `:53`), untied `output`
 optional (`:22-27`).
 
-`ferrox_models::parallel_dense_ffn` (the dense FFN summed with the
+`frink_models::parallel_dense_ffn` (the dense FFN summed with the
 experts; `grok`'s Grok-2 shape is the other row) and
 `RouterInput::NormedLayerInput` (the branch operand; one graph of 140
 creates `FFN_NORM_EXPS`) are the seams.
 
 `--weights-scale S` writes `{arch}.expert_weights_scale = S`. llama.cpp
 does not read it for `arctic` (measured: the golden is byte-identical
-to the base file's), so the variant pins that ferrox ignores it too
+to the base file's), so the variant pins that frink ignores it too
 (`EXPERT_WEIGHTS_SCALE_READERS`).
 
 Weights are pseudo-random from a fixed seed so the file is byte-stable.
@@ -79,7 +79,7 @@ def main(out_path: str, weights_scale: float | None) -> None:
         return (1.5 + rng.standard_normal(shape) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-arctic-fixture")
+    w.add_name("frink-arctic-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

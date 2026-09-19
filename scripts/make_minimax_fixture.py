@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `minimax-m2` GGUF behind ferrox's MiniMax
+"""Generate the tiny synthetic `minimax-m2` GGUF behind frink's MiniMax
 refusal test.
 
 MiniMax-M2 used to be refused here for "256-expert sigmoid MoE + MTP".
@@ -16,7 +16,7 @@ contain -- glm4moe's `q_lora_rank` defect in a different costume.
 
 **The routing is nothing new.** `minimax-m2.cpp:131-141` is one
 `build_moe_ffn` with `LLM_FFN_SILU`, `norm_w=true`, `exp_probs_b` and
-whatever `expert_gating_func` says. ferrox reads all of that already.
+whatever `expert_gating_func` says. frink reads all of that already.
 
 So what this file pins is the shape of a *valid* minimax-m2 checkpoint,
 transcribed from `minimax-m2.cpp` and `conversion/minimax.py`:
@@ -42,7 +42,7 @@ transcribed from `minimax-m2.cpp` and `conversion/minimax.py`:
     `conversion/minimax.py` writes both only for M3 (:70-71), and
     `minimax-m2.cpp` reads neither -- it hardcodes `norm_w=true` and
     leaves the scale at llama.cpp's 0.0f, which `llama-graph.cpp:2070`
-    treats as "do not scale". ferrox's defaults land on the same
+    treats as "do not scale". frink's defaults land on the same
     behaviour, and `tests/minimax_refusal.rs` pins that they do.
   * **`n_ff == n_ff_exp`.** `minimax-m2.cpp` shapes its expert tensors
     with `n_ff`, not `n_ff_exp`, and the converter sets both from
@@ -54,10 +54,10 @@ Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
         python3 scripts/make_minimax_fixture.py OUT.gguf
 
-No golden logits are checked in: ferrox has no minimax graph to compare
+No golden logits are checked in: frink has no minimax graph to compare
 against, and admitting `minimax-m2` to `AUDITED_GENERIC_GQA` needs a
 logit comparison against llama.cpp, not this file. See
-`crates/ferrox-models/tests/minimax_refusal.rs`.
+`crates/frink-models/tests/minimax_refusal.rs`.
 """
 
 import sys
@@ -94,7 +94,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-minimax-m2-fixture")
+    w.add_name("frink-minimax-m2-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

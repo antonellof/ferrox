@@ -8,13 +8,13 @@ import {
 import { cn } from "@/lib/utils";
 
 /**
- * The Ferrox mark. See `lib/logo-geometry.ts` for what it draws and why.
+ * The Frink mark. See `lib/logo-geometry.ts` for what it draws and why.
  *
  * It is inline SVG on `currentColor` rather than an image, so one file
  * serves the sidebar, the assistant avatar, the empty state and the
  * favicon, in both themes, with no second asset to keep in step.
  */
-export function FerroxMark({
+export function FrinkMark({
   className,
   title,
 }: {
@@ -43,12 +43,12 @@ export function FerroxMark({
 }
 
 /** Mark plus name. The weight split is the whole lockup: no hue does it. */
-export function FerroxWordmark({ className }: { className?: string }) {
+export function FrinkWordmark({ className }: { className?: string }) {
   return (
     <div className={cn("flex min-w-0 items-center gap-2", className)}>
-      <FerroxMark className="size-5 text-fg" />
+      <FrinkMark className="size-5 text-fg" />
       <span className="truncate text-sm tracking-tight">
-        <span className="font-semibold">Ferrox</span>{" "}
+        <span className="font-semibold">Frink</span>{" "}
         <span className="text-faint">Studio</span>
       </span>
     </div>

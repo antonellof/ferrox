@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `maple` GGUF used by ferrox's
+"""Generate the tiny synthetic `maple` GGUF used by frink's
 per-layer-RoPE coverage test.
 
 `maple` landed upstream after the 2026-08-04 llama.cpp pin and was
@@ -64,7 +64,7 @@ N_EXPERT_USED = 2
 IS_SWA = [True, True, False, True]
 # Per-layer expert width (`maple.cpp:6` reads the array); the tensors
 # are sized from `n_ff_exp()`, layer 0's entry, so the array is uniform
-# here and what it evidences is that ferrox READS it as an array rather
+# here and what it evidences is that frink READS it as an array rather
 # than failing on one.
 FF_EXP = [16, 16, 16, 16]
 # A zero beside each nonzero entry, so the `> 1e-6` branch of
@@ -80,7 +80,7 @@ def main(out_path: str, no_clamp: bool = False, all_swa: bool = False) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-maple-fixture")
+    w.add_name("frink-maple-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `smollm3` GGUF used by ferrox's
+"""Generate the tiny synthetic `smollm3` GGUF used by frink's
 per-layer-RoPE coverage test.
 
 `smollm3` was refused OUTRIGHT -- `ArchPath::DedicatedOnly`, in
@@ -21,8 +21,8 @@ set, so the file loads clean, runs at full speed, and answers fluently
 from positions three layers in four never encode -- which is why it was
 a refusal rather than a gate.
 
-ferrox implements the rule once, in
-`crates/ferrox-models/src/rope_layers.rs`, shared with `exaone4`,
+frink implements the rule once, in
+`crates/frink-models/src/rope_layers.rs`, shared with `exaone4`,
 `exaone-moe`, `smallthinker`, `afmoe` and `llama4`. `smollm3` is the row
 where it is the ONLY thing: the other five each carry the rule plus
 something else, so this is the fixture that isolates it.
@@ -79,7 +79,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-smollm3-fixture")
+    w.add_name("frink-smollm3-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

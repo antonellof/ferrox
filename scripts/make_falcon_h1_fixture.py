@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `falcon-h1` GGUFs used by ferrox's
-Falcon-H1 coverage test (`crates/ferrox-models/tests/falcon_h1_graphs.rs`).
+"""Generate the tiny synthetic `falcon-h1` GGUFs used by frink's
+Falcon-H1 coverage test (`crates/frink-models/tests/falcon_h1_graphs.rs`).
 
 `falcon-h1` (Falcon-H1 0.5B / 1.5B / 3B / 7B / 34B) runs attention AND
 a Mamba-2 block on EVERY layer, in parallel, on the same normed input,
@@ -72,7 +72,7 @@ def main(out_path: str, ssm_norm: bool, separate_output: bool, ffn_norm_suffix: 
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-falcon-h1-fixture")
+    w.add_name("frink-falcon-h1-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `spark2_5` GGUF used by ferrox's
+"""Generate the tiny synthetic `spark2_5` GGUF used by frink's
 gated-attention coverage test.
 
 `spark2_5` landed upstream after the 2026-08-04 llama.cpp pin and was
@@ -77,7 +77,7 @@ def main(out_path: str, simple: bool = False, mode: str = "") -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-spark25-fixture")
+    w.add_name("frink-spark25-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

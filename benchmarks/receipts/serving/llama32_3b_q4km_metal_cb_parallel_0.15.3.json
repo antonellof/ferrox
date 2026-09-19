@@ -2,7 +2,7 @@
   "id": "llama32_3b_q4km",
   "kind": "serving",
   "workload": "parallel_stream_burst",
-  "ferrox_version": "0.15.3",
+  "frink_version": "0.15.3",
   "host_spec": {
     "arch": "aarch64",
     "cores": 10,
@@ -62,7 +62,7 @@
       "max_ttft_ms": 1949.9
     }
   ],
-  "driver": "pi-agent-tests/ferrox_parallel_bench.py",
+  "driver": "pi-agent-tests/frink_parallel_bench.py",
   "notes": "Concurrent streaming bursts via POST /v1/chat/completions. CB auto-on on Metal. 0 failures at all concurrency levels after 0.15.3 host-KV prefill fix. Compare with 0.15.2 parallel receipt (same ~24 tok/s at concurrency 8, but 0.15.2 returned garbled text under CB).",
   "measured_at": "2026-09-02"
 }

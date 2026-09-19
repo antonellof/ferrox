@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `granite` GGUF used by ferrox's Granite
+"""Generate the tiny synthetic `granite` GGUF used by frink's Granite
 coverage test.
 
-`granite` is IBM's Granite 3.x dense decoder. It sat on ferrox's generic
+`granite` is IBM's Granite 3.x dense decoder. It sat on frink's generic
 GQA path refusing, triaged NEW CODE, for one reason: the four scalar
 MULTIPLIERS `src/models/granite.cpp` applies and the generic decoder did
 not.
@@ -44,7 +44,7 @@ built to drive:
     `add_rope_scaling_finetuned` in `conversion/granite.py` is at :253,
     inside `GraniteHybridModel`, whose `model_arch` is
     `GRANITE_HYBRID`. So every converter-produced `granite` and
-    `granitemoe` file rotates. ferrox refuses a file that declares the
+    `granitemoe` file rotates. frink refuses a file that declares the
     key FALSE rather than rotating anyway, and
     `tests/granite_family_graphs.rs` proves that refusal is reachable by
     writing the key.
@@ -116,7 +116,7 @@ def main(out_path: str, rope_finetuned: bool, logit_scale: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-granite-fixture")
+    w.add_name("frink-granite-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
@@ -135,7 +135,7 @@ def main(out_path: str, rope_finetuned: bool, logit_scale: bool) -> None:
     # `--no-logit-scale` omits the one llama.cpp reads as REQUIRED
     # (granite.cpp:7, no default), producing a file llama.cpp itself
     # cannot load -- `key not found in model: granite.logit_scale`. It
-    # exists so ferrox's matching refusal is driven by a real file
+    # exists so frink's matching refusal is driven by a real file
     # rather than asserted to exist.
     if logit_scale:
         w.add_logit_scale(LOGIT_SCALE)
@@ -144,8 +144,8 @@ def main(out_path: str, rope_finetuned: bool, logit_scale: bool) -> None:
     w.add_attention_scale(ATTENTION_SCALE)
 
     # Only written for the `--no-rope` variant, which exists to prove
-    # ferrox's refusal is reachable. llama.cpp would happily run this
-    # file with NO rotation at all (granite.cpp:206); ferrox has no way
+    # frink's refusal is reachable. llama.cpp would happily run this
+    # file with NO rotation at all (granite.cpp:206); frink has no way
     # to express "this architecture, unrotated", so it stops.
     if not rope_finetuned:
         w.add_rope_scaling_finetuned(False)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `phi2` GGUFs used by ferrox's Phi-2
+"""Generate the tiny synthetic `phi2` GGUFs used by frink's Phi-2
 coverage test.
 
 `phi2` (Phi-2, Phi-1.5) refused as a `dedicated` row for its parallel
@@ -70,7 +70,7 @@ def main(out_path: str, fused: bool) -> None:
         return (0.5 + rng.standard_normal(n) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-phi2-fixture")
+    w.add_name("frink-phi2-fixture")
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
     w.add_feed_forward_length(N_FF)

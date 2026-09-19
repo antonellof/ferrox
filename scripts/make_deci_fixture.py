@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `deci` GGUFs used by ferrox's per-layer
+"""Generate the tiny synthetic `deci` GGUFs used by frink's per-layer
 shape coverage test.
 
 `deci` (DeciLM, Llama-3.1-Nemotron-51B/253B) was triaged NEW CODE on
@@ -41,13 +41,13 @@ Three files:
   * `--kv-only` -- the DECILM-7B shape: `head_count 4` and
     `feed_forward_length 40` as scalars, `head_count_kv = [2, 1, 4]`.
     Same tensor set as `llama`, different K/V widths per layer.
-  * `--attn-ffnfree` -- the combination ferrox REFUSES: a MIDDLE layer
+  * `--attn-ffnfree` -- the combination frink REFUSES: a MIDDLE layer
     with attention (`head_count 4, kv 2`) and `feed_forward_length 0`
     (middle for the reason above).
     deci.cpp:147-149 `continue`s before the residual add at :150-153,
     so the attention output computed at :115-137 is DISCARDED and the
     layer is the identity in llama.cpp's graph, which is almost
-    certainly not the model's. libllama loads the file; ferrox names
+    certainly not the model's. libllama loads the file; frink names
     the line and stops (`layer_shapes::LayerShapes::resolve`).
 
 Common to all: NORM RoPE (`LLM_ARCH_DECI` is in `llama_model_rope_type`'s
@@ -100,7 +100,7 @@ def main(out_path: str, variant: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name(f"ferrox-deci-{variant}-fixture")
+    w.add_name(f"frink-deci-{variant}-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

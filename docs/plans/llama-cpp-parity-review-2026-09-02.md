@@ -17,8 +17,8 @@ now carries what is true rather than what was true at breakfast.
 | Architecture coverage | **16** audited + 4 dedicated engines vs 140 llama.cpp graphs | P0, expand audited set |
 | CLI flag semantics | `-ngl` still refuses a partial count deliberately; `-e` and `--repeat-last-n` already match | P2, documented rather than divergent |
 | Server flags | **DONE**: `-c`, `--api-key`, `--api-key-file`, `--alias`, `--ctk`, `-hf`, `--hf-file`, `-cb`, `-np` | closed |
-| Sampling / grammar | **Done**: GBNF, JSON Schema, forced `tool_choice`, the two penalties, and `--samplers` ordering with unimplemented samplers refused by name | closed, bar the samplers ferrox does not implement (`dry`, `xtc`, `typ_p`, `top_n_sigma`) |
-| Tools (quantize, perplexity) | `ferrox quantize` writes Q8_0 byte-identically; `ferrox perplexity` agrees with `llama-perplexity` to within a fifth of a standard error on five checkpoints | P1, K-quant encoders (#70); HellaSwag and the other corpus sub-tools remain |
+| Sampling / grammar | **Done**: GBNF, JSON Schema, forced `tool_choice`, the two penalties, and `--samplers` ordering with unimplemented samplers refused by name | closed, bar the samplers frink does not implement (`dry`, `xtc`, `typ_p`, `top_n_sigma`) |
+| Tools (quantize, perplexity) | `frink quantize` writes Q8_0 byte-identically; `frink perplexity` agrees with `llama-perplexity` to within a fifth of a standard error on five checkpoints | P1, K-quant encoders (#70); HellaSwag and the other corpus sub-tools remain |
 | Serving / batching | CB auto-on Metal; incremental CB streaming | P1, slot save/load |
 | Metal concurrency | Phase 1 shipped (#46 closed); per-request Metal KV is follow-up | P2 |
 
@@ -39,13 +39,13 @@ now carries what is true rather than what was true at breakfast.
 ### What the re-check found that this document did not
 
 `quantize` is filed here as a missing TOOL. It is a missing
-CAPABILITY: `ferrox-quant` has `quantize_q8_0` and two activation
-quantizers, and nothing that writes a K-quant. A `ferrox quantize`
+CAPABILITY: `frink-quant` has `quantize_q8_0` and two activation
+quantizers, and nothing that writes a K-quant. A `frink quantize`
 subcommand is not the work; K-quant encoders with importance-weighted
 rounding are, and pretending otherwise would produce a command that
 can only emit Q8_0 while its name implies llama.cpp's range. Tracked
 with the step-wise shape it would need as
-[#70](https://github.com/antonellof/ferrox/issues/70).
+[#70](https://github.com/antonellof/frink/issues/70).
 
 ---
 
@@ -55,8 +55,8 @@ with the step-wise shape it would need as
 
 From gap inventory §4.1:
 
-- **`-ngl`**: llama.cpp partial layer offload vs ferrox all-or-nothing — **refuse with clear error** until partial placement exists, or implement layer counting.
-- **`-e` / escape**: default off in ferrox vs on in llama.cpp — default-on or `--no-escape` alias parity.
+- **`-ngl`**: llama.cpp partial layer offload vs frink all-or-nothing — **refuse with clear error** until partial placement exists, or implement layer counting.
+- **`-e` / escape**: default off in frink vs on in llama.cpp — default-on or `--no-escape` alias parity.
 - **`--repeat-penalty`**: windowed vs full-history — add `--repeat-last-n` and match default 64.
 
 ### 2. Metal parallel decode (#46)
@@ -87,22 +87,22 @@ The unaudited-arch refusal gate is **good** (better than silent wrong). Next:
 
 ### Continuous batching & parallelism
 
-| llama.cpp | ferrox (after this branch) | Gap |
+| llama.cpp | frink (after this branch) | Gap |
 |-----------|----------------------------|-----|
-| `-cb` / `--cont-batching` | `--cont-batching`, `-cb`, `FERROX_CONTINUOUS_BATCHING` | **CLI added**; document auto-default on Metal |
-| `-np` / `--parallel` | `FERROX_CB_MAX_SEQS` only | Add `-np` → env |
+| `-cb` / `--cont-batching` | `--cont-batching`, `-cb`, `FRINK_CONTINUOUS_BATCHING` | **CLI added**; document auto-default on Metal |
+| `-np` / `--parallel` | `FRINK_CB_MAX_SEQS` only | Add `-np` → env |
 | Slot save/load | None | Missing |
-| Streamed CB output | Token stream | ferrox buffers full completion under CB |
+| Streamed CB output | Token stream | frink buffers full completion under CB |
 
 ### Server flags → env today
 
-High-value CLI additions (map to existing `FERROX_*`):
+High-value CLI additions (map to existing `FRINK_*`):
 
-- ~~`-c` / `--ctx-size`~~ **done**, sets `FERROX_CB_MAX_CONTEXT`
+- ~~`-c` / `--ctx-size`~~ **done**, sets `FRINK_CB_MAX_CONTEXT`
 - ~~`--api-key`~~ **done**, plus `--api-key-file`, which is the form to
   prefer on a shared host since an argument is visible in `ps`
 - ~~`-fa`~~ **done**, accepted; `-fa off` refuses by name and points at
-  `FERROX_METAL_ATTN=0`, because fused attention is a backend property
+  `FRINK_METAL_ATTN=0`, because fused attention is a backend property
   here rather than a per-run switch
 - `-b` / `-ub` → prefill/decode batch envs, still open
 
@@ -118,14 +118,14 @@ Gaps (inventory §3): `logit_bias` dropped on chat, JSON schema under CB, Anthro
 
 ### Missing llama.cpp tools
 
-| Tool | ferrox | Action |
+| Tool | frink | Action |
 |------|--------|--------|
 | `quantize` | None | **Critical** — users need llama.cpp side-by-side |
-| `perplexity` / benchmarks | `bench`, `parity`, no corpus ppl | Add perplexity or document `ferrox bench` scope |
+| `perplexity` / benchmarks | `bench`, `parity`, no corpus ppl | Add perplexity or document `frink bench` scope |
 | `gguf-split` | read shards only | Merge/split utility |
 | `imatrix` | None | Lower priority |
 
-### `ferrox run` vs `llama-cli`
+### `frink run` vs `llama-cli`
 
 Align: `-n` default (-1 = EOS), `-cnv`/`-no-cnv`, `-sys` spelling, `-hf` on run path, grammar/json flags.
 
@@ -133,8 +133,8 @@ Align: `-n` default (-1 = EOS), `-cnv`/`-no-cnv`, `-sys` spelling, `-hf` on run 
 
 ## P2 — Performance parity
 
-- **Engine bench:** `ferrox bench` vs `llama-bench` — keep receipt discipline ([`benchmarks/README.md`](../../benchmarks/README.md))
-- **HTTP bench:** `ferrox serve-bench` vs `llama-server` load — extend parallel/concurrency scenarios
+- **Engine bench:** `frink bench` vs `llama-bench` — keep receipt discipline ([`benchmarks/README.md`](../../benchmarks/README.md))
+- **HTTP bench:** `frink serve-bench` vs `llama-server` load — extend parallel/concurrency scenarios
 - **Kernel parity:** Metal/CUDA gap inventory in [`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md) §2
 
 ---
@@ -153,7 +153,7 @@ Align: `-n` default (-1 = EOS), `-cnv`/`-no-cnv`, `-sys` spelling, `-hf` on run 
 2. **Flag semantics sprint** — `-ngl`, escape, repeat-last-n (refuse > wrong)
 3. **Server CLI parity pack** — `-c`, `--api-key`, document env mapping table
 4. **Fixture-away architectures** — 3–5 new audited rows with tiny GGUF fixtures
-5. **Slot save/load** — llama.cpp KV serialize/restore (Ferrox has no equivalent yet)
+5. **Slot save/load** — llama.cpp KV serialize/restore (Frink has no equivalent yet)
 6. **Quantize tool** — or official doc pointing to llama.cpp quantize
 
 ---
@@ -172,7 +172,7 @@ Use [`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md) as the evidence l
 
 ## References
 
-- Issue [#46](https://github.com/antonellof/ferrox/issues/46) — Metal parallel decode (closed in 0.15.2)
+- Issue [#46](https://github.com/antonellof/frink/issues/46) — Metal parallel decode (closed in 0.15.2)
 - [`docs/plans/metal-parallel-concurrency.md`](metal-parallel-concurrency.md) — design
 - [`docs/CONFIG.md`](../../CONFIG.md) — env vars
 - [`docs/API.md`](../../API.md) — HTTP surface

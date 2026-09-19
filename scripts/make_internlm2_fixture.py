@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `internlm2` GGUF used by ferrox's
+"""Generate the tiny synthetic `internlm2` GGUF used by frink's
 InternLM2 coverage test.
 
-`internlm2` is Shanghai AI Lab's InternLM2-7B/20B. It sat on ferrox's
+`internlm2` is Shanghai AI Lab's InternLM2-7B/20B. It sat on frink's
 generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY: the graph
 is plain llama, so the only thing missing was evidence.
 
@@ -24,7 +24,7 @@ What the fixture carries beyond the minimum:
   * The OPTIONAL per-projection biases `create_tensor_qkv` allows
     (llama-model.cpp:2897-2899, `TENSOR_NOT_REQUIRED`), which real
     InternLM2 checkpoints ship because the HF model sets `bias=True` on
-    `wqkv`. ferrox loads them generically (`loader.rs`'s
+    `wqkv`. frink loads them generically (`loader.rs`'s
     `q_bias`/`k_bias`/`v_bias`), and they are non-zero here so a decoder
     that dropped them would be visible.
   * GQA: `n_head_kv = 2 < n_head = 4`.
@@ -76,7 +76,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-internlm2-fixture")
+    w.add_name("frink-internlm2-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

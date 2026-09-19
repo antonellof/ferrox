@@ -13,7 +13,7 @@ plan in the parent directory:
 | Plan | Done |
 |---|---|
 | serving-and-tiered-kv | 17/18 |
-| ferrox-ui | 15/17 |
+| frink-ui | 15/17 |
 | one-binary-serve | 10/11 |
 | freetoken-parity | 60/73 |
 | llama-cpp-parity-push | 22/38 |
