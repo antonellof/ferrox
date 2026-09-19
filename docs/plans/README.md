@@ -30,6 +30,16 @@ Four items are large enough to carry their own design document:
   per layer, copied both ways), and four measured non-results so they
   are not tried again.
 
+Audits of the other engines sit beside them:
+
+- **[`parity-audit-2026-09-19.md`](parity-audit-2026-09-19.md)**,
+  llama.cpp and vLLM re-measured against a moved pin.
+- **[`xinfer-audit-2026-09-19.md`](xinfer-audit-2026-09-19.md)**,
+  xInfer read the same way: the three-way Metal benchmark that put
+  frink ahead of it and of llama.cpp on the hardware, what it has that
+  frink does not, and the TurboQuant rotation that closed on the back
+  of it.
+
 How work lands is written down too:
 
 - **[`contribution-workflow.md`](contribution-workflow.md)**, the rule

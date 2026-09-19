@@ -437,3 +437,23 @@ If frink ever vendors or adapts actual source lines from an MIT or
 Apache-2.0 licensed project, the applicable upstream copyright and
 license notice will be added to this file alongside that code, per the
 terms of those licenses.
+
+## TurboQuant KV rotation (xInfer / attention.rs)
+
+`frink-quant`'s `turboquant` module and the `kv_append_turbo4` /
+`rotate_q_turbo4` Metal kernels implement the randomized Hadamard
+rotation that xInfer applies to its 4-bit KV cache. The scheme
+(deterministic per-head, per-channel sign flip, then a normalized
+Walsh-Hadamard transform over the head vector, with the query put
+through the same transform so the dot product is unchanged) was read
+from `attention.rs`'s `flash_attention.metal`, and the sign hash is
+that file's `tq_sign_flip` verbatim so a vector rotated by either
+implementation is the same vector. The surrounding code, the wire
+layout (frink keeps its own per-32-element scales) and the Rust host
+definition are frink's.
+
+  xInfer and attention.rs are MIT licensed:
+  Copyright (c) 2026 Guoqing Bao
+
+    https://github.com/guoqingbao/xinfer
+    https://github.com/guoqingbao/attention.rs

@@ -51,7 +51,7 @@
 pub use crate::decode_dense::{
     launch_decode_dense_stack, AttnExtras, DenseLayerMetal, EmbdGatherMetal,
 };
-use crate::dispatch::dispatch_counted;
+pub(crate) use crate::dispatch::dispatch_counted;
 use crate::elem::{
     encode_act_mul_f32_to_f16, encode_argmax, encode_f32_to_f16, encode_silu_mul, encode_vec_add,
     encode_vec_add_at, warm_prefill_elem_pipelines,
@@ -107,178 +107,19 @@ pub fn metal_attn_enabled() -> bool {
 // which states what it is and why running a decode step on the wrong
 // thread used to change the answer (GitHub issue #166). Re-exported
 // here because `frink-models` reads it at `frink_metal::attn::`.
+// The KV wire moved to `crate::kv_wire` when the TurboQuant rotation
+// landed. Re-exported here because `frink-models`, the bench guard and
+// the tests all read these at `frink_metal::attn::`, and a wire format
+// is not worth a rename across nine call sites.
+pub use crate::kv_wire::{
+    effective_metal_kv_dtype, encode_kv_dequant_to_f16, encode_kv_store_append, metal_kv_dtype,
+    metal_kv_q8_0_viable, metal_kv_turbo4_viable, parse_metal_kv_dtype, MetalKvDtype,
+};
+
 pub use crate::greedy_fold::{
     adopt_greedy_fold, greedy_fold_setting, metal_greedy_argmax_active, set_metal_greedy_argmax,
     GreedyFold, GreedyFoldGuard,
 };
-
-const KV_APPEND_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-// Append f32 K/V token into an f16-resident cache (llama.cpp default).
-//
-// K and V are one dispatch: the grid's HEIGHT is the plane count, so
-// `gid.y` picks the pair of buffers and no uniform has to carry it.
-// Every call site appends K and V at the same offset and length, and
-// GitHub issue #149 makes the second encode worth removing.
-kernel void kv_append(
-    device const float* src [[buffer(0)]],
-    device half* dst [[buffer(1)]],
-    constant uint& offset_elems [[buffer(2)]],
-    constant uint& n_elems [[buffer(3)]],
-    device const float* src2 [[buffer(4)]],
-    device half* dst2 [[buffer(5)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    uint i = gid.x;
-    if (i >= n_elems) return;
-    device const float* s = (gid.y == 0u) ? src : src2;
-    device half* d = (gid.y == 0u) ? dst : dst2;
-    d[offset_elems + i] = half(s[i]);
-}
-"#;
-
-/// ggml Q8_0: 32 int8 values + one f16 scale (34 bytes). One thread / block.
-const KV_APPEND_Q8_0_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-// K and V in one dispatch; grid height is the plane count (see
-// `kv_append`).
-kernel void kv_append_q8_0(
-    device const float* src_in [[buffer(0)]],
-    device uchar* dst_in [[buffer(1)]],
-    constant uint& offset_elems [[buffer(2)]],
-    constant uint& n_elems [[buffer(3)]],
-    device const float* src2 [[buffer(4)]],
-    device uchar* dst2 [[buffer(5)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    uint b = gid.x;
-    device const float* src = (gid.y == 0u) ? src_in : src2;
-    device uchar* dst = (gid.y == 0u) ? dst_in : dst2;
-    const uint BLOCK = 32u;
-    const uint BLOCK_BYTES = 34u;
-    uint n_blocks = n_elems / BLOCK;
-    if (b >= n_blocks) return;
-    uint src_base = b * BLOCK;
-    float amax = 0.0f;
-    for (uint i = 0u; i < BLOCK; i++) {
-        amax = fmax(amax, fabs(src[src_base + i]));
-    }
-    float d = amax / 127.0f;
-    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
-    uint dst_block = (offset_elems / BLOCK) + b;
-    uint dst_base = dst_block * BLOCK_BYTES;
-    half d_h = half(d);
-    dst[dst_base + 0] = uchar(as_type<ushort>(d_h) & 0xFFu);
-    dst[dst_base + 1] = uchar(as_type<ushort>(d_h) >> 8u);
-    for (uint i = 0u; i < BLOCK; i++) {
-        int q = int(round(src[src_base + i] * id));
-        q = clamp(q, -127, 127);
-        dst[dst_base + 2u + i] = uchar(char(q));
-    }
-}
-"#;
-
-const DEQUANT_Q8_0_TO_F16_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void dequant_q8_0_to_f16(
-    device const uchar* src [[buffer(0)]],
-    device half* dst [[buffer(1)]],
-    constant uint& n_elems [[buffer(2)]],
-    uint b [[thread_position_in_grid]]
-) {
-    const uint BLOCK = 32u;
-    const uint BLOCK_BYTES = 34u;
-    uint n_blocks = n_elems / BLOCK;
-    if (b >= n_blocks) return;
-    uint src_base = b * BLOCK_BYTES;
-    ushort d_bits = ushort(src[src_base]) | (ushort(src[src_base + 1u]) << 8u);
-    float d = float(as_type<half>(d_bits));
-    uint dst_base = b * BLOCK;
-    for (uint i = 0u; i < BLOCK; i++) {
-        char q = char(src[src_base + 2u + i]);
-        dst[dst_base + i] = half(float(q) * d);
-    }
-}
-"#;
-
-/// TurboQuant-style 4-bit KV: f16 scale + 16 nibble bytes / 32 elems (18 B).
-const KV_APPEND_TURBO4_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-// K and V in one dispatch; grid height is the plane count (see
-// `kv_append`).
-kernel void kv_append_turbo4(
-    device const float* src_in [[buffer(0)]],
-    device uchar* dst_in [[buffer(1)]],
-    constant uint& offset_elems [[buffer(2)]],
-    constant uint& n_elems [[buffer(3)]],
-    device const float* src2 [[buffer(4)]],
-    device uchar* dst2 [[buffer(5)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    uint b = gid.x;
-    device const float* src = (gid.y == 0u) ? src_in : src2;
-    device uchar* dst = (gid.y == 0u) ? dst_in : dst2;
-    const uint BLOCK = 32u;
-    const uint BLOCK_BYTES = 18u;
-    uint n_blocks = n_elems / BLOCK;
-    if (b >= n_blocks) return;
-    uint src_base = b * BLOCK;
-    float amax = 0.0f;
-    for (uint i = 0u; i < BLOCK; i++) {
-        amax = fmax(amax, fabs(src[src_base + i]));
-    }
-    float d = amax / 7.0f;
-    float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
-    uint dst_block = (offset_elems / BLOCK) + b;
-    uint dst_base = dst_block * BLOCK_BYTES;
-    half d_h = half(d);
-    dst[dst_base + 0] = uchar(as_type<ushort>(d_h) & 0xFFu);
-    dst[dst_base + 1] = uchar(as_type<ushort>(d_h) >> 8u);
-    for (uint i = 0u; i < 16u; i++) {
-        int q0 = int(round(src[src_base + 2u * i] * id));
-        int q1 = int(round(src[src_base + 2u * i + 1u] * id));
-        q0 = clamp(q0, -8, 7);
-        q1 = clamp(q1, -8, 7);
-        dst[dst_base + 2u + i] = uchar((q0 & 0xF) | ((q1 & 0xF) << 4));
-    }
-}
-"#;
-
-const DEQUANT_TURBO4_TO_F16_KERNEL_SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void dequant_turbo4_to_f16(
-    device const uchar* src [[buffer(0)]],
-    device half* dst [[buffer(1)]],
-    constant uint& n_elems [[buffer(2)]],
-    uint b [[thread_position_in_grid]]
-) {
-    const uint BLOCK = 32u;
-    const uint BLOCK_BYTES = 18u;
-    uint n_blocks = n_elems / BLOCK;
-    if (b >= n_blocks) return;
-    uint src_base = b * BLOCK_BYTES;
-    ushort d_bits = ushort(src[src_base]) | (ushort(src[src_base + 1u]) << 8u);
-    float d = float(as_type<half>(d_bits));
-    uint dst_base = b * BLOCK;
-    for (uint i = 0u; i < 16u; i++) {
-        uchar byte = src[src_base + 2u + i];
-        int q0 = int(char((byte & 0xFu) << 4) >> 4);
-        int q1 = int(char((byte >> 4) << 4) >> 4);
-        dst[dst_base + 2u * i] = half(float(q0) * d);
-        dst[dst_base + 2u * i + 1u] = half(float(q1) * d);
-    }
-}
-"#;
 
 /// Whether FA-vec GQA decode is enabled.
 ///
@@ -296,130 +137,6 @@ pub fn metal_fa_vec_enabled() -> bool {
             // ~1.15× decode gap (legacy GQA ≈ llama `-ctk f32`).
             _ => true,
         }
-    })
-}
-
-/// Device KV cache element type (llama.cpp `-ctk` / `--kvcache-dtype` analogue).
-///
-/// Selected via `FRINK_CTK` ([`metal_kv_dtype`]). Implemented: F16, Q8_0,
-/// Turbo8 (=Q8_0 wire), Turbo4, Fp8 (=Q8_0 wire). Turbo3 warns → F16.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetalKvDtype {
-    F16,
-    Q8_0,
-    /// FP8-style KV (scaled int8 / Q8_0 layout).
-    Fp8,
-    /// TurboQuant 8-bit (Metal: same store as Q8_0; host WHT optional).
-    Turbo8,
-    /// TurboQuant 4-bit (WHT optional on host; Metal absmax nibble groups).
-    Turbo4,
-    /// TurboQuant 3-bit (experimental; not implemented yet).
-    Turbo3,
-}
-
-impl MetalKvDtype {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::F16 => "f16",
-            Self::Q8_0 => "q8_0",
-            Self::Fp8 => "fp8",
-            Self::Turbo8 => "turbo8",
-            Self::Turbo4 => "turbo4",
-            Self::Turbo3 => "turbo3",
-        }
-    }
-
-    pub fn is_implemented(self) -> bool {
-        matches!(
-            self,
-            Self::F16 | Self::Q8_0 | Self::Turbo8 | Self::Turbo4 | Self::Fp8
-        )
-    }
-
-    /// True when attention must dequant store → f16 scratch before FA/GQA.
-    pub fn needs_f16_scratch(self) -> bool {
-        matches!(self, Self::Q8_0 | Self::Turbo8 | Self::Turbo4 | Self::Fp8)
-    }
-
-    /// Uses ggml Q8_0 / fp8 34-byte blocks.
-    fn is_q8_wire(self) -> bool {
-        matches!(self, Self::Q8_0 | Self::Turbo8 | Self::Fp8)
-    }
-}
-
-/// True when `n_kv_heads * head_dim` is a multiple of ggml Q8_0 block size (32).
-pub fn metal_kv_q8_0_viable(n_kv_heads: usize, head_dim: usize) -> bool {
-    (n_kv_heads * head_dim).is_multiple_of(frink_quant::Q8_0_BLOCK_ELEMS)
-}
-
-/// turbo4 / fp8 share the 32-elem group alignment.
-pub fn metal_kv_turbo4_viable(n_kv_heads: usize, head_dim: usize) -> bool {
-    (n_kv_heads * head_dim).is_multiple_of(frink_quant::TURBO4_KV_GROUP)
-}
-
-/// Dtype actually used for new [`MetalKvBuffers`] (unimplemented / non-viable → F16).
-pub fn effective_metal_kv_dtype(n_kv_heads: usize, head_dim: usize) -> MetalKvDtype {
-    let requested = metal_kv_dtype();
-    if !requested.is_implemented() {
-        return MetalKvDtype::F16;
-    }
-    if requested.is_q8_wire() && !metal_kv_q8_0_viable(n_kv_heads, head_dim) {
-        static WARNED: OnceLock<()> = OnceLock::new();
-        let _ = WARNED.get_or_init(|| {
-            eprintln!(
-                "FRINK_CTK={}: n_kv_heads*head_dim={} not divisible by {}; using f16",
-                requested.as_str(),
-                n_kv_heads * head_dim,
-                frink_quant::Q8_0_BLOCK_ELEMS
-            );
-        });
-        return MetalKvDtype::F16;
-    }
-    if requested == MetalKvDtype::Turbo4 && !metal_kv_turbo4_viable(n_kv_heads, head_dim) {
-        static WARNED: OnceLock<()> = OnceLock::new();
-        let _ = WARNED.get_or_init(|| {
-            eprintln!(
-                "FRINK_CTK=turbo4: n_kv_heads*head_dim={} not divisible by {}; using f16",
-                n_kv_heads * head_dim,
-                frink_quant::TURBO4_KV_GROUP
-            );
-        });
-        return MetalKvDtype::F16;
-    }
-    requested
-}
-
-/// Parse `FRINK_CTK` / `-ctk`-style strings. Unknown → [`MetalKvDtype::F16`].
-pub fn parse_metal_kv_dtype(raw: Option<&str>) -> MetalKvDtype {
-    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("q8_0") | Some("q8") => MetalKvDtype::Q8_0,
-        Some("fp8") | Some("e4m3") => MetalKvDtype::Fp8,
-        Some("turbo8") => MetalKvDtype::Turbo8,
-        Some("turbo4") => MetalKvDtype::Turbo4,
-        Some("turbo3") => MetalKvDtype::Turbo3,
-        Some("f16") | Some("fp16") | Some("half") | Some("bf16") => MetalKvDtype::F16,
-        _ => MetalKvDtype::F16,
-    }
-}
-
-/// KV dtype requested by `FRINK_CTK` (default F16).
-///
-/// Unimplemented dtypes emit a one-time stderr warning; callers keep F16 buffers.
-pub fn metal_kv_dtype() -> MetalKvDtype {
-    static DTYPE: OnceLock<MetalKvDtype> = OnceLock::new();
-    *DTYPE.get_or_init(|| {
-        let dt = parse_metal_kv_dtype(std::env::var("FRINK_CTK").ok().as_deref());
-        if !dt.is_implemented() {
-            static WARNED: OnceLock<()> = OnceLock::new();
-            let _ = WARNED.get_or_init(|| {
-                eprintln!(
-                    "FRINK_CTK={}: Metal {} KV cache not implemented yet; using f16 buffers",
-                    dt.as_str(),
-                    dt.as_str()
-                );
-            });
-        }
-        dt
     })
 }
 
@@ -1334,7 +1051,16 @@ kernel void gqa_prefill(
 /// viable head layout, stores ggml Q8_0 (~½ the bytes); attention kernels still
 /// read f16 via a process-wide dequant scratch shared across layers.
 pub struct MetalKvBuffers {
-    dtype: MetalKvDtype,
+    pub(crate) dtype: MetalKvDtype,
+    /// Whether the stored K went through the TurboQuant rotation.
+    ///
+    /// Decided once, at construction, by
+    /// [`crate::kv_wire::turbo4_rotation_viable`], and read by exactly
+    /// two places: the append, which rotates, and the attention sites,
+    /// which rotate the query to match. A wire written one way and read
+    /// the other is a wrong answer rather than an error, so there is one
+    /// field and no second derivation of it.
+    pub(crate) k_rotated: bool,
     pub(crate) k: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) v: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub n_kv_heads: usize,
@@ -1409,6 +1135,8 @@ impl MetalKvBuffers {
             .ok_or(MetalError::BufferAllocFailed)?;
         Ok(Self {
             dtype,
+            k_rotated: dtype == MetalKvDtype::Turbo4
+                && crate::kv_wire::turbo4_rotation_viable(head_dim),
             k,
             v,
             n_kv_heads,
@@ -1462,7 +1190,23 @@ impl MetalKvBuffers {
                 }
             }
             MetalKvDtype::Turbo4 => {
-                let k_q = frink_quant::pack_turbo4_kv_blocks(&k[..n]);
+                // The store holds K rotated, so host rows are rotated on
+                // the way in exactly as `kv_append_turbo4` rotates the
+                // ones the GPU writes. The pair with the unrotate in
+                // `tokens_host` is what keeps a sequence that crosses
+                // between the two paths reading the same K.
+                let k_rot: Vec<f32>;
+                let k_in: &[f32] = if self.k_rotated {
+                    let mut owned = k[..n].to_vec();
+                    for row in owned.chunks_exact_mut(self.elems_per_token()) {
+                        frink_quant::turboquant::rotate_row_inplace(row, self.head_dim);
+                    }
+                    k_rot = owned;
+                    &k_rot
+                } else {
+                    &k[..n]
+                };
+                let k_q = frink_quant::pack_turbo4_kv_blocks(k_in);
                 let v_q = frink_quant::pack_turbo4_kv_blocks(&v[..n]);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -1550,8 +1294,18 @@ impl MetalKvBuffers {
                 let v_bytes = unsafe {
                     std::slice::from_raw_parts(v_ptr.as_ptr().add(byte_off) as *const u8, nbytes)
                 };
+                let mut k = frink_quant::unpack_turbo4_kv_blocks(k_bytes).expect("turbo4 k");
+                // The device store holds K rotated; the host cache this
+                // feeds is read by host kernels whose queries are not,
+                // so the rotation is undone on the way out. This is the
+                // one site that reads a rotated store as plain K.
+                if self.k_rotated {
+                    for row in k.chunks_exact_mut(per) {
+                        frink_quant::turboquant::unrotate_row_inplace(row, self.head_dim);
+                    }
+                }
                 (
-                    frink_quant::unpack_turbo4_kv_blocks(k_bytes).expect("turbo4 k"),
+                    k,
                     frink_quant::unpack_turbo4_kv_blocks(v_bytes).expect("turbo4 v"),
                 )
             }
@@ -1583,6 +1337,12 @@ impl MetalKvBuffers {
 struct Q8AttnScratch {
     k: Retained<ProtocolObject<dyn MTLBuffer>>,
     v: Retained<ProtocolObject<dyn MTLBuffer>>,
+    /// Rotated Q for a `k_rotated` store. f32, and sized by the query
+    /// rather than the cache, so it rides on the same guard: the
+    /// rotated K and the query that can read it are produced under one
+    /// lock and cannot be taken apart.
+    q: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q_elems_cap: usize,
     elems_cap: usize,
 }
 
@@ -1594,11 +1354,18 @@ static Q8_ATTN_SCRATCH: Mutex<Option<Q8AttnScratch>> = Mutex::new(None);
 fn borrow_q8_attn_scratch(
     device: &Retained<ProtocolObject<dyn MTLDevice>>,
     elems: usize,
+    q_elems: usize,
 ) -> Result<std::sync::MutexGuard<'static, Option<Q8AttnScratch>>, MetalError> {
     let mut guard = Q8_ATTN_SCRATCH.lock().unwrap();
-    let fits = guard.as_ref().is_some_and(|s| s.elems_cap >= elems);
+    let fits = guard
+        .as_ref()
+        .is_some_and(|s| s.elems_cap >= elems && s.q_elems_cap >= q_elems);
     if !fits {
-        let nbytes = elems.max(1) * 2;
+        let elems = elems.max(guard.as_ref().map_or(0, |s| s.elems_cap)).max(1);
+        let q_elems = q_elems
+            .max(guard.as_ref().map_or(0, |s| s.q_elems_cap))
+            .max(1);
+        let nbytes = elems * 2;
         *guard = Some(Q8AttnScratch {
             k: device
                 .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
@@ -1606,7 +1373,11 @@ fn borrow_q8_attn_scratch(
             v: device
                 .newBufferWithLength_options(nbytes, MTLResourceOptions::StorageModeShared)
                 .ok_or(MetalError::BufferAllocFailed)?,
-            elems_cap: elems.max(1),
+            q: device
+                .newBufferWithLength_options(q_elems * 4, MTLResourceOptions::StorageModeShared)
+                .ok_or(MetalError::BufferAllocFailed)?,
+            q_elems_cap: q_elems,
+            elems_cap: elems,
         });
     }
     Ok(guard)
@@ -1909,31 +1680,9 @@ impl MetalGraph {
         ensure_pipeline(device, rope_src, rope_name)?;
         mark(rope_name);
 
-        match params.kv_dtype {
-            d if d.is_q8_wire() => {
-                ensure_pipeline(device, KV_APPEND_Q8_0_KERNEL_SRC, "kv_append_q8_0")?;
-                mark("kv_append_q8_0");
-                ensure_pipeline(
-                    device,
-                    DEQUANT_Q8_0_TO_F16_KERNEL_SRC,
-                    "dequant_q8_0_to_f16",
-                )?;
-                mark("dequant_q8_0_to_f16");
-            }
-            MetalKvDtype::Turbo4 => {
-                ensure_pipeline(device, KV_APPEND_TURBO4_KERNEL_SRC, "kv_append_turbo4")?;
-                mark("kv_append_turbo4");
-                ensure_pipeline(
-                    device,
-                    DEQUANT_TURBO4_TO_F16_KERNEL_SRC,
-                    "dequant_turbo4_to_f16",
-                )?;
-                mark("dequant_turbo4_to_f16");
-            }
-            _ => {
-                ensure_pipeline(device, KV_APPEND_KERNEL_SRC, "kv_append")?;
-                mark("kv_append");
-            }
+        for (src, name) in crate::kv_wire::kv_wire_pipelines(params.kv_dtype) {
+            ensure_pipeline(device, src, name)?;
+            mark(name);
         }
 
         warm_gqa_prefill_pipeline(device, params.head_dim, &mut mark)?;
@@ -2110,204 +1859,6 @@ fn borrow_prefill_scratch(
     Ok(guard)
 }
 
-/// Kernel + block geometry for one KV wire format.
-///
-/// One table rather than three near-identical encoders: the f16, Q8_0
-/// and Turbo4 appends previously restated the same threadgroup sizing,
-/// the same alignment check and the same buffer bindings, which is the
-/// shape that loses a fix in two of three copies.
-struct KvAppendKernel {
-    src: &'static str,
-    name: &'static str,
-    /// f32 elements one dispatched unit handles: 1 for the f16 copy, the
-    /// block size for a quantized wire, which is also the alignment
-    /// `offset_elems` and `n_elems` must satisfy.
-    elems_per_unit: u32,
-}
-
-fn kv_append_kernel(dtype: MetalKvDtype) -> KvAppendKernel {
-    if dtype.is_q8_wire() {
-        return KvAppendKernel {
-            src: KV_APPEND_Q8_0_KERNEL_SRC,
-            name: "kv_append_q8_0",
-            elems_per_unit: frink_quant::Q8_0_BLOCK_ELEMS as u32,
-        };
-    }
-    match dtype {
-        MetalKvDtype::Turbo4 => KvAppendKernel {
-            src: KV_APPEND_TURBO4_KERNEL_SRC,
-            name: "kv_append_turbo4",
-            elems_per_unit: frink_quant::TURBO4_KV_GROUP as u32,
-        },
-        _ => KvAppendKernel {
-            src: KV_APPEND_KERNEL_SRC,
-            name: "kv_append",
-            elems_per_unit: 1,
-        },
-    }
-}
-
-fn encode_dequant_q8_0_to_f16(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    src: &ProtocolObject<dyn MTLBuffer>,
-    dst: &ProtocolObject<dyn MTLBuffer>,
-    n_elems: u32,
-) -> Result<(), MetalError> {
-    if !n_elems.is_multiple_of(frink_quant::Q8_0_BLOCK_ELEMS as u32) {
-        return Err(MetalError::CommandFailed);
-    }
-    let pipe = ensure_pipeline(
-        device,
-        DEQUANT_Q8_0_TO_F16_KERNEL_SRC,
-        "dequant_q8_0_to_f16",
-    )?;
-    encoder.setComputePipelineState(&pipe.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
-        let mut n = n_elems;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 2);
-    }
-    let n_blocks = (n_elems as usize) / frink_quant::Q8_0_BLOCK_ELEMS;
-    let tg = 256usize.min(n_blocks).max(1);
-    let n_tg = n_blocks.div_ceil(tg);
-    dispatch_counted(
-        encoder,
-        MTLSize {
-            width: n_tg,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
-fn encode_dequant_turbo4_to_f16(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    src: &ProtocolObject<dyn MTLBuffer>,
-    dst: &ProtocolObject<dyn MTLBuffer>,
-    n_elems: u32,
-) -> Result<(), MetalError> {
-    if !n_elems.is_multiple_of(frink_quant::TURBO4_KV_GROUP as u32) {
-        return Err(MetalError::CommandFailed);
-    }
-    let pipe = ensure_pipeline(
-        device,
-        DEQUANT_TURBO4_TO_F16_KERNEL_SRC,
-        "dequant_turbo4_to_f16",
-    )?;
-    encoder.setComputePipelineState(&pipe.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst), 0, 1);
-        let mut n = n_elems;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 2);
-    }
-    let n_blocks = (n_elems as usize) / frink_quant::TURBO4_KV_GROUP;
-    let tg = 256usize.min(n_blocks).max(1);
-    let n_tg = n_blocks.div_ceil(tg);
-    dispatch_counted(
-        encoder,
-        MTLSize {
-            width: n_tg,
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
-fn encode_kv_dequant_to_f16(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    dtype: MetalKvDtype,
-    src: &ProtocolObject<dyn MTLBuffer>,
-    dst: &ProtocolObject<dyn MTLBuffer>,
-    n_elems: u32,
-) -> Result<(), MetalError> {
-    match dtype {
-        d if d.is_q8_wire() => encode_dequant_q8_0_to_f16(encoder, device, src, dst, n_elems),
-        MetalKvDtype::Turbo4 => encode_dequant_turbo4_to_f16(encoder, device, src, dst, n_elems),
-        _ => Err(MetalError::CommandFailed),
-    }
-}
-
-/// Append this token's K and V into the layer's cache in ONE dispatch.
-///
-/// Both planes always land at the same `offset_elems` with the same
-/// `n_elems` -- there is no caller that appends one without the other --
-/// so the kernel takes the second pair of buffers and the grid's height
-/// selects between them. That halves this step's encode cost, which is
-/// the whole point of GitHub issue #149: the K and V appends were 32 of
-/// the 242 dispatches a Llama-3.2-1B decode token encoded.
-///
-/// Taking both planes as parameters is also why there is no `KvPlane`
-/// enum any more: a single-plane entry point would be a second code path
-/// to keep in step with this one.
-pub(crate) fn encode_kv_store_append(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    device: &Retained<ProtocolObject<dyn MTLDevice>>,
-    k_src: &ProtocolObject<dyn MTLBuffer>,
-    v_src: &ProtocolObject<dyn MTLBuffer>,
-    kv: &MetalKvBuffers,
-    offset_elems: u32,
-    n_elems: u32,
-) -> Result<(), MetalError> {
-    let kernel = kv_append_kernel(kv.dtype);
-    let unit = kernel.elems_per_unit;
-    // A quantized wire writes whole blocks, so a token that does not sit
-    // on a block boundary would corrupt its neighbour. Refuse instead.
-    if !offset_elems.is_multiple_of(unit) || !n_elems.is_multiple_of(unit) {
-        return Err(MetalError::CommandFailed);
-    }
-    let units = (n_elems / unit) as usize;
-    let pipe = ensure_pipeline(device, kernel.src, kernel.name)?;
-    encoder.setComputePipelineState(&pipe.0);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(k_src), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&kv.k), 0, 1);
-        let mut off = offset_elems;
-        encoder.setBytes_length_atIndex(
-            NonNull::new(&mut off as *mut u32 as *mut _).unwrap(),
-            4,
-            2,
-        );
-        let mut n = n_elems;
-        encoder.setBytes_length_atIndex(NonNull::new(&mut n as *mut u32 as *mut _).unwrap(), 4, 3);
-        encoder.setBuffer_offset_atIndex(Some(v_src), 0, 4);
-        encoder.setBuffer_offset_atIndex(Some(&kv.v), 0, 5);
-    }
-    let tg = 256usize.min(units).max(1);
-    let n_tg = units.div_ceil(tg);
-    dispatch_counted(
-        encoder,
-        MTLSize {
-            width: n_tg,
-            // Plane 0 is K, plane 1 is V.
-            height: 2,
-            depth: 1,
-        },
-        MTLSize {
-            width: tg,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Ok(())
-}
-
 /// Decode GQA against the layer's KV cache, hazard-tracked through `mrs`.
 /// Same shared-f16-scratch caveat as [`encode_gqa_prefill_with_kv`].
 #[allow(clippy::too_many_arguments)]
@@ -2327,7 +1878,8 @@ pub(crate) fn encode_gqa_with_kv(
 ) -> Result<(), MetalError> {
     if kv.dtype.needs_f16_scratch() {
         let elems = (seq_len as usize) * kv.elems_per_token();
-        let mut guard = borrow_q8_attn_scratch(device, elems)?;
+        let q_elems = (n_heads as usize) * (head_dim as usize);
+        let mut guard = borrow_q8_attn_scratch(device, elems, q_elems)?;
         let scratch = guard.as_mut().unwrap();
         let (sk, sv) = (scratch.k.as_ref(), scratch.v.as_ref());
         let (kk, vv) = (kv.k.as_ref(), kv.v.as_ref());
@@ -2335,6 +1887,20 @@ pub(crate) fn encode_gqa_with_kv(
         encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.k, &scratch.k, elems as u32)?;
         encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.v, &scratch.v, elems as u32)?;
         mrs.end_op(&[kk, vv], &[sk, sv]);
+        // A rotated store is only readable by a rotated query, and the
+        // two are produced in the same block for that reason.
+        let q = if kv.k_rotated {
+            let sq = scratch.q.as_ref();
+            mrs.begin_op(encoder, &[q], &[sq]);
+            let r = crate::kv_wire::encode_rotate_q_turbo4(
+                encoder, device, q, &scratch.q, 1, n_heads, n_kv_heads, head_dim,
+            );
+            mrs.end_op(&[q], &[sq]);
+            r?;
+            scratch.q.as_ref()
+        } else {
+            q
+        };
         mrs.begin_op(encoder, &[q, sk, sv], &[out]);
         let res = encode_gqa(
             encoder, device, q, &scratch.k, &scratch.v, out, n_heads, n_kv_heads, head_dim,
@@ -2379,7 +1945,8 @@ fn encode_gqa_prefill_with_kv(
     let total_seq = kv_prefix_len + n_q;
     if kv.dtype.needs_f16_scratch() {
         let elems = (total_seq as usize) * kv.elems_per_token();
-        let mut guard = borrow_q8_attn_scratch(device, elems)?;
+        let q_elems = (n_q as usize) * (n_heads as usize) * (head_dim as usize);
+        let mut guard = borrow_q8_attn_scratch(device, elems, q_elems)?;
         let scratch = guard.as_mut().unwrap();
         let (sk, sv) = (scratch.k.as_ref(), scratch.v.as_ref());
         let (kk, vv) = (kv.k.as_ref(), kv.v.as_ref());
@@ -2387,6 +1954,18 @@ fn encode_gqa_prefill_with_kv(
         encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.k, &scratch.k, elems as u32)?;
         encode_kv_dequant_to_f16(encoder, device, kv.dtype, &kv.v, &scratch.v, elems as u32)?;
         mrs.end_op(&[kk, vv], &[sk, sv]);
+        let q = if kv.k_rotated {
+            let sq = scratch.q.as_ref();
+            mrs.begin_op(encoder, &[q], &[sq]);
+            let r = crate::kv_wire::encode_rotate_q_turbo4(
+                encoder, device, q, &scratch.q, n_q, n_heads, n_kv_heads, head_dim,
+            );
+            mrs.end_op(&[q], &[sq]);
+            r?;
+            scratch.q.as_ref()
+        } else {
+            q
+        };
         // GQA must not race the dequant writes it just queued.
         mrs.begin_op(encoder, &[q, sk, sv], &[out]);
         let res = encode_gqa_prefill(
@@ -6675,6 +6254,144 @@ mod tests {
         }
         let (k_dl, _) = kv_q8.tokens_host(0, n_q);
         assert_eq!(k_dl.len(), n_q * n_kv_heads * head_dim);
+    }
+
+    /// A rotated turbo4 store has to answer what an f16 store answers.
+    ///
+    /// The rotation is invisible by construction: K is stored rotated
+    /// and Q is rotated to match, so the attention output is the same
+    /// up to the 4-bit quantization error. A rotation applied to one
+    /// side and not the other is not a small error, it is a different
+    /// model, which is what this test is for; it went red on the first
+    /// run and stayed red until the append and the query agreed about
+    /// which head's sign pattern to use.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn turbo4_kv_prefill_matches_f16_path() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 64;
+        let n_q = 2;
+        let q: Vec<f32> = (0..n_q * n_heads * head_dim)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let k: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.05).cos())
+            .collect();
+        let v: Vec<f32> = (0..n_q * n_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.04).sin())
+            .collect();
+        let mut kv_f16 =
+            MetalKvBuffers::with_capacity_dtype(n_kv_heads, head_dim, 16, MetalKvDtype::F16)
+                .expect("f16 kv");
+        let mut kv_t4 =
+            MetalKvBuffers::with_capacity_dtype(n_kv_heads, head_dim, 16, MetalKvDtype::Turbo4)
+                .expect("turbo4 kv");
+        assert!(kv_t4.k_rotated, "head_dim 64 should rotate");
+        let rope = MetalRope::new(MetalRopeLayout::Norm);
+        let layer_rope = LayerRope {
+            theta: 10000.0,
+            freq_factors: None,
+        };
+        let (attn_f16, _, _) = launch_prefill_attn_block(
+            &q,
+            &k,
+            &v,
+            &mut kv_f16,
+            n_heads,
+            n_q,
+            rope,
+            layer_rope,
+            0,
+            None,
+            false,
+        )
+        .expect("f16 prefill");
+        let (attn_t4, _, _) = launch_prefill_attn_block(
+            &q, &k, &v, &mut kv_t4, n_heads, n_q, rope, layer_rope, 0, None, false,
+        )
+        .expect("turbo4 prefill");
+        assert_eq!(attn_f16.len(), attn_t4.len());
+        for (i, (a, b)) in attn_f16.iter().zip(attn_t4.iter()).enumerate() {
+            let tol = 8e-2 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "attn elem {i}: f16={a} turbo4={b} tol={tol}"
+            );
+        }
+
+        // The host cache is filled from the device one when the dense
+        // stack runs ahead of it, and the host attention does not rotate
+        // its query, so what comes back here has to be plain K. Without
+        // the unrotate in `tokens_host` these rows are the rotated ones,
+        // which is a different vector entirely rather than a lossier one.
+        //
+        // Compared per head in L2, not per element: the quantization
+        // error is introduced in the rotated basis and the inverse
+        // rotation spreads it over the whole head, so a channel whose
+        // own value is small can carry a large share of it. The norm is
+        // what an orthogonal transform preserves, so the norm is what
+        // has a bound.
+        let (k_f16, v_f16) = kv_f16.tokens_host(0, n_q);
+        let (k_t4, v_t4) = kv_t4.tokens_host(0, n_q);
+        assert_eq!(k_f16.len(), k_t4.len());
+        // 0.20 against a measured 0.15 worst head: 4-bit is 4-bit.
+        // What this catches is the rotate/unrotate pair disagreeing,
+        // which is off by more than 1, not by the quantization step.
+        assert_head_l2_close(&k_f16, &k_t4, head_dim, 0.20, "k");
+        assert_head_l2_close(&v_f16, &v_t4, head_dim, 0.20, "v");
+    }
+
+    /// Relative L2 error per head, the bound a rotated 4-bit store has.
+    fn assert_head_l2_close(a: &[f32], b: &[f32], head_dim: usize, tol: f32, what: &str) {
+        assert_eq!(a.len(), b.len());
+        for (h, (ha, hb)) in a
+            .chunks_exact(head_dim)
+            .zip(b.chunks_exact(head_dim))
+            .enumerate()
+        {
+            let num: f32 = ha.iter().zip(hb).map(|(x, y)| (x - y) * (x - y)).sum();
+            let den: f32 = ha.iter().map(|x| x * x).sum::<f32>().max(1e-12);
+            let rel = (num / den).sqrt();
+            assert!(rel <= tol, "{what} head {h}: relative L2 {rel} > {tol}");
+        }
+    }
+
+    /// The host upload and the host download have to agree about the
+    /// rotation, because a sequence can cross between the CPU path and
+    /// the Metal one in both directions: `upload_from_host` after a CPU
+    /// prefill, `tokens_host` when the dense stack runs ahead. Rotating
+    /// on one side only is silent, so it gets a round trip of its own.
+    #[test]
+    #[ignore = "needs a real Metal GPU"]
+    fn turbo4_host_round_trip_is_plain_k() {
+        let n_kv_heads = 2;
+        let head_dim = 64;
+        let seq = 3;
+        let per = n_kv_heads * head_dim;
+        // Deliberately NOT a smooth sweep: a smooth vector is exactly
+        // what a Hadamard transform concentrates into a few bands, so
+        // its rotated absmax is far above its plain one and a 4-bit
+        // store of it is much lossier than a real K row. This is a
+        // scattered sequence for that reason.
+        let k: Vec<f32> = (0..seq * per)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
+        let v: Vec<f32> = (0..seq * per)
+            .map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let mut kv =
+            MetalKvBuffers::with_capacity_dtype(n_kv_heads, head_dim, 16, MetalKvDtype::Turbo4)
+                .expect("turbo4 kv");
+        assert!(kv.k_rotated);
+        kv.upload_from_host(&k, &v, seq).expect("upload");
+        let (k_back, v_back) = kv.tokens_host(0, seq);
+        // Per head in L2, for the reason given on `assert_head_l2_close`.
+        // Without the rotate/unrotate pair agreeing, K comes back as a
+        // different vector and this is off by more than 1, not by the
+        // 4-bit step.
+        assert_head_l2_close(&k, &k_back, head_dim, 0.20, "k");
+        assert_head_l2_close(&v, &v_back, head_dim, 0.20, "v");
     }
 
     /// Deterministic weights for one dense decode layer, owned so the

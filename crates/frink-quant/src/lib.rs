@@ -86,6 +86,10 @@ pub const Q5_1_BLOCK_ELEMS: usize = 32;
 pub const Q8_1_BLOCK_BYTES: usize = 36;
 pub const Q8_1_BLOCK_ELEMS: usize = 32;
 
+/// TurboQuant's randomized Hadamard rotation, which the turbo4 wire
+/// applies to K before quantizing it.
+pub mod turboquant;
+
 /// Metal `FRINK_CTK=turbo4` KV block: 32 elems → f16 scale + 16 nibble bytes.
 pub const TURBO4_KV_GROUP: usize = 32;
 pub const TURBO4_KV_BLOCK_BYTES: usize = 18;
