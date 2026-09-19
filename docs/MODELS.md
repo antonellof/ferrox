@@ -90,7 +90,7 @@ OLMoE (1.11×) and Gemma-3-1B (1.18×) on Metal.
 | Kimi K3 / GLM-5.2 / DeepSeek V4 | Loaders and primitives only. Nothing has been run end to end on a real checkpoint |
 | Vision | Finds an mmproj file and warns about it. An `image_url` in a request returns an error |
 | MTP / speculative | `--mtp` errors by design. `ferrox speculative` is prompt-lookup only (an n-gram match over the history, no draft model) and runs on **synthetic random weights**, so the hit rate it prints is not representative of a real drafter. Plan for a real one: [`docs/plans/on-hold/dflash-speculative-decoding.md`](plans/on-hold/dflash-speculative-decoding.md) |
-| Embeddings | `/v1/embeddings` for GGUF Decoder (mean/last pool) |
+| Embeddings | `/v1/embeddings` for a GGUF decoder (mean/last pool), and for the BERT-family ENCODERS `bert`, `nomic-bert` (nomic-embed-text v1 / v1.5) and `jina-bert-v3` (jina-embeddings-v3), each checked against llama.cpp's own pooled embedding (`tests/bert_family_graphs.rs`; the real-checkpoint comparison is `tests/bert_llama_cpp_parity.rs`, `--ignored`). `bert_gguf_loader::ENCODER_ARCHS` is the table: the three differ from each other in a rotation and an FFN and in nothing else. `/v1/rerank` uses the same encoder with a rank head |
 
 ## When a model will not load
 

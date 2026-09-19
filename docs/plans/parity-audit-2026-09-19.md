@@ -45,6 +45,57 @@ hyper-connections), `qwen4exp` (delta-net over a hybrid memory index),
 and the two TTS rows. Each needs a block that does not exist here yet,
 which is the honest reason the cheap ones went first.
 
+## Update 2: the encoder family, and a correction to this document
+
+Two more rows closed the same day, and they are the cheapest of the
+eight because they are not on the decoder at all: `nomic-bert`
+(nomic-embed-text v1 / v1.5) and `jina-bert-v3` (jina-embeddings-v3)
+embed, on the BERT encoder ferrox has had since before this audit.
+
+**This document's section 1.2 was imprecise about them.** It counted
+eleven "deferred encoder/embedding" rows as gaps; `bert` was already
+SERVED for embeddings with its own libllama parity test, and the
+catalog row says so in as many words -- it is deferred from the
+DECODER path, which is a different claim. Reading the catalog's own
+comment rather than its scope column is what found that, which is the
+same lesson `pangu-embedded` taught on 2026-09-14.
+
+What the two rows cost: one line each of
+`bert_gguf_loader::ENCODER_ARCHS`, plus `BertFfn` and
+`BertHparams::rope_theta` for the two facts that differ across the
+family, plus a fixture each. `bert.cpp`'s graph serves several
+architectures and the ones ferrox builds differ from `bert` in two
+lines of it and nothing else:
+
+| arch | rotation | FFN |
+|---|---|---|
+| `bert` | learned position table | ungated GELU, both biases |
+| `nomic-bert` | NEOX RoPE on Q/K | gated SiLU, no biases |
+| `jina-bert-v3` | NEOX RoPE on Q/K | ungated GELU, both biases |
+
+`jina-bert-v3`'s refusal had named "RoPE and per-projection QK norm",
+and the second half does not exist: its own tensor loader creates no
+`attn_q_norm`, so that branch of the shared graph is dead for it. A
+verdict read from a graph's BRANCHES rather than from the
+architecture's own loader names blockers it does not have.
+
+And one open question, recorded rather than answered: on an F32
+fixture ferrox and libllama agree EXACTLY with the attention output
+switched off and differ by ~3e-4 with it on. That is not the Q8_0
+activation-quantization story `tests/bert_llama_cpp_parity.rs` tells
+about the real checkpoint, and two obvious explanations are measured
+and eliminated (a uniform softmax still differs; f16 K/V does not move
+it). `tests/bert_family_graphs.rs` carries the bisection.
+
+**What is left in the family**: `jina-bert-v2` (ALiBi, an optional
+whole-projection QK LayerNorm, a second attention norm and a fused
+gate+up), `neo-bert` (its own graph), `modern-bert` (alternating
+local/global attention), `eurobert` (its own graph), `nomic-bert-moe`
+(a second FFN shape on its MoE layers), `t5encoder`, and the two
+decoder-embedding rows. `jina-bert-v2` is the next cheapest and needs
+ALiBi on the encoder's attention, which `ferrox_core::alibi` already
+computes for the decoder.
+
 ## 0. The one-line answer
 
 Against the llama.cpp this repo PINS, ferrox serves **every text
