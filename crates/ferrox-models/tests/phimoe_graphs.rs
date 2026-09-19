@@ -4,7 +4,7 @@
 //! biases: an RMSNorm WITH a bias at every norm site (`phimoe.cpp:20-21,
 //! 28-29,35-36` create the pairs REQUIRED; `phi3.cpp:99-102,137-139,
 //! 174-177` pass them to `LLM_NORM_RMS`) -- `NormOp::RmsBias`, one
-//! graph of 140 on the generic path -- plus `attn_output.bias` and
+//! graph of 155 on the generic path -- plus `attn_output.bias` and
 //! `output.bias` (`:33,23`, REQUIRED, `ferrox_models::proj_bias`). The
 //! old refusal had called the norm biases LayerNorm biases; they are
 //! not, and the fixture is what says so (an RMS body with the bias

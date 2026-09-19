@@ -17,7 +17,7 @@
 //! input Q/K/V read, multiplies the attention output after the
 //! softmax-weighted V sum and before `wo`, and a per-head value
 //! broadcasts over its head's `head_dim` channels. Six of llama.cpp's
-//! 140 graphs create the tensor; the other three (`qwen3next`, `qwen35`,
+//! 155 graphs create the tensor; the other three (`qwen3next`, `qwen35`,
 //! `qwen35moe`) store the gated delta-net's `z` projection under the
 //! same name, a different op on a different engine
 //! (`attn_gate::GDN_Z_GATE_ARCHS`).
@@ -64,8 +64,8 @@
 
 mod common;
 use common::{
-    assert_all_three_paths_match, graph_caches, graph_fixture_path, kl_vs_golden,
-    load_graph_fixture, worst_vs, GRAPH_PROMPT,
+    assert_all_three_paths_match, assert_all_three_paths_match_within, graph_caches,
+    graph_fixture_path, kl_vs_golden, load_graph_fixture, worst_vs, GRAPH_PROMPT,
 };
 use ferrox_models::attn_gate::{GateAct, GateWidth};
 use ferrox_models::layer_shapes::AttnShape;
@@ -74,6 +74,26 @@ use ferrox_models::ModelConfig;
 const AFMOE: &str = "afmoe";
 const LAGUNA: &str = "laguna";
 const LAGUNA_SWA: &str = "laguna_swa";
+const SPARK25: &str = "spark25";
+
+/// `spark2_5` is the suite's one GeGLU row, so llama.cpp's f16 GELU
+/// table is the approximate side and `GELU_TABLE_TOL` (2e-4, set from
+/// a Gemma-shaped fixture) is too tight for it. MEASURED rather than
+/// widened by feel: with ferrox's `gelu_mul` made to emulate ggml's
+/// table -- input rounded to f16, the tanh form, the result rounded to
+/// f16 again, which is what `GGML_GELU_FP16` does at
+/// `ggml/src/ggml-cpu/vec.h:1414-1425` -- this fixture agrees with
+/// libllama to **6.08e-6** (KL 3.34e-12) where the unemulated build
+/// reads **2.86e-3** (KL 7.70e-7). So the whole of the gap is the
+/// table, on a four-layer file whose residual stream the attention
+/// amplifies; the same shape as `starcoder2` and `codeshell` in
+/// `tests/proj_bias_graphs.rs`, which carry their own constant for the
+/// same reason.
+///
+/// 5e-3 is under every sabotage below -- dropping the gate moves these
+/// logits by more than 1, and reading the window array as a period
+/// moves them by 3.5 (both measured while the row was built).
+const SPARK25_GELU_TOL: f32 = 5e-3;
 
 const AFMOE_GOLDEN: [f32; 48] = [
     -0.17821455,
@@ -228,6 +248,57 @@ const LAGUNA_SWA_GOLDEN: [f32; 48] = [
     0.4321354,
 ];
 
+const SPARK25_GOLDEN: [f32; 48] = [
+    1.1904615,
+    -1.5599897,
+    -0.4287688,
+    -0.79204,
+    4.722593,
+    2.877309,
+    -1.7242424,
+    2.707797,
+    1.2134902,
+    0.6893058,
+    0.9260141,
+    -0.33815855,
+    -1.0772187,
+    1.4401295,
+    -1.3031607,
+    -0.7704283,
+    -0.66947174,
+    0.182432,
+    0.6031899,
+    -0.2503235,
+    -0.65955424,
+    -0.12335199,
+    -0.056718677,
+    0.5392068,
+    1.0678068,
+    -1.328313,
+    -0.39162576,
+    2.3502724,
+    1.288382,
+    0.23902476,
+    0.58983445,
+    0.939625,
+    -0.3550618,
+    -0.18232766,
+    -1.142412,
+    1.8027571,
+    -0.12490639,
+    -2.3195045,
+    2.1821742,
+    1.4608009,
+    -0.59154177,
+    -2.1486416,
+    -0.22655094,
+    0.832515,
+    -0.28606927,
+    -2.0903263,
+    -0.39845926,
+    0.6822282,
+];
+
 #[test]
 fn afmoe_matches_llama_cpp_on_all_three_paths() {
     assert_all_three_paths_match(AFMOE, &AFMOE_GOLDEN);
@@ -243,14 +314,36 @@ fn laguna_xs2_shape_matches_llama_cpp_on_all_three_paths() {
     assert_all_three_paths_match(LAGUNA_SWA, &LAGUNA_SWA_GOLDEN);
 }
 
+/// Spark-2.5, the first row closed against the llama.cpp pin moved on
+/// 2026-09-19.
+///
+/// It is `step35`'s corner of the two axes -- sigmoid, per head -- with
+/// the tensor REQUIRED instead of optional, so what this golden adds to
+/// the suite is not the arithmetic (`laguna_swa` already evidences a
+/// per-head gate) but the ROW: an architecture whose graph landed
+/// upstream six weeks after the last census, gated the same way, and
+/// was refused here until somebody read it.
+#[test]
+fn spark25_matches_llama_cpp_on_all_three_paths() {
+    // GeGLU: `spark2-5.cpp:124` is `LLM_FFN_GELU` under `LLM_FFN_PAR`,
+    // and llama.cpp's CPU GELU is an f16 lookup table, so the
+    // reference is the approximate side here exactly as it is for
+    // `grok`, `falcon` and the two StarCoder rows.
+    assert_all_three_paths_match_within(SPARK25, &SPARK25_GOLDEN, SPARK25_GELU_TOL);
+}
+
 /// The numbers in the report, so they can be regenerated rather than
 /// trusted. Run with `--nocapture` to see them.
 #[test]
 fn report_kl_against_llama_cpp() {
-    for (name, golden) in [
-        (AFMOE, &AFMOE_GOLDEN),
-        (LAGUNA, &LAGUNA_GOLDEN),
-        (LAGUNA_SWA, &LAGUNA_SWA_GOLDEN),
+    for (name, golden, kl_line) in [
+        (AFMOE, &AFMOE_GOLDEN, 1e-8),
+        (LAGUNA, &LAGUNA_GOLDEN, 1e-8),
+        (LAGUNA_SWA, &LAGUNA_SWA_GOLDEN, 1e-8),
+        // The GeGLU row's line is llama.cpp's own f16 GELU table, and
+        // the constant above says what it measures to with the table
+        // emulated (3.34e-12).
+        (SPARK25, &SPARK25_GOLDEN, 1e-5),
     ] {
         let d = load_graph_fixture(name);
         let mut kv = graph_caches(&d);
@@ -258,7 +351,7 @@ fn report_kl_against_llama_cpp() {
         let kl = kl_vs_golden(&got, golden);
         let worst = worst_vs(&got, golden);
         println!("| `{name}` | {kl:.2e} | {worst:.2e} |");
-        assert!(kl < 1e-8, "{name}: KL {kl}");
+        assert!(kl < kl_line, "{name}: KL {kl}");
     }
 }
 

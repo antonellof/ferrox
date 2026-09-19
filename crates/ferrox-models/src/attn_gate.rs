@@ -27,8 +27,19 @@
 //! activation and the ADMISSIBLE widths, and the loader reads the width
 //! off the tensor and refuses a width the table does not admit.
 //!
-//! **Measured before built.** Six of the 140 `src/models/*.cpp` create
-//! `LLM_TENSOR_ATTN_GATE`. The other three -- `qwen3next.cpp:92,335`,
+//! **Measured before built.** Six of the then-140 `src/models/*.cpp`
+//! created `LLM_TENSOR_ATTN_GATE`; re-measured on 2026-09-19 against
+//! the moved pin it is FIFTEEN of 155, and the nine new ones all
+//! landed upstream in one six-week window -- `bailingmoe3`,
+//! `dots3note`, `hrm-text`, `hy-v4`, `kimi-k3`, `minimax-01`,
+//! `muse-glimmer`, `qwen4exp`, `spark2-5`. Every one of the nine is a
+//! refusal today (`capability::NORM_ROPE_TRIAGED` /
+//! `NEOX_ROPE_TRIAGED` / the `dedicated` rows), and `spark2_5` is the
+//! cheapest row in the tree because it needs ONE line of the table
+//! below: sigmoid, per head, required, `src/models/spark2-5.cpp:41,
+//! 97-105`. A gate that is one table row away should not be a
+//! refusal for long. The other three of the original six --
+//! `qwen3next.cpp:92,335`,
 //! `qwen35.cpp:82,241`, `qwen35moe.cpp:88,265` -- store the gated
 //! delta-net's `z` projection under the same name, sized
 //! `{n_embd, value_dim}` and consumed by `build_norm_gated` on the
@@ -142,6 +153,21 @@ pub const ATTN_GATE_ARCHS: &[(&str, AttnGateSpec)] = &[
             widths: &[GateWidth::PerHead],
             presence: GatePresence::Optional,
             lines: "src/models/step35.cpp:96,268-284",
+        },
+    ),
+    // Landed upstream after the 2026-08-04 pin and closed on
+    // 2026-09-19 as ONE row: `spark2-5.cpp:41` creates the tensor
+    // REQUIRED at `{n_embd, n_head}` and `:97-105` sigmoids it and
+    // multiplies it in per head, which is `step35`'s corner of the two
+    // axes with the presence flipped. Nothing else in that graph was
+    // new (`tests/gated_attention_graphs.rs`).
+    (
+        "spark2_5",
+        AttnGateSpec {
+            act: GateAct::Sigmoid,
+            widths: &[GateWidth::PerHead],
+            presence: GatePresence::Required,
+            lines: "src/models/spark2-5.cpp:41,97-105",
         },
     ),
 ];
@@ -440,10 +466,13 @@ mod tests {
 
     /// The table is keyed by architecture, every row cites its lines,
     /// and the three GDN rows that share the tensor NAME are not in it.
+    ///
+    /// Four rows since 2026-09-19: `spark2_5` landed upstream after the
+    /// 2026-08-04 pin and is `step35`'s pair with the tensor required.
     #[test]
-    fn the_table_covers_the_three_softmax_gates_and_excludes_the_gdn_z_gates() {
+    fn the_table_covers_the_softmax_gates_and_excludes_the_gdn_z_gates() {
         let names: Vec<&str> = ATTN_GATE_ARCHS.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["afmoe", "laguna", "step35"]);
+        assert_eq!(names, ["afmoe", "laguna", "step35", "spark2_5"]);
         for (arch, spec) in ATTN_GATE_ARCHS {
             assert!(spec.lines.contains(".cpp:"), "`{arch}` cites no line");
             assert!(!spec.widths.is_empty(), "`{arch}` admits no width");

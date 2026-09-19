@@ -24,7 +24,7 @@
 //! # Who reads it -- MEASURED, not read off one file
 //!
 //! `grep -ln 'attn_temp\|temperature_scale\|build_inp_attn_scale'
-//! src/models/*.cpp` over all 140 graphs, 2026-09-11:
+//! src/models/*.cpp` over all 155 graphs, 2026-09-11:
 //!
 //! | arch | scale | floor | offset | layers | line |
 //! |---|---|---|---|---|---|
@@ -196,7 +196,7 @@ pub const ATTN_TEMPERATURE_READERS: &[(&str, FloorSource, &str)] = &[
 ];
 
 /// The graphs that seed the three constants from LITERALS rather than
-/// keys, with the values and the line. One of 140 (`grep -n
+/// keys, with the values and the line. One of 155 (`grep -n
 /// f_attn_temp_scale src/models/*.cpp`): the three assignments at
 /// `llama4.cpp:15-17`, on the chunked branch its files take.
 pub const LITERAL_ATTN_TEMPERATURE: &[(&str, AttnTemperature, &str)] = &[(

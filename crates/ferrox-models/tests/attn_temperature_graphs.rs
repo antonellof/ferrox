@@ -11,7 +11,7 @@
 //! per-position Q scale and NO gate on the key, so a real Ministral-3
 //! loaded and ran at the wrong temperature with no error. That is the
 //! defect this suite closes; `crate::attn_temperature` is the seam and
-//! carries the census (three graphs of 140 build the input; only this
+//! carries the census (three graphs of 155 build the input; only this
 //! one is on the generic path).
 //!
 //! **Two things the fixtures found on the way.**

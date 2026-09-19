@@ -19,7 +19,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! `grep -l 'FFN_UP, *"bias"' src/models/*.cpp` over all 140 graphs is
+//! `grep -l 'FFN_UP, *"bias"' src/models/*.cpp` over all 155 graphs is
 //! twenty-seven files (2026-09-12); most create the biases as
 //! `TENSOR_NOT_REQUIRED` (`llama.cpp` itself, `granite`, `deci`,
 //! `mistral3`, `minicpm`, `nemotron`), and `starcoder2`, `codeshell`,

@@ -36,7 +36,7 @@
 //!
 //! # Reach
 //!
-//! Three graphs of 140 build the block (`grep -l build_layer_attn_linear
+//! Three graphs of 155 build the block (`grep -l build_layer_attn_linear
 //! src/models/*.cpp`: `qwen35`, `qwen35moe`, `qwen3next`) over the ONE
 //! `delta-net-base.cpp`. `qwen3next` differs in two places, both
 //! tables here: its V heads read K heads GROUPED (`h / ratio`,

@@ -19,7 +19,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! Over all 140 `src/models/*.cpp` (2026-09-12):
+//! Over all 155 `src/models/*.cpp` (2026-09-12):
 //!
 //! ```text
 //! grep -l 'ATTN_OUT, *"bias"'   src/models/*.cpp   # 33 graphs
@@ -129,7 +129,7 @@ pub const FFN_BIAS_CREATORS: &[(&str, Presence, bool)] = &[
 
 /// Generic-path graphs that create `output.bias` on the LM head,
 /// `{n_vocab}`, added right after `build_lora_mm(output, cur)`.
-/// Measured: `grep -l 'LLM_TENSOR_OUTPUT, *"bias"'` over all 140 graphs
+/// Measured: `grep -l 'LLM_TENSOR_OUTPUT, *"bias"'` over all 155 graphs
 /// is `phi2.cpp:22` (REQUIRED, `:136`), `phimoe.cpp:23` (REQUIRED),
 /// `qwen2.cpp:27` (optional, `:147-148`), and `qwen2vl` / `dream` /
 /// `wavtokenizer-dec` on no engine here.

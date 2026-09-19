@@ -17,7 +17,7 @@
 //!
 //! The census is measured, not remembered: `grep -n
 //! LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN src/models/*.cpp` over all
-//! 140 graphs. Twenty-two read the key. Five read only the array
+//! 155 graphs. Twenty-two read the key. Five read only the array
 //! ([`PER_LAYER_ARRAY_READERS`]), two try the scalar and fall back to
 //! the array ([`SCALAR_THEN_ARRAY_READERS`]), and the other fifteen read
 //! only the scalar. An architecture that reads the key in NO form
@@ -168,6 +168,9 @@ pub const PER_LAYER_ARRAY_READERS: &[(&str, &str)] = &[
     ("dflash", "src/models/dflash.cpp:69"),
     ("step35", "src/models/step35.cpp:26"),
     ("mimo2", "src/models/mimo2.cpp:12"),
+    // Landed upstream after the 2026-08-04 pin; `ml.get_arr` with no
+    // scalar attempt, like the four above.
+    ("spark2_5", "src/models/spark2-5.cpp:8"),
 ];
 
 /// The graphs that read `nextn_predict_layers` BEFORE the array, so

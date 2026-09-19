@@ -3,7 +3,7 @@
 //! gains.
 //!
 //! `talkie` was triaged NEW CODE on four things (`src/models/talkie.cpp`),
-//! each measured to be one graph of 140: every norm is
+//! each measured to be one graph of 155: every norm is
 //! `build_norm(x, nullptr, nullptr, LLM_NORM_RMS)` (`:50,68,90,110,137`;
 //! `NormOp::RmsNoParams`); `attn_q_norm` is `{1, n_head}` applied after
 //! RoPE with a weightless per-head K norm (`:26,82-91`;

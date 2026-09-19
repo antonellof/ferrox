@@ -16,7 +16,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! `grep -l POS_EMBD src/models/*.cpp` over all 140 graphs
+//! `grep -l POS_EMBD src/models/*.cpp` over all 155 graphs
 //! (2026-09-14): `gpt2`, `starcoder` (REQUIRED, decoders on the generic
 //! path), `mpt` (`mpt.cpp:19,80-84`, OPTIONAL beside its ALiBi bias),
 //! and `bert` / `nomic-bert` /

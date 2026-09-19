@@ -11,7 +11,7 @@
 //! are shared and the KV is not, so `Decoder::layers` stays physical,
 //! `ModelConfig::n_layers` is the logical count, `Decoder::layer_for`
 //! is the one mapping, and the loop norm sits at the end of both FFN
-//! bodies. The reach was MEASURED first: one graph of 140 reads either
+//! bodies. The reach was MEASURED first: one graph of 155 reads either
 //! key.
 //!
 //! # What each fixture is shaped to catch

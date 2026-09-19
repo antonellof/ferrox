@@ -24,7 +24,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! Over all 140 `src/models/*.cpp` (2026-09-12): `grep -l "par_res\|
+//! Over all 155 `src/models/*.cpp` (2026-09-12): `grep -l "par_res\|
 //! parallel residual"` is `gptneox.cpp` and `stablelm.cpp`; a scan for
 //! TWO consecutive `cur = ggml_add(ctx0, cur, ...)` lines -- the
 //! three-term sum spelled out -- is `cohere2`, `cohere2moe` (twice, the

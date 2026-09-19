@@ -24,7 +24,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! Over all 140 `src/models/*.cpp` (2026-09-12): every graph that calls
+//! Over all 155 `src/models/*.cpp` (2026-09-12): every graph that calls
 //! `build_moe_ffn` AND reads a dense `layers[il].ffn_up` was listed;
 //! all but two use the dense triple on their LEADING dense layers
 //! (`if (il < n_layer_dense_lead)` or `if (ffn_gate_inp == nullptr)`)
@@ -41,7 +41,7 @@
 //! already answers for the shared-expert slot. Arctic's OTHER
 //! difference -- the routed branch reading `ffn_norm_exps(inpSA)` --
 //! is `crate::router_input::RouterInput::NormedLayerInput`, one graph
-//! of 140, and not this module's business.
+//! of 155, and not this module's business.
 //!
 //! # Why the shared-expert slot
 //!
@@ -107,7 +107,7 @@ pub const PARALLEL_DENSE_FFN_ARCHITECTURES: &[ParallelDenseFfn] = &[
 /// `moe_out + shexp_out` by a constant. `cohere2moe.cpp:248-260`
 /// (`ggml_scale(ctx0, ggml_add(cur, ffn_shexp), 0.5f)`, the HF
 /// "average" combination strategy, the only one its converter admits,
-/// `conversion/command_r.py:103-105`) is the one graph of 140 that does
+/// `conversion/command_r.py:103-105`) is the one graph of 155 that does
 /// (measured: `grep -n 'ggml_scale' src/models/*.cpp` beside a
 /// `ffn_shexp`), and only on a layer that HAS the shared expert
 /// (`:248` `if (layer.ffn_up_shexp)`). The loader records it as

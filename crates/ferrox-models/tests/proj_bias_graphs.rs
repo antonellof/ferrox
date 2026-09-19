@@ -9,7 +9,7 @@
 //! `MoeWeights::dense_bias` (`ferrox_moe::DenseBias`) before the
 //! activation and after `down` (`build_ffn`'s) -- filled for exactly
 //! the architectures whose graph creates the tensors, which the module
-//! measured over all 140 graphs; gpt-oss's `o_bias` moved onto the
+//! measured over all 155 graphs; gpt-oss's `o_bias` moved onto the
 //! same slot from its side table. Two of the three also needed the
 //! ungated GELU (`FfnActivation::GeluUngated`, `LLM_FFN_GELU` under
 //! `LLM_FFN_SEQ`), the third the ReLU-squared FFN `arcee` had.

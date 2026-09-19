@@ -45,7 +45,7 @@
 //!
 //! # Reach
 //!
-//! `grep -l shortconv src/models/*.cpp` over all 140 llama.cpp graphs:
+//! `grep -l shortconv src/models/*.cpp` over all 155 llama.cpp graphs:
 //! `lfm2.cpp` and `lfm2moe.cpp`, and `models.h:1899` gives the second
 //! the first's graph (`using graph = llama_model_lfm2::graph`). So
 //! [`SHORTCONV_ARCHITECTURES`] is two rows, and what `head_count_kv 0`

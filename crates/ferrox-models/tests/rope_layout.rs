@@ -41,6 +41,13 @@ use ferrox_models::capability::{architecture_catalog, resolve_profile, ArchPath}
 use ferrox_models::config::RopeLayout;
 
 const LLAMA_ROPE_TYPES: &[(&str, RopeLayout)] = &[
+    // Added 2026-09-19 with the pin move to `5b59b83`: seven of the
+    // fifteen graphs that landed upstream since 2026-08-04 are in the
+    // NORM or NEOX group (`llama-model.cpp`'s switch). All seven
+    // refuse today, so the layout here is what ferrox WOULD rotate
+    // them as if the refusal lifted -- which is exactly what this test
+    // is for. `qwen4exp` and `qwen3tts` answer IMROPE and `kimi-k3`
+    // NONE, so they stay out of the table as the other MROPE rows do.
     ("afmoe", RopeLayout::Neox),
     ("apertus", RopeLayout::Neox),
     ("arcee", RopeLayout::Norm),
@@ -86,10 +93,13 @@ const LLAMA_ROPE_TYPES: &[(&str, RopeLayout)] = &[
     ("gpt-oss", RopeLayout::Neox),
     ("gptneox", RopeLayout::Neox),
     ("granite", RopeLayout::Norm),
+    ("granite_swa", RopeLayout::Norm),
     ("granitehybrid", RopeLayout::Norm),
     ("granitemoe", RopeLayout::Norm),
+    ("graniteswitch", RopeLayout::Norm),
     ("grok", RopeLayout::Neox),
     ("grovemoe", RopeLayout::Neox),
+    ("hrm_text", RopeLayout::Neox),
     ("hunyuan-dense", RopeLayout::Neox),
     ("hunyuan-moe", RopeLayout::Neox),
     ("hy_v3", RopeLayout::Neox),
@@ -105,15 +115,18 @@ const LLAMA_ROPE_TYPES: &[(&str, RopeLayout)] = &[
     ("llama-embed", RopeLayout::Norm),
     ("llama4", RopeLayout::Norm),
     ("maincoder", RopeLayout::Norm),
+    ("maple", RopeLayout::Neox),
     ("mellum", RopeLayout::Neox),
     ("mimo2", RopeLayout::Neox),
     ("minicpm", RopeLayout::Norm),
     ("minicpm3", RopeLayout::Neox),
+    ("minimax-01", RopeLayout::Neox),
     ("minimax-m2", RopeLayout::Neox),
     ("minimax-m3", RopeLayout::Neox),
     ("mistral3", RopeLayout::Norm),
     ("mistral4", RopeLayout::Norm),
     ("modern-bert", RopeLayout::Neox),
+    ("muse-glimmer", RopeLayout::Norm),
     ("nanbeige", RopeLayout::Norm),
     ("nemotron", RopeLayout::Neox),
     ("neo-bert", RopeLayout::Norm),
@@ -142,6 +155,7 @@ const LLAMA_ROPE_TYPES: &[(&str, RopeLayout)] = &[
     ("seed_oss", RopeLayout::Neox),
     ("smallthinker", RopeLayout::Neox),
     ("smollm3", RopeLayout::Norm),
+    ("spark2_5", RopeLayout::Neox),
     ("stablelm", RopeLayout::Neox),
     ("starcoder", RopeLayout::Norm),
     ("starcoder2", RopeLayout::Neox),
@@ -281,7 +295,13 @@ fn a_ferrox_only_name_on_the_generic_path_is_declared() {
     //    NEOX band for band (`ferrox_models::mrope`), which
     //    `tests/qwen35_graphs.rs` pins against libllama with the
     //    sections in the file.
+    //  * `qwen4exp` -- `llama_model_rope_type` answers `IMROPE` for it
+    //    as it does for `qwen35` (`llama-model.cpp`), and the row is a
+    //    NEW CODE refusal on its delta-net and its hybrid memory index,
+    //    so nothing rotates today; the NEOX layout it carries is what
+    //    IMROPE is on text positions (`ferrox_models::mrope`).
     const DECLARED: &[&str] = &[
+        "qwen4exp",
         "phi4",
         "granite-moe",
         "granite-hybrid",

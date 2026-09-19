@@ -74,12 +74,15 @@
 //! all. `NormOp::None` is no help here and neither is `NormOp::Rms`.
 //!
 //! **This is the only architecture in llama.cpp that does it.** Scanned
-//! over every `build_norm` call in all 140 `src/models/*.cpp` graphs,
+//! over every `build_norm` call in all 155 `src/models/*.cpp` graphs,
 //! extracting the weight argument: three calls pass a null weight to
 //! `LLM_NORM`, and all three are `olmo.cpp`. (`talkie.cpp` passes a null
 //! weight to `LLM_NORM_RMS` at five sites, which is a different
-//! function and a different row.) So this variant closes exactly one
-//! refusal and the hoped-for shared cause is not there -- see
+//! function and a different row, and since the 2026-09-19 pin move so
+//! do `hrm-text.cpp` at three sites and `muse-glimmer.cpp` at one --
+//! the RMS row grew, the LayerNorm row did not.) So this variant
+//! closes exactly one refusal and the hoped-for shared cause is not
+//! there -- see
 //! `capability::NON_PARAMETRIC_LAYER_NORM`, which says so where the next
 //! person will look.
 //!
@@ -355,7 +358,7 @@ pub fn norm_function(arch: &str) -> NormFunction {
     norm_function_for_file(arch, None)
 }
 
-/// The ONE graph of 140 whose norm function is decided by the FILE:
+/// The ONE graph of 155 whose norm function is decided by the FILE:
 /// `cohere2moe.cpp:4-11` read both epsilon keys as optional, zero the
 /// RMS one when it is absent, and `:166,314` pick `LLM_NORM` when
 /// `f_norm_rms_eps == 0.0f` and `LLM_NORM_RMS` otherwise. Every real

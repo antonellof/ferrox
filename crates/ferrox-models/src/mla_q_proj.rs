@@ -18,9 +18,13 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! `grep -l ATTN_KV_A_MQA src/models/*.cpp` over all 140 graphs is six
-//! files (`deepseek2`, `deepseek32`, `glm-dsa`, `kimi-linear`,
-//! `minicpm3`, `plm`); of those, `grep 'LLM_TENSOR_ATTN_Q,'` finds a
+//! `grep -l ATTN_KV_A_MQA src/models/*.cpp` over the then-140 graphs
+//! was six files (`deepseek2`, `deepseek32`, `glm-dsa`, `kimi-linear`,
+//! `minicpm3`, `plm`); re-measured over 155 on 2026-09-19 it is TEN,
+//! and the four new ones (`bailingmoe3`, `dots3note`, `hy-v4`,
+//! `kimi-k3`) all pair MLA with a second attention -- KDA, a DSA
+//! indexer, hyper-connections -- so each is a `dedicated` refusal and
+//! none changes the two rows below. Of the original six, `grep 'LLM_TENSOR_ATTN_Q,'` finds a
 //! direct `wq` in `deepseek2.cpp:114`, `kimi-linear.cpp:120` and
 //! `plm.cpp:32`. On the MLA engine that is two rows: `plm`, always
 //! direct, and `deepseek2` for the "lite" checkpoints (`deepseek2.cpp:

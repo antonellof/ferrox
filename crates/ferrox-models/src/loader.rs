@@ -126,7 +126,7 @@ const SIGMOID_GATING_ARCHITECTURES: &[&str] = &[
 /// the literal wins even over a key that says otherwise.
 ///
 /// Measured 2026-09-12 by parsing every `build_moe_ffn(` call's
-/// arguments in all 140 `src/models/*.cpp`: three graphs pass
+/// arguments in all 155 `src/models/*.cpp`: three graphs pass
 /// `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID` (`llama4.cpp`, `mimo2.cpp:227`,
 /// `nemotron-h.cpp`), twenty-six pass `_SOFTMAX`, nineteen pass
 /// `hparams.expert_gating_func`. Only `mimo2` of the three is on this
@@ -597,12 +597,52 @@ impl ModelConfig {
         let n_experts = metadata_u64_any(file, &[key("expert_count")]).unwrap_or(0) as usize;
         let is_moe = n_experts > 1;
 
+        // `expert_used_count` is scalar OR an array at `block_count`
+        // length: `llama-model.cpp:1266` reads it with `get_key_or_arr`
+        // in the COMMON loader, for every architecture, and
+        // `gguf_writer.py:869-873` writes whichever it is handed.
+        // `conversion/nemotron.py:574` hands it a LIST (Nemotron-H
+        // Puzzle, one entry per block), and `nemotron_h` is an
+        // architecture ferrox serves -- so before 2026-09-19 such a
+        // file read no scalar here, fell into the default, and routed
+        // top-2 on every layer whatever the file said. A uniform array
+        // is that one value; a varying one needs a per-layer top-k the
+        // MoE layer does not have and stops by name rather than
+        // picking a number.
         let n_experts_active = if is_moe {
-            metadata_u64_any(file, &[key("expert_used_count")]).unwrap_or_else(|| {
-                best_effort_fields
-                    .push("moe.n_experts_active (no expert_used_count key; defaulted to 2)");
-                2
-            }) as usize
+            match crate::layer_shapes::read_u64_per_layer(
+                file,
+                &key("expert_used_count"),
+                // `n_layer_all`, i.e. `block_count` including any MTP
+                // blocks, which is the length llama.cpp asks for at
+                // `llama-model.cpp:1266` -- BEFORE `n_layer()` drops
+                // them.
+                block_count,
+            )? {
+                Some(per_layer) => {
+                    let first = per_layer[0];
+                    if per_layer.iter().any(|v| *v != first) {
+                        return Err(LoadError::UnsupportedFeature(
+                            key("expert_used_count"),
+                            format!(
+                                "a PER-LAYER expert count ({per_layer:?}). llama.cpp reads this \
+                                 key with `get_key_or_arr` for every architecture \
+                                 (llama-model.cpp:1266) and routes layer `il` to \
+                                 `n_expert_used_arr[il]` experts; ferrox carries one top-k for \
+                                 the model, so it would route every layer to {first} and answer \
+                                 something else. conversion/nemotron.py:574 writes the array for \
+                                 Nemotron-H Puzzle"
+                            ),
+                        ));
+                    }
+                    first as usize
+                }
+                None => {
+                    best_effort_fields
+                        .push("moe.n_experts_active (no expert_used_count key; defaulted to 2)");
+                    2
+                }
+            }
         } else {
             1
         };
@@ -5481,6 +5521,66 @@ mod tests {
             without.sliding_window,
             Some(4096),
             "the same trunk without the block is the 32B"
+        );
+    }
+
+    /// `expert_used_count` is scalar-or-array upstream, and the array
+    /// spelling used to fall through to a DEFAULT of 2 here.
+    ///
+    /// `llama-model.cpp:1266` reads the key with `get_key_or_arr` in
+    /// the common loader -- every architecture, `n_layer_all` entries
+    /// -- and `conversion/nemotron.py:574` writes a list for
+    /// Nemotron-H Puzzle, whose architecture (`nemotron_h`) ferrox
+    /// serves. Before this test, `metadata_u64` answered `None` for an
+    /// array value, the `unwrap_or_else` below it pushed a best-effort
+    /// note, and the model routed top-2 on every layer whatever the
+    /// file declared: the silent-wrong class, not a refusal.
+    ///
+    /// Both arms are pinned, because a reader that honoured the
+    /// uniform case and silently averaged the varying one would pass
+    /// half of this.
+    #[test]
+    fn a_per_layer_expert_used_count_is_honoured_when_uniform_and_refused_when_not() {
+        fn file(used: Kv<'_>) -> Vec<(&'static str, Kv<'_>)> {
+            vec![
+                ("general.architecture", Kv::Str("llama")),
+                ("llama.block_count", Kv::U32(2)),
+                ("llama.embedding_length", Kv::U32(32)),
+                ("llama.attention.head_count", Kv::U32(4)),
+                ("llama.attention.head_count_kv", Kv::U32(2)),
+                ("llama.attention.key_length", Kv::U32(8)),
+                ("llama.attention.value_length", Kv::U32(8)),
+                ("llama.rope.freq_base", Kv::F32(10_000.0)),
+                ("llama.expert_count", Kv::U32(8)),
+                ("llama.expert_used_count", used),
+            ]
+        }
+        let scalar = ModelConfig::from_gguf(&open_metadata_gguf(
+            "experts_used_scalar",
+            &file(Kv::U32(3)),
+        ))
+        .expect("the scalar spelling loads");
+        assert_eq!(scalar.moe.n_experts_active, 3);
+
+        let uniform = ModelConfig::from_gguf(&open_metadata_gguf(
+            "experts_used_uniform",
+            &file(Kv::Arr32(&[3, 3])),
+        ))
+        .expect("a uniform array is that one value");
+        assert_eq!(
+            uniform.moe.n_experts_active, 3,
+            "an array of one repeated value is the scalar, not the default of 2"
+        );
+
+        let err = ModelConfig::from_gguf(&open_metadata_gguf(
+            "experts_used_varying",
+            &file(Kv::Arr32(&[3, 5])),
+        ))
+        .expect_err("a varying array has no single top-k and must stop");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expert_used_count") && msg.contains("PER-LAYER"),
+            "the refusal must name the key and what is wrong with it: {msg}"
         );
     }
 

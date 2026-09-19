@@ -21,7 +21,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! `grep -l 'n_loops\|n_layer_phys' src/models/*.cpp` over all 140
+//! `grep -l 'n_loops\|n_layer_phys' src/models/*.cpp` over all 155
 //! graphs (2026-09-12) is `nanbeige.cpp`; `LLM_KV_NUM_LOOPS` and
 //! `LLM_KV_SKIP_LOOP_FINAL_NORM` are read nowhere else. So
 //! [`LOOP_READERS`] has one row and the keys are dead metadata on every

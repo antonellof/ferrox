@@ -58,7 +58,7 @@
 //!
 //! # The one loader that HONOURS the step
 //!
-//! `grep -n n_moe_layer_step src/models/*.cpp` over all 140 graphs is
+//! `grep -n n_moe_layer_step src/models/*.cpp` over all 155 graphs is
 //! the two ERNIE lines above and `llama4.cpp:6,64`. Llama 4 reads the
 //! key as REQUIRED (`:6`) and its TENSOR LOADER branches on it
 //! (`:64`, `is_moe_layer = n_moe_layer_step > 0 && (i + 1) % step ==

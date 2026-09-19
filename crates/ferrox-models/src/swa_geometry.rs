@@ -7,7 +7,7 @@
 //!    `n_rot_full` and lets `rope.dimension_count_swa` override it
 //!    (`llama-model.cpp:1222-1223`), and `llama_hparams::n_rot(il)` is
 //!    `is_swa(il) ? n_rot_swa : n_rot_full` (`llama-hparams.cpp:85-91`).
-//!    It is a TWO-VALUED field, not an array -- measured over all 140
+//!    It is a TWO-VALUED field, not an array -- measured over all 155
 //!    graphs when the per-layer shape seam was built. Two things set the
 //!    sliding width apart from the full one:
 //!

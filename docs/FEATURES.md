@@ -201,7 +201,7 @@ is faster.
   every expert count but Maverick's 128 (`weightless_qk_norm`); the
   routing weight multiplied into the expert's INPUT rather than its
   output (`routed_weight_site`, `llama-graph.cpp:1947`, the one graph
-  of 140); and the interleave step the TENSOR LOADER honours
+  of 155); and the interleave step the TENSOR LOADER honours
   (`moe_interleave::INTERLEAVE_STEP_HONOURED_BY_LOADER`, unlike
   ERNIE's). Sigmoid routing from a literal with `norm_w = false`,
   which found `route_top_k_sigmoid` renormalising whatever the flag
@@ -283,7 +283,7 @@ is faster.
   `ferrox_models::proj_bias`: `attn_output.bias` after `wo` and the
   dense FFN's `ffn_{up,gate,down}.bias` where `build_ffn` adds them, for
   exactly the architectures whose graph creates the tensors (33 and 27
-  of 140, measured, most OPTIONAL -- a `llama` file with biases used to
+  of 155, measured, most OPTIONAL -- a `llama` file with biases used to
   be refused as unread and matches libllama now, 2.7e-13). The ungated
   GELU (`FfnActivation::GeluUngated`) landed with it. Every fused Metal
   dense launch refuses a biased layer.
@@ -302,7 +302,7 @@ is faster.
 - **The parallel residual, and with it GPT-NeoX / Pythia (`gptneox`)
   and PLaMo (`plamo`).** `x + attn(norm(x)) + ffn(norm(x))`:
   `ferrox_models::parallel_residual` is one table for the eight graphs
-  that build it (measured over all 140), in its two spellings -- the FFN
+  that build it (measured over all 155), in its two spellings -- the FFN
   reading its own norm of the layer input (`gptneox` under
   `use_parallel_residual`, Falcon-40B under `attn_norm_2`) or the vector
   attention read (`plamo`, `stablelm` without `ffn_norm`, `phi2`,
@@ -331,13 +331,13 @@ is faster.
   `attn_norm_2`, which norms the layer input FOR ATTENTION while
   `attn_norm` keeps feeding the FFN, the two-norm arm with the names
   crossed relative to `gptneox` (`norm_sites::ATTN_NORM_2_FEEDS_
-  ATTENTION`, one graph of 140). `tests/falcon_graphs.rs`: KL 3.8e-8
+  ATTENTION`, one graph of 155). `tests/falcon_graphs.rs`: KL 3.8e-8
   and 1.9e-7 at the f16 GELU-table line; swapping the two slots back
   diverges by more than 1.
 - **Phi-2 (`phi2`): Phi-2 and Phi-1.5 run, and the LM head has a bias
   slot.** `output.bias` (`phi2.cpp:22,136`, REQUIRED; `phimoe` the same,
   `qwen2` optional: `proj_bias::OUTPUT_BIAS_CREATORS`, three graphs of
-  140) is `Decoder::output_bias`, added right after the head in the one
+  155) is `Decoder::output_bias`, added right after the head in the one
   place its post-projection transforms run (`decoder::lm_head::Logits`),
   and a head with one is never folded into a fused Metal argmax stack
   (a bias moves the argmax where the cap and the multiplier cannot). The
@@ -361,7 +361,7 @@ is faster.
 - **Phi-3.5-MoE (`phimoe`) runs.** `phi3`'s graph on routed experts,
   whose only differences from a Phi-3 file are biases: an RMSNorm WITH
   a bias at every norm site (`NormOp::RmsBias`, `capability::
-  BIASED_RMS_NORM`, one graph of 140 on the generic path; the old
+  BIASED_RMS_NORM`, one graph of 155 on the generic path; the old
   refusal had called these LayerNorm biases, and they are not) plus
   `attn_output.bias` and `output.bias`, both slots that already
   existed. LongRoPE's factor pair and attn factor, softmax top-2
@@ -373,7 +373,7 @@ is faster.
   learned position table.** `position_embd.weight` `{n_embd,
   n_ctx_train}` is gathered at the position and ADDED to the token
   embedding before layer 0 (`gpt2.cpp:19,74-77`), and the graph calls
-  no `ggml_rope`: `ferrox_models::position_embd` (three graphs of 140
+  no `ggml_rope`: `ferrox_models::position_embd` (three graphs of 155
   create the tensor on the generic path, `mpt`'s optional beside its
   ALiBi) adds row `pos` at the one embedding site, and
   `rope_layers::RopeLayers::Never` is the rule that rotates nothing (not
@@ -399,7 +399,7 @@ is faster.
   the bias and the absence of rotation cannot disagree about a layer
   count. Every fused Metal launch and the CUDA resident attention
   refuse a model with a bias. On the way: `bloom`'s `token_embd_norm`
-  (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`, the one decoder of 140
+  (`norm_sites::EMBEDDING_NORM_ARCHITECTURES`, the one decoder of 155
   that norms its embeddings), `jais`'s `1/d` attention scale
   (`jais.cpp:83`, the one graph that passes a literal `kq_scale` other
   than `1/sqrt(d)`), `mpt`'s `clamp_kqv` and optional `position_embd`,
@@ -493,7 +493,7 @@ is faster.
   fused-QKV cut read it; every fused Metal launch, the CUDA resident
   hook, the slot file and the KV block file refuse a split model, so
   MiMo-V2 runs on the host paths. Its `attention.value_scale` is
-  `ferrox_models::attn_value_scale`, one reader of 140. Building it
+  `ferrox_models::attn_value_scale`, one reader of 155. Building it
   found `expert_weights_scale` / `expert_weights_norm` honoured for
   every architecture where llama.cpp reads them in twenty loaders; the
   loader's `EXPERT_WEIGHTS_*_READERS` tables are the measurement.
@@ -501,7 +501,7 @@ is faster.
   `bitnet.cpp:24,36` require `attn_sub_norm` on the attention output
   BEFORE `wo` and `ffn_sub_norm` on `silu(gate) * up` BEFORE `down`,
   two sites the generic decoder's four norm slots did not have; one
-  graph of 140 creates either tensor (measured), so
+  graph of 155 creates either tensor (measured), so
   `ModelConfig::block_sub_norms` is a `bool` the loader and the Metal
   predicate both read (`ferrox_models::sub_norms`). Applied in the one
   attention tail and the one dense FFN row body; every fused Metal
@@ -531,7 +531,7 @@ is faster.
   and the floor is `n_ctx_orig_yarn` -- `context_length` unless the
   YaRN key overrides it. `ferrox_models::attn_temperature` is one value
   behind `ModelConfig::attn_temperature`, applied on the three host
-  bodies and fenced off the fused Metal launches; three graphs of 140
+  bodies and fenced off the fused Metal launches; three graphs of 155
   build the input (measured), and the two on other engines are
   recorded, with the MLA loader refusing Mistral-Large-3's key by name
   where it used to drop it.

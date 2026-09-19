@@ -405,7 +405,7 @@ pub struct ModelConfig {
     /// `log(floor((pos + offset) / floor_scale) + 1) * scale + 1` that
     /// `mistral3.cpp:153-156` multiplies into Q after RoPE, before
     /// `build_attn`, with `kq_scale` untouched. See
-    /// [`crate::attn_temperature`] for the census (three graphs of 140)
+    /// [`crate::attn_temperature`] for the census (three graphs of 155)
     /// and the resolution.
     ///
     /// `Some` only for an architecture whose graph builds the input AND
@@ -420,7 +420,7 @@ pub struct ModelConfig {
     /// WHICH TENSOR THE MoE ROUTER READS -- the normed FFN input for
     /// every graph but one, the raw layer input for `smallthinker`
     /// (`smallthinker.cpp:111`). See [`crate::router_input`] for the
-    /// census (four graphs of 140 pass a precomputed `probs_in`, one on
+    /// census (four graphs of 155 pass a precomputed `probs_in`, one on
     /// the generic path) and the seam. `Decoder::router_operand` is the
     /// ONE place the operand is captured, and the GPU router paths
     /// refuse a model whose operand they cannot read
@@ -430,7 +430,7 @@ pub struct ModelConfig {
     /// BitNet's `attn_sub_norm` (on the attention output, BEFORE `wo`)
     /// and `ffn_sub_norm` (on `silu(gate) * up`, BEFORE `down`),
     /// `bitnet.cpp:24,36,101-106,135-140`. See [`crate::sub_norms`] for
-    /// the census (one graph of 140) and the two readers: the loader,
+    /// the census (one graph of 155) and the two readers: the loader,
     /// which REQUIRES the pair when this is set, and
     /// `Decoder::metal_can_serve_model`, which refuses every fused
     /// launch, since none has a norm at either site.
@@ -626,7 +626,7 @@ pub enum FfnActivation {
     /// UNGATED GELU: `down(gelu(up(x)))`, two matrices in sequence and
     /// no `ffn_gate` -- llama.cpp's `LLM_FFN_GELU` under `LLM_FFN_SEQ`
     /// with a null gate (`starcoder2.cpp:125-131`, `codeshell.cpp:
-    /// 120-126`; eleven graphs of 140 pass the pair, measured,
+    /// 120-126`; eleven graphs of 155 pass the pair, measured,
     /// `capability::uses_gelu_ungated`). Aliased and served exactly as
     /// [`Self::ReluSqr`], mapping to `ferrox_moe::GluAct::GeluUngated`;
     /// no fused device kernel spells it. `ggml_gelu` is the tanh form
@@ -637,7 +637,7 @@ pub enum FfnActivation {
     /// matrix -- llama.cpp's `LLM_FFN_RELU` under `build_moe_ffn` with
     /// `gate_exps` present, which takes `ggml_reglu_split(gate, up)`
     /// (`llama-graph.cpp:2195-2197`; `smallthinker.cpp:158`, the only
-    /// graph of 140 that passes it there -- `capability::uses_reglu`).
+    /// graph of 155 that passes it there -- `capability::uses_reglu`).
     ///
     /// `ferrox_moe::GluAct::Reglu`, on a pair the loader did NOT alias.
     /// Two variants rather than [`Self::ReluSqr`] with a flag, because

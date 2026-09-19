@@ -20,7 +20,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! Over all 140 `src/models/*.cpp` (2026-09-12): `grep -A3
+//! Over all 155 `src/models/*.cpp` (2026-09-12): `grep -A3
 //! "build_norm(Qcur" | grep "LLM_NORM,"` is five graphs. Two of them
 //! (`bert.cpp:124`, `mpt.cpp:110`) norm the WHOLE projection with a
 //! `{n_embd}` weight and a bias, a different op on non-generic rows.

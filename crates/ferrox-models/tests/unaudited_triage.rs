@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 2,
+        n, 9,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -86,7 +86,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          multipliers (`tests/granite_family_graphs.rs`), and 22 until `olmo` closed on \
          the non-parametric LayerNorm (`ferrox_models::norm`, `tests/olmo_graphs.rs`) -- \
          the FIRST NEW CODE row to close alone, and it closed alone because its cause \
-         really is unshared: every `build_norm` call in llama.cpp's 140 graphs was \
+         really is unshared: every `build_norm` call in llama.cpp's 155 graphs was \
          scanned for a null weight and all three hits are `olmo.cpp`, and 21 until \
          `exaone-moe` closed on the per-layer RoPE gate (`ferrox_models::rope_layers`, \
          `tests/no_rope_layer_graphs.rs`) -- ONE cause behind THREE refusals, of which \
@@ -135,7 +135,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          answered `relu(up)^2` for a real gate, and its `n_swa = 4096` pin is a third \
          answer on the one table `swa_disabled_by_arch` is derived from, and 8 until \
          `bitnet` closed on the two norms INSIDE the blocks (`ferrox_models::sub_norms`, \
-         tests/sub_norm_graphs.rs) -- one graph of 140 creates either tensor, measured, \
+         tests/sub_norm_graphs.rs) -- one graph of 155 creates either tensor, measured, \
          so the seam is a `bool` on `ModelConfig` and the row closed alone; its optional \
          per-projection `.scale` tensors are a refusal by name now \
          (`ferrox_models::weight_scales`) from a fixture whose libllama logits differ \
@@ -148,7 +148,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          `expert_weights_scale` honoured for every architecture where llama.cpp reads it \
          in twenty loaders (`EXPERT_WEIGHTS_SCALE_READERS`), and 6 until `nanbeige` \
          closed on the layer loop (`ferrox_models::layer_loops`, \
-         tests/layer_loop_graphs.rs) -- one graph of 140 reads `num_loops`; the weights \
+         tests/layer_loop_graphs.rs) -- one graph of 155 reads `num_loops`; the weights \
          are shared and the KV is not, so `Decoder::layers` stays physical, `n_layers` is \
          logical, and one mapping serves the three bodies, and 5 until `talkie` closed \
          on its four things at once (`ferrox_models::skip_stream`, `NormOp::RmsNoParams`, \
@@ -156,21 +156,28 @@ fn every_unaudited_architecture_renders_a_detail_line() {
          `ferrox_models::weight_scales` now serves; tests/skip_stream_graphs.rs), and 4 \
          until `plm` closed on the MLA engine (`ferrox_models::mla_arch`, \
          `ferrox_models::mla_q_proj`, tests/plm_graphs.rs) -- the reach measured first: \
-         six graphs of 140 create `attn_kv_a_mqa` and three have a direct `attn_q` \
+         six graphs of 155 create `attn_kv_a_mqa` and three have a direct `attn_q` \
          beside it, and on that engine the direct form is `plm` and every LITE \
          `deepseek2` (`deepseek2.cpp:8`, decided from the layer count), which the loader \
          had refused for a `q_lora_rank` llama.cpp never reads there; the fixture is the \
          MLA engine's FIRST libllama golden, and 3 until `arctic` closed on the parallel \
          dense + MoE layer (`ferrox_models::parallel_dense_ffn`, \
          `RouterInput::NormedLayerInput`, tests/parallel_dense_ffn_graphs.rs) -- the reach \
-         measured first: two graphs of 140 SUM a dense FFN with their routed output, and \
+         measured first: two graphs of 155 SUM a dense FFN with their routed output, and \
          the other is Grok-2, refused by name until then from a fixture that has a golden \
-         now; the branch operand is one graph of 140, a third variant of the seam \
+         now; the branch operand is one graph of 155, a third variant of the seam \
          `smallthinker` opened, and the verdict that said the seam did not reach it \
          was read before it was believed \
          -- rows closing is the count going DOWN for the best reason. Either an \
          architecture was audited or reclassified (good -- update the count and the docs) \
-         or one was added (check it was triaged)"
+         or one was added (check it was triaged). ON 2026-09-19 IT WENT UP, 2 to 10, for \
+         the third reason: the llama.cpp PIN moved (2026-08-04 to `5b59b83`, 792 commits, \
+         fifteen new graphs) and eight of the new architectures are generic-path \
+         candidates that had to be read before they could be refused honestly -- \
+         `granite_swa`, `graniteswitch`, `muse-glimmer`, `maple`, `spark2_5`, `hrm_text`, \
+         `minimax-01`, `qwen4exp`. A parity count against a moving upstream goes UP when \
+         the pin moves and DOWN when a row closes, and one that only ever went down would \
+         mean nobody was reading upstream"
     );
 }
 
@@ -348,7 +355,7 @@ fn the_post_norm_group_is_three_topologies_and_only_two_of_them_closed() {
         ferrox_models::capability::NON_PARAMETRIC_LAYER_NORM,
         &["olmo"],
         "a second name here would be a second llama.cpp graph with a null-weight \
-         `LLM_NORM`, and the scan over all 140 found none"
+         `LLM_NORM`, and the scan over all 155 found none"
     );
 }
 
@@ -419,7 +426,9 @@ fn the_remaining_work_is_counted() {
         .iter()
         .filter(|p| p.triage.is_some())
         .count();
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 2);
+    // 2 before the 2026-09-19 pin move (`grovemoe`, `phi4`), plus the
+    // eight upstream architectures it brought in.
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 9);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -751,7 +760,7 @@ fn batch_three_verdicts_are_pinned_to_what_was_read() {
 /// three says so: the verdict names the per-layer half as done and the
 /// remaining blocker as something else.
 ///
-/// The reach was MEASURED before the seam was built -- all 140
+/// The reach was MEASURED before the seam was built -- all 155
 /// `src/models/*.cpp` scanned for `n_head(i)` / `n_head_kv(i)` /
 /// `n_ff(i)` in both the tensor loader and the graph -- and
 /// `PER_LAYER_SHAPE_ARCHS` is the record. A verdict that still called
@@ -1192,12 +1201,20 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 0, 1, 1),
+        (0, 1, 7, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
-         update this and docs/MODELS.md together. TWO classes are ZERO now: `gemma` was \
-         the last FIXTURE-AWAY row and `chatglm` the last ONE MATCH ARM one, so nothing \
-         refusing today is one fixture or one arm away and EVERY remaining row is NEW \
-         CODE. That column went 26 to 24 when `olmo2` and `exaone4` closed together -- \
+         update this and docs/MODELS.md together. BOTH cheap classes were ZERO between \
+         2026-09-12 and 2026-09-19 -- `gemma` was the last FIXTURE-AWAY row and `chatglm` \
+         the last ONE MATCH ARM one -- and the 2026-09-19 pin move refilled the ONE MATCH \
+         ARM column with two: `maple` needs one `ferrox_models::rope_layers` row \
+         (`RopeLayers::SlidingOnly`, `src/models/maple.cpp:88`) and `spark2_5` needed one \
+         `ferrox_models::attn_gate` row (sigmoid, per head, `src/models/spark2-5.cpp:41`), \
+         which it got the same day -- so the column reads 1, not 2, and the row that \
+         closed took a fixture and an hour. `maple` should not sit here either: the lesson \
+         of `minimax-m2` is that a row whose verdict names its own closing evidence and \
+         does not go and get it is a refusal that could have been a row. The NEW CODE \
+         column went 1 to 7 the same day (`granite_swa`, `graniteswitch`, `muse-glimmer`, \
+         `hrm_text`, `minimax-01`, `qwen4exp`, plus `grovemoe`). That column went 26 to 24 when `olmo2` and `exaone4` closed together -- \
          one topology, one implementation -- 24 to 21 when `granite`, `granitemoe` \
          and the `granite-moe` alias closed on ONE implementation of their four scalar \
          multipliers, 21 to 20 when `olmo` closed on the non-parametric LayerNorm, and \
@@ -1249,7 +1266,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          one `GluAct` variant that had served `arcee` by aliasing answering \
          `relu(up)^2` for a REAL gate; it is two variants now. And 7 to 6 when `bitnet` \
          closed on the two norms INSIDE the blocks (`ferrox_models::sub_norms`): the \
-         reach came back with one graph of 140, so the fact is a `bool` read by the \
+         reach came back with one graph of 155, so the fact is a `bool` read by the \
          loader and by the Metal predicate, and the arithmetic landed in the one \
          attention tail and the one dense FFN row body that already existed. And 6 to \
          5 when `mimo2` closed on the split K/V head width (`ferrox_models::kv_head_dims`), \
@@ -1258,7 +1275,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          a V width beside every K width in the cache, the kernels and the checks. And 5 \
          to 4 when `nanbeige` closed on the layer loop (`ferrox_models::layer_loops`): a \
          logical-to-physical mapping and a loop norm at the end of both FFN bodies. And \
-         4 to 3 when `talkie` closed on four seams at once, each one graph of 140: a \
+         4 to 3 when `talkie` closed on four seams at once, each one graph of 155: a \
          weightless RMSNorm variant, a per-head scalar QK gain, the embedding skip stream \
          and the two projection gains. And 3 to 2 when `plm` moved to the MLA engine \
          (`ferrox_models::mla_arch`): its attention had been there since the engine \
@@ -1267,9 +1284,9 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          which is the evidence every other row in this file was held to. And 2 to 1 when \
          `arctic` closed on `ferrox_models::parallel_dense_ffn` (the dense FFN summed with \
          the experts: the shared-expert slot under the dense names plus the row's scale, \
-         two graphs of 140, Grok-2's refusal by name lifted with it) and \
+         two graphs of 155, Grok-2's refusal by name lifted with it) and \
          `RouterInput::NormedLayerInput` (the routed branch reading the layer input under \
-         a second norm, one graph of 140). What is left is `grovemoe`, whose upstream graph \
+         a second norm, one graph of 155). What is left is `grovemoe`, whose upstream graph \
          diverges from its reference, and `phi4`. \
          The first two closures took several rows at once because each found ONE cause \
          behind several refusals; `olmo` is the first that did not, and the reason is \
@@ -1279,7 +1296,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 2);
+    assert_eq!(fixture + arm + new_code + unknown, 9);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

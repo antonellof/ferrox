@@ -22,8 +22,31 @@
 //!   `mimo2.cpp:35-37,51-52`) unless the context was opened as an MTP
 //!   draft (`load_mtp`), so the bytes are neither read nor missed.
 //!
-//! **Only the graphs that READ the key subtract.** Measured: `grep -l
-//! LLM_KV_NEXTN_PREDICT_LAYERS src/models/*.cpp` is the seventeen in
+//! **UPSTREAM CHANGED THIS, and the change is recorded before it is
+//! followed.** When the pin moved to `5b59b83` on 2026-09-19,
+//! `llama-model.cpp:1261` reads `LLM_KV_NEXTN_PREDICT_LAYERS` in the
+//! COMMON loader, for every architecture, right after `block_count`
+//! and with a `GGML_ASSERT(n_layer_nextn <= n_layer_all)` beside it
+//! (upstream commit 9d81721, "load hparams.n_layer_nextn before
+//! n_layer() calls"). So upstream now subtracts the trailing blocks
+//! whatever the architecture, where it used to subtract only in the
+//! per-architecture loaders, and `grep -l
+//! LLM_KV_NEXTN_PREDICT_LAYERS src/models/*.cpp` is down to six files
+//! that read it a second time for their own reasons.
+//!
+//! ferrox still refuses a nonzero key on an architecture outside
+//! [`NEXTN_READERS`], which is now an OVER-refusal rather than a
+//! divergence in the dangerous direction: a file upstream would run
+//! by skipping its MTP blocks stops here instead of running them as
+//! decoder layers. Lifting it is a row of its own -- it needs a
+//! libllama golden built from the moved pin, on an architecture that
+//! is NOT one of the seventeen -- and until that exists the table
+//! below is what has evidence.
+//!
+//! **Only the graphs that READ the key subtract** (the measurement as
+//! it stood at the 2026-08-04 pin, and the one the table is built
+//! from): `grep -l
+//! LLM_KV_NEXTN_PREDICT_LAYERS src/models/*.cpp` was the seventeen in
 //! [`NEXTN_READERS`]. For any other architecture `n_layer_nextn` stays
 //! 0, every block runs, and a file carrying `nextn.*` tensors fails
 //! llama.cpp's own "not all tensors loaded" check -- so for those a
@@ -64,7 +87,7 @@ use ferrox_gguf::{ShardedGguf, TensorSource};
 use crate::loader::LoadError;
 
 /// Every graph whose `load_arch_hparams` reads
-/// `LLM_KV_NEXTN_PREDICT_LAYERS`, with the file. Measured over all 140
+/// `LLM_KV_NEXTN_PREDICT_LAYERS`, with the file. Measured over all 155
 /// `src/models/*.cpp`; `llama-arch.cpp` and `llama-model-saver.cpp` are
 /// the only other hits and neither is a graph.
 pub const NEXTN_READERS: &[(&str, &str)] = &[
