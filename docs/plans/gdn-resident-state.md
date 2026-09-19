@@ -331,6 +331,32 @@ and 5 ms a token; the rest is the PTQ1_0 matvecs, which
 `gemm_throughput_probe` and the six measured non-results below say are
 close to what this kernel shape gives.
 
+## What is left, and what it is worth
+
+Waits per token are 69: sixteen `gdn-run` (three recurrent layers each),
+thirty-five `matvec-fused` and eighteen `dense-ffn`, and forty-eight of
+those sixty-nine belong to the SIXTEEN attention layers, which still
+cost three submissions each. GPU is 88.8 ms of a 98 ms token and the
+reference's whole token is 86.7 to 87.3.
+
+So the arithmetic for the last step, and it is the last one:
+
+| | waits | latency | token | tok/s |
+|---|---|---|---|---|
+| today | 69 | 11.7 ms | 98 ms | 10.1 |
+| attention layers fused, one submission each | 37 | 6.3 ms | 93 ms | 10.8 |
+| the whole token as ONE run | ~2 | 0.3 ms | 89 ms | 11.2 |
+
+That last row is within noise of the reference, and it needs the
+attention layer on the device end to end: a gated Q split from a
+double-width `wq`, the per-head QK norm, RoPE, the attention itself
+against a Metal-resident KV, the sigmoid gate, `wo`. `launch_decode_attn_block`
+already does the shape of that for un-gated models and
+`Decoder::metal_attn_view` answers `None` for a gate, which is the fence
+that has to move. Nothing smaller closes the gap: every scheduling lever
+is now measured, and the kernel's own inner loop has three measured
+neutral results against it.
+
 ## What is left, and it is one thing
 
 The token is now GPU 82.7 ms, latency 16.7 ms, host about 13 ms. The
@@ -488,14 +514,33 @@ measured non-result below.
 
 - The fused recurrent layer on a concurrent encoder with RESOURCE-scoped
   barriers (`MemRanges::begin_op`, every dispatch declaring what it
-  reads and writes, a barrier only on a real conflict), which is the
-  form the scope-Buffers attempt below said might pay. It produced
-  WRONG results -- both oracle tests red, the branch by 0.4% and the
-  whole layer by a factor of two -- and the missing dependency was not
-  found. The declared sets are recorded in the commit that reverts it,
-  so the next attempt starts from them rather than from nothing. It is
-  a non-result twice over: unfinished, and aimed at an overlap whose
-  full-barrier version had already measured slower.
+  reads and writes, a barrier only on a real conflict), so `beta` runs
+  beside `alpha`, `qkv` beside `z` and `gate` beside `up` -- the two
+  biggest matvecs in the layer. Correct, and **10.11 to 10.20 tok/s
+  against 10.12 to 10.17: flat.** Reverted, because it buys nothing and
+  costs a concurrent encoder plus a dependency declaration at every
+  dispatch.
+
+  This one is worth reading as a MODEL and not just a number. The
+  argument for it was that the kernel splits 42% ALU and 58% memory
+  (measured: removing the trit decode takes the isolated matvec from
+  0.94 ms to 0.57), so perfect overlap should have had 1.7x in it. It
+  does not, because a single PTQ1_0 matvec at Bonsai's shape already
+  dispatches 4352 threadgroups and fills the part: the GPU is ALREADY
+  interleaving that kernel's own ALU and memory across its concurrent
+  threads, and a second dispatch has no idle capacity to use. Overlap
+  pays when a dispatch UNDER-occupies, and in this layer the only
+  dispatches that do are the small ones that are not where the time is.
+  So the 42/58 split is not headroom; it is the kernel sitting at its
+  balance point.
+
+  It was also built TWICE. The first version paired `begin_op` and
+  `end_op` by hand at each of 21 sites, got one pair's declaration
+  wrong, and produced wrong answers that the oracle tests caught. The
+  second routes every dispatch through ONE `stage(reads, writes)` helper
+  and was correct on the first run. The difference is the repo's own
+  rule: 21 hand-written pairs that must agree, against one helper they
+  all go through.
 - The fused recurrent layer on a CONCURRENT encoder
   (`computeCommandEncoderWithDispatchType`), with scope-Buffers
   barriers only between stages that depend on each other, so `qkv` runs
