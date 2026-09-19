@@ -15,6 +15,8 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-09-19
+
 ### Changed
 
 - **The project is Frink.** Every crate is `frink-*`, the binaries are
