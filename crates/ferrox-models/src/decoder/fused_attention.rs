@@ -65,6 +65,40 @@ impl Decoder {
         LayerFfnParts::for_layer(layer, self.config.rms_norm_eps, true).map(|_| ())
     }
 
+    /// The launch description for this layer's tail, or `None` when
+    /// anything refuses.
+    ///
+    /// ONE builder, because the tail runs two ways -- in a command
+    /// buffer of its own ([`Self::fused_attention_tail`]) and at the
+    /// head of a recurrent run
+    /// ([`Self::fused_attention_tail_then_run`]) -- and a second place
+    /// assembling it would be a second place that has to remember the
+    /// fold width and the refusals.
+    #[cfg(feature = "metal")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn attn_tail_launch<'a>(
+        &self,
+        l: usize,
+        layer: &'a LayerWeights,
+        branch: &[f32],
+    ) -> Option<(
+        ferrox_metal::gpu::MatvecLaunch<'a>,
+        Option<ferrox_metal::hadamard::FoldPlan<'a>>,
+        LayerFfnParts<'a>,
+        crate::fused_layer::LayerFfnLaunches<'a>,
+    )> {
+        self.fused_attention_refusals(l, layer)?;
+        let (base, fold) = layer.attn.o_proj.launch_parts();
+        let out_proj = crate::metal_launch::matvec(base)?;
+        let fold_branch = match fold {
+            None => None,
+            Some(f) => Some(f.metal_plan(branch.len())?),
+        };
+        let ffn = LayerFfnParts::for_layer(layer, self.config.rms_norm_eps, true)?;
+        let launches = ffn.launches()?;
+        Some((out_proj, fold_branch, ffn, launches))
+    }
+
     /// `residual + ffn(rms_norm(residual + wo(branch)))` in one
     /// submission, or `None` when this layer is not that shape.
     ///
@@ -78,15 +112,7 @@ impl Decoder {
         branch: &[f32],
         residual: &[f32],
     ) -> Option<Vec<f32>> {
-        self.fused_attention_refusals(l, layer)?;
-        let (base, fold) = layer.attn.o_proj.launch_parts();
-        let out_proj = crate::metal_launch::matvec(base)?;
-        let fold_branch = match fold {
-            None => None,
-            Some(f) => Some(f.metal_plan(branch.len())?),
-        };
-        let ffn = LayerFfnParts::for_layer(layer, self.config.rms_norm_eps, true)?;
-        let launches = ffn.launches()?;
+        let (out_proj, fold_branch, _ffn, launches) = self.attn_tail_launch(l, layer, branch)?;
         let out = ferrox_metal::gdn_branch::launch_attn_tail(
             &out_proj,
             fold_branch.as_ref(),

@@ -3102,6 +3102,19 @@ impl Decoder {
                     self.attn_block_tail(l, layer, &normed, pos, KvStep::Decode(&mut *cache), tail);
                 #[cfg(feature = "metal")]
                 if let Some(branch) = deferred {
+                    // The tail feeds the recurrent layers after it, so
+                    // it rides in THEIR command buffer when there are
+                    // any: one wait for the four layers instead of two.
+                    if let Some(end) = self.fused_attention_tail_then_run(
+                        l,
+                        layer,
+                        &branch,
+                        &mut hidden,
+                        kv_caches,
+                    ) {
+                        fused_through = end;
+                        continue;
+                    }
                     if let Some(out) = self.fused_attention_tail(l, layer, &branch, &hidden) {
                         hidden = out;
                         continue;

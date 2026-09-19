@@ -117,21 +117,76 @@ impl Decoder {
             return None;
         }
         let mut run = ferrox_metal::gdn_branch::GdnRun::start(hidden).ok()?;
+        self.run_layers(&mut run, start, end, kv_caches)?;
+        *hidden = run.finish().ok()?;
+        Some(end)
+    }
+
+    /// The same run, begun with an ATTENTION layer's tail.
+    ///
+    /// A hybrid alternates three recurrent layers and one attention
+    /// layer, and the attention layer's tail feeds the next three: its
+    /// output is the residual stream they read, which the host never
+    /// looks at. So it goes in their command buffer and shares their
+    /// single wait, which is sixteen fewer a token on Bonsai.
+    #[cfg(feature = "metal")]
+    pub(crate) fn fused_attention_tail_then_run(
+        &self,
+        l: usize,
+        layer: &LayerWeights,
+        branch: &[f32],
+        hidden: &mut Vec<f32>,
+        kv_caches: &mut [ferrox_core::KvCache],
+    ) -> Option<usize> {
+        let (out_proj, fold_branch, ffn, launches) = self.attn_tail_launch(l, layer, branch)?;
+        let mut end = l + 1;
+        while end < kv_caches.len() && self.fused_layer_parts(end).is_some() {
+            end += 1;
+        }
+        // With no recurrent layer behind it there is nothing to share a
+        // wait with, and `launch_attn_tail` is the cheaper shape.
+        if end == l + 1 {
+            return None;
+        }
+        let mut run = ferrox_metal::gdn_branch::GdnRun::start(hidden).ok()?;
+        run.attn_tail(
+            &out_proj,
+            fold_branch.as_ref(),
+            &launches.as_metal(),
+            branch,
+        )
+        .ok()?;
+        let _ = ffn;
+        layer.moe.record_activations_dense();
+        self.run_layers(&mut run, l + 1, end, kv_caches)?;
+        *hidden = run.finish().ok()?;
+        Some(end)
+    }
+
+    /// Appends layers `start..end` to `run`. The ONE place a recurrent
+    /// layer joins a run, whatever began it.
+    #[cfg(feature = "metal")]
+    fn run_layers(
+        &self,
+        run: &mut ferrox_metal::gdn_branch::GdnRun,
+        start: usize,
+        end: usize,
+        kv_caches: &mut [ferrox_core::KvCache],
+    ) -> Option<()> {
         for (l, cache) in (start..end).zip(kv_caches[start..end].iter_mut()) {
             let layer = self.layer_for(l);
             let (gdn, attn_norm, ffn) = self.fused_layer_parts(l)?;
             let state = cache.recurrent.get_or_insert_with(|| gdn.zero_state());
             // SAFETY: each layer's state lives in its own cache element,
-            // which nothing else touches until `finish` below returns;
-            // the run holds the scratch its command buffers read.
-            unsafe { gdn.run_layer(&mut run, attn_norm, self.config.rms_norm_eps, &ffn, state) }?;
+            // which nothing else touches until the run finishes; the
+            // run holds the scratch its command buffers read.
+            unsafe { gdn.run_layer(run, attn_norm, self.config.rms_norm_eps, &ffn, state) }?;
             cache
                 .advance_len(1)
                 .expect("unbounded/planned KvCache growth is infallible");
             layer.moe.record_activations_dense();
         }
-        *hidden = run.finish().ok()?;
-        Some(end)
+        Some(())
     }
 
     /// Layer `l`'s block, `attn_norm` and dense FFN when every half of
