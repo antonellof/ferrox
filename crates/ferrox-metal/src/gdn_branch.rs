@@ -402,15 +402,7 @@ unsafe fn encode_layer(
         conv_out,
     )?;
     // Q and K only: V is the convolution's output as it stands.
-    encode_l2_norm_heads(
-        encoder,
-        device,
-        conv_out,
-        0,
-        h.head_dim,
-        h.n_k_heads,
-        w.eps,
-    )?;
+    encode_l2_norm_heads(encoder, device, conv_out, 0, h.head_dim, h.n_k_heads, w.eps)?;
     encode_l2_norm_heads(
         encoder,
         device,
