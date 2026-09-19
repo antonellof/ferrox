@@ -8,6 +8,10 @@ __pycache__/
 *.pyc
 /vast-receipts/
 frink-journal.log*
+# The old name, for a checkout that still has one: the rename renamed
+# this pattern too, which un-ignored an existing ferrox-journal.log and
+# swept it into the rename commit. Deleted there, ignored here.
+ferrox-journal.log*
 /.scratch-logitcheck/
 /.scratch/
 
