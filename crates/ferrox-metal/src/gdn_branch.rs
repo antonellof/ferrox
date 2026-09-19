@@ -55,6 +55,58 @@ pub struct BranchWeights<'a> {
     /// `blk.N.ssm_out.weight`, and the rotation its input needs.
     pub out_proj: &'a MatvecLaunch<'a>,
     pub fold_y: Option<&'a FoldPlan<'a>>,
+    /// The layer's HEAD, when the caller owns it too: the input norm
+    /// and the four projections that feed the branch.
+    ///
+    /// `Some` removes the second submission a recurrent layer costs,
+    /// and with `ffn` set as well the layer is ONE.
+    pub head_in: Option<LayerHeadIn<'a>>,
+    /// The rest of the layer, when the caller owns it too.
+    ///
+    /// `Some` turns three submissions a layer into ONE: the branch's
+    /// output is added to the residual, normed and run through the FFN
+    /// without the hidden state coming back to the host in between,
+    /// which is the only thing left between this engine and the
+    /// reference's decode rate
+    /// (`docs/plans/gdn-resident-state.md`). `None` stops at
+    /// `ssm_out` and the caller finishes the layer itself.
+    pub ffn: Option<LayerFfn<'a>>,
+}
+
+/// The head of a layer: `attn_norm(x)`, then the four projections the
+/// branch reads.
+///
+/// `beta` and `alpha` are the SPLIT spelling only; the fused one's
+/// per-group interleave is host arithmetic with no kernel here, and a
+/// caller carrying it passes `None` for the whole head.
+pub struct LayerHeadIn<'a> {
+    pub norm: &'a [f32],
+    pub norm_eps: f32,
+    pub qkv: &'a MatvecLaunch<'a>,
+    pub z: &'a MatvecLaunch<'a>,
+    pub beta: &'a MatvecLaunch<'a>,
+    pub alpha: &'a MatvecLaunch<'a>,
+    /// The rotation the projections' shared input needs. One plan, not
+    /// four: they all read `attn_norm(x)`, and a checkpoint whose four
+    /// disagree about their input basis is not this shape.
+    pub fold_x: Option<&'a FoldPlan<'a>>,
+}
+
+/// The dense half of a layer: `x + ffn(norm(x + branch))`.
+///
+/// One shape only, and a caller whose layer is not that shape passes
+/// `None` rather than having this approximate it. What that excludes is
+/// named at the call site, field by field.
+pub struct LayerFfn<'a> {
+    /// `blk.N.ffn_norm.weight` and the model's RMS epsilon.
+    pub norm: &'a [f32],
+    pub norm_eps: f32,
+    pub gate: &'a MatvecLaunch<'a>,
+    pub up: &'a MatvecLaunch<'a>,
+    pub down: &'a MatvecLaunch<'a>,
+    /// The rotations the FFN's input and its activation need.
+    pub fold_x: Option<&'a FoldPlan<'a>>,
+    pub fold_act: Option<&'a FoldPlan<'a>>,
 }
 
 impl BranchWeights<'_> {
@@ -79,6 +131,32 @@ impl BranchWeights<'_> {
             && self.ssm_norm.len() == h.head_dim
             && self.out_proj.row_bytes / self.out_proj.block_bytes * self.out_proj.block_elems
                 == h.value_dim()
+            && match &self.head_in {
+                None => true,
+                Some(hd) => {
+                    let hidden = self.out_proj.rows;
+                    hd.norm.len() == hidden
+                        && hd.qkv.rows == h.conv_dim()
+                        && hd.z.rows == h.value_dim()
+                        && hd.beta.rows == h.n_v_heads
+                        && hd.alpha.rows == h.n_v_heads
+                        && [hd.qkv, hd.z, hd.beta, hd.alpha]
+                            .iter()
+                            .all(|m| m.row_bytes / m.block_bytes * m.block_elems == hidden)
+                }
+            }
+            && match &self.ffn {
+                None => true,
+                Some(f) => {
+                    let hidden = self.out_proj.rows;
+                    f.norm.len() == hidden
+                        && f.gate.rows == f.up.rows
+                        && f.down.rows == hidden
+                        && f.gate.row_bytes / f.gate.block_bytes * f.gate.block_elems == hidden
+                        && f.up.row_bytes / f.up.block_bytes * f.up.block_elems == hidden
+                        && f.down.row_bytes / f.down.block_bytes * f.down.block_elems == f.gate.rows
+                }
+            }
     }
 }
 
@@ -103,19 +181,33 @@ pub unsafe fn launch_gdn_branch(
     conv_ptr: *mut f32,
     conv_bytes: usize,
     conv_len: usize,
-    qkv: &[f32],
-    z: &[f32],
-    beta_in: &[f32],
-    alpha_in: &[f32],
+    qkv: Option<&[f32]>,
+    z: Option<&[f32]>,
+    beta_in: Option<&[f32]>,
+    alpha_in: Option<&[f32]>,
+    residual: Option<&[f32]>,
 ) -> Result<Vec<f32>, MetalError> {
     let h = w.head;
     let (key_dim, value_dim, conv_dim) = (h.key_dim(), h.value_dim(), h.conv_dim());
     if !w.is_supported()
         || conv_len != h.conv_state_len()
-        || qkv.len() != conv_dim
-        || z.len() != value_dim
-        || beta_in.len() != h.n_v_heads
-        || alpha_in.len() != h.n_v_heads
+        // The four projections arrive from the host exactly when the
+        // head is NOT on the device, so a caller cannot half-fuse.
+        || w.head_in.is_some() == qkv.is_some()
+        || qkv.is_some_and(|x| x.len() != conv_dim)
+        || z.is_some_and(|x| x.len() != value_dim)
+        || beta_in.is_some_and(|x| x.len() != h.n_v_heads)
+        || alpha_in.is_some_and(|x| x.len() != h.n_v_heads)
+        || qkv.is_some() != z.is_some()
+        || qkv.is_some() != beta_in.is_some()
+        || qkv.is_some() != alpha_in.is_some()
+        // The residual is needed by the FFN, and by the head as the
+        // vector it norms.
+        || (w.ffn.is_some() || w.head_in.is_some()) != residual.is_some()
+        // The residual travels exactly when the FFN does, so a caller
+        // cannot ask for the fused layer and forget what to add the
+        // branch to.
+        || residual.is_some_and(|r| r.len() != w.out_proj.rows)
     {
         return Err(MetalError::CommandFailed);
     }
@@ -166,16 +258,53 @@ pub unsafe fn launch_gdn_branch(
         ],
     )
     .ok_or(MetalError::BufferAllocFailed)?;
+    let hidden = w.out_proj.rows;
+    // The head's own scratch: one buffer for `attn_norm(x)`, which the
+    // two gate projections read BEFORE it is rotated in place and the
+    // other two read after.
+    let head_scratch = match &w.head_in {
+        None => None,
+        // Two: the residual as it arrives, and the norm of it. Not
+        // one in place -- an RMS norm reduces the whole vector before
+        // it writes any of it, and a kernel reading a buffer it is
+        // writing is a hazard nothing here would report.
+        Some(_) => Some(
+            crate::scratch_pool::Scratch::take(device, &[hidden, hidden])
+                .ok_or(MetalError::BufferAllocFailed)?,
+        ),
+    };
+    // The FFN's own scratch, taken only when there is an FFN: the
+    // residual (which becomes the layer's output), the normed copy, the
+    // two projections, the activation and the FFN output.
+    let ffn_scratch = match &w.ffn {
+        None => None,
+        Some(f) => Some(
+            crate::scratch_pool::Scratch::take(
+                device,
+                &[hidden, hidden, f.gate.rows, f.up.rows, f.gate.rows, hidden],
+            )
+            .ok_or(MetalError::BufferAllocFailed)?,
+        ),
+    };
     let conv_out = scratch.buf(0);
     let (beta_buf, g_buf) = (scratch.buf(1), scratch.buf(2));
     let o_buf = scratch.buf(3);
     let y_buf = scratch.buf(4);
     let out_buf = scratch.buf(5);
-    let fill = |i: usize, xs: &[f32]| scratch.write(i, xs).ok_or(MetalError::CommandFailed);
-    let qkv_buf = fill(6, qkv)?;
-    let z_buf = fill(7, z)?;
-    let beta_in_buf = fill(8, beta_in)?;
-    let alpha_in_buf = fill(9, alpha_in)?;
+    // The four projection OUTPUTS: filled from the host when the head
+    // is not fused, written by matvecs below when it is.
+    let (qkv_buf, z_buf, beta_in_buf, alpha_in_buf) = match (qkv, z, beta_in, alpha_in) {
+        (Some(a), Some(b), Some(c), Some(d)) => {
+            let fill = |i: usize, xs: &[f32]| scratch.write(i, xs).ok_or(MetalError::CommandFailed);
+            (fill(6, a)?, fill(7, b)?, fill(8, c)?, fill(9, d)?)
+        }
+        _ => (
+            scratch.buf(6),
+            scratch.buf(7),
+            scratch.buf(8),
+            scratch.buf(9),
+        ),
+    };
     let weights_buf = resident_weight_buffer(device, w.out_proj.weights)?;
     let signs_buf = match w.fold_y.and_then(|p| p.signs) {
         None => None,
@@ -195,6 +324,58 @@ pub unsafe fn launch_gdn_branch(
     let encoder = cmd_buf
         .computeCommandEncoder()
         .ok_or(MetalError::CommandFailed)?;
+    // The layer's HEAD, when the caller owns it: the norm and the four
+    // projections, which is the second of a recurrent layer's three
+    // submissions.
+    if let (Some(hd), Some(sc), Some(res)) = (&w.head_in, &head_scratch, residual) {
+        let x_buf = sc.write(0, res).ok_or(MetalError::CommandFailed)?;
+        let normed = sc.buf(1);
+        let norm_w = crate::gpu::resident_f32_buffer(device, hd.norm)?;
+        crate::norm::encode_rms_norm(
+            &encoder,
+            device,
+            x_buf,
+            &norm_w.buffer,
+            normed,
+            hidden as u32,
+            hd.norm_eps,
+        )?;
+        // BEFORE the rotation: the two gate projections are stored
+        // unfolded, so they read `attn_norm(x)` in the primal basis,
+        // and the fold below rewrites that buffer in place.
+        let beta_w = resident_weight_buffer(device, hd.beta.weights)?;
+        let alpha_w = resident_weight_buffer(device, hd.alpha.weights)?;
+        encode_matvec(&encoder, device, hd.beta, &beta_w, normed, beta_in_buf)?;
+        encode_matvec(&encoder, device, hd.alpha, &alpha_w, normed, alpha_in_buf)?;
+        if let Some(plan) = hd.fold_x {
+            plan.check(hidden)?;
+            let signs = match plan.signs {
+                None => None,
+                Some(sg) => {
+                    // SAFETY: a `&[f32]` viewed as its own bytes, read only.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            sg.as_ptr() as *const u8,
+                            std::mem::size_of_val(sg),
+                        )
+                    };
+                    Some(resident_weight_buffer(device, bytes)?)
+                }
+            };
+            crate::hadamard::encode_fold(
+                &encoder,
+                device,
+                normed,
+                hidden,
+                plan,
+                signs.as_ref().map(|b| &*b.buffer),
+            )?;
+        }
+        let qkv_w = resident_weight_buffer(device, hd.qkv.weights)?;
+        let z_w = resident_weight_buffer(device, hd.z.weights)?;
+        encode_matvec(&encoder, device, hd.qkv, &qkv_w, normed, qkv_buf)?;
+        encode_matvec(&encoder, device, hd.z, &z_w, normed, z_buf)?;
+    }
     encode_gates(
         &encoder,
         device,
@@ -269,16 +450,98 @@ pub unsafe fn launch_gdn_branch(
         )?;
     }
     encode_matvec(&encoder, device, w.out_proj, &weights_buf, y_buf, out_buf)?;
+
+    // The rest of the layer, when the caller owns it: the whole point
+    // of the file, because none of this needs the host and each piece
+    // of it used to cost a submission.
+    let result_buf = match (&w.ffn, &ffn_scratch, residual) {
+        (Some(f), Some(sc), Some(res)) => {
+            let h_buf = sc.write(0, res).ok_or(MetalError::CommandFailed)?;
+            let (normed, gate_buf) = (sc.buf(1), sc.buf(2));
+            let (up_buf, act_buf, ffn_out) = (sc.buf(3), sc.buf(4), sc.buf(5));
+            let ffn_signs = |plan: Option<&FoldPlan<'_>>| match plan.and_then(|p| p.signs) {
+                None => Ok(None),
+                Some(signs) => {
+                    // SAFETY: a `&[f32]` viewed as its own bytes, read only.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            signs.as_ptr() as *const u8,
+                            std::mem::size_of_val(signs),
+                        )
+                    };
+                    resident_weight_buffer(device, bytes).map(Some)
+                }
+            };
+            let x_signs = ffn_signs(f.fold_x)?;
+            let act_signs = ffn_signs(f.fold_act)?;
+            let norm_w = crate::gpu::resident_f32_buffer(device, f.norm)?;
+            let gate_w = resident_weight_buffer(device, f.gate.weights)?;
+            let up_w = resident_weight_buffer(device, f.up.weights)?;
+            let down_w = resident_weight_buffer(device, f.down.weights)?;
+
+            crate::elem::encode_vec_add(&encoder, device, h_buf, out_buf, hidden as u32)?;
+            crate::norm::encode_rms_norm(
+                &encoder,
+                device,
+                h_buf,
+                &norm_w.buffer,
+                normed,
+                hidden as u32,
+                f.norm_eps,
+            )?;
+            if let Some(plan) = f.fold_x {
+                plan.check(hidden)?;
+                crate::hadamard::encode_fold(
+                    &encoder,
+                    device,
+                    normed,
+                    hidden,
+                    plan,
+                    x_signs.as_ref().map(|b| &*b.buffer),
+                )?;
+            }
+            encode_matvec(&encoder, device, f.gate, &gate_w, normed, gate_buf)?;
+            encode_matvec(&encoder, device, f.up, &up_w, normed, up_buf)?;
+            crate::elem::encode_silu_mul(
+                &encoder,
+                device,
+                gate_buf,
+                up_buf,
+                act_buf,
+                f.gate.rows as u32,
+            )?;
+            if let Some(plan) = f.fold_act {
+                plan.check(f.gate.rows)?;
+                crate::hadamard::encode_fold(
+                    &encoder,
+                    device,
+                    act_buf,
+                    f.gate.rows,
+                    plan,
+                    act_signs.as_ref().map(|b| &*b.buffer),
+                )?;
+            }
+            encode_matvec(&encoder, device, f.down, &down_w, act_buf, ffn_out)?;
+            crate::elem::encode_vec_add(&encoder, device, h_buf, ffn_out, hidden as u32)?;
+            h_buf
+        }
+        _ => out_buf,
+    };
     encoder.endEncoding();
     let clock = crate::timing::SubmitClock::start();
-    crate::timing::commit_wait_note(&cmd_buf, "gdn-branch", 32, clock);
+    let label = match (w.head_in.is_some(), w.ffn.is_some()) {
+        (true, true) => "gdn-layer-full",
+        (false, true) => "gdn-layer",
+        _ => "gdn-branch",
+    };
+    crate::timing::commit_wait_note(&cmd_buf, label, 32, clock);
 
     // SAFETY: shared storage of exactly `out_proj.rows` floats, written
     // by kernels this call has waited for. The convolution window needs
     // no read-back: the kernel wrote the caller's own bytes.
     unsafe {
         Ok(
-            std::slice::from_raw_parts(out_buf.contents().as_ptr() as *const f32, w.out_proj.rows)
+            std::slice::from_raw_parts(result_buf.contents().as_ptr() as *const f32, hidden)
                 .to_vec(),
         )
     }

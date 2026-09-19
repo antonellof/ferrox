@@ -259,6 +259,53 @@ call site that owns both. At one submission per layer the arithmetic is
 64 x 0.15 = 9.6 ms of latency against today's 35, no host step, and
 about 86 ms a token: the reference's 87.
 
+## A recurrent layer is ONE submission
+
+`ferrox-metal/src/gdn_branch.rs` now encodes a whole recurrent layer in
+one command buffer: `attn_norm`, the four projections, the two gates,
+the causal convolution, the l2 norms, the delta rule, the gated norm,
+the folded rotation, `ssm_out`, the residual add, `ffn_norm`, the
+SwiGLU FFN and the second residual add. `crate::fused_layer` says what
+the layer's weights have to be and `decoder::fused_recurrent` what the
+model has to be; anything else takes the host bodies.
+
+Bonsai, 220 decode tokens, one box:
+
+| | tok/s | submissions/token | latency |
+|---|---|---|---|
+| host branch | 7.10 | 192 | 35 ms |
+| device branch | 7.27 | 192 | 35 ms |
+| + FFN fused | 7.95 | 144 | 24.7 ms |
+| + head fused | **8.93** | **97** | **16.7 ms** |
+
+Parity MATCH at every step (KL 2.203e-5 on the 5-token path, and the
+256-token GEMM path unchanged).
+
+The ordering that matters and is easy to get wrong: the two gate
+projections are stored UNFOLDED and `attn_qkv` / `attn_gate` share one
+fold, so the gates must read `attn_norm(x)` BEFORE the rotation
+rewrites that buffer in place. Moving them after it left the fused-layer
+test green until the test was given a real fold -- with unfolded
+weights the order is unobservable, and Bonsai's are folded. That is the
+second time in this file's history that a sabotage passing meant the
+TEST was wrong rather than the code right.
+
+## What is left, and it is one thing
+
+The token is now GPU 82.7 ms, latency 16.7 ms, host about 13 ms. The
+host that remains is the SIXTEEN attention layers, which still cost
+three submissions each (two `matvec-fused`, one `dense-ffn`) and run
+their attention row on the CPU, because the fused Metal attention block
+refuses them: Qwen3.5's Q is gated, and `Decoder::metal_attn_view`
+answers `None` for a gate.
+
+Fusing those the way the recurrent ones are now fused is 48 submissions
+and about 13 ms of host: 97 to 65 submissions, 16.7 to 11 ms of
+latency, and roughly 94 ms a token, or **10.6 tok/s**. Against the
+reference's 87 ms the remainder would then be the GPU time itself,
+82.7 ms for a 5.95 GB weight read, which is 72 GB/s of a 200 GB/s part
+and the only number left that is not overhead.
+
 ## The plumbing, once the algorithm is right
 
 The state has to live on the device across tokens, with the host copy

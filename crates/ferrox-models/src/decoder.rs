@@ -17,6 +17,8 @@ mod attn_block;
 mod cuda_prefill;
 mod entry;
 mod ffn_block;
+#[cfg(feature = "metal")]
+mod fused_recurrent;
 #[cfg(any(feature = "metal", feature = "cuda"))]
 mod fused_view;
 pub mod kv_window;
@@ -430,6 +432,14 @@ impl MoeWeights {
                 f(&tmp)
             }
         }
+    }
+
+    /// The one expert a DENSE layer runs, recorded as the host body
+    /// records it, so a fused layer's hotness counters do not depend on
+    /// which backend ran it (`crate::fused_layer`).
+    #[cfg(feature = "metal")]
+    pub(crate) fn record_activations_dense(&self) {
+        self.record_activations(&[0]);
     }
 
     fn record_activations(&self, expert_ids: &[usize]) {
@@ -3028,6 +3038,23 @@ impl Decoder {
                     .gpt_oss
                     .as_ref()
                     .map(|g| &g.layers[self.physical_index(l)]);
+                // A recurrent layer whose whole shape the fused Metal
+                // launch serves runs END TO END in one submission --
+                // branch, residual, norm, FFN, residual -- and this
+                // loop moves to the next layer. Everything it does not
+                // serve it refuses (`crate::fused_layer`,
+                // `decoder::fused_recurrent`), and the two bodies below
+                // run exactly as before.
+                #[cfg(feature = "metal")]
+                if let Some(out) =
+                    self.fused_recurrent_layer(l, layer, &normed, &hidden, &mut cache.recurrent)
+                {
+                    hidden = out;
+                    cache
+                        .advance_len(1)
+                        .expect("unbounded/planned KvCache growth is infallible");
+                    continue;
+                }
                 if let Some(projected) =
                     self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache))
                 {

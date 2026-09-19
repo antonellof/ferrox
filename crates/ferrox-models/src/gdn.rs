@@ -358,9 +358,13 @@ impl Gdn {
         // the oracle.
         #[cfg(feature = "metal")]
         if rows == 1 {
-            if let Some(out) =
-                self.device_branch(&qkv_all, &z_all, &beta_all, &alpha_all, state, rms_eps)
-            {
+            if let Some(out) = self.device_branch_full(
+                state,
+                rms_eps,
+                None,
+                None,
+                Some((&qkv_all, &z_all, &beta_all, &alpha_all)),
+            ) {
                 return out;
             }
         }
@@ -449,6 +453,58 @@ impl Gdn {
 }
 
 impl Gdn {
+    /// One decode token's WHOLE LAYER in one command buffer: this
+    /// branch, the residual add, the FFN norm, the FFN and the second
+    /// residual add. Returns the layer's output, or `None` when the
+    /// shapes are not ones the kernels serve and the host bodies run.
+    ///
+    /// This is the step that changes the submission COUNT, which
+    /// `docs/plans/gdn-resident-state.md` prices as the whole of what
+    /// is left between this engine and the reference's decode rate.
+    #[cfg(feature = "metal")]
+    pub fn fused_layer(
+        &self,
+        attn_norm: &[f32],
+        normed: &[f32],
+        state: &mut RecurrentState,
+        rms_eps: f32,
+        ffn: &crate::fused_layer::LayerFfnParts<'_>,
+        residual: &[f32],
+    ) -> Option<Vec<f32>> {
+        let BetaAlpha::Split { beta, alpha } = &self.beta_alpha else {
+            // The fused spelling's per-group interleave is host
+            // arithmetic with no kernel here.
+            return None;
+        };
+        // The HEAD on the device too, when its four matrices have
+        // kernels and agree about their input basis: then the layer is
+        // ONE submission and `normed` never leaves the GPU.
+        if let Some(head) = crate::fused_layer::LayerHeadParts::for_block(
+            attn_norm,
+            rms_eps,
+            &self.qkv,
+            &self.z_proj,
+            beta,
+            alpha,
+        ) {
+            if let Some(out) =
+                self.device_branch_full(state, rms_eps, Some(&head), Some((ffn, residual)), None)
+            {
+                return Some(out);
+            }
+        }
+        // Otherwise the projections run on the host, as they did.
+        let (qkv_all, z_all) = WeightMatrix::apply_pair(&self.qkv, &self.z_proj, normed);
+        let (beta_all, alpha_all) = (beta.apply(normed), alpha.apply(normed));
+        self.device_branch_full(
+            state,
+            rms_eps,
+            None,
+            Some((ffn, residual)),
+            Some((&qkv_all, &z_all, &beta_all, &alpha_all)),
+        )
+    }
+
     /// One decode token's whole branch in ONE command buffer:
     /// `ferrox_metal::gdn_branch`. `None` when this layer is not what
     /// those kernels serve, and then the host body runs.
@@ -461,14 +517,14 @@ impl Gdn {
     /// (`qwen3next.cpp:422-436`) is host arithmetic this has no kernel
     /// for. Each one falls through rather than being approximated.
     #[cfg(feature = "metal")]
-    fn device_branch(
+    #[allow(clippy::type_complexity)]
+    fn device_branch_full(
         &self,
-        qkv: &[f32],
-        z: &[f32],
-        beta_in: &[f32],
-        alpha_in: &[f32],
         state: &mut RecurrentState,
         rms_eps: f32,
+        head: Option<&crate::fused_layer::LayerHeadParts<'_>>,
+        rest: Option<(&crate::fused_layer::LayerFfnParts<'_>, &[f32])>,
+        host_proj: Option<(&[f32], &[f32], &[f32], &[f32])>,
     ) -> Option<Vec<f32>> {
         if !ferrox_core::weight_matrix::metal_dense_enabled() {
             return None;
@@ -510,6 +566,23 @@ impl Gdn {
             eps: rms_eps,
             out_proj: &out_proj,
             fold_y: fold_y.as_ref(),
+            ffn: None,
+            head_in: None,
+        };
+        // The rest of the layer, when the caller owns it: this is what
+        // turns three submissions a layer into one.
+        let ffn_launches = match rest {
+            None => None,
+            Some((parts, _)) => Some(parts.launches()?),
+        };
+        let head_launches = match head {
+            None => None,
+            Some(parts) => Some(parts.launches()?),
+        };
+        let w = ferrox_metal::gdn_branch::BranchWeights {
+            ffn: ffn_launches.as_ref().map(|l| l.as_metal()),
+            head_in: head_launches.as_ref().map(|l| l.as_metal()),
+            ..w
         };
         if !w.is_supported() {
             return None;
@@ -525,7 +598,19 @@ impl Gdn {
         // bytes, and the launch waits for the GPU before returning.
         unsafe {
             ferrox_metal::gdn_branch::launch_gdn_branch(
-                &w, ssm_ptr, ssm_bytes, conv_ptr, conv_bytes, conv_len, qkv, z, beta_in, alpha_in,
+                &w,
+                ssm_ptr,
+                ssm_bytes,
+                conv_ptr,
+                conv_bytes,
+                conv_len,
+                host_proj.map(|(q, _, _, _)| q),
+                host_proj.map(|(_, z, _, _)| z),
+                host_proj.map(|(_, _, b, _)| b),
+                host_proj.map(|(_, _, _, a)| a),
+                // The residual is what the head norms and what the FFN
+                // adds to, so it travels when either does.
+                rest.map(|(_, residual)| residual),
             )
         }
         .ok()
@@ -913,13 +998,12 @@ mod tests {
             // The device branch, through the path `forward_rows` takes.
             let mut device_state = state0();
             let device_out = m
-                .device_branch(
-                    &qkv_all,
-                    &z_all,
-                    &beta_all,
-                    &alpha_all,
+                .device_branch_full(
                     &mut device_state,
                     eps,
+                    None,
+                    None,
+                    Some((&qkv_all, &z_all, &beta_all, &alpha_all)),
                 )
                 .expect("this shape is one the kernels serve");
 
@@ -956,6 +1040,192 @@ mod tests {
                 );
             }
             let _ = key_dim;
+        }
+    }
+
+    /// The fused WHOLE LAYER is the host layer: the input norm, the
+    /// four projections, the branch, the residual add, the FFN norm,
+    /// the FFN and the second residual add.
+    ///
+    /// This is Bonsai's production decode path, so the oracle is the
+    /// host pieces composed in the order the decoder composes them --
+    /// `forward_rows` for the branch, then `rms_norm`, the SwiGLU
+    /// expert and two adds -- and NOT `fused_layer` itself.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn the_fused_layer_matches_the_host_layer() {
+        use crate::fused_layer::{LayerFfnParts, LayerHeadParts};
+
+        let h = GdnHparams {
+            d_conv: 4,
+            head_dim: 128,
+            n_k_heads: 4,
+            n_v_heads: 48,
+            map: HeadMap::Tiled,
+        };
+        let (n_embd, ffn_dim) = (64usize, 96usize);
+        let mut seed = 31_337u32;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (((seed >> 9) as f32 / (1u32 << 23) as f32) - 0.5) * scale
+                })
+                .collect()
+        };
+        let mat = |rows: usize, cols: usize, v: Vec<f32>| {
+            WeightMatrix::F32(Tensor::new(v, vec![rows, cols]))
+        };
+        let (value_dim, conv_dim) = (h.value_dim(), h.conv_dim());
+        let m = Gdn {
+            h,
+            qkv: mat(conv_dim, n_embd, rnd(conv_dim * n_embd, 1.0)),
+            z_proj: mat(value_dim, n_embd, rnd(value_dim * n_embd, 1.0)),
+            conv1d: rnd(h.d_conv * conv_dim, 1.0),
+            dt_bias: rnd(h.n_v_heads, 1.0),
+            a: rnd(h.n_v_heads, 1.0),
+            beta_alpha: BetaAlpha::Split {
+                beta: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd, 1.0)),
+                alpha: mat(h.n_v_heads, n_embd, rnd(h.n_v_heads * n_embd, 1.0)),
+            },
+            norm: rnd(h.head_dim, 1.0),
+            out_proj: mat(n_embd, value_dim, rnd(n_embd * value_dim, 1.0)),
+        };
+        // `qkv` and `z` share ONE fold and the two gate matrices carry
+        // none, which is Bonsai's layout and the only one the kernel
+        // serves. Without a real fold here the ORDER of the head's four
+        // projections around the rotation is unobservable, and moving
+        // the gate projections after it left this test green -- which
+        // is why it carries one.
+        let signs: std::sync::Arc<[f32]> = rnd(n_embd, 2.0)
+            .iter()
+            .map(|x| if *x < 0.0 { -1.0f32 } else { 1.0 })
+            .collect::<Vec<f32>>()
+            .into();
+        let fold = std::sync::Arc::new(ferrox_core::weight_matrix::hadamard::HadamardFold {
+            block: 16,
+            signs: Some(signs),
+            perm: None,
+            site: ferrox_core::weight_matrix::hadamard::FoldSite::Input,
+        });
+        let mut m = m;
+        m.qkv.fold_hadamard(fold.clone());
+        m.z_proj.fold_hadamard(fold.clone());
+        let m = m;
+        let attn_norm = rnd(n_embd, 0.5).iter().map(|x| 1.0 + x).collect::<Vec<_>>();
+        let ffn_norm = rnd(n_embd, 0.5).iter().map(|x| 1.0 + x).collect::<Vec<_>>();
+        let (gate_v, up_v, down_v) = (
+            rnd(ffn_dim * n_embd, 1.0),
+            rnd(ffn_dim * n_embd, 1.0),
+            rnd(n_embd * ffn_dim, 1.0),
+        );
+        let gate = mat(ffn_dim, n_embd, gate_v.clone());
+        let up = mat(ffn_dim, n_embd, up_v.clone());
+        let down = mat(n_embd, ffn_dim, down_v.clone());
+        let (conv_len, ssm_len) = h.state_floats();
+        let conv0 = rnd(conv_len, 1.0);
+        let ssm0 = rnd(ssm_len, 0.5);
+        let hidden = rnd(n_embd, 1.0);
+        let eps = 1e-6f32;
+        let state0 = || RecurrentState {
+            conv: {
+                let mut a = ferrox_core::recurrent_state::AlignedF32::zeros(conv_len);
+                a.copy_from_slice(&conv0);
+                a
+            },
+            ssm: {
+                let mut a = ferrox_core::recurrent_state::AlignedF32::zeros(ssm_len);
+                a.copy_from_slice(&ssm0);
+                a
+            },
+        };
+
+        // The host layer, piece by piece as the decoder runs it.
+        let mut host_state = state0();
+        let normed = rms_norm(&hidden, &attn_norm, eps);
+        let branch = m.forward_rows(&normed, 1, &mut host_state, eps);
+        let mut host_out = hidden.clone();
+        for (x, b) in host_out.iter_mut().zip(branch.iter()) {
+            *x += b;
+        }
+        let normed2 = rms_norm(&host_out, &ffn_norm, eps);
+        let ffn_out = ferrox_moe::run_expert(
+            &normed2,
+            &ferrox_moe::ExpertWeights {
+                gate: mat(ffn_dim, n_embd, gate_v),
+                up: mat(ffn_dim, n_embd, up_v),
+                down: mat(n_embd, ffn_dim, down_v),
+            },
+            ferrox_moe::GluAct::Swiglu,
+        );
+        for (x, f) in host_out.iter_mut().zip(ffn_out.iter()) {
+            *x += f;
+        }
+
+        // The fused layer, through the path the decoder takes.
+        let mut device_state = state0();
+        let ffn = LayerFfnParts::from_parts(&ffn_norm, eps, &gate, &up, &down);
+        let head = LayerHeadParts::for_block(
+            &attn_norm,
+            eps,
+            &m.qkv,
+            &m.z_proj,
+            match &m.beta_alpha {
+                BetaAlpha::Split { beta, .. } => beta,
+                BetaAlpha::Fused { .. } => unreachable!("split above"),
+            },
+            match &m.beta_alpha {
+                BetaAlpha::Split { alpha, .. } => alpha,
+                BetaAlpha::Fused { .. } => unreachable!("split above"),
+            },
+        )
+        .expect("every field is required");
+        // Both arms: the head on the device, and the head on the host
+        // with only the branch and the FFN fused.
+        let with_head = m
+            .device_branch_full(
+                &mut device_state,
+                eps,
+                Some(&head),
+                Some((&ffn, &hidden)),
+                None,
+            )
+            .expect("this shape is one the kernels serve");
+        let mut host_head_state = state0();
+        let host_head = m
+            .fused_layer(
+                &attn_norm,
+                &normed,
+                &mut host_head_state,
+                eps,
+                &ffn,
+                &hidden,
+            )
+            .expect("this shape is one the kernels serve");
+
+        let tol = 2e-4;
+        for (what, got) in [
+            ("head on device", &with_head),
+            ("through fused_layer", &host_head),
+        ] {
+            for (i, (x, y)) in got.iter().zip(host_out.iter()).enumerate() {
+                assert!(
+                    (x - y).abs() <= tol * y.abs().max(1.0),
+                    "{what} out[{i}]: device={x} host={y}"
+                );
+            }
+        }
+        for (i, (x, y)) in device_state
+            .ssm
+            .iter()
+            .zip(host_state.ssm.iter())
+            .enumerate()
+        {
+            assert!(
+                (x - y).abs() <= tol * y.abs().max(1.0),
+                "ssm state[{i}]: device={x} host={y}"
+            );
         }
     }
 

@@ -34,6 +34,11 @@ pub mod engine_factory;
 pub mod execution_plan;
 pub mod gdn;
 
+/// When a whole decoder layer can run in ONE Metal submission, and the
+/// weights it takes. The refusals are exhaustive by construction.
+#[cfg(feature = "metal")]
+pub mod fused_layer;
+
 pub mod gemma4_engine;
 pub mod gemma4_gguf_loader;
 pub mod glm52_decoder;
