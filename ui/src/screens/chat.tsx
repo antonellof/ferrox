@@ -30,7 +30,7 @@ import { Thread } from "@/screens/chat/thread";
 import {
   DEFAULT_SAMPLING,
   LEGACY_MAX_TOKENS,
-  useFerroxRuntime,
+  useFrinkRuntime,
   type Sampling,
 } from "@/screens/chat/runtime";
 import {
@@ -42,9 +42,9 @@ import { parseReasoningBudget } from "@/lib/sampling-wire";
 import { describeAway, RESUME_WINDOW_MS } from "@/lib/entry-state";
 import { useTabActivity } from "@/lib/use-tab-activity";
 
-const SETTINGS_KEY = "ferrox.studio.sampling.v2";
+const SETTINGS_KEY = "frink.studio.sampling.v2";
 /** The shape whose default `maxTokens` was 512. */
-const LEGACY_SETTINGS_KEY = "ferrox.studio.sampling.v1";
+const LEGACY_SETTINGS_KEY = "frink.studio.sampling.v1";
 
 function loadSampling(): Sampling {
   try {
@@ -99,7 +99,7 @@ function useServingModel(healthModelId: string | null): [Loaded, () => void] {
 
   useEffect(() => {
     let cancelled = false;
-    getJson<{ data?: { id: string; ferrox_synthetic_weights?: boolean }[] }>(
+    getJson<{ data?: { id: string; frink_synthetic_weights?: boolean }[] }>(
       routes.models,
     )
       .then((body) => {
@@ -107,7 +107,7 @@ function useServingModel(healthModelId: string | null): [Loaded, () => void] {
         const first = body?.data?.[0];
         setState({
           modelId: first?.id ?? null,
-          synthetic: !!first?.ferrox_synthetic_weights,
+          synthetic: !!first?.frink_synthetic_weights,
           error: null,
         });
       })
@@ -620,7 +620,7 @@ export function ChatScreen() {
     saveSampling(next);
   }, []);
 
-  const runtime = useFerroxRuntime({
+  const runtime = useFrinkRuntime({
     modelId: () => servingRef.current.modelId,
     sampling: () => samplingRef.current,
     // A stream that has gone quiet is not the same as a slow model — the

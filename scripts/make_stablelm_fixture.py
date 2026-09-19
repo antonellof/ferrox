@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `stablelm` GGUFs used by ferrox's StableLM
+"""Generate the tiny synthetic `stablelm` GGUFs used by frink's StableLM
 coverage test.
 
 `stablelm` (StableLM-2-1.6B / 12B, StableLM-3B-4E1T) refused as a
@@ -18,14 +18,14 @@ architecture string, decided by TENSOR PRESENCE and never by a key:
   * `attn_q_norm` / `attn_k_norm` PRESENT (`:34-35`, `{n_embd_head_k,
     n_head}`, DISTINCT weights per head, applied as `LLM_NORM` -- a
     LayerNorm, not RMS -- `:84-95`, before RoPE). StableLM-2-12B again
-    (it has both). REFUSED by name (`crate::qk_layer_norm`): ferrox's
+    (it has both). REFUSED by name (`crate::qk_layer_norm`): frink's
     per-head QK norm is one RMS weight shared by every head.
 
 `use_parallel_residual` is WRITTEN by the converter (`conversion/
 stablelm.py:35`) and READ BY NOTHING in `stablelm.cpp`: the graph
 decides by `ffn_norm`. `--par-key` writes the key `true` on the
 sequential file; libllama's logits are byte-identical to the file
-without it (measured), and the test pins that ferrox ignores it too.
+without it (measured), and the test pins that frink ignores it too.
 
 Shapes, one script:
 
@@ -84,7 +84,7 @@ def main(out_path: str, parallel: bool, qk_norm: bool, par_key: bool) -> None:
         return (0.5 + rng.standard_normal(N_EMBD) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-stablelm-fixture")
+    w.add_name("frink-stablelm-fixture")
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
     w.add_block_count(N_LAYER)

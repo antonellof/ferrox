@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `dots1` GGUF used by ferrox's MoE
+"""Generate the tiny synthetic `dots1` GGUF used by frink's MoE
 routing-bias coverage test.
 
 `dots1` is the smallest architecture on llama.cpp's *generic* MoE path
@@ -7,7 +7,7 @@ that carries `blk.N.exp_probs_b.bias` -- the DeepSeek-V3 aux-loss-free
 selection bias. The same tensor appears on ernie4_5-moe, bailingmoe2,
 exaone-moe, hunyuan-moe and afmoe, so one validated implementation covers
 all of them; dots1 is picked here only because its graph is otherwise
-plain GQA + shared expert, which ferrox already implements.
+plain GQA + shared expert, which frink already implements.
 
 The fixture is deliberately small (2 layers, 32-wide, 6 experts) and
 carries the features the bias interacts with:
@@ -72,7 +72,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-dots1-fixture")
+    w.add_name("frink-dots1-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

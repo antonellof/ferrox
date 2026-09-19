@@ -54,7 +54,7 @@ jobs:
           set -euo pipefail
           TAG="${{ inputs.tag || github.ref_name }}"
           WS_VERSION="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name=="ferrox-inference") | .version')"
+            | jq -r '.packages[] | select(.name=="frink-inference") | .version')"
           if [[ "${TAG}" != "v${WS_VERSION}" ]]; then
             echo "::error::tag ${TAG} does not match workspace version ${WS_VERSION}"
             exit 1
@@ -97,24 +97,24 @@ jobs:
           #   cli                             <- server, for the optional
           #                                      `serve` feature. Publishing
           #                                      cli first fails to resolve
-          #                                      ferrox-server at the new
+          #                                      frink-server at the new
           #                                      version, which is exactly
           #                                      how v0.11.0 broke.
           #   inference                       <- the whole stack
           CRATES=(
-            ferrox-api
-            ferrox-gguf
-            ferrox-quant
-            ferrox-safetensors
-            ferrox-cuda
-            ferrox-metal
-            ferrox-vulkan
-            ferrox-core
-            ferrox-moe
-            ferrox-models
-            ferrox-server
-            ferrox-cli
-            ferrox-inference
+            frink-api
+            frink-gguf
+            frink-quant
+            frink-safetensors
+            frink-cuda
+            frink-metal
+            frink-vulkan
+            frink-core
+            frink-moe
+            frink-models
+            frink-server
+            frink-cli
+            frink-inference
           )
 
           if [[ "${DRY_RUN}" == "1" ]]; then
@@ -129,7 +129,7 @@ jobs:
               #
               # And packaging itself still resolves against the index,
               # so on a FIRST publish every dependent legitimately
-              # fails with "no matching package named ferrox-*". That
+              # fails with "no matching package named frink-*". That
               # is the dry run hitting the same ordering constraint the
               # real publish satisfies by uploading as it goes -- it is
               # not a defect in the crate, so it is reported and not
@@ -142,8 +142,8 @@ jobs:
                 # only the first meant the dry run passed for the workspace's
                 # first release and hard-failed for every one after it, on the
                 # ordering constraint it is documented to tolerate.
-                if grep -qE 'no matching package named `ferrox-|failed to select a version for the requirement `ferrox-' <<<"${out}"; then
-                  echo "${c}: cannot be packaged until its ferrox-* deps are on crates.io at this version, expected in a dry run, which uploads nothing"
+                if grep -qE 'no matching package named `frink-|failed to select a version for the requirement `frink-' <<<"${out}"; then
+                  echo "${c}: cannot be packaged until its frink-* deps are on crates.io at this version, expected in a dry run, which uploads nothing"
                   blocked=$((blocked + 1))
                 else
                   echo "${out}"
@@ -167,7 +167,7 @@ jobs:
           fi
 
           version="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name=="ferrox-inference") | .version')"
+            | jq -r '.packages[] | select(.name=="frink-inference") | .version')"
 
           for c in "${CRATES[@]}"; do
             echo "::group::publish ${c} ${version}"
@@ -176,7 +176,7 @@ jobs:
             # re-run of a partially failed publish. Skip rather than
             # fail: the alternative is a workspace that can never be
             # finished, because the first crate always 403s.
-            if curl -sf -H "User-Agent: ferrox-ci" \
+            if curl -sf -H "User-Agent: frink-ci" \
                  "https://crates.io/api/v1/crates/${c}/${version}" >/dev/null; then
               echo "${c} ${version} is already published, skipping"
               echo "::endgroup::"
@@ -192,9 +192,9 @@ jobs:
             # Wait for the SPARSE INDEX, not the web API.
             #
             # These are different services and the index lags. v0.13.3
-            # failed exactly here: ferrox-quant 0.13.3 was live on the
-            # API, the loop moved on, and ferrox-metal then could not
-            # resolve `ferrox-quant = "^0.13.3"` because the index still
+            # failed exactly here: frink-quant 0.13.3 was live on the
+            # API, the loop moved on, and frink-metal then could not
+            # resolve `frink-quant = "^0.13.3"` because the index still
             # offered 0.13.2. Five crates went up and the publish died
             # halfway.
             #
@@ -205,7 +205,7 @@ jobs:
             idx="https://index.crates.io/${c:0:2}/${c:2:2}/${c}"
             echo "waiting for ${c} ${version} in the sparse index"
             for i in $(seq 1 60); do
-              if curl -sf -H "User-Agent: ferrox-ci" "${idx}" \
+              if curl -sf -H "User-Agent: frink-ci" "${idx}" \
                    | jq -e --arg v "${version}" 'select(.vers == $v)' >/dev/null 2>&1; then
                 echo "${c} ${version} is resolvable"
                 break

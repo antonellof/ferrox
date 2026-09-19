@@ -1,7 +1,7 @@
 /**
- * The Ferrox mark, as numbers.
+ * The Frink mark, as numbers.
  *
- * Ferrox is iron oxide, and the structure of α-iron — ferrite — is
+ * Frink is iron oxide, and the structure of α-iron — ferrite — is
  * body-centred cubic. Seen down its body diagonal a cubic cell projects
  * to a regular hexagon with three visible edges meeting at the centre,
  * and the body-centred atom sits exactly on that meeting point. So the

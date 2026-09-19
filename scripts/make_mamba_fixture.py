@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate the tiny synthetic `jamba`, `mamba` and `mamba2` GGUFs used by
-ferrox's Mamba-1 coverage test (`crates/ferrox-models/tests/mamba_graphs.rs`).
+frink's Mamba-1 coverage test (`crates/frink-models/tests/mamba_graphs.rs`).
 
 Three architectures, one block body each:
 
@@ -78,7 +78,7 @@ def main(out_path: str, arch: str, dt_b_c_rms: bool, separate_output: bool) -> N
     pure = arch != "jamba"
     n_layer = 3 if pure else len(JAMBA_KV)
     w = gguf.GGUFWriter(out_path, arch)
-    w.add_name(f"ferrox-{arch}-fixture")
+    w.add_name(f"frink-{arch}-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

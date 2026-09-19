@@ -22,7 +22,7 @@ The rest of the graph is a seam that already landed, and this fixture
 carries each:
 
   * the per-element sigmoid attention gate (`:46,100-135`, "same as
-    afmoe", `ferrox_models::attn_gate`),
+    afmoe", `frink_models::attn_gate`),
   * RoPE on the SLIDING layers only (`:88`, `RopeLayers::SlidingOnly`)
     with its own base (`:13`, `rope.freq_base_swa`),
   * the window pattern read scalar-then-array through
@@ -78,7 +78,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-muse-glimmer-fixture")
+    w.add_name("frink-muse-glimmer-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

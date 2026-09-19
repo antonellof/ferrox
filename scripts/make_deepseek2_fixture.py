@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `deepseek2` GGUFs used by ferrox's MLA
+"""Generate the tiny synthetic `deepseek2` GGUFs used by frink's MLA
 hparam-contract test and the MLA engine's libllama-golden test.
 
 `deepseek2` is what DeepSeek-V2, V2.5, V3 and R1 all tag, so it is the
-architecture behind the largest open models people run. ferrox routes it
+architecture behind the largest open models people run. frink routes it
 to `mla_gguf_loader` / `MlaEngine`, and this fixture exists to check the
 one thing nobody had checked: that the loader asks for keys a real
 checkpoint actually carries.
@@ -61,7 +61,7 @@ served context is 64), and `yarn_log_multiplier = 0.1 * MSCALE_ALL_DIM`
 -- `0.707` is DeepSeek-V2 / V2-Lite (`config.json`: `mscale ==
 mscale_all_dim == 0.707`), `1.0` is DeepSeek-V3 / R1. No beta keys, as
 the converters write none for these configs. What llama.cpp does with
-them is `crates/ferrox-models/src/mla_yarn.rs`; this fixture is how it
+them is `crates/frink-models/src/mla_yarn.rs`; this fixture is how it
 is checked, because `deepseek2.cpp:34-37` divide the key by 0.1 and
 `llama-context.cpp:202-215` special-case `LLM_ARCH_DEEPSEEK2`, and a
 reading of either can be wrong in a way only libllama's logits show.
@@ -71,7 +71,7 @@ reading of either can be wrong in a way only libllama's logits show.
 `deepseek2.cpp:46-47` read for Mistral-Large-3's per-position attention
 temperature (`conversion/mistral.py:110,177`). llama.cpp's loader
 accepts it and reads both keys (measured, `llama_model_loader: - kv
-27/28`) and runs the graph; ferrox's MLA engine has no per-position Q
+27/28`) and runs the graph; frink's MLA engine has no per-position Q
 scale and REFUSES the file by name (`crate::attn_temperature`), where it
 used to load and drop the key, so no golden is checked in for it.
 
@@ -82,7 +82,7 @@ Usage:
 The golden values that go with the default and `--legacy-kv-b` files
 are produced by llama.cpp itself (`scripts/gptoss_reference_logits.cpp`
 against a real `libllama`), not by this script; see
-`crates/ferrox-models/tests/deepseek2_graphs.rs`.
+`crates/frink-models/tests/deepseek2_graphs.rs`.
 """
 
 import sys
@@ -137,7 +137,7 @@ def main(
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-deepseek2-fixture")
+    w.add_name("frink-deepseek2-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

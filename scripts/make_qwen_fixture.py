@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `qwen` GGUF used by ferrox's Qwen-1
+"""Generate the tiny synthetic `qwen` GGUF used by frink's Qwen-1
 coverage test.
 
 `qwen` is the ORIGINAL Qwen (`QWenLMHeadModel`), not Qwen-2 and not
 Qwen-3; those are separate GGUF architecture strings with separate
-ferrox rows. Two things separate it from every audited row, and the
+frink rows. Two things separate it from every audited row, and the
 fixture exists to make both visible:
 
   * **The fused `attn_qkv.bias`** (`src/models/qwen.cpp:28`, REQUIRED,
     not `TENSOR_NOT_REQUIRED`). `build_qkv` adds it to the fused
     projection before splitting (llama-graph.cpp:1605-1609). This is
     the same arm `chatglm` needed, and it is the reason both rows were
-    refused: ferrox split the fused WEIGHT and read bias only under the
+    refused: frink split the fused WEIGHT and read bias only under the
     split `attn_q.bias` names.
   * **`n_ff` counts gate and up TOGETHER.** `qwen.cpp:33-35` sizes
     `ffn_gate`, `ffn_up` and `ffn_down` at `n_ff / 2`, because Qwen-1's
@@ -89,7 +89,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-qwen-fixture")
+    w.add_name("frink-qwen-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

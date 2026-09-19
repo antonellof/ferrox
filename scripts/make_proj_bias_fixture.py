@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Generate the tiny synthetic `starcoder2`, `codeshell`, `jais2` and
-biased-`llama` GGUFs used by ferrox's projection-bias coverage test.
+biased-`llama` GGUFs used by frink's projection-bias coverage test.
 
 The three were the rows of the "LayerNorm-with-bias group" whose OTHER
 blocker was the projection biases: every one REQUIRES `attn_output.bias`,
 `ffn_up.bias` and `ffn_down.bias` beside the six LayerNorm biases, and
 the generic dense path had no slot for the first three
-(`ferrox_models::proj_bias` is that slot; `NormOp::LayerNormBias` the
+(`frink_models::proj_bias` is that slot; `NormOp::LayerNormBias` the
 norm). One script, because the three graphs differ in three cells:
 
 | | `starcoder2.cpp` | `codeshell.cpp` | `jais2.cpp` |
@@ -20,7 +20,7 @@ own graph creates `attn_output.bias` and all three FFN biases as
 `TENSOR_NOT_REQUIRED` and applies them when present, with a GATED
 SwiGLU, so this file carries `ffn_gate.bias` too -- the one bias the
 three ungated rows cannot exercise -- and RMSNorm rather than the biased
-LayerNorm. ferrox used to refuse such a file as carrying unread
+LayerNorm. frink used to refuse such a file as carrying unread
 tensors.
 
 The three biased-LayerNorm rows agree on everything else: Q/K/V biases present (`create_tensor_qkv`
@@ -81,7 +81,7 @@ def main(arch: str, out_path: str) -> None:
         return (0.5 + rng.standard_normal(n) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, arch)
-    w.add_name(f"ferrox-{arch}-fixture")
+    w.add_name(f"frink-{arch}-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

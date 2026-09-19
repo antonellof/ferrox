@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `afmoe` GGUF used by ferrox's
+"""Generate the tiny synthetic `afmoe` GGUF used by frink's
 gated-attention coverage test.
 
 `afmoe` refused as UNAUDITED, triaged NEW CODE, for one blocker after
@@ -8,8 +8,8 @@ the per-layer RoPE gate closed: **the learned attention output gate.**
 `{n_embd, n_head * n_embd_head}`), `:154` projects it from the SAME
 normed input Q/K/V read, and `:183-185` multiplies the attention output
 by `sigmoid(gate)` BEFORE `wo`. `laguna` and `step35` carry the same
-op with a different activation or width; ferrox implements the three
-once (`crates/ferrox-models/src/attn_gate.rs`) and this fixture is the
+op with a different activation or width; frink implements the three
+once (`crates/frink-models/src/attn_gate.rs`) and this fixture is the
 sigmoid / per-element / required corner of it.
 
 The one other afmoe-specific fact in the graph is `:120`: the
@@ -24,7 +24,7 @@ rather than from a key. Measured over all 140 `src/models/*.cpp`,
 slide and rotate and the file would be evidence about neither. Layer 3
 is the full-attention, unrotated, MoE layer.
 
-The rest of the graph is machinery ferrox already had, and the fixture
+The rest of the graph is machinery frink already had, and the fixture
 carries all of it so that "the rest is generic" is measured rather than
 asserted:
 
@@ -88,7 +88,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-afmoe-fixture")
+    w.add_name("frink-afmoe-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

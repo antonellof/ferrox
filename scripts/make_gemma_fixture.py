@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `gemma` GGUF used by ferrox's Gemma-1
+"""Generate the tiny synthetic `gemma` GGUF used by frink's Gemma-1
 coverage test.
 
 `gemma` is Gemma-1 (2B / 7B), the oldest row of the family. It sat on
-ferrox's generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY:
+frink's generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY:
 the three Gemma-specific pieces were all implemented for `GemmaFamily`
 and only the evidence was missing.
 
@@ -27,7 +27,7 @@ and only the evidence was missing.
       - :112 `LLM_FFN_GELU, LLM_FFN_PAR`, i.e. GeGLU rather than SwiGLU;
       - :86 scales Q by `1/sqrtf(n_embd_head)` and :91 then passes
         `kq_scale = 1.0f`, which is exactly the `1/sqrt(head_dim)`
-        ferrox's attention kernels apply when `attention_scale` is None.
+        frink's attention kernels apply when `attention_scale` is None.
   * RoPE is **NEOX** (`LLM_ARCH_GEMMA` in `llama_model_rope_type`'s NEOX
     group, llama-model.cpp:2642).
   * Gemma-1 declares no softcap and no sliding window, so the Gemma-2/3
@@ -82,7 +82,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-gemma-fixture")
+    w.add_name("frink-gemma-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `gpt2` and `starcoder` GGUFs used by ferrox's
+"""Generate the tiny synthetic `gpt2` and `starcoder` GGUFs used by frink's
 learned-position-embedding coverage test.
 
 Both refused as `dedicated` rows for a learned `position_embd` the
@@ -61,7 +61,7 @@ def main(out_path: str, starcoder: bool) -> None:
         return (0.5 + rng.standard_normal(n) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, arch)
-    w.add_name(f"ferrox-{arch}-fixture")
+    w.add_name(f"frink-{arch}-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

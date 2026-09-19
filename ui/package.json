@@ -1,9 +1,9 @@
 {
-  "name": "ferrox-studio",
+  "name": "frink-studio",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Ferrox Studio \u2014 the web frontend embedded in ferrox-server.",
+  "description": "Frink Studio \u2014 the web frontend embedded in frink-server.",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=20.19"

@@ -16,11 +16,11 @@ Three claims, in order. A step that improves one while breaking a
 higher one is a regression, not progress.
 
 1. **It answers the same.** Token-identical greedy output, or a KL
-   within the reference spread. `ferrox parity` is the oracle.
+   within the reference spread. `frink parity` is the oracle.
 2. **It runs at all.** The kind has a kernel on that backend. Falling
    back to the host is not running: it is a different program with the
    same output.
-3. **It is not slower.** `gap = llama / ferrox` at or below 1.0 on the
+3. **It is not slower.** `gap = llama / frink` at or below 1.0 on the
    same host, same GGUF, same backend, quiet host.
 
 Claim 2 is where CUDA fails today, and it is invisible in a gap column
@@ -77,11 +77,11 @@ What is left on x86, by class:
    `batch` times per prefill and multiplies in f32. llama.cpp's
    `ggml_vec_dot_iq4_xs_q8_K` is an int8 dot over Q8_K-quantized
    activations (the codebook lookup into `maddubs` / `sdot`).
-   **Closed on the same day**, `ferrox_quant::iq4_xs_q8` (scalar twin,
+   **Closed on the same day**, `frink_quant::iq4_xs_q8` (scalar twin,
    SDOT, AVX2; the activations quantized once per matmul on both the
    single-vector and the batched path): on the M2 Pro, interleaved
    twice against the previous binary, Llama-3.2-1B IQ4_XS prefill went
-   53 to 170 tok/s and decode 40 to 85, and `ferrox parity` against
+   53 to 170 tok/s and decode 40 to 85, and `frink parity` against
    libllama is MATCH at KL 3.8e-5. The x86 number needs a rented box;
    the local ratio is the evidence that the missing kernel was the
    gap. The same fallback still serves IQ4_NL, Q2_K, Q3_K, Q5_0, Q4_1
@@ -94,8 +94,8 @@ What is left on x86, by class:
 ### CUDA (RTX 3090, Ampere)
 
 Step 1's exit criterion is half met. **The K-quant GEMM is correct on
-hardware**: `cargo test -p ferrox-cuda --features cuda -- --ignored`
-passes all 13 tests, and `ferrox verify --backend cuda` is
+hardware**: `cargo test -p frink-cuda --features cuda -- --ignored`
+passes all 13 tests, and `frink verify --backend cuda` is
 token-identical to the CPU on Q4_K_M, Q5_K_M, Q6_K, Q8_0 and IQ4_XS
 Llama / TinyLlama checkpoints over a 64-token prompt and 24 generated
 tokens. One tolerance was wrong, not one kernel:
@@ -134,7 +134,7 @@ third of the problem.
 (`decoder.rs`, `forward_batch_*`) runs a dense layer as seven
 `WeightMatrix::apply_batch` calls -- `q_proj`, `k_proj`, `v_proj`,
 `o_proj`, `gate`, `up`, `down` -- and on CUDA each one is
-`ferrox_cuda::mul_mm_launch::launch_mul_mm`, which is ONE round trip:
+`frink_cuda::mul_mm_launch::launch_mul_mm`, which is ONE round trip:
 `x_batch[..].to_vec()` (a host copy), `htod_copy` of it (pageable),
 `alloc_zeros` for the output, one launch, `dtoh_sync_copy`. Nothing
 else in the layer touches the device: the norms, RoPE, the causal
@@ -174,7 +174,7 @@ the CUDA prefill work is the Metal work again, in order: a batched
 RMSNorm, RoPE, a causal prefill attention kernel and the residual add
 on the device, `launch_mul_mm` taking a device pointer for its
 activation, and one download at the end; and it is verified the way
-step 1 was, by the hardware test suite and `ferrox verify --backend
+step 1 was, by the hardware test suite and `frink verify --backend
 cuda`, before any receipt. The direct measurement that confirms the
 split (memcpy time against kernel time inside one pp512 step, `nsys`
 or event-timed) is the first thing to take on the next rented box; it
@@ -188,12 +188,12 @@ and 591 `cuMemcpyHtoD`, 0.88 s of memcpy per step against 0.39 s of
 GEMM kernels (`q4_k_mul_mm` 1.9 ms per call, `q6_k_mul_mm` 2.2 ms).
 The copies were two thirds of the step, as the arithmetic said.
 
-**The resident stack landed (`ferrox_cuda::prefill`, #260).** A run
+**The resident stack landed (`frink_cuda::prefill`, #260).** A run
 of dense layers per launch: the hidden batch up once, five small
 kernels (row RMSNorm, bias add, RoPE, causal GQA, residual add) plus
 the existing SwiGLU between GEMMs that now take device pointers
 (`enqueue_mul_mm`), the hidden batch down once, and each layer's K/V
-rows down for the host cache, which stays authoritative. `ferrox
+rows down for the host cache, which stays authoritative. `frink
 verify --backend cuda` token-identical on Llama-3.2-3B / 1B Q4_K_M
 and Qwen3-0.6B Q8_0 (QK norm), all 17 hardware tests green, and
 **pp512 305 to 912 tok/s, 2.9x**, interleaved against `main` three
@@ -216,7 +216,7 @@ gone -- which is the order the 2026-09-15 paragraph asked for.
 `mma.sync.m16n8k16` (f16 operands, f32 accumulation) under the same
 per-kind dequantization; the attention kernel reads `float4` slices
 with four query rows per block. RTX 3090, three interleaves with the
-SIMT body in the same binary (`FERROX_CUDA_MUL_MM=simt`): pp512
+SIMT body in the same binary (`FRINK_CUDA_MUL_MM=simt`): pp512
 Llama-3.2-3B Q4_K_M **975 to 1932 tok/s**, Llama-3.2-1B 2368 to 4577.
 Per two steps the kernels are now `q4_k_mul_mm_tc` 0.24 s (0.70 ms a
 call, from 1.88), `causal_gqa_prefill_f32` 0.054 s (0.96 ms a layer,
@@ -256,7 +256,7 @@ launches. Fixed in this branch; **unverified on hardware**.
 
 ### CPU, aarch64 (20-core Cortex-A725, i8mm, idle)
 
-| model | test | ferrox default | ferrox `spin` | llama.cpp |
+| model | test | frink default | frink `spin` | llama.cpp |
 |---|---|---|---|---|
 | 3B Q4_K_M | pp512 | **132.53** | | 46.40 |
 | 3B Q4_K_M | tg128 | 10.38 | **23.14** | 17.86 |
@@ -279,8 +279,8 @@ either pool: a fixed cost of about 60 ms per token (#128).
 
 ## Coverage: which kinds have a kernel
 
-ferrox has 21 `QuantKind`s. llama.cpp implements all of them on both
-CPU and CUDA. ferrox does not, and this table is the parity gap that a
+frink has 21 `QuantKind`s. llama.cpp implements all of them on both
+CPU and CUDA. frink does not, and this table is the parity gap that a
 tok/s column cannot show.
 
 | kind | CPU fast path | CUDA matvec | CUDA GEMM | Metal |
@@ -304,11 +304,11 @@ that matmul. It still answers correctly, which is why this never
 surfaced as a bug.
 
 "new, unverified" means the kernel exists, its arithmetic is checked
-against `ferrox_quant` by a Rust twin, and for the GEMM the emitted
+against `frink_quant` by a Rust twin, and for the GEMM the emitted
 CUDA C is executed on a host CPU and compared to that twin bit for bit
-(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`, 75,042 positions
+(`crates/frink-cuda/tools/mul_mm_host_check/run.sh`, 75,042 positions
 over eleven kinds and three shapes each, zero mismatches on 2026-09-09).
-**No GPU has run it.** `cargo test -p ferrox-cuda --features cuda --
+**No GPU has run it.** `cargo test -p frink-cuda --features cuda --
 --ignored` on a real device is the exit criterion, plus a bench row.
 
 ## The four kinds of gap, and why the distinction matters
@@ -321,29 +321,29 @@ priorities wrong. These are different problems with different fixes.
    and the before number is meaningless as a performance signal.
 2. **Wrong dispatch.** A kernel exists and is not selected, or is
    selected for the wrong shape. Fix: the predicate. Costs nothing to
-   run and is usually a large win. `FERROX_CPU_POOL` is this.
+   run and is usually a large win. `FRINK_CPU_POOL` is this.
 3. **Fixed per-token overhead.** Independent of weights, threads and
    backend. Fix: find the constant. Worth more than any kernel at small
    sizes and worth nothing at large ones.
 4. **Genuinely slower arithmetic.** The kernel is right and loses.
    Fix: profile. This is the only class that needs new performance
-   work, and it is the class ferrox has the least of.
+   work, and it is the class frink has the least of.
 
-Today's evidence says ferrox's remaining gap is mostly 1, 2 and 3.
+Today's evidence says frink's remaining gap is mostly 1, 2 and 3.
 That is good news and it should change the order of work.
 
 ## Ordered plan
 
 Each step names its exit criterion. "Measured" always means: quiet
-host, `ferrox bench` guard passing, `ps` checked for a single busy
+host, `frink bench` guard passing, `ps` checked for a single busy
 core, receipt committed.
 
 ### 1. Verify the K-quant CUDA GEMM on hardware  [blocks everything else on CUDA]
 
-Written and held against `ferrox_quant::dequant_q*_k` sub-block by
+Written and held against `frink_quant::dequant_q*_k` sub-block by
 sub-block, but the CUDA C is a second transcription of the same
 arithmetic and no GPU has run it. Rent one box, run
-`ferrox parity` for correctness and `ferrox bench --suite --backend
+`frink parity` for correctness and `frink bench --suite --backend
 cuda` for the gap.
 
 **Exit:** Q4_K/Q5_K/Q6_K prefill within the same order of magnitude as
@@ -356,11 +356,11 @@ Present on every kind including Q8_0, so it is not the missing GEMM.
 Three candidates were tested on hardware on 2026-09-04 and **two are
 now ruled out**:
 
-- **The GQA reduction is not it.** `FERROX_CUDA_GQA=1` is correct
+- **The GQA reduction is not it.** `FRINK_CUDA_GQA=1` is correct
   (`verify` is token-identical) and **42% SLOWER**: 6.85 tok/s against
   11.88 on Llama-3.2-1B Q4_K_M. It also never compiled before that day
   (NVRTC has no `INFINITY`), so the flag had never run at all.
-- **CUDA graphs are not it, yet.** `FERROX_CUDA_GRAPH=1` measures
+- **CUDA graphs are not it, yet.** `FRINK_CUDA_GRAPH=1` measures
   11.80 against 11.84 off, exactly as its own doc predicts: nothing
   enqueues into a captured stream, so it is groundwork.
 - **The GPU is NOT idle, and the claim that it was is retracted.** An
@@ -383,11 +383,11 @@ now ruled out**:
 **And prefill is a second, larger problem that widens with hardware.**
 Re-measured on an RTX 3060 (Ampere): prefill is **55x to 57x** off
 llama.cpp, against ~11x on the GTX 1080. llama.cpp is 2.4x faster on
-Ampere than on Pascal; ferrox is not faster at all. Decode is roughly
+Ampere than on Pascal; frink is not faster at all. Decode is roughly
 unchanged at 11.5x to 12.2x. The GPU sits about half idle during
 prefill (0%, 57%, 50%) where decode runs it at ~90%, so the two have
 different signatures and are probably different bugs. Thread count is
-not it: `-t 4` against ferrox's chosen `-t 1` is worth 25% and leaves
+not it: `-t 4` against frink's chosen `-t 1` is worth 25% and leaves
 44x.
 
 Treat the 50% as a lead needing repeated sampling, not a conclusion.
@@ -411,12 +411,12 @@ this gap:
 That is a real architectural difference and it settles the identity
 question a residency scheme would face: a tensor's device buffer IS its
 identity, for its lifetime, which is stronger than any length or epoch
-comparison. But ferrox's decode already runs the GPU at ~90%, so it is
+comparison. But frink's decode already runs the GPU at ~90%, so it is
 not waiting on the host, and closing this difference would not close
 the gap. Recorded so the next reader does not re-derive it and reach
 the conclusion this plan already retracted.
 
-**The cause is the kernels.** ferrox's CUDA matvec uses one 256-thread
+**The cause is the kernels.** frink's CUDA matvec uses one 256-thread
 block per row with a shared-memory tree reduction; ggml-cuda uses
 warp-level `dp4a` with no shared-memory round trip. At ~90%
 utilization and 9x to 17x off, that is where essentially all of the
@@ -424,7 +424,7 @@ difference is. Compare one kernel against its ggml-cuda equivalent for
 the same kind and shape, and close the arithmetic.
 
 **A dead API that should still go.** 
-`ferrox-cuda/src/gpu.rs` defines `DeviceAct` / `upload_act` /
+`frink-cuda/src/gpu.rs` defines `DeviceAct` / `upload_act` /
 `matvec_into` / `download_act`, whose doc says they exist "so a
 matvec's output can be fed straight into the next matvec without a
 DtoH/HtoD round-trip (the exact per-call upload/download overhead that
@@ -450,9 +450,9 @@ It was not safe. There is one publisher but THREE consumers, each
 routinely handed a `hidden_dim`-long activation that is not the
 published one, and the publication was a thread-local raw pointer into
 `DECODE_SCRATCH` -- a process-wide `Mutex` the pointer escaped, so two
-concurrent `ferrox-server` requests could have one answer the other's
+concurrent `frink-server` requests could have one answer the other's
 `lm_head` with its own activation, lengths agreeing by construction.
-Fixed in `ferrox-metal/src/resident_act.rs` (issue #166): the
+Fixed in `frink-metal/src/resident_act.rs` (issue #166): the
 publication lives inside the thing the mutex protects, records the host
 address and length of the exact vector the stack returned, is dropped by
 any borrow of the buffer it describes, and holds the guard while the
@@ -462,7 +462,7 @@ wrong, not a length comparison.
 
 ### 3. Decide the CPU pool by work size, not by environment variable
 
-`FERROX_CPU_POOL=spin` is +123% at 3B and +87% at 8B on aarch64 and
+`FRINK_CPU_POOL=spin` is +123% at 3B and +87% at 8B on aarch64 and
 takes decode PAST llama.cpp. It is -37% at 135M. So the default cannot
 flip and cannot stay: it needs a rule.
 
@@ -520,7 +520,7 @@ wait was the round trip, not the work.
 
 #### The fix, and what it measured
 
-`ferrox_core::par::on_workers` wraps a whole forward pass in one
+`frink_core::par::on_workers` wraps a whole forward pass in one
 `rayon::scope`, so the step runs on a worker and every nested region
 takes the hot arm. `~150` cold entries per token become **one**.
 `decoder/entry.rs` is the one place every public `Decoder::forward_*`
@@ -556,7 +556,7 @@ rented aarch64 box it was taken on.
 ### 5. x86 CPU  [DONE for decode, 2026-09-04]
 
 The answer was a **default**, not a missing kernel.
-`FERROX_CPU_INT_DOT` defaults on, its interleaved integer kernels are
+`FRINK_CPU_INT_DOT` defaults on, its interleaved integer kernels are
 aarch64-only, and on x86 it selected a scalar loop while bypassing the
 AVX2 f32 dot that does exist. Cost: 4x to 8.8x of decode. Fixed
 architecture-aware; Llama-3.2-1B Q4_K_M went from 6.8x off llama.cpp to
@@ -573,7 +573,7 @@ the code read as if they were right.
   the ledger and has had no investigation at all.
 - **No x86 int8 path exists.** Zen 4 advertises `avx512_vnni` and
   nothing here uses it. That is the natural successor to this fix, and
-  `FERROX_CPU_INT_DOT=1` stays available precisely so such a port can
+  `FRINK_CPU_INT_DOT=1` stays available precisely so such a port can
   measure itself against the f32 path.
 
 ### 6. Kernel coverage, by what people actually run
@@ -584,9 +584,9 @@ in the wild uses it:
 - **CUDA Q5_0, landed 2026-09-05, UNVERIFIED ON HARDWARE.** Matvec and
   GEMM together, because `a_cuda_kind_with_a_matvec_also_has_a_gemm`
   forbids half of it. The GEMM's emitted C is executed on the host by
-  `crates/ferrox-cuda/tools/mul_mm_host_check/run.sh` and matches the
+  `crates/frink-cuda/tools/mul_mm_host_check/run.sh` and matches the
   Rust twin bit for bit; the matvec's C has no such harness and no GPU
-  has run either. `cargo test -p ferrox-cuda --features cuda --
+  has run either. `cargo test -p frink-cuda --features cuda --
   --ignored` is the exit criterion, plus a Q5_0 bench row.
 - **CUDA IQ4_NL and IQ4_XS, landed 2026-09-09, UNVERIFIED ON
   HARDWARE.** Matvec and GEMM together. They are codebook formats, so

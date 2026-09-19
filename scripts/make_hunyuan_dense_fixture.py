@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `hunyuan-dense` GGUF used by ferrox's
+"""Generate the tiny synthetic `hunyuan-dense` GGUF used by frink's
 HunYuan dense coverage test.
 
 `hunyuan-dense` has no graph of its own: `src/models/models.h:1830-1834`
@@ -24,7 +24,7 @@ so the file to read is `src/models/hunyuan-vl.cpp`.
     `n_embd_head_k`, `ffn_norm` and `ffn_gate`/`ffn_up`/`ffn_down`. No
     biases, no post-norms, no window, no experts.
   * The graph (:60-175) ropes Q and K (:56-66 of the else branch) and
-    THEN norms them (:73-81) -- the post-RoPE QK-norm order ferrox
+    THEN norms them (:73-81) -- the post-RoPE QK-norm order frink
     already implements as `Decoder::qk_norm_after_rope` for
     `hunyuan-moe` and `maincoder`. `kq_scale = 1/sqrt(n_embd_head)`
     (:22), SiLU SwiGLU (:100-105), sequential residual.
@@ -38,9 +38,9 @@ converter, and it does the NTK-alpha arithmetic in PYTHON --
 the already-scaled value through `add_rope_freq_base` and no alpha key
 at all. The `add_rope_scaling_alpha` call at :356 belongs to
 `HunyuanVLTextModel`, whose `model_arch` is `HUNYUAN_VL`: a different
-GGUF architecture string and a different ferrox row. So on a converted
+GGUF architecture string and a different frink row. So on a converted
 file llama.cpp's :8-12 is a no-op, and this fixture writes the key
-explicitly precisely so that the arm ferrox implements is the arm the
+explicitly precisely so that the arm frink implements is the arm the
 reference runs.
 
 `{arch}.rope.freq_base` is deliberately SMALL (500) rather than the
@@ -53,7 +53,7 @@ DELIBERATELY ABSENT: `{arch}.rope.dimension_sections`. `use_mrope()`
 (llama-hparams.cpp:284-286) is true only when the first two sections are
 positive, and no converter writes the key under the `hunyuan-dense`
 prefix, so the M-RoPE branch at :43-54 is unreachable for this row and
-ferrox is not asked to have M-RoPE.
+frink is not asked to have M-RoPE.
 
 Weights are pseudo-random from a fixed seed so the file is byte-stable.
 
@@ -100,7 +100,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-hunyuan-dense-fixture")
+    w.add_name("frink-hunyuan-dense-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

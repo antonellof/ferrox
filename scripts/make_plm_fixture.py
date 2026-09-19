@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `plm` GGUFs used by ferrox's MLA-engine
+"""Generate the tiny synthetic `plm` GGUFs used by frink's MLA-engine
 coverage test.
 
 `plm` refused as UNAUDITED, triaged NEW CODE: DeepSeek-2 MLA attention
@@ -27,7 +27,7 @@ Keys, as `conversion/plm.py:14-19` writes them: `attention.key_length`
 v_head_dim, `rope.dimension_count` = qk_rope, `attention.kv_lora_rank`.
 
 `--decoy-output` adds an `output.weight` the graph does not read, so
-the test can pin that ferrox refuses the file as libllama does rather
+the test can pin that frink refuses the file as libllama does rather
 than silently preferring the decoy.
 
 Weights are pseudo-random from a fixed seed so the file is byte-stable.
@@ -77,7 +77,7 @@ def main(out_path: str, decoy_output: bool) -> None:
     qk_head = QK_NOPE + QK_ROPE
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-plm-fixture")
+    w.add_name("frink-plm-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

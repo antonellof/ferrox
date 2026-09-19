@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `maincoder` GGUF used by ferrox's
+"""Generate the tiny synthetic `maincoder` GGUF used by frink's
 MainCoder coverage test.
 
-`maincoder` sat on ferrox's generic GQA path refusing as UNAUDITED,
+`maincoder` sat on frink's generic GQA path refusing as UNAUDITED,
 triaged ONE MATCH ARM for one reason, and this fixture is what makes the
 arm checkable: it norms Q and K **after** RoPE, not before.
 `src/models/maincoder.cpp:78-90` calls `ggml_rope_ext` on Q and K and
 only then `build_norm(Qcur, attn_q_norm, ...)` at :92 and the K norm at
-:95. Every architecture ferrox had audited before this norms first, so
+:95. Every architecture frink had audited before this norms first, so
 the fixture's QK-norm weights are deliberately far from 1.0 -- swapping
 the two operations moves the logits by orders of magnitude more than the
 comparison tolerance.
@@ -18,7 +18,7 @@ The rest of what it pins against `maincoder.cpp`:
     (`llama_model_rope_type`'s NORM group, llama-model.cpp:2608), not
     NEOX.
   * PER-HEAD QK norm: `attn_q_norm` / `attn_k_norm` are `{n_embd_head_k}`
-    long (:33-34), not `n_head * head_dim`, so ferrox's loader has to
+    long (:33-34), not `n_head * head_dim`, so frink's loader has to
     resolve `QkNormStyle::PerHead` from the weight length.
   * `head_dim * n_head != n_embd`: Q is `{n_embd, n_embd_head_k * n_head}`
     and `attn_output` is `{n_embd_head_k * n_head, n_embd}` (:30-31), so
@@ -71,7 +71,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-maincoder-fixture")
+    w.add_name("frink-maincoder-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

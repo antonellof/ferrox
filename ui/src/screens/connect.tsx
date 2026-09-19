@@ -79,7 +79,7 @@ export function ConnectScreen() {
         setStatus(
           id
             ? `serving: ${id}`
-            : 'no model loaded — snippets use the placeholder id "ferrox"',
+            : 'no model loaded — snippets use the placeholder id "frink"',
         );
       })
       .catch((error: Error) => {
@@ -92,13 +92,13 @@ export function ConnectScreen() {
   }, [savedKey, savedOrigin]);
 
   const snippets = useMemo(() => {
-    const model = modelId || "ferrox";
+    const model = modelId || "frink";
     const authHeaderCurl = savedKey
       ? ` \\\n  -H "Authorization: Bearer ${savedKey}"`
       : "";
     const pyKey = savedKey
       ? `"${savedKey}"`
-      : 'os.environ.get("FERROX_API_KEY", "not-needed")';
+      : 'os.environ.get("FRINK_API_KEY", "not-needed")';
 
     return [
       {
@@ -202,7 +202,7 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
                 />
               </Field>
               <Field
-                label="API key (FERROX_API_KEY)"
+                label="API key (FRINK_API_KEY)"
                 className="min-w-56 flex-1"
                 htmlFor="apikey"
               >
@@ -222,7 +222,7 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
             </div>
             <p className="text-2xs text-faint">
               {origin
-                ? "Cross-origin: the server needs FERROX_CORS_ORIGINS set to this app's origin."
+                ? "Cross-origin: the server needs FRINK_CORS_ORIGINS set to this app's origin."
                 : `Empty — this app's own requests go to ${window.location.origin} and the dev server proxies them. Snippets below assume the server is at its default ${DEFAULT_SERVER_ORIGIN}.`}
             </p>
           </form>
@@ -232,14 +232,14 @@ curl -s ${base}${routes.adminStats} | jq '.recent[-1]'`,
             The key is stored in this browser's localStorage and sent as an
             Authorization header, exactly as any other client would. Leave it
             empty when the server was started without{" "}
-            <code className="font-mono">FERROX_API_KEY</code>. It is never put
+            <code className="font-mono">FRINK_API_KEY</code>. It is never put
             in a URL.
           </p>
           <p>
             Studio is a separate app from the server it talks to. Pointing it
             at another origin means the operator must start that server with{" "}
             <code className="font-mono">
-              FERROX_CORS_ORIGINS={window.location.origin}
+              FRINK_CORS_ORIGINS={window.location.origin}
             </code>
             . The <code className="font-mono">*</code> wildcard is refused by
             design — a wildcard beside a bearer token is a credential-leak

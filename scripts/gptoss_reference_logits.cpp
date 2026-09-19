@@ -1,9 +1,9 @@
 // Dumps llama.cpp's own logits for an explicit token-id sequence.
 //
-// This is the *reference* half of ferrox's gpt-oss coverage test: the
-// golden values checked into `crates/ferrox-models/tests/` are produced
+// This is the *reference* half of frink's gpt-oss coverage test: the
+// golden values checked into `crates/frink-models/tests/` are produced
 // by this program running against a real llama.cpp build, not by
-// re-reading a spec or by ferrox checking itself.
+// re-reading a spec or by frink checking itself.
 //
 // Build (out-of-source llama.cpp build in $LL):
 //   clang++ -std=c++17 -O2 scripts/gptoss_reference_logits.cpp \
@@ -17,7 +17,7 @@
 // `--lora FNAME[:SCALE]` (repeatable, before the model path) loads a
 // LoRA adapter GGUF through `llama_adapter_lora_init` and applies it at
 // SCALE (default 1.0) through `llama_set_adapters_lora`, which is what
-// `llama-cli --lora-scaled` does. It is the reference half of ferrox's
+// `llama-cli --lora-scaled` does. It is the reference half of frink's
 // LoRA coverage test.
 //
 // `REF_N_CTX=N` in the environment sizes the context and the batch at
@@ -97,7 +97,7 @@ int main(int argc, char ** argv) {
     cparams.type_k    = GGML_TYPE_F32;
     cparams.type_v    = GGML_TYPE_F32;
     // ggml's CPU flash-attention kernel accumulates V in F16
-    // (`VKQ16`), which is a second ~1e-4 floor. ferrox's CPU attention
+    // (`VKQ16`), which is a second ~1e-4 floor. frink's CPU attention
     // is plain F32, so compare against the F32 reference path.
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `exaone-moe` GGUF used by ferrox's
+"""Generate the tiny synthetic `exaone-moe` GGUF used by frink's
 per-layer-RoPE coverage test.
 
 `exaone-moe` refused as UNAUDITED, triaged NEW CODE, for exactly one
@@ -14,8 +14,8 @@ global, forever.
 That is the SAME RULE as `exaone4`, not a similar one: `exaone4.cpp:116`
 is `use_rope = is_swa(il) || swa_type == NONE`, and `exaone-moe`'s
 `swa_type` is nailed to `STANDARD`, which makes the second disjunct
-false and the two predicates identical. ferrox implements it once
-(`crates/ferrox-models/src/rope_layers.rs`); this fixture and
+false and the two predicates identical. frink implements it once
+(`crates/frink-models/src/rope_layers.rs`); this fixture and
 `exaone4_32b_tiny.gguf` are what prove the shared body is right for both
 rows rather than right for one and plausible for the other.
 
@@ -25,7 +25,7 @@ the file would be evidence about nothing. Layer 3 is the global one:
 unrotated, and (with `leading_dense_block_count = 1`) an MoE layer too,
 so the row's two halves meet in it.
 
-The rest of the graph is machinery ferrox already had, and the fixture
+The rest of the graph is machinery frink already had, and the fixture
 carries all of it so that "the MoE half is fine" stops being an
 assertion:
 
@@ -56,7 +56,7 @@ base fixture stays byte-identical to the one that audited the row:
     and :8 keeps `set_swa_pattern(4)`. `agree` writes the array a real
     converter would ([T, T, T, F]); `disagree` writes its inverse, so
     that the golden logits being IDENTICAL for the two is the
-    measurement that upstream ignores the value, and ferrox matching
+    measurement that upstream ignores the value, and frink matching
     both is the evidence that it does too.
   * `--mtp` appends ONE NextN/MTP block after the trunk, inside
     `block_count` (5 blocks, `nextn_predict_layers = 1`), exactly as
@@ -124,7 +124,7 @@ def main(out_path: str, window_array: str | None, mtp: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-exaone-moe-fixture")
+    w.add_name("frink-exaone-moe-fixture")
     w.add_block_count(block_count)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

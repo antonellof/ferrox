@@ -1,19 +1,19 @@
 # A recurrent layer that does not come back to the host
 
 Status: **the chunked rule landed for prefill, and then took the device
-with it.** `ferrox_core::gdn_chunk` is 2.1x on the step alone, and
-`ferrox_metal::gdn_chunk` is 3.0x on top of THAT at prefill lengths, so
+with it.** `frink_core::gdn_chunk` is 2.1x on the step alone, and
+`frink_metal::gdn_chunk` is 3.0x on top of THAT at prefill lengths, so
 a batch's recurrence now runs on the GPU after three attempts that lost.
-The row-at-a-time kernels in `ferrox-metal/src/gdn.rs` are still not
+The row-at-a-time kernels in `frink-metal/src/gdn.rs` are still not
 wired, and the three measurements below still say why: the thing that
 changed is not the kernel, it is what the kernel is given to do.
 
 ## The measurement this plan exists for
 
-Bonsai-2-27B on an M2 Pro, `ferrox bench -p 128 -n 32`, decode at 7.7
+Bonsai-2-27B on an M2 Pro, `frink bench -p 128 -n 32`, decode at 7.7
 tok/s against PrismML's llama.cpp fork at 11.5, measured back to back on
 a quiet box. Every Metal submission
-is timed (`FERROX_METAL_GPU_TIMING=1`), so the token accounts for
+is timed (`FRINK_METAL_GPU_TIMING=1`), so the token accounts for
 itself:
 
 | per decode token | |
@@ -28,7 +28,7 @@ A `sample` of the decode thread agrees from the other side: **83% of it
 sits in `waitUntilCompleted`**. The fork's token is 87 ms and it encodes
 ONE graph. So the gap is not kernel speed -- 66 ms of GPU for 5.95 GB of
 weights is ~90 GB/s of a 200 GB/s machine, and the trit decode is
-arithmetic-bound in both engines -- it is that a Ferrox layer returns to
+arithmetic-bound in both engines -- it is that a Frink layer returns to
 the host about three times.
 
 ## What a recurrent layer costs today
@@ -45,12 +45,12 @@ and 64 FFNs is the 159.
 
 ## What landed
 
-`ferrox-metal/src/gdn.rs`:
+`frink-metal/src/gdn.rs`:
 
 - `gdn_delta_step`: one threadgroup per value head, one thread per state
   row; decay in place, predict `k`, scale the error by beta, rank-one
   update, read out with the scaled query. Pinned against
-  `ferrox_core::gdn::delta_step` on three shapes including Bonsai's
+  `frink_core::gdn::delta_step` on three shapes including Bonsai's
   (48 heads, 128 wide) by
   `gdn::tests::the_device_delta_step_matches_this_one`; swapping the
   head map in the kernel turns it red.
@@ -80,7 +80,7 @@ that turns the three rows below from "the GPU is not better at this"
 into "a decode token cannot afford a submission per layer". The fix is
 the one the arithmetic at the end of this file already names -- fewer
 command buffers, not a better kernel -- and `DEVICE_ROWS = 32` in
-`ferrox_core::gdn_chunk` is where the two sides cross.
+`frink_core::gdn_chunk` is where the two sides cross.
 
 The access pattern was still wrong, and fixing it is what made the
 prefill numbers above: `gdn_delta_step` gave each thread a whole state
@@ -109,7 +109,7 @@ The first says what everyone expects: Bonsai's state is
 is 300 MB a token, more traffic than the whole 5.95 GB weight read.
 
 The second and third are the interesting ones. `RecurrentState::ssm` is
-page-aligned (`ferrox_core::recurrent_state::AlignedF32`) precisely so
+page-aligned (`frink_core::recurrent_state::AlignedF32`) precisely so
 that Metal can wrap the host's own bytes with no copy at all, and
 wrapping them still costs: mapping host pages for the GPU is not free,
 which the cached wrapper then removes. With BOTH of those gone the fused
@@ -144,7 +144,7 @@ is what the plumbing around it should look like.
 
 ## The decode token, priced
 
-Measured on the real checkpoint, `FERROX_METAL_GPU_TIMING=1`, 24 decode
+Measured on the real checkpoint, `FRINK_METAL_GPU_TIMING=1`, 24 decode
 tokens after a short prompt. The submissions are two `matvec-fused` and
 one `dense-ffn` per layer, 64 layers:
 
@@ -186,7 +186,7 @@ So the honest ceiling on increments is ~8.3 tok/s, and parity needs the
 whole layer in one command buffer with NO host step inside it: the QKV
 projection, the conv and gates, the recurrence, the output projection,
 the residual, the norm and the FFN, with the hidden state resident
-across layers. That is `ferrox-metal/src/decode_dense.rs` -- which
+across layers. That is `frink-metal/src/decode_dense.rs` -- which
 already does exactly this for dense models -- extended to PTQ1_0
 weights, to the folded Hadamard rotation between matmuls, and to the
 gated delta-net block. At one submission per layer the arithmetic is
@@ -199,10 +199,10 @@ story, and none of them is a faster kernel.
 
 ## The host recurrence is gone, and what that bought
 
-`ferrox-metal/src/gdn_branch.rs` runs a recurrent layer's WHOLE branch
+`frink-metal/src/gdn_branch.rs` runs a recurrent layer's WHOLE branch
 in the submission `ssm_out` already cost: the two gates, the causal
 convolution with its SiLU, the per-head l2 norms
-(`ferrox-metal/src/gdn_head.rs`), the delta rule, the gated norm, the
+(`frink-metal/src/gdn_head.rs`), the delta rule, the gated norm, the
 folded rotation and the output projection. A `sample` of a decode run
 no longer has `delta_step` in it at all, where it had been two thirds
 of the host time.
@@ -222,7 +222,7 @@ cost was never the gap.
 Getting there took three findings, each worth more than the 2.2%:
 
 - **`Q5_0` and `PTQ1_0` were unreachable from every fused Metal path in
-  `ferrox-models`.** `ferrox_metal::gpu::MATVEC_KINDS` served both and
+  `frink-models`.** `frink_metal::gpu::MATVEC_KINDS` served both and
   a hand-written match in the decoder listed six kinds and neither.
   `QuantKind::metal_kind_name` is exhaustive with no `_` arm now, and
   `crate::metal_launch` asks the backend's own table by that name, so
@@ -234,7 +234,7 @@ Getting there took three findings, each worth more than the 2.2%:
   ms of the 19 it had lost, because it made eleven fresh Metal buffers
   per layer per token, some 500 allocations a token. Resident
   constants, the convolution window wrapped in place, and
-  `ferrox-metal/src/scratch_pool.rs` took it 6.68 to 6.98 to 7.11 to
+  `frink-metal/src/scratch_pool.rs` took it 6.68 to 6.98 to 7.11 to
   7.27.
 - **`RecurrentState::conv` was not page-aligned** while `ssm` was, so
   the one state small enough to seem harmless was the one being copied
@@ -261,7 +261,7 @@ about 86 ms a token: the reference's 87.
 
 ## A recurrent layer is ONE submission
 
-`ferrox-metal/src/gdn_branch.rs` now encodes a whole recurrent layer in
+`frink-metal/src/gdn_branch.rs` now encodes a whole recurrent layer in
 one command buffer: `attn_norm`, the four projections, the two gates,
 the causal convolution, the l2 norms, the delta rule, the gated norm,
 the folded rotation, `ssm_out`, the residual add, `ffn_norm`, the
@@ -294,7 +294,7 @@ TEST was wrong rather than the code right.
 
 Nothing required the host to wait per layer. Consecutive recurrent
 layers hand each other a residual stream the host never looks at, and
-one Metal queue is ordered, so `ferrox_metal::gdn_branch::GdnRun`
+one Metal queue is ordered, so `frink_metal::gdn_branch::GdnRun`
 commits them back to back against ONE device buffer and waits for the
 last. Qwen3.5 puts a full-attention layer every fourth, so the runs are
 three layers long and three waits become one.
@@ -336,7 +336,7 @@ close to what this kernel shape gives.
 The sixteen attention layers cost three submissions each while the
 forty-eight recurrent ones cost one, and two of those three are `wo`
 and the FFN with nothing but a vector add and a norm between them. They
-are one now (`ferrox_metal::gdn_branch::launch_attn_tail`,
+are one now (`frink_metal::gdn_branch::launch_attn_tail`,
 `crate::decoder::fused_attention`), which is 51 waits a token instead
 of 69: **10.29 to 10.59 tok/s**, interleaved on one build, parity
 MATCH. The attention itself still runs on the host, because the KV
@@ -451,7 +451,7 @@ grows with `seq_len`.
 **The bug worth recording cost an hour and would have shipped.** The
 first version encoded this on a CONCURRENT encoder, and
 `encode_attn_tail` was written for one that orders its own dispatches.
-The model generated fluent nonsense -- and `ferrox parity` stayed
+The model generated fluent nonsense -- and `frink parity` stayed
 MATCH, because parity reads the FIRST token, which is prefill, and this
 path is decode. Nothing in the test suite covers a decode step against
 a reference. What caught it was reading the generated text, and what
@@ -548,7 +548,7 @@ and the only number left that is not overhead.
 The state has to live on the device across tokens, with the host copy
 updated only when a host consumer actually reads it. The consumers are
 the ones that make a recurrent cache different from an attention cache
-(`ferrox_core::recurrent_state`): `KvCache::truncate` refuses a middle
+(`frink_core::recurrent_state`): `KvCache::truncate` refuses a middle
 position, the prefix cache does not store such a cache, `--model-draft`
 refuses such a model, and a slot file writes it out. So the shape is:
 
@@ -567,7 +567,7 @@ submission at ~0.2 ms + the host recurrence at ~0.15 ms) is about 17 ms
 of a 141 ms token, and fusing the FFN in behind a device-side residual
 and norm is about 10 ms more. That is 8.8 tok/s, not 11.5: the rest is
 the remaining submissions and the 66 ms of GPU itself, which is where
-the fused decode stack (`ferrox-metal/src/decode_dense.rs`, already
+the fused decode stack (`frink-metal/src/decode_dense.rs`, already
 serving dense models) would have to take over for PTQ1_0 and for folded
 weights.
 
@@ -597,7 +597,7 @@ this": every one of them moved the state once per ROW. Bonsai's state is
 that. Chunking is what removes it -- the state is touched once per CHUNK
 -- and only then is there anything for a GPU to be good AT.
 
-`ferrox-metal/src/gdn_chunk.rs` is the same algebra as the host chunk:
+`frink-metal/src/gdn_chunk.rs` is the same algebra as the host chunk:
 one threadgroup per value head, one thread per state ROW, the `t` loop
 kept sequential behind threadgroup barriers because that is the
 recurrence, and the `j` loop spread across threads because it is not.
@@ -671,7 +671,7 @@ back NEUTRAL:
 
 The probe does not predict production, but three production
 configurations measured across this work do, because each differs from
-the next by exactly one stage. Their `FERROX_METAL_GPU_TIMING` averages
+the next by exactly one stage. Their `FRINK_METAL_GPU_TIMING` averages
 subtract:
 
 | stage of a recurrent layer | GPU | bytes | achieved |
@@ -836,12 +836,12 @@ Bonsai prefill, by top-of-stack:
 `delta_chunk` is not in it. The attention rows are Bonsai's 16 softmax
 layers, which the FUSED Metal attention block refuses because their Q
 is gated, so they fell back to the Rayon host kernel while
-`ferrox-metal`'s own `launch_gqa_prefill_host_ex` sat there with no
+`frink-metal`'s own `launch_gqa_prefill_host_ex` sat there with no
 caller. Wiring it (`Decoder::prefill_attention_blocked`) is 41.5 to
 43.1 tok/s.
 
 That is much less than 11178 of ~18000 samples suggests, and the
-`FERROX_METAL_GPU_TIMING` ledger says why: those samples are on worker
+`FRINK_METAL_GPU_TIMING` ledger says why: those samples are on worker
 threads that were already overlapping the GPU. With both host costs
 gone, prefill is the GEMM and nothing else -- 82 ms a submission over
 some 500 submissions of a 56 s run, about 3.2 TFLOP/s against the
@@ -854,7 +854,7 @@ Arithmetic, not a profile: 128 tokens through 26.9B parameters is
 6.9 TFLOP of matmul. The fork's `pp128` of 66.8 tok/s is 1.92 s, so
 3.6 TFLOP/s; ours of 32.9 is 3.89 s, so 1.8 TFLOP/s. An M2 Pro's GPU
 peaks near 6.8 TFLOP/s in f32, so the fork runs its PTQ1_0 GEMM at 53%
-of peak and ferrox at 26%. Both use llama.cpp's simdgroup-matrix
+of peak and frink at 26%. Both use llama.cpp's simdgroup-matrix
 `mul_mm` shape with the tile dequantized once into threadgroup memory,
 so the difference is in the tiling constants and the dequant's cost per
 tile, not in the algorithm. That is a bounded kernel project and it is

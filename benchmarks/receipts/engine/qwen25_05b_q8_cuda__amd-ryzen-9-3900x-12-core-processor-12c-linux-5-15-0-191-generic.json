@@ -5,9 +5,9 @@
   "backend": "cuda",
   "backend_active": "CUDA",
   "engine_env": {
-    "FERROX_CPU_INT_DOT": "1"
+    "FRINK_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.21.0",
+  "frink_version": "0.21.0",
   "host_load_1min_end": 1.56,
   "host_load_1min_start": 1.61,
   "host_spec": {
@@ -44,26 +44,26 @@
   "size_bytes": 675710816,
   "tests": [
     {
-      "ferrox_samples": [
+      "frink_samples": [
         1359.5808994157674,
         1371.0770382935364,
         1353.061702338249
       ],
-      "ferrox_stddev": 7.447695163340022,
-      "ferrox_tps": 1359.5808994157674,
+      "frink_stddev": 7.447695163340022,
+      "frink_tps": 1359.5808994157674,
       "gap": 27.85650343887199,
       "llama_tps": 37873.17,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
-      "ferrox_samples": [
+      "frink_samples": [
         129.22159375210364,
         129.25562794656128,
         129.23027858440722
       ],
-      "ferrox_stddev": 0.014438924498801426,
-      "ferrox_tps": 129.23027858440722,
+      "frink_stddev": 0.014438924498801426,
+      "frink_tps": 129.23027858440722,
       "gap": 5.078918092491016,
       "llama_tps": 656.35,
       "test": "tg128",

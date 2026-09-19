@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `smallthinker` GGUFs used by ferrox's
+"""Generate the tiny synthetic `smallthinker` GGUFs used by frink's
 router-input coverage test.
 
 `smallthinker` refused as UNAUDITED, triaged NEW CODE, on three things,
@@ -11,8 +11,8 @@ and the first of them is the one no other generic-path graph has:
     `attn_norm` (:115), before attention, before the FFN norm -- and
     :151-161 hands those logits to `build_moe_ffn` as `probs_in` with a
     NULL `ffn_gate_inp`. Every other MoE graph on the generic path
-    routes on the normed FFN input, which is what ferrox computed.
-    `crates/ferrox-models/src/router_input.rs` is the seam and has the
+    routes on the normed FFN input, which is what frink computed.
+    `crates/frink-models/src/router_input.rs` is the seam and has the
     census: four of 140 graphs pass a precomputed `probs_in`, and this
     is the only one whose operand is the layer input.
   * **`LLM_FFN_RELU` experts** (:158), the GATED form: `build_moe_ffn`
@@ -119,7 +119,7 @@ def main(out_path: str, no_window: bool, swa_period: int | None, declared_window
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-smallthinker-fixture")
+    w.add_name("frink-smallthinker-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

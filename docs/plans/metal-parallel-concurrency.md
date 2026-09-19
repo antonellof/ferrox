@@ -1,8 +1,8 @@
 # Metal parallel decode concurrency
 
-Status: **phase 1 shipped** in **0.15.2** ([PR #47](https://github.com/antonellof/ferrox/pull/47)); **CB Metal prefill fix** in **0.15.3**
+Status: **phase 1 shipped** in **0.15.2** ([PR #47](https://github.com/antonellof/frink/pull/47)); **CB Metal prefill fix** in **0.15.3**
 
-Related defect: https://github.com/antonellof/ferrox/issues/46 (closed)
+Related defect: https://github.com/antonellof/frink/issues/46 (closed)
 
 ## Hotfix (0.15.3)
 
@@ -17,7 +17,7 @@ host_kv: true)` on the private path.
 
 ### Verified on Host B (2026-09-02)
 
-Model: **Llama-3.2-3B-Instruct Q4_K_M**, `ferrox serve -dev metal -ngl
+Model: **Llama-3.2-3B-Instruct Q4_K_M**, `frink serve -dev metal -ngl
 all` (CB auto-on), binary **0.15.3**.
 
 **Correctness:** `"Hi"` → assistant greeting; `"What is 2+2?"` → `"2 +
@@ -39,8 +39,8 @@ TTFT **118 ms**.
 Receipts:
 [`benchmarks/receipts/serving/llama32_3b_q4km_metal_cb_parallel_0.15.3.json`](../../benchmarks/receipts/serving/llama32_3b_q4km_metal_cb_parallel_0.15.3.json),
 [`benchmarks/receipts/serving/llama32_3b_q4km_metal_cb_stream_0.15.3.json`](../../benchmarks/receipts/serving/llama32_3b_q4km_metal_cb_stream_0.15.3.json).
-Harness: `pi-agent-tests/ferrox_parallel_bench.py`,
-`pi-agent-tests/ferrox_stream_bench.py`.
+Harness: `pi-agent-tests/frink_parallel_bench.py`,
+`pi-agent-tests/frink_stream_bench.py`.
 
 ## Phase 1 shipped (0.15.2)
 
@@ -53,23 +53,23 @@ Harness: `pi-agent-tests/ferrox_parallel_bench.py`,
 
 ## Problem (historical, pre-0.15.2)
 
-With Metal enabled and continuous batching **off**, ferrox-server accepted multiple concurrent streaming requests but only reliably served **one at a time**. Two or more parallel private-loop decodes against the same loaded GGUF model produced:
+With Metal enabled and continuous batching **off**, frink-server accepted multiple concurrent streaming requests but only reliably served **one at a time**. Two or more parallel private-loop decodes against the same loaded GGUF model produced:
 
 - Truncated SSE streams (one token, then silence; HTTP 200, no `[DONE]`)
-- Journal panics: `rms_norm` length mismatch (`0` vs `3072`) in `ferrox-core/src/matmul.rs`
+- Journal panics: `rms_norm` length mismatch (`0` vs `3072`) in `frink-core/src/matmul.rs`
 - Cascading `PoisonError` on `Decoder::metal_attn_kv` (`decoder.rs:1810`, `3749`)
 - Subsequent requests fail with `internal error during generation` until restart
 
-Reproduction: run two concurrent `POST /v1/chat/completions` with `stream: true` against a real GGUF on Metal (`ferrox serve -dev metal -ngl all`). A Python parallel bench lives in `pi-agent-tests/ferrox_parallel_bench.py`.
+Reproduction: run two concurrent `POST /v1/chat/completions` with `stream: true` against a real GGUF on Metal (`frink serve -dev metal -ngl all`). A Python parallel bench lives in `pi-agent-tests/frink_parallel_bench.py`.
 
 ## Root cause
 
-The server module docs in `ferrox-server/src/lib.rs` state that the loaded model is immutable and that each request builds its own host `KvCache`, so multiple requests can decode concurrently via `spawn_blocking`. That is **true for weights** and **true for host KV**, but **false for Metal-resident KV**.
+The server module docs in `frink-server/src/lib.rs` state that the loaded model is immutable and that each request builds its own host `KvCache`, so multiple requests can decode concurrently via `spawn_blocking`. That is **true for weights** and **true for host KV**, but **false for Metal-resident KV**.
 
 `Decoder` carries one shared arena:
 
 ```rust
-// ferrox-models/src/decoder.rs
+// frink-models/src/decoder.rs
 pub(crate) metal_attn_kv: Mutex<Option<Vec<MetalKvBuffers>>>,
 ```
 
@@ -80,7 +80,7 @@ Every concurrent private-loop request locks this mutex and runs `forward_token` 
 3. CPU fallback calls `rms_norm(&hidden, …)` with empty `hidden` → panic
 4. `metal_attn_kv.lock().unwrap()` poisons the mutex; all later Metal decodes fail
 
-Continuous batching avoids this by design: one `ferrox-continuous-batch` worker calls `forward_multi_seq` per tick — no concurrent `forward_token` on shared Metal KV. Trade-off: streaming is buffered, not token-overlapped.
+Continuous batching avoids this by design: one `frink-continuous-batch` worker calls `forward_multi_seq` per tick — no concurrent `forward_token` on shared Metal KV. Trade-off: streaming is buffered, not token-overlapped.
 
 The existing concurrency integration test (`concurrent_requests_against_the_same_model_do_not_interfere`) uses `Decoder::new_random_small` (synthetic, no Metal fused path) and does not cover this failure mode.
 
@@ -94,7 +94,7 @@ When `metal_attn_enabled()` and continuous batching is off, serialize decode thr
 
 - **Pros:** Small diff, stops panics and truncated streams immediately, honest behavior
 - **Cons:** No parallel Metal throughput on private path; document in `/health` capabilities
-- **Files:** `ferrox-server/src/lib.rs`, possibly `loaded.rs`
+- **Files:** `frink-server/src/lib.rs`, possibly `loaded.rs`
 
 ### B. Proper fix — per-request Metal KV residency
 
@@ -102,7 +102,7 @@ Move `metal_attn_kv` off `Decoder` into the generation context (alongside per-re
 
 - **Pros:** Matches the documented concurrency model; true parallel private-loop decode on Metal
 - **Cons:** Higher GPU memory use (N × KV); allocation/teardown per request; largest change
-- **Files:** `ferrox-models/src/decoder.rs`, `ferrox-metal/src/attn/`, `generate` module
+- **Files:** `frink-models/src/decoder.rs`, `frink-metal/src/attn/`, `generate` module
 
 ### C. Middle ground — sync host KV before lock release
 
@@ -113,7 +113,7 @@ Before releasing `metal_attn_kv`, always `sync_metal_attn_kv_to_host` for the ac
 
 ### D. Require continuous batching for parallel Metal serving
 
-Treat `FERROX_CONTINUOUS_BATCHING=1` as the supported multi-request path on Metal; reject or queue additional private-loop decodes with 503 + `Retry-After`.
+Treat `FRINK_CONTINUOUS_BATCHING=1` as the supported multi-request path on Metal; reject or queue additional private-loop decodes with 503 + `Retry-After`.
 
 - **Pros:** Uses existing safe scheduler
 - **Cons:** Buffered streaming; CB disabled when prefix cache or non-paged KV pool is configured
@@ -137,11 +137,11 @@ Treat `FERROX_CONTINUOUS_BATCHING=1` as the supported multi-request path on Meta
 
 | Location | Role |
 |----------|------|
-| `ferrox-server/src/lib.rs:11-27` | Concurrency documentation (host KV only) |
-| `ferrox-server/src/lib.rs:2397-2428` | Private loop vs continuous batcher routing |
-| `ferrox-server/src/lib.rs:3038` | Streaming `spawn_blocking` (not joined) |
-| `ferrox-models/src/decoder.rs:422-426` | Shared `metal_attn_kv` |
-| `ferrox-models/src/decoder.rs:1807-1843` | Lock, reset, stale Metal detection |
-| `ferrox-models/src/decoder.rs:2057-2248` | Dense stack skip + empty `hidden` + `rms_norm` |
-| `ferrox-core/src/matmul.rs:63` | Panic site |
-| `ferrox-journal.log` | Observed panic chain from parallel bench |
+| `frink-server/src/lib.rs:11-27` | Concurrency documentation (host KV only) |
+| `frink-server/src/lib.rs:2397-2428` | Private loop vs continuous batcher routing |
+| `frink-server/src/lib.rs:3038` | Streaming `spawn_blocking` (not joined) |
+| `frink-models/src/decoder.rs:422-426` | Shared `metal_attn_kv` |
+| `frink-models/src/decoder.rs:1807-1843` | Lock, reset, stale Metal detection |
+| `frink-models/src/decoder.rs:2057-2248` | Dense stack skip + empty `hidden` + `rms_norm` |
+| `frink-core/src/matmul.rs:63` | Panic site |
+| `frink-journal.log` | Observed panic chain from parallel bench |

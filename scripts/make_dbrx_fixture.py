@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `dbrx` GGUF used by ferrox's DBRX coverage
+"""Generate the tiny synthetic `dbrx` GGUF used by frink's DBRX coverage
 test.
 
-`dbrx` sat on ferrox's generic GQA path refusing as UNAUDITED, triaged
+`dbrx` sat on frink's generic GQA path refusing as UNAUDITED, triaged
 NEW CODE on three blockers, and each turned out to be one implementation
 that another row also needed:
 
@@ -55,7 +55,7 @@ moves llama.cpp's own logits rather than assuming it.
 
 **`--no-clamp` writes the file llama.cpp refuses.** `dbrx.cpp:5` reads
 the clamp with no default, so a DBRX file without the key fails to load
-there, and ferrox refuses it by name rather than defaulting it to "no
+there, and frink refuses it by name rather than defaulting it to "no
 clamp" and running a graph the reference cannot. No golden goes with
 that file; it exists so the refusal is driven from a file shaped exactly
 like the ones the converter writes, minus one key.
@@ -111,7 +111,7 @@ def main(out_path: str, no_clamp: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-dbrx-fixture")
+    w.add_name("frink-dbrx-fixture")
     # The same key set conversion/dbrx.py:16-36 writes, and nothing else.
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
@@ -121,7 +121,7 @@ def main(out_path: str, no_clamp: bool) -> None:
     w.add_head_count_kv(N_HEAD_KV)
     w.add_rope_freq_base(ROPE_BASE)
     # REQUIRED (dbrx.cpp:5). A file without it is refused by llama.cpp
-    # and by ferrox alike; `--no-clamp` is that file.
+    # and by frink alike; `--no-clamp` is that file.
     if not no_clamp:
         w.add_clamp_kqv(CLAMP_KQV)
     w.add_expert_count(N_EXPERT)

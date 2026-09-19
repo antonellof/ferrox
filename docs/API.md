@@ -1,6 +1,6 @@
 # API
 
-`ferrox-server` exposes an OpenAI-compatible HTTP API for chat serving.
+`frink-server` exposes an OpenAI-compatible HTTP API for chat serving.
 
 Fields marked **Reject** return HTTP 400 or 501 with an error message
 that names the problem. Multimodal input the server does not handle
@@ -30,20 +30,20 @@ comes back the same way.
 | `GET`/`POST /v1/conversations/{conversation_id}` | Read one with its messages, or rename, retarget and append |
 | `POST /v1/conversations/{conversation_id}/delete` | Delete. Spelled as a POST suffix because the CORS allow-list is `GET, POST`, so a `DELETE` method would work from curl and fail from every cross-origin browser |
 | `POST /v1/admin/prepare-stop` | Close admission, seal the accounting, and make the receipt durable (see below) |
-| `POST /slots/{id_slot}?action=save\|restore` | llama.cpp's slot save/restore: persist a prompt prefix's KV to disk and load it back after a restart. Needs `--slot-save-path` and `FERROX_PREFIX_CACHE_ENTRIES` (see below). `action=erase` is refused by name |
+| `POST /slots/{id_slot}?action=save\|restore` | llama.cpp's slot save/restore: persist a prompt prefix's KV to disk and load it back after a restart. Needs `--slot-save-path` and `FRINK_PREFIX_CACHE_ENTRIES` (see below). `action=erase` is refused by name |
 | `GET /lora-adapters` · `POST /lora-adapters` | llama.cpp's LoRA listing and scale setting; the per-request `lora` field is honoured on `/v1/chat/completions`, `/v1/completions` and `/completion` (see below) |
-| `GET /cache/stats` · `GET /metrics` | Ferrox extensions |
+| `GET /cache/stats` · `GET /metrics` | Frink extensions |
 | `/admin/*` | Control surface (see below) |
 | `GET /` | 404. The web UI in [`ui/`](../ui) is a separate app and this server does not serve it |
 | Audio / images | Not supported |
 
 That is the whole list. Every path lives as one constant in the
-`ferrox-api` crate, and the server mounts nothing that is not in it, so
+`frink-api` crate, and the server mounts nothing that is not in it, so
 the UI and the server cannot disagree about a URL.
 
 ## Authentication
 
-Set `FERROX_API_KEY` and every route except `GET /health` needs
+Set `FRINK_API_KEY` and every route except `GET /health` needs
 `Authorization: Bearer <key>`. `/metrics` and `/cache/stats` are in that
 set, so a Prometheus scraper needs the header too.
 
@@ -74,12 +74,12 @@ conversation or a large `/v1/embeddings` batch past that comes back
 | `grammar` | Supported. llama.cpp's own field: a GBNF string, enforced per token by a real parser |
 | `response_format: json_schema` | Supported. The `json_schema.schema` is compiled to GBNF and enforced per token. `strict: false` and any unknown member of the `json_schema` object are refused **by name**; a schema the converter cannot compile is a 400 naming the keyword |
 | Other `response_format` types | **Reject** |
-| `session_id` | Ferrox extension (server-side history) |
+| `session_id` | Frink extension (server-side history) |
 | `chat_template_kwargs` | Supported (see [Chat templates](#chat-templates)) |
 | `reasoning_effort` | Supported, quantized onto what the checkpoint grades; `none`/`off` turn thinking off |
 | `thinking: {"type": …}` | Supported (DeepSeek wire): `enabled`/`disabled`, anything else is a 400. On `/v1/messages`, `thinking.budget_tokens` becomes `reasoning_budget_tokens` exactly as llama.cpp's Anthropic lowering does (`server-chat.cpp:585-591`): `enabled` without a number gets 10,000 |
-| `ignore_eos` | Ferrox extension: run past the model's own end-of-generation tokens so the request produces exactly `max_tokens`. A serving-benchmark knob. Suppresses the model's set only. A caller's own `stop` strings still end the answer |
-| `reasoning_content` (both ways) | Ferrox extension: a reasoning model's chain of thought, split out of `content` on the way out and replayable on the way in (`reasoning` is accepted as an alias) |
+| `ignore_eos` | Frink extension: run past the model's own end-of-generation tokens so the request produces exactly `max_tokens`. A serving-benchmark knob. Suppresses the model's set only. A caller's own `stop` strings still end the answer |
+| `reasoning_content` (both ways) | Frink extension: a reasoning model's chain of thought, split out of `content` on the way out and replayable on the way in (`reasoning` is accepted as an alias) |
 | `continue_final_message` | Supported, llama.cpp's field and value set: `true` (auto), `"reasoning_content"`, `"content"`, or `false`. The trailing assistant message is rendered as a turn still being written, thought included, so the model carries on from where it stopped. **Default on, as llama.cpp's server** (`server-common.cpp:1046-1056`): a request that says nothing and ends in an assistant message is continued; `false` renders it as a closed turn for that request (llama.cpp reads `false` as absence, so this is the one deliberate difference), and `--no-prefill-assistant` turns the default off server-wide. One rule for `/v1/chat/completions`, `/v1/messages` and `/v1/responses`, applied in one renderer. The harmony and ATEM channel formats, a content continuation for an always-open family, and a turn with tool calls are **501 by name**; a 501 reached by the default says how to switch it off |
 | `reasoning_budget_tokens` / `thinking_budget_tokens` | Supported, llama.cpp's sampler-level budget (`common/reasoning-budget.cpp`): `-1` or absent takes the server's `--reasoning-budget` (itself `-1`, unrestricted); `N` allows N tokens of thought after the opener and then forces the closer one token per step, so the answer still arrives with `finish_reason: "stop"`; `0` forces the closer the moment the block opens. The closer is never counted, a forced closer waits for a split UTF-8 character to complete, and a second block in the same response gets a fresh budget. Below `-1` is a 400 naming the field. Also accepted at the top level of a `/v1/responses` body, as llama.cpp's lowering passes it. A checkpoint with no reasoning format has no thought to bound (llama.cpp builds no sampler either); the harmony and ATEM channel formats are **501 by name** |
 
@@ -224,7 +224,7 @@ Every `/v1/chat/completions` response carries a server-assigned
 `chatcmpl-…` id. It is the `id` field, and it is repeated once under
 `request_id`. For a non-streamed call it sits in the JSON body. For a
 streamed one it arrives in the **first** SSE chunk, before any content.
-That is the key ferrox logs and cancels by, so a client never has to
+That is the key frink logs and cancels by, so a client never has to
 guess which in-flight request is its own.
 
 ## Usage timings
@@ -259,8 +259,8 @@ uniformly mediocre one, and the two call for opposite block sizes.
 `/admin/stats` rows carry `acceptance_length` and
 `draft_accept_rate_per_position` for the same reason.
 
-**Today these fields are always absent**: `ferrox-server` has no
-speculative decode path yet (`ferrox speculative` is a CLI-only demo),
+**Today these fields are always absent**: `frink-server` has no
+speculative decode path yet (`frink speculative` is a CLI-only demo),
 so nothing populates them. They are the wire contract the engine's
 metrics land on, not evidence that the server speculates.
 
@@ -269,9 +269,9 @@ Streamed requests get the same `usage` object on the final chunk.
 ## Admin / control surface
 
 Everything under `/admin` either changes what the server serves or
-writes to disk, so it needs the same `FERROX_API_KEY` as `/v1/*`. None
+writes to disk, so it needs the same `FRINK_API_KEY` as `/v1/*`. None
 of it sits on the unauthenticated `/health` side. Paths and payload
-shapes are defined once in the `ferrox-api` crate, so the UI and the
+shapes are defined once in the `frink-api` crate, so the UI and the
 server cannot disagree about them.
 
 | Endpoint | Answer |
@@ -311,12 +311,12 @@ context length and a zero one are different facts. `quant` comes from
 `general.file_type` when that maps to a known name, which is the only
 place the `_M` in `Q4_K_M` is stated. Failing that it comes from the
 dominant tensor dtype, which is coarser and still measured rather than
-invented. `resident_bytes` is always `null`, because ferrox keeps
+invented. `resident_bytes` is always `null`, because frink keeps
 checkpoints mmap-resident and the true figure is a page-cache property
 this process has no way to read.
 
-Discovery scans `FERROX_MODEL_DIR` and the directory holding
-`FERROX_MODEL_PATH`, non-recursively, for `*.gguf` plus any
+Discovery scans `FRINK_MODEL_DIR` and the directory holding
+`FRINK_MODEL_PATH`, non-recursively, for `*.gguf` plus any
 safetensors-index checkpoint directory. Split checkpoints fold into one
 entry named for the shard prefix.
 
@@ -416,7 +416,7 @@ Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) for gated repos, and
     "ttft_ms": 6586.2, "duration_ms": 23603, "decode_ms": 17004.8,
     "stream": false,
     "via_api_key": "key-4f21a0c3",   // fingerprint, never the key; null if none
-    "client": "ferrox-studio"        // SELF-DECLARED (X-Ferrox-Client); null if absent
+    "client": "frink-studio"        // SELF-DECLARED (X-Frink-Client); null if absent
   }]
 }
 ```
@@ -455,10 +455,10 @@ that served the request, never the key and never anything the key can be
 recovered from; it is salted per process, so it is stable within one
 server run, meaningless across a restart, and useless for testing key
 guesses offline. `null` means no `Authorization: Bearer` header was
-presented, which on a server started without `FERROX_API_KEY` is every
-request. `client` is the caller's own `X-Ferrox-Client` header, kept to
-32 label characters, **a claim, not proof**: Ferrox Studio sends
-`ferrox-studio` and so could anything else. Nothing authenticates it, and
+presented, which on a server started without `FRINK_API_KEY` is every
+request. `client` is the caller's own `X-Frink-Client` header, kept to
+32 label characters, **a claim, not proof**: Frink Studio sends
+`frink-studio` and so could anything else. Nothing authenticates it, and
 a UI that shows it must say so.
 
 ## Embeddings
@@ -468,7 +468,7 @@ equally good:
 
 | Source | How it is loaded | Default pooling | Normalized |
 |---|---|---|---|
-| A **BERT/BGE encoder** | `FERROX_MODEL_PATH` at an encoder-only GGUF, `/admin/models/load`, or `FERROX_EMBEDDING_MODEL_PATH` beside a generative model | the checkpoint's own `bert.pooling_type` (`CLS` for every BGE) | yes |
+| A **BERT/BGE encoder** | `FRINK_MODEL_PATH` at an encoder-only GGUF, `/admin/models/load`, or `FRINK_EMBEDDING_MODEL_PATH` beside a generative model | the checkpoint's own `bert.pooling_type` (`CLS` for every BGE) | yes |
 | A **decoder's hidden states** | whatever generative model is loaded | `mean` | no |
 
 The encoder is the one that was trained to put a sentence
@@ -478,11 +478,11 @@ model that was not. `embedding_type` overrides the default: `mean` and
 hidden states is its BOS position and means nothing in particular).
 `none` and `rank` are refused on both, because this response shape carries one
 vector per input, not per token, and `rank` is a reranker
-classification head ferrox does not implement.
+classification head frink does not implement.
 
 ### An encoder as the served model
 
-`FERROX_MODEL_PATH=bge-small-en-v1.5-q8_0.gguf` works. The file's
+`FRINK_MODEL_PATH=bge-small-en-v1.5-q8_0.gguf` works. The file's
 `general.architecture` is what decides: an encoder/embedding
 architecture never reaches a decoder loader.
 
@@ -491,11 +491,11 @@ a request to find out:
 
 ```json
 {"id": "bge-small-en-v1.5", "object": "model",
- "ferrox_model_kind": "embedding",
- "ferrox_endpoints": ["/v1/embeddings"],
- "ferrox_n_embd": 384, "ferrox_pooling": "CLS",
- "ferrox_context_length": 512,
- "ferrox_tokenizer": "gguf-wordpiece"}
+ "frink_model_kind": "embedding",
+ "frink_endpoints": ["/v1/embeddings"],
+ "frink_n_embd": 384, "frink_pooling": "CLS",
+ "frink_context_length": 512,
+ "frink_tokenizer": "gguf-wordpiece"}
 ```
 
 `GET /health` is `ready`, the server really can serve. Every
@@ -528,7 +528,7 @@ Only `bert` loads. The other encoder rows upstream builds from
 each one needs (RoPE, a gated FFN, per-projection QK norm, its own
 graph). `pangu-embedded` was in that list from its name alone and is a
 decoder LLM (openPangu-Embedded); it runs on the decode routes since
-2026-09-14. `ferrox_models::embedding_model::NOT_YET` is that
+2026-09-14. `frink_models::embedding_model::NOT_YET` is that
 list, and a test pins it against the capability registry so a new row
 cannot fall through to a generic refusal.
 
@@ -551,8 +551,8 @@ Request `{"model"?, "query", "documents": [...], "top_n"?,
 - Ties keep request order; the sort is stable.
 - `top_n` clamps to `documents.len()`, and `top_n: 0` returns no
   results. An empty `documents` array is a 400.
-- Needs a `bert` GGUF carrying a rank head, through `FERROX_MODEL_PATH`
-  or `FERROX_EMBEDDING_MODEL_PATH`. Anything else answers **501 naming
+- Needs a `bert` GGUF carrying a rank head, through `FRINK_MODEL_PATH`
+  or `FRINK_EMBEDDING_MODEL_PATH`. Anything else answers **501 naming
   the model** rather than substituting a similarity.
 
 `/v1/embeddings` against a rank-head checkpoint still refuses: its
@@ -563,7 +563,7 @@ The pair is encoded as `[CLS] query [SEP] document [SEP]`, with the
 query in segment 0 and the document in segment 1.
 
 **This deliberately differs from llama.cpp**, which hardcodes token
-types to zero, and it is one of the few places ferrox does. The reason
+types to zero, and it is one of the few places frink does. The reason
 is measured rather than preferred: segment ids do not merely shift the
 scores, THEY REORDER THE RESULTS. On "How many people live in Berlin?"
 against five documents, the one carrying the population figure ranks
@@ -578,11 +578,11 @@ HuggingFace reference on four query sets.
 
 ### Which head ran, and why it changes the scale
 
-**A rerank response reports `ferrox_score_head`**, and a client that
+**A rerank response reports `frink_score_head`**, and a client that
 thresholds on an absolute score has to read it. There are two regimes
 and they differ by more than an order of magnitude:
 
-| `ferrox_score_head` | Meaning | Range on `ms-marco-MiniLM-L6-v2` |
+| `frink_score_head` | Meaning | Range on `ms-marco-MiniLM-L6-v2` |
 |---|---|---|
 | `classifier(tanh(pooler(cls)))` | The full head the checkpoint was trained with | about plus or minus 11 |
 | `classifier(cls)` | The classifier alone, no pooler in the file | about plus or minus 0.2 |
@@ -600,7 +600,7 @@ the pooler by name (`conversion/bert.py`, `BertModel.filter_tensors`,
 layer"; still unconditional on `master` as of 2026-09-11), and under
 llama.cpp's tensor naming the pooler slot is `cls`, with `cls.output`
 being the classifier that follows it (`src/llama-graph.cpp`: `cls`,
-then bias, then `tanh`, then an optional head norm). ferrox reads `cls`
+then bias, then `tanh`, then an optional head norm). frink reads `cls`
 when a file carries it and refuses to invent one when it does not.
 
 An absent pooler is a NOTE rather than a refusal on purpose: nothing in
@@ -609,9 +609,9 @@ without one", and `jina-reranker-v1-tiny-en` is a real checkpoint whose
 head IS a direct projection. Refusing would reject a valid model to
 flag a lossy conversion.
 
-### Getting the first regime: `ferrox splice-pooler`
+### Getting the first regime: `frink splice-pooler`
 
-The pooler is in the checkpoint's own safetensors, and `ferrox
+The pooler is in the checkpoint's own safetensors, and `frink
 splice-pooler` writes a GGUF that carries it (`docs/CLI.md`). The tie
 between the two files is the classifier they both hold, compared
 element-wise to within the GGUF's storage precision; the GGUF's
@@ -641,7 +641,7 @@ llama.cpp loads the spliced file and runs the pooler too (its
 `build_pooling` RANK arm reads `cls`); its scores still differ from
 HuggingFace by its all-zero token types, described above.
 
-Tracked as [#82](https://github.com/antonellof/ferrox/issues/82): the
+Tracked as [#82](https://github.com/antonellof/frink/issues/82): the
 converter's output is still uncalibrated, and the splice is the
 in-tree route until upstream keeps the tensor.
 
@@ -668,12 +668,12 @@ and only one of them is in the client's hands:
 
 | `code` | Meaning | Fix |
 |---|---|---|
-| `context_length_exceeded` | Longer than any single request is allowed to be (`FERROX_CB_MAX_CONTEXT`) | Shorter prompt, lower `max_tokens` |
-| `device_memory_budget_exceeded` | Bigger than the server's whole KV budget (`FERROX_CB_KV_BLOCKS`) | More KV blocks, or a smaller model |
+| `context_length_exceeded` | Longer than any single request is allowed to be (`FRINK_CB_MAX_CONTEXT`) | Shorter prompt, lower `max_tokens` |
+| `device_memory_budget_exceeded` | Bigger than the server's whole KV budget (`FRINK_CB_KV_BLOCKS`) | More KV blocks, or a smaller model |
 
 `estimated_bytes` and `limit_bytes` are the KV cost of the request and
 of the ceiling, priced from the model's own layout. It is the same
-arithmetic `ferrox inspect-plan` prints, so check it yourself instead of
+arithmetic `frink inspect-plan` prints, so check it yourself instead of
 taking it on trust. When a request exceeds both ceilings, the
 per-request one is reported, because that is the one the caller acts on.
 
@@ -715,7 +715,7 @@ Two tiers, both ending at the same server-side flag.
    receiver is gone and stops at the next token. Before this it ignored
    the failed send and generated the rest of the answer into nothing.
 2. **`POST /v1/cancel`** with the `request_id` the first SSE chunk
-   states. Behind `FERROX_API_KEY` like the endpoint that started the
+   states. Behind `FRINK_API_KEY` like the endpoint that started the
    work. A browser should send it with `keepalive: true` so it survives
    the page unload that killed the stream, which is the case tier 1
    handles worst.
@@ -825,7 +825,7 @@ one per request:
 ```
 
 Then every event carries `id: {request_id}:{n}` and the first one also
-carries `retry: 1500`. Two ways back in, both behind `FERROX_API_KEY`
+carries `retry: 1500`. Two ways back in, both behind `FRINK_API_KEY`
 like the request that filled the buffer:
 
 ```bash
@@ -872,15 +872,15 @@ Concurrent requests share one batched decode worker (llama.cpp's slot
 model): many in-flight sequences, one `forward_multi_seq` step per tick.
 This is the supported multi-client path on Metal.
 
-Enable explicitly with `FERROX_CONTINUOUS_BATCHING=1`, `--cont-batching`
+Enable explicitly with `FRINK_CONTINUOUS_BATCHING=1`, `--cont-batching`
 / `-cb`, or `-np N` / `--parallel N` (which also sets
-`FERROX_CB_MAX_SEQS`). Disable with `FERROX_CONTINUOUS_BATCHING=0` or
+`FRINK_CB_MAX_SEQS`). Disable with `FRINK_CONTINUOUS_BATCHING=0` or
 `--no-cont-batching`. When unset on Metal builds with fused attention,
 continuous batching is **on by default** unless a KV pool or prefix cache
 forces the private decode path.
 
-Mutually exclusive with `FERROX_KV_POOL_BLOCKS` and
-`FERROX_PREFIX_CACHE_ENTRIES` on the contiguous path (paged KV lifts
+Mutually exclusive with `FRINK_KV_POOL_BLOCKS` and
+`FRINK_PREFIX_CACHE_ENTRIES` on the contiguous path (paged KV lifts
 this; see [`CONFIG.md`](CONFIG.md)).
 
 Streaming under continuous batching emits tokens incrementally as they are
@@ -888,30 +888,30 @@ sampled (same SSE shape as the private decode path), not one string at
 the end.
 
 Prefill is chunked. Per tick the scheduler runs one bounded prefill
-chunk (`FERROX_CB_PREFILL_CHUNK`, default 128 tokens, round-robin
+chunk (`FRINK_CB_PREFILL_CHUNK`, default 128 tokens, round-robin
 across waiting prompts) plus one batched decode step. A long prompt
 joining the batch therefore costs an in-flight decode one chunk instead
 of the whole prompt.
 
-`FERROX_CB_MAX_SEQS` caps in-flight sequences, counting prompts still
-prefilling. `FERROX_CB_MAX_QUEUE` (default 512) caps how many requests
+`FRINK_CB_MAX_SEQS` caps in-flight sequences, counting prompts still
+prefilling. `FRINK_CB_MAX_QUEUE` (default 512) caps how many requests
 wait for admission. Past that cap a request gets a `503` with a
 `Retry-After` header instead of joining an unbounded queue, and the JSON
 body names the queue depth, the cap and `retry_after_seconds`.
 
 `-b N` / `--batch-size N` and `-ub N` / `--ubatch-size N` set the
-prefill chunk on both decode paths at once (`FERROX_CB_PREFILL_CHUNK`
-here and `FERROX_CHUNKED_PREFILL` on the private loop, which used to be
-two independent knobs for one number). ferrox has one prefill stage, so
+prefill chunk on both decode paths at once (`FRINK_CB_PREFILL_CHUNK`
+here and `FRINK_CHUNKED_PREFILL` on the private loop, which used to be
+two independent knobs for one number). frink has one prefill stage, so
 the two flags resolve the way llama.cpp resolves them
 (`src/llama-context.cpp:265`): the smaller of whichever was named.
 
 While a batcher is active, `GET /metrics` reports
-`ferrox_prefill_chunks_total`, `ferrox_prefill_tokens_total`,
-`ferrox_decode_steps_total`, `ferrox_scheduler_queue_depth`,
-`ferrox_scheduler_queue_rejected_total`, and the configured caps
-`ferrox_scheduler_max_seqs` (`-np`; 0 when unlimited) and
-`ferrox_scheduler_prefill_chunk` (`-ub`), so a flag can be read back
+`frink_prefill_chunks_total`, `frink_prefill_tokens_total`,
+`frink_decode_steps_total`, `frink_scheduler_queue_depth`,
+`frink_scheduler_queue_rejected_total`, and the configured caps
+`frink_scheduler_max_seqs` (`-np`; 0 when unlimited) and
+`frink_scheduler_prefill_chunk` (`-ub`), so a flag can be read back
 from the process that received it rather than trusted.
 
 Every `503` this server returns carries `Retry-After: 1`. It is a fixed
@@ -930,7 +930,7 @@ written against `llama-server` works unchanged.
 ```bash
 # Start with somewhere to put the files, and the prefix cache the
 # slots restore into.
-FERROX_PREFIX_CACHE_ENTRIES=8 ferrox-server -m model.gguf \
+FRINK_PREFIX_CACHE_ENTRIES=8 frink-server -m model.gguf \
   --slot-save-path ./slots --port 8383
 
 # Prefill a prompt, store its KV in the prefix cache, and write it to
@@ -955,7 +955,7 @@ the same greedy output the cold server gave.
 Two things differ from llama.cpp, and are said rather than emulated:
 
 - **`id_slot` is bookkeeping.** llama.cpp has N fixed slots each owning
-  a KV region, and `-np` sets N. ferrox builds KV per request and
+  a KV region, and `-np` sets N. frink builds KV per request and
   shares prefixes through one `PrefixCache`, so there is no per-slot
   region for the id to select. It is validated (a non-negative
   integer) and echoed.
@@ -992,7 +992,7 @@ shape field that differs. llama.cpp's own slot file
 (`src/llama-context.cpp:3081-3141`) carries no identity at all.
 
 The file is framed with a length-and-digest prefix like
-`ferrox_core::kv_disk`'s blocks: a truncated, edited or foreign file is
+`frink_core::kv_disk`'s blocks: a truncated, edited or foreign file is
 refused before anything is parsed or allocated. Filenames are a strict
 whitelist (`[A-Za-z0-9._-]`, no leading dot), so a name cannot leave
 `--slot-save-path`.
@@ -1008,7 +1008,7 @@ per-request `lora` field, over adapters loaded with `--lora` /
 `--lora-scaled` (see [`CLI.md`](CLI.md#lora-adapters)).
 
 ```sh
-ferrox-server -m model.gguf --lora style.gguf --lora-scaled tone.gguf:0.5
+frink-server -m model.gguf --lora style.gguf --lora-scaled tone.gguf:0.5
 
 curl localhost:8383/lora-adapters
 # [{"id":0,"path":"style.gguf","scale":1.0,"task_name":"","prompt_prefix":""},
@@ -1050,7 +1050,7 @@ not serve the first answer to the second.
 
 ## MCP
 
-`--mcp-config PATH` loads server metadata under `ferrox_mcp` in
+`--mcp-config PATH` loads server metadata under `frink_mcp` in
 `GET /v1/models`. Tool invocation is not wired yet.
 
 ## Reasoning content
@@ -1064,7 +1064,7 @@ overlapped SSE stream and a buffered one report the same fields for the
 same request rather than differing by transport.
 
 Which family applies is inferred from the served model's name, which is
-all there is: ferrox carries no per-checkpoint parser declaration. A
+all there is: frink carries no per-checkpoint parser declaration. A
 name that implies nothing gets no reasoning parser at all, the right
 answer for a model that does not reason, since an unconditional
 splitter would eat a literal `<think>` written in a code block.
@@ -1246,7 +1246,7 @@ is easy to get wrong: **an absent `n_predict` is `-1`**, which means
 substitute a smaller budget. `-1` resolves against the derived context
 ceiling (`crate::budget`) minus the tokenized prompt. On a deployment
 where the model could not be priced there is no ceiling to be full of,
-and `-1` is a **501** naming `n_predict` and `FERROX_CB_MAX_CONTEXT`
+and `-1` is a **501** naming `n_predict` and `FRINK_CB_MAX_CONTEXT`
 rather than a silent 16. `n_predict: 0` generates nothing, as upstream.
 
 `repeat_last_n: -1` ("the whole context") is refused for the same
@@ -1256,7 +1256,7 @@ orders of magnitude smaller than the one it asked for.
 `cache_prompt: true` is upstream's default and is a *permission* to
 reuse KV, so it is always servable. `cache_prompt: false` is a
 *requirement* not to, which this server can only keep when no prefix
-cache is configured; with `FERROX_PREFIX_CACHE_ENTRIES` set it is
+cache is configured; with `FRINK_PREFIX_CACHE_ENTRIES` set it is
 refused rather than ignored.
 
 ### What it refuses, by name
@@ -1270,7 +1270,7 @@ naming the field:
 `dynatemp_range` · `mirostat` ·
 `n_probs` and `post_sampling_probs` (no per-token logprobs) ·
 `min_keep` · `return_tokens` (the decode loop hands this layer text,
-not ids) · `n_indent` · `n_keep` (ferrox refuses an oversized request
+not ids) · `n_indent` · `n_keep` (frink refuses an oversized request
 rather than shifting context, so there is nothing to protect) ·
 `n_cmpl` · `n_cache_reuse` · `t_max_predict_ms` · `id_slot` (no slots)
 · `response_fields` · `return_progress` · `timings_per_token`
@@ -1296,7 +1296,7 @@ ignores it.
 ### Response fields, and two honest ones
 
 `truncated` is always `false`, and that is a statement rather than a
-placeholder: ferrox refuses a request that does not fit its context
+placeholder: frink refuses a request that does not fit its context
 instead of discarding tokens to make it fit, so a served answer was
 never truncated. A `timings` value this server did not measure is
 `null` rather than `0`, which would read as an instantaneous prefill,
@@ -1323,8 +1323,8 @@ reported correctly.
 
 ## Tokenize / detokenize, in both dialects
 
-These two are the one place ferrox invented a path OpenAI does not have.
-OpenAI has no tokenize endpoint at all, so `/v1/tokenize` was ferrox's
+These two are the one place frink invented a path OpenAI does not have.
+OpenAI has no tokenize endpoint at all, so `/v1/tokenize` was frink's
 own spelling, while llama.cpp serves `/tokenize` and `/detokenize`
 unprefixed. Every llama.cpp client therefore asked for a URL that did
 not exist and got a 404 naming nothing.
@@ -1339,18 +1339,18 @@ The request body accepts both dialects on both paths:
 | Field | Status |
 |---|---|
 | `content` | llama.cpp's name for the text. Supported |
-| `prompt` | ferrox's name for the same text. Supported |
+| `prompt` | frink's name for the same text. Supported |
 | both at once | **400.** They are one field, and guessing which was meant would tokenize text the caller did not ask about |
-| neither | **400** naming both. llama.cpp answers an empty array here; ferrox does not, because an empty array cannot be told apart from tokenizing `""` |
+| neither | **400** naming both. llama.cpp answers an empty array here; frink does not, because an empty array cannot be told apart from tokenizing `""` |
 | `add_special` | Supported. Prepends the same BOS id the generation path prepends, including its no-op on a checkpoint whose metadata says not to add one, so the count matches the prompt the model would really see |
 | `parse_special: true` (upstream's default) | Supported. Special-token markers in the text are the tokens they name |
 | `parse_special: false` | Supported. `<|im_start|>` is tokenized as the characters it is written with, as llama.cpp does |
-| `with_pieces` | **501 by name.** ferrox's tokenizers expose decoded text, not the raw per-token piece bytes, so a byte-fallback token could not be given llama.cpp's `piece` byte array |
+| `with_pieces` | **501 by name.** frink's tokenizers expose decoded text, not the raw per-token piece bytes, so a byte-fallback token could not be given llama.cpp's `piece` byte array |
 | `model` | Accepted and ignored; this server serves one model at a time |
 
-The tokenize response carries `tokens` (llama.cpp's key) plus ferrox's
+The tokenize response carries `tokens` (llama.cpp's key) plus frink's
 own `count`. The detokenize response carries the text under **both**
-`content` (llama.cpp's key) and `text` (ferrox's), same string, so
+`content` (llama.cpp's key) and `text` (frink's), same string, so
 neither dialect's client reads a null.
 
 ## Grammar-constrained decoding
@@ -1382,7 +1382,7 @@ Everything inside `json_schema` that this server does not act on is
 refused **by name** rather than dropped: an unknown member is a 400
 naming it, and `strict: false` is a 400 too. OpenAI's `strict: false`
 asks for best-effort guidance and permits schemas that strict mode
-rejects. ferrox has one behaviour for a schema, which is to enforce it
+rejects. frink has one behaviour for a schema, which is to enforce it
 token by token, so serving that under `strict: false` would report a
 guarantee the caller declined. An **omitted** `strict` is enforced.
 
@@ -1415,7 +1415,7 @@ alternative.
 llama.cpp.** Upstream forces a call with an *eager* grammar. That does
 not survive this server: several families open the reasoning block in
 the prompt, so the model's first token is already inside `<think>`, and
-a call forced there is read back by ferrox's own reasoning parser as
+a call forced there is read back by frink's own reasoning parser as
 thinking, so the caller who demanded a call would get `reasoning_content`
 and no call. So the grammar stays lazy, triggers on the wire format's
 opening marker, and while awaiting masks *only* the end-of-generation
@@ -1446,7 +1446,7 @@ An argument whose declared type the family's own spelling and this
 server's own reader disagree about is refused BY PROPERTY NAME rather
 than written approximately. On `gemma4` that is an `object` or `array`
 argument: the template writes a composite in gemma's DSL (bare keys,
-gemma-quoted strings) and ferrox reads a value with `serde_json`, so the
+gemma-quoted strings) and frink reads a value with `serde_json`, so the
 spelling the checkpoint was trained to write comes back as a string. On
 the element formats it is a property with no declared `type` at all.
 
@@ -1474,7 +1474,7 @@ streamed tool calls on the continuous-batching path · a speculative
 decode path in the server, so every speculation field in `usage` is
 absent today · llama.cpp's `/infill`, `/props`, `GET /slots` (the live
 slot listing; `POST /slots/{id}` save/restore is supported, see above),
-and `/apply-template`, none of which has a ferrox counterpart.
+and `/apply-template`, none of which has a frink counterpart.
 
 A few request fields deserialize and then go nowhere, accepted so a
 stock client's body does not fail validation over something this server

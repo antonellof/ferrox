@@ -7,22 +7,22 @@ worth writing down.
 
 ## What exists
 
-- `ferrox_models::speculative`: the `Drafter` trait,
+- `frink_models::speculative`: the `Drafter` trait,
   `PromptLookupSpeculator` (n-gram over the history, no second model),
   `speculative_decode_with` / `_observed`, and the Leviathan / Chen
   rejection rule with `accept_or_resample` pinned by unit tests.
-- `ferrox_models::draft_model::DraftModelSpeculator`: a second GGUF as
+- `frink_models::draft_model::DraftModelSpeculator`: a second GGUF as
   the drafter, refused at construction when the vocabularies differ.
-- `ferrox run -d draft.gguf`: a real generation path, with the
+- `frink run -d draft.gguf`: a real generation path, with the
   refusals it needs (no grammar, no recurrent target, no recurrent
   draft, a drafter whose KV is on the device).
 
 ## What does not
 
 ```
-$ grep -rn 'speculat' crates/ferrox-server/src --include=*.rs -l
-crates/ferrox-server/src/stats/requests.rs
-$ grep -rn 'with_speculation' crates/ferrox-server/src | grep -v test
+$ grep -rn 'speculat' crates/frink-server/src --include=*.rs -l
+crates/frink-server/src/stats/requests.rs
+$ grep -rn 'with_speculation' crates/frink-server/src | grep -v test
 (nothing)
 ```
 
@@ -33,7 +33,7 @@ a gate that cannot fire.
 
 vLLM ships five drafting methods (n-gram, suffix, EAGLE/EAGLE3, MLP,
 MTP) and llama.cpp's server ships `--model-draft` with `--draft-max` /
-`--draft-min`. ferrox ships neither over HTTP.
+`--draft-min`. frink ships neither over HTTP.
 
 ## Why it is not "call the function"
 
@@ -59,7 +59,7 @@ force:
    takes a callback that, given the target's logits at a position and
    the draft's proposal, answers accept/reject and returns the token --
    implemented by `sample_step`. The rejection rule stays in
-   `ferrox-models`; the DISTRIBUTION comes from the one sampler the
+   `frink-models`; the DISTRIBUTION comes from the one sampler the
    non-speculative path uses. Cost: a new seam in the speculative
    module, and every sampler feature has to be expressible for a
    position that may be rolled back (the grammar machine in particular
@@ -78,14 +78,14 @@ silent fallback.
 
 - **The continuous batcher.** Speculation and batching are two
   schedulers for one KV cache; llama.cpp's server disables the draft
-  when a slot is shared. ferrox should refuse the pair by name before
+  when a slot is shared. frink should refuse the pair by name before
   it is measured.
 - **Paged KV and the prefix cache.** The drafter rolls back the
   positions the target rejects; a paged store and a radix cache both
   have to be able to undo them. `KvCache::truncate` already refuses a
-  middle position for a recurrent layer (`ferrox_core::
+  middle position for a recurrent layer (`frink_core::
   recurrent_state`), which is the same question.
-- **Device-resident KV.** `ferrox run` already refuses a drafter whose
+- **Device-resident KV.** `frink run` already refuses a drafter whose
   KV lives on the device, because it cannot roll back rows it cannot
   see. The server's Metal path is exactly that case, so on Apple
   silicon this is a CPU-only feature until the device KV mirror

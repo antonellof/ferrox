@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `mistral3` GGUFs used by ferrox's
+"""Generate the tiny synthetic `mistral3` GGUFs used by frink's
 per-position attention-temperature coverage test.
 
 `mistral3` is what every Ministral-3 (3B/8B/14B) export tags
@@ -12,7 +12,7 @@ reads it, `:14-17` floors it on `hparams.n_ctx_orig_yarn`, and
     log(floor(pos / floor_scale) + 1) * temp_scale + 1
 
 AFTER RoPE and BEFORE `build_attn`, with `kq_scale` untouched. Until
-2026-09-11 ferrox had no per-position Q scale and no gate on the key.
+2026-09-11 frink had no per-position Q scale and no gate on the key.
 
 The verdict also described this graph as "leading-dense + MoE + shared
 expert", and reading `mistral3.cpp` in full corrects that: `:64-84`
@@ -45,7 +45,7 @@ keys under test:
                   the same temperature key (whose floor is never
                   reached in six tokens, so this file exercises YaRN's
                   MAGNITUDE term `1 + 0.1 ln 4` on q and k, which
-                  ferrox did not apply before this fixture existed).
+                  frink did not apply before this fixture existed).
   --yarn-logmul   `--yarn` plus `rope.scaling.yarn_log_multiplier = 0.5`
                   (`mistral3.cpp:9`), which turns the magnitude into
                   `(1 + 0.1 ln 4) / (1 + 0.05 ln 4)`. Real Ministral-3
@@ -102,11 +102,11 @@ def main(out_path: str, variant: str | None) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-mistral3-fixture")
+    w.add_name("frink-mistral3-fixture")
     w.add_block_count(N_LAYER)
     # `--temp-ctx` floors on the TRAINED context, so the file has to
     # say a short one; llama.cpp's reference tool runs at n_ctx = 128
-    # regardless, and ferrox sizes nothing from this key.
+    # regardless, and frink sizes nothing from this key.
     w.add_context_length(TEMP_FLOOR if variant == "--temp-ctx" else CTX)
     w.add_embedding_length(N_EMBD)
     w.add_feed_forward_length(N_FF)

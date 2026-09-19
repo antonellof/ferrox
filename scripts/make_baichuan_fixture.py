@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `baichuan` GGUF used by ferrox's
+"""Generate the tiny synthetic `baichuan` GGUF used by frink's
 Baichuan-7B coverage test.
 
 `baichuan` is ONE architecture string covering TWO different models, and
@@ -16,7 +16,7 @@ would fall into the no-RoPE arm at :91, and would therefore be evidence
 about a graph no real checkpoint runs. 32 layers is the smallest honest
 size.
 
-ferrox refuses the 13B by name at `loader.rs`'s `block_count == 40`
+frink refuses the 13B by name at `loader.rs`'s `block_count == 40`
 check, pinned by
 `baichuan_13b_is_refused_because_it_uses_alibi_and_the_7b_is_not`, so the
 unaudited refusal only ever reached a 32-layer file. For that file the
@@ -82,7 +82,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.15).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-baichuan-fixture")
+    w.add_name("frink-baichuan-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

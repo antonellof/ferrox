@@ -3,7 +3,7 @@ import { NavLink, Outlet, useLocation, useNavigate, useParams } from "react-rout
 import { PanelLeft, Search, SquarePen, Trash2, X } from "lucide-react";
 import { SCREENS } from "@/lib/screens";
 import { HealthPill } from "@/components/health-pill";
-import { FerroxWordmark } from "@/components/logo";
+import { FrinkWordmark } from "@/components/logo";
 import { useHealth } from "@/lib/use-health";
 import {
   recencyBucket,
@@ -206,7 +206,7 @@ export function AppShell() {
   const sidebar = (
     <div className="flex h-full flex-col gap-3 p-3">
       <div className="flex items-center justify-between px-1 pt-1">
-        <FerroxWordmark />
+        <FrinkWordmark />
         <button
           type="button"
           onClick={() => setDrawer(false)}
@@ -265,7 +265,7 @@ export function AppShell() {
           >
             <PanelLeft className="size-4" />
           </button>
-          <FerroxWordmark />
+          <FrinkWordmark />
         </header>
 
         <main id="main" tabIndex={-1} className="min-h-0 flex-1 overflow-hidden">

@@ -1,12 +1,12 @@
 # Agents & IDEs
 
-Point coding agents at a running Ferrox server. Start it either way:
-`ferrox serve` from the main binary (needs `--features serve` at build
-time) or the standalone `ferrox-server`. Both take the same flags.
+Point coding agents at a running Frink server. Start it either way:
+`frink serve` from the main binary (needs `--features serve` at build
+time) or the standalone `frink-server`. Both take the same flags.
 
 ```bash
-cargo build -p ferrox-cli --release --features "serve metal"
-./target/release/ferrox serve -m /path/to/model.gguf \
+cargo build -p frink-cli --release --features "serve metal"
+./target/release/frink serve -m /path/to/model.gguf \
   --host 127.0.0.1 --port 8383
 ```
 
@@ -20,7 +20,7 @@ cargo build -p ferrox-cli --release --features "serve metal"
 | codex | Responses provider → `POST /v1/responses` |
 | curl | `POST /v1/chat/completions` (see [CLI.md](CLI.md)) |
 
-If `FERROX_API_KEY` is set, send `Authorization: Bearer …` or
+If `FRINK_API_KEY` is set, send `Authorization: Bearer …` or
 `x-api-key: …`. Both are accepted, so an Anthropic SDK works unchanged
 against a keyed server. Leave the key unset on a loopback bind if you
 would rather not send one at all.
@@ -36,17 +36,17 @@ Also available: `POST /v1/tokenize`, `/v1/detokenize`, `/v1/embeddings`
 to stop a generation by the `request_id` its first streamed chunk
 carries. Full list: [API.md](API.md).
 
-For a browser client, Ferrox Studio lives in [`ui/`](../ui) as a
+For a browser client, Frink Studio lives in [`ui/`](../ui) as a
 separate app. This server does not serve it, and `GET /` here is a 404.
 Run `npm run dev` from that directory.
 
 ## Continuous batching
 
 ```bash
-FERROX_CONTINUOUS_BATCHING=1 ./target/release/ferrox-server -m model.gguf …
+FRINK_CONTINUOUS_BATCHING=1 ./target/release/frink-server -m model.gguf …
 ```
 
-- Mutually exclusive with `FERROX_KV_POOL_BLOCKS` and `FERROX_PREFIX_CACHE_ENTRIES`
+- Mutually exclusive with `FRINK_KV_POOL_BLOCKS` and `FRINK_PREFIX_CACHE_ENTRIES`
 - GGUF Decoder only (Kimi / MLA ignore CB)
 
 ## Sharing a system prompt between conversations
@@ -56,8 +56,8 @@ once and lets each conversation point at those pages, instead of every
 request holding a copy:
 
 ```bash
-FERROX_PAGED_KV_BLOCKS=4096 FERROX_PAGED_KV_BLOCK_SIZE=16 \
-  ./target/release/ferrox-server -m model.gguf -dev metal -ngl all
+FRINK_PAGED_KV_BLOCKS=4096 FRINK_PAGED_KV_BLOCK_SIZE=16 \
+  ./target/release/frink-server -m model.gguf -dev metal -ngl all
 ```
 
 `usage.cached_tokens` on each response says how much of that prompt was

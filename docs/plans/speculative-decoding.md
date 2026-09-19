@@ -1,6 +1,6 @@
 ---
 name: "speculative decoding with a real draft model, on CPU, CUDA and Metal"
-overview: "THE ONE ITEM THAT RAISES DECODE THROUGHPUT WITHOUT BUYING HARDWARE. Decode is memory-bandwidth bound: to emit one token the engine reads every weight in the model, so a 17 GB checkpoint on a 960 GB/s card cannot exceed ~56 tok/s no matter how good the kernels are. That ceiling is arithmetic, not engineering. Speculative decoding breaks it by changing WHAT IS READ PER TOKEN rather than how fast it is read: a small draft model proposes k tokens, the target verifies all k in ONE pass over its weights, and the rejection rule guarantees the output distribution is exactly the target's. FERROX ALREADY HAS THE HARD HALF. `speculative.rs` implements the Leviathan/Chen rejection rule, is lossless at every temperature rather than only at `--temp 0`, and proves it against 200k sampled tokens. What is missing is a DRAFTER WORTH HAVING: the only implementation in the tree is an n-gram prompt-lookup with no model at all. This plan adds a second GGUF as the draft model, wires it through the CLI and the server, and refuses loudly when the two checkpoints do not share a vocabulary. SCOPE: CPU, CUDA and Metal, which is every backend ferrox has. No AMD-specific work."
+overview: "THE ONE ITEM THAT RAISES DECODE THROUGHPUT WITHOUT BUYING HARDWARE. Decode is memory-bandwidth bound: to emit one token the engine reads every weight in the model, so a 17 GB checkpoint on a 960 GB/s card cannot exceed ~56 tok/s no matter how good the kernels are. That ceiling is arithmetic, not engineering. Speculative decoding breaks it by changing WHAT IS READ PER TOKEN rather than how fast it is read: a small draft model proposes k tokens, the target verifies all k in ONE pass over its weights, and the rejection rule guarantees the output distribution is exactly the target's. FRINK ALREADY HAS THE HARD HALF. `speculative.rs` implements the Leviathan/Chen rejection rule, is lossless at every temperature rather than only at `--temp 0`, and proves it against 200k sampled tokens. What is missing is a DRAFTER WORTH HAVING: the only implementation in the tree is an n-gram prompt-lookup with no model at all. This plan adds a second GGUF as the draft model, wires it through the CLI and the server, and refuses loudly when the two checkpoints do not share a vocabulary. SCOPE: CPU, CUDA and Metal, which is every backend frink has. No AMD-specific work."
 ---
 
 # Speculative decoding with a real draft model
@@ -16,7 +16,7 @@ tokens/sec <= memory bandwidth / model bytes
 A 17 GB checkpoint at 960 GB/s cannot pass ~56 tok/s. Better kernels
 move the engine toward that number and cannot move it past. Every other
 decode optimisation in `roadmap.md` is a fight for the gap between where
-ferrox is and where that ceiling sits. This item moves the ceiling.
+frink is and where that ceiling sits. This item moves the ceiling.
 
 The mechanism is one sentence: a 2 GB drafter proposes k tokens, the
 17 GB target checks all k in a single pass over its weights, good
@@ -26,9 +26,9 @@ desktop card report 38 to over 100 tok/s on a 27B model, and every gain
 after the first came from making the guesser better and the check
 cheaper rather than from new hardware.
 
-## What ferrox already has
+## What frink already has
 
-`crates/ferrox-models/src/speculative.rs`, 1343 lines:
+`crates/frink-models/src/speculative.rs`, 1343 lines:
 
 - `speculative_decode_with`, which verifies a proposed block in one
   `forward_batch` call and does not care who proposed it.
@@ -43,7 +43,7 @@ cheaper rather than from new hardware.
   the rule against deliberately bad draft distributions, a temperature
   1.0 decode against exactly enumerated per-position marginals, and
   token-for-token identity with a plain loop at temperature 0.
-- `ferrox-api`'s `Usage` already declares `acceptance_length`,
+- `frink-api`'s `Usage` already declares `acceptance_length`,
   `draft_tokens`, `accepted_draft_tokens` and
   `draft_accept_rate_per_position`, the last per position rather than
   folded into the mean, because a drafter that is right at position 0
@@ -60,9 +60,9 @@ through `forward_batch`, which already runs on CPU, CUDA and Metal.
 at all. It is free and it helps on repetitive text, which is why it was
 first. It cannot carry a coding workload.
 
-**Any wiring at all.** `ferrox speculative` is a demo command on
+**Any wiring at all.** `frink speculative` is a demo command on
 synthetic random weights, so the hit rate it prints says nothing about a
-real checkpoint. `ferrox run` has no draft flags. The server has no
+real checkpoint. `frink run` has no draft flags. The server has no
 speculative path, so every speculation field in `Usage` is absent on
 every response. `--mtp` errors by design.
 
@@ -112,7 +112,7 @@ accept rate on stderr beside the existing throughput line.
 
 ### 4. The server path, and the `Usage` fields it already declares
 
-`FERROX_DRAFT_MODEL_PATH`, the draft decoder held beside the target, and
+`FRINK_DRAFT_MODEL_PATH`, the draft decoder held beside the target, and
 the four speculation fields populated instead of absent. `None` and
 `Some(1.0)` are different answers there: "speculation did not run"
 versus "speculation ran and never helped".
@@ -146,7 +146,7 @@ The claim to test is not "tok/s went up". It is two claims:
 1. **The output distribution is unchanged.** At `--temp 0` the text must
    be token-for-token identical to a plain decode of the same prompt and
    seed. That is a test, not a benchmark, and it runs in CI.
-2. **Tok/s went up on a real checkpoint**, measured with `ferrox bench`
+2. **Tok/s went up on a real checkpoint**, measured with `frink bench`
    on a quiet host, reported as a pair with the acceptance length, since
    a speedup without an accept rate cannot be reproduced or debugged.
 
@@ -155,7 +155,7 @@ worse on prose. Report which prompt produced the number.
 
 ## Not in scope
 
-AMD and HIP. ferrox's backends are CPU, CUDA and Metal, and Vulkan is
+AMD and HIP. frink's backends are CPU, CUDA and Metal, and Vulkan is
 one `Q8_0` matvec. Nothing in this plan is backend-specific: the draft
 model is another `Decoder` and verification is another `forward_batch`,
 so all three backends get it from the same code.

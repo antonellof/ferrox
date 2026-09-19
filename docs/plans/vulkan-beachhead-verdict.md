@@ -7,7 +7,7 @@ This is that verdict. Dated 2026-09-01.
 
 **The answer is GO**, on the narrow question actually asked, with the
 costs below written down so nobody has to rediscover them. The question
-was *can ferrox reach a Vulkan device from Rust, upload a quantized
+was *can frink reach a Vulkan device from Rust, upload a quantized
 weight verbatim, run one compute shader, and read back a correct
 answer?* It can, and it did.
 
@@ -19,10 +19,10 @@ here is a performance claim; no number was measured, deliberately.
 ## What ran
 
 ```
-$ cargo run -p ferrox-vulkan --features vulkan --example probe
+$ cargo run -p frink-vulkan --features vulkan --example probe
 vulkan device: Apple M2 Pro (Vulkan 1.0.357)
 
-$ cargo test -p ferrox-vulkan --features vulkan
+$ cargo test -p frink-vulkan --features vulkan
 test dispatch::tests::gpu_matvec_matches_the_scalar_twin ... ok
 test result: ok. 17 passed; 0 failed
 ```
@@ -33,7 +33,7 @@ shapes: `(rows, blocks) = (1,1), (9,3), (65,4), (200,11)`. Those cover a
 row stride that is not 4-byte aligned (`3 * 34 = 102`), a row count that
 is not a multiple of the 64-wide workgroup, and a dispatch spanning
 several workgroups. Every output matched the scalar twin within 1e-4
-relative, the same tolerance `ferrox-cuda`'s hardware test uses and for
+relative, the same tolerance `frink-cuda`'s hardware test uses and for
 the same reason: a GPU is free to contract `acc + a * b` into an FMA.
 
 Held to this repo's standard for a GPU kernel, which is a scalar twin
@@ -42,7 +42,7 @@ checked against an independent reference:
 | Claim | Checked by | Status |
 |---|---|---|
 | The f16 scale decode is right | `half` crate, **all 65,536** bit patterns | exact |
-| The twin is right | `ferrox_quant::dequant_q8_0` + a plain dot | **bit-exact**, 4 shapes |
+| The twin is right | `frink_quant::dequant_q8_0` + a plain dot | **bit-exact**, 4 shapes |
 | The emitted module is legal SPIR-V | `spirv-val --target-env vulkan1.0` | accepted |
 | The shader agrees with the twin | a real GPU | 1e-4 relative, 4 shapes |
 | The tests can fail | sabotage | see below |
@@ -78,13 +78,13 @@ project has, after a three-formula install.
 `ash` is a thin FFI binding: no build script, no bindgen, no vendored
 C++. With `default-features = false, features = ["loaded", "std"]` it
 opens `libvulkan` with `dlopen` at runtime, so **no Vulkan SDK, headers
-or linker flags are needed to build**, exactly the shape `ferrox-cuda`
+or linker flags are needed to build**, exactly the shape `frink-cuda`
 chose for cudarc. `cargo build --features vulkan` succeeds on a machine
 with no driver.
 
 `Cargo.lock` grew by exactly one third-party crate, `ash` (`libloading`
 was already in the tree). Compare `vulkano`, which layers a large safe
-abstraction and would decide ferrox's resource model for it, and
+abstraction and would decide frink's resource model for it, and
 `wgpu`, which is a second graphics abstraction entire. The roadmap
 named `ash` and the roadmap was right.
 
@@ -101,8 +101,8 @@ There are three ways to get SPIR-V into a Rust binary:
 
 1. **`glslangValidator` / `glslc` in `build.rs`.** What llama.cpp does
    (it builds a `vulkan-shaders-gen` C++ program at configure time).
-   Makes a C++ toolchain a build prerequisite for every ferrox user who
-   enables the feature, forever. `ferrox-cuda` deliberately refused the
+   Makes a C++ toolchain a build prerequisite for every frink user who
+   enables the feature, forever. `frink-cuda` deliberately refused the
    equivalent.
 2. **Commit pre-built `.spv` blobs.** No build dependency, but the repo
    carries opaque binaries no reviewer can read, which drift from
@@ -110,16 +110,16 @@ There are three ways to get SPIR-V into a Rust binary:
 3. **Emit the words from Rust.** No build step at all, ordinary
    reviewable Rust, testable with no GPU.
 
-The beachhead took option 3 and it works: `crates/ferrox-vulkan/src/spirv.rs`
+The beachhead took option 3 and it works: `crates/frink-vulkan/src/spirv.rs`
 is a ~250-line word emitter and the shader is ~560 lines of Rust that
 produce an 801-word (3,204-byte) module. `spirv-val` accepts it. The
 whole SPIR-V half compiles and is tested **unconditionally**, on a
-machine with no driver — which is strictly more than `ferrox-cuda` can
+machine with no driver — which is strictly more than `frink-cuda` can
 say, since NVRTC compiles at runtime.
 
 **And it does not scale.** ~560 lines of Rust per kernel, for the
 *simplest possible* kernel: one invocation per row, no subgroup
-reduction, no shared-memory tiling, no integer dot. `ferrox-metal` is
+reduction, no shared-memory tiling, no integer dot. `frink-metal` is
 19,881 lines with roughly 180 kernel definitions. Hand-emission at this
 rate is a six-figure line count and is not a serious proposal.
 
@@ -158,7 +158,7 @@ f16 scale is decoded with an integer `OpSelect` chain rather than a
 hardware `float16_t`.
 
 This is not a Q8_0 quirk. Q4_0 is 18 bytes, Q4_K is 144, Q6_K is 210.
-*Any* Vulkan backend for ferrox either does this byte extraction
+*Any* Vulkan backend for frink either does this byte extraction
 everywhere, or repacks weights on upload — and repacking gives up the
 zero-copy-from-mmap property that `amd-strix-halo` built its entire UMA
 argument on. llama.cpp's Vulkan backend takes the extraction road. So
@@ -174,7 +174,7 @@ deliberately did not take.
 The beachhead **copies** weights into host-visible device memory. The
 zero-copy import the archived plan wants —
 `VK_EXT_external_memory_host`, importing the GGUF mmap directly, as
-`ferrox-metal`'s `register_weight_mmap` / `BytesNoCopy` does — was not
+`frink-metal`'s `register_weight_mmap` / `BytesNoCopy` does — was not
 attempted. It is an optional extension, it needs page-aligned host
 pointers, and it is a property of a backend rather than of a GO/NO-GO.
 
@@ -184,7 +184,7 @@ of `vulkan-decode-path`, ahead of any kernel: on a unified-memory box a
 staging copy doubles the footprint, which is one of the two things
 Strix Halo punishes.
 
-### 5. How much of `ferrox-metal` transfers
+### 5. How much of `frink-metal` transfers
 
 More of the *structure* than of the *code*, and none of the kernels.
 
@@ -204,7 +204,7 @@ consumes pre-built SPIR-V, which is *better* for testing and worse for
 specialization.
 
 Realistic size of a full Vulkan backend, extrapolating from
-`ferrox-metal`'s 19,881 lines: **the same order, 15,000 to 25,000
+`frink-metal`'s 19,881 lines: **the same order, 15,000 to 25,000
 lines**, plus the shader-language decision above. That is an XL item and
 the roadmap already calls it one.
 
@@ -222,7 +222,7 @@ the roadmap already calls it one.
    "testable on an Intel iGPU" — testable on the M2 Pro that is already
    Host B, via MoltenVK, after `brew install molten-vk vulkan-loader`.
 3. **`backend-seam-refactor` is still first, and this crate is
-   deliberately not wired in.** `ferrox-vulkan` has no caller.
+   deliberately not wired in.** `frink-vulkan` has no caller.
    `WeightMatrix::apply_gpu` knows two backends, and adding a third to
    the seam as it stands means a third copy of four hand-kept tables
    with mismatched signatures, plus a share of 214 backend `#[cfg]`
@@ -232,7 +232,7 @@ the roadmap already calls it one.
 
 ## Appendix: the seam a third backend needs
 
-Surveyed 2026-09-01 against `crates/ferrox-core/src/weight_matrix.rs`,
+Surveyed 2026-09-01 against `crates/frink-core/src/weight_matrix.rs`,
 which this pass did not modify.
 
 There is no backend trait. `kernel_registry::Backend`
@@ -271,7 +271,7 @@ What the seam has to become:
    `fn(&[u8], &[f32], rows, row_bytes, n_blocks_per_row) -> Result<Vec<f32>, E>`
    — with one error type the backend errors convert into. The arity
    difference alone is what forces two dispatch tables that cannot be
-   written as one. `ferrox-vulkan`'s `q8_0_matvec` already takes exactly
+   written as one. `frink-vulkan`'s `q8_0_matvec` already takes exactly
    this argument list, on purpose.
 2. **One capability table per backend behind one shape.** A trait whose
    four members are `matvec_kernel`, `gemm_supported`, `dense_enabled`,

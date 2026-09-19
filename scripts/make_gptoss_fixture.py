@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `gpt-oss` GGUF used by ferrox's gpt-oss
+"""Generate the tiny synthetic `gpt-oss` GGUF used by frink's gpt-oss
 coverage tests, plus its metadata sidecar.
 
 The fixture is deliberately small (2 layers, 32-wide, 4 experts) but
@@ -9,7 +9,7 @@ generic GQA decoder does not otherwise see:
   * `blk.N.attn_sinks.weight`   -- per-head attention sink logits
   * `blk.N.attn_output.bias`    -- attention output bias
   * `blk.N.post_attention_norm` -- gpt-oss's *pre-FFN* norm (not Gemma's
-                                   post-attention norm; see the ferrox
+                                   post-attention norm; see the frink
                                    loader for why the distinction bites)
   * `blk.N.ffn_gate_inp.bias`   -- router bias
   * `blk.N.ffn_{gate,up,down}_exps.bias` -- per-expert biases
@@ -58,7 +58,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-gptoss-fixture")
+    w.add_name("frink-gptoss-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

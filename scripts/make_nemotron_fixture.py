@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `nemotron` GGUFs used by ferrox's
+"""Generate the tiny synthetic `nemotron` GGUFs used by frink's
 biased-LayerNorm coverage test.
 
 `nemotron` (Nemotron-4, Minitron) refused as a `dedicated` row for its
@@ -71,7 +71,7 @@ def main(out_path: str, biases: bool) -> None:
         return (0.5 + rng.standard_normal(N_EMBD) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-nemotron-fixture")
+    w.add_name("frink-nemotron-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -5,7 +5,7 @@
 // same streaming path. There is no private UI endpoint anywhere in this
 // app, which is what stops the public contract from rotting silently.
 //
-// Studio is a STANDALONE app — `ferrox-server` does not serve it — so it
+// Studio is a STANDALONE app — `frink-server` does not serve it — so it
 // cannot assume the page's own origin is the API's. Two supported ways
 // to point it at one:
 //
@@ -14,12 +14,12 @@
 //    out same-origin and CORS never applies. The base URL stays empty
 //    and every path below is used as-is.
 //  - **A different origin**: set the base URL on the Connect screen (or
-//    `VITE_FERROX_BASE_URL` at build time). The operator must then set
-//    `FERROX_CORS_ORIGINS` on the server to this app's exact origin —
+//    `VITE_FRINK_BASE_URL` at build time). The operator must then set
+//    `FRINK_CORS_ORIGINS` on the server to this app's exact origin —
 //    the wildcard is rejected by design, because `*` alongside a bearer
 //    token is a credential-leak shape.
 //
-// Route strings mirror `ferrox_api::routes` one-for-one. Keeping them
+// Route strings mirror `frink_api::routes` one-for-one. Keeping them
 // in a single object means a rename shows up here as one diff rather
 // than as a scattering of string literals.
 
@@ -50,8 +50,8 @@ export const routes = {
     `/admin/tasks/${encodeURIComponent(taskId)}/cancel`,
 } as const;
 
-const KEY_STORAGE = "ferrox.studio.apiKey";
-const BASE_STORAGE = "ferrox.studio.baseUrl";
+const KEY_STORAGE = "frink.studio.apiKey";
+const BASE_STORAGE = "frink.studio.baseUrl";
 
 /**
  * Build-time default, for a deployment that ships pre-pointed.
@@ -61,7 +61,7 @@ const BASE_STORAGE = "ferrox.studio.baseUrl";
  * exist at all.
  */
 const BUILT_IN_BASE = (
-  import.meta.env?.VITE_FERROX_BASE_URL ?? ""
+  import.meta.env?.VITE_FRINK_BASE_URL ?? ""
 ).replace(/\/+$/, "");
 
 /**
@@ -98,7 +98,7 @@ export function url(path: string): string {
   return base ? `${base}${path}` : path;
 }
 
-/** The API key, when the operator has set FERROX_API_KEY and told us. */
+/** The API key, when the operator has set FRINK_API_KEY and told us. */
 export function apiKey(): string {
   try {
     return localStorage.getItem(KEY_STORAGE) || "";
@@ -116,7 +116,7 @@ export function setApiKey(value: string): void {
   }
 }
 
-/** Where `ferrox-server` binds unless told otherwise. */
+/** Where `frink-server` binds unless told otherwise. */
 export const DEFAULT_SERVER_ORIGIN = "http://127.0.0.1:8383";
 
 /**
@@ -130,7 +130,7 @@ export const DEFAULT_SERVER_ORIGIN = "http://127.0.0.1:8383";
  * A snippet that works where it was copied and nowhere else is the same
  * failure as one that still says YOUR_MODEL_HERE.
  *
- * So: the configured base when there is one, and ferrox's default bind
+ * So: the configured base when there is one, and frink's default bind
  * address when there is not. The Connect screen says which it used.
  */
 export const snippetBase = () => apiBase() || DEFAULT_SERVER_ORIGIN;
@@ -148,12 +148,12 @@ export const baseUrl = () => apiBase() || window.location.origin;
  * than the alternative, which is inferring "that must have been the UI"
  * from timing.
  */
-export const CLIENT_LABEL = "ferrox-studio";
+export const CLIENT_LABEL = "frink-studio";
 
 function headers(extra: Record<string, string> = {}): Record<string, string> {
   const h: Record<string, string> = {
     ...extra,
-    "X-Ferrox-Client": CLIENT_LABEL,
+    "X-Frink-Client": CLIENT_LABEL,
   };
   const key = apiKey();
   if (key) h.Authorization = `Bearer ${key}`;

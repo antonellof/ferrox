@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `arcee` GGUF used by ferrox's ungated
+"""Generate the tiny synthetic `arcee` GGUF used by frink's ungated
 ReLU-squared coverage test.
 
 `arcee` (Arcee AFM-4.5B) was triaged NEW CODE on one fact shared with
@@ -23,7 +23,7 @@ NORM group), `1/sqrt(n_embd_head)` unless `f_attention_scale` is set
 
 What this fixture pins:
 
-  * **No `ffn_gate` tensor on any layer.** ferrox's `FfnActivation::
+  * **No `ffn_gate` tensor on any layer.** frink's `FfnActivation::
     ReluSqr` aliases the expert's gate to its up matrix so that
     `relu(gate) * up` is `relu(up)^2`; a decoder that demanded a gate
     could not load this file, and one that ran SwiGLU on the aliased
@@ -78,7 +78,7 @@ def main(out_path: str, gated: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-arcee-fixture")
+    w.add_name("frink-arcee-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

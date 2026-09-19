@@ -1,0 +1,147 @@
+{"type":"session_start","timestamp":"2026-09-02T10:56:10.731Z","version":"0.15.0","pid":10103}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.406Z","message":"assertion `left == right` failed\n  left: 0\n right: 3072","thread":"tokio-rt-worker","location":"crates/ferrox-core/src/matmul.rs:63","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.407Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:1800","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.413Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.413Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.416Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.417Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.420Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.420Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.423Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.424Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.428Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.428Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.428Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.429Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.430Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.431Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.434Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.435Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.436Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.437Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.438Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.440Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.440Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:53.442Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:57.103Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:57.103Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:57.103Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:10:57.104Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:11:00.390Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:11:00.394Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:11:00.397Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:11:00.400Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:11:02.840Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:11:02.985Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:11:07.820Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:11:14.735Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"session_start","timestamp":"2026-09-02T11:11:50.930Z","version":"0.15.0","pid":19922}
+{"type":"panic","timestamp":"2026-09-02T11:12:05.044Z","message":"assertion `left == right` failed\n  left: 0\n right: 3072","thread":"tokio-rt-worker","location":"crates/ferrox-core/src/matmul.rs:63","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:05.046Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:1800","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:07.055Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:07.055Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:09.066Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:09.067Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:09.076Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:09.077Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:11.091Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:11.093Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:11.094Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:11.096Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:11.097Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:11.104Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:11.104Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:11.105Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:16.392Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"session_start","timestamp":"2026-09-02T11:12:21.863Z","version":"0.15.0","pid":20260}
+{"type":"panic","timestamp":"2026-09-02T11:12:44.119Z","message":"assertion `left == right` failed\n  left: 0\n right: 3072","thread":"tokio-rt-worker","location":"crates/ferrox-core/src/matmul.rs:63","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:44.120Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:1800","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:47.147Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:47.147Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:47.148Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:12:47.148Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"session_start","timestamp":"2026-09-02T11:13:17.671Z","version":"0.15.0","pid":20695}
+{"type":"panic","timestamp":"2026-09-02T11:13:32.068Z","message":"assertion `left == right` failed\n  left: 0\n right: 3072","thread":"tokio-rt-worker","location":"crates/ferrox-core/src/matmul.rs:63","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:32.069Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:1800","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:35.094Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:35.095Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:35.108Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:38.135Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:38.135Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:38.136Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:38.136Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:41.152Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:41.153Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:41.153Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:41.153Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:41.163Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:44.192Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:44.195Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:44.195Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:44.195Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:44.196Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:44.196Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:44.197Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:44.197Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.231Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.231Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.233Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.233Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.234Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.235Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.235Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.235Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"panic","timestamp":"2026-09-02T11:13:47.245Z","message":"called `Result::unwrap()` on an `Err` value: PoisonError { .. }","thread":"tokio-rt-worker","location":"crates/ferrox-models/src/decoder.rs:3749","expected":false}
+{"type":"session_start","timestamp":"2026-09-02T11:13:59.703Z","version":"0.15.0","pid":20876}
+{"type":"session_start","timestamp":"2026-09-02T11:42:42.190Z","version":"0.15.1","pid":37476}
+{"type":"session_start","timestamp":"2026-09-02T12:33:09.710Z","version":"0.15.2","pid":67704}
+{"type":"session_start","timestamp":"2026-09-02T12:49:02.044Z","version":"0.15.2","pid":83153}
+{"type":"session_start","timestamp":"2026-09-02T12:50:30.229Z","version":"0.15.2","pid":85021}
+{"type":"session_start","timestamp":"2026-09-02T12:53:23.992Z","version":"0.15.2","pid":89542}
+{"type":"session_start","timestamp":"2026-09-02T12:54:18.078Z","version":"0.15.2","pid":90546}
+{"type":"session_start","timestamp":"2026-09-02T12:54:51.956Z","version":"0.15.2","pid":91473}
+{"type":"session_start","timestamp":"2026-09-02T12:56:33.766Z","version":"0.15.2","pid":92989}
+{"type":"session_start","timestamp":"2026-09-02T12:57:02.551Z","version":"0.15.2","pid":93154}
+{"type":"session_start","timestamp":"2026-09-02T14:38:54.619Z","version":"0.15.3","pid":648}
+{"type":"session_start","timestamp":"2026-09-02T14:39:49.538Z","version":"0.15.3","pid":1383}
+{"type":"session_start","timestamp":"2026-09-02T14:59:22.873Z","version":"0.15.3","pid":15942}
+{"type":"session_start","timestamp":"2026-09-02T15:00:46.000Z","version":"0.15.3","pid":16451}
+{"type":"session_start","timestamp":"2026-09-04T10:28:50.424Z","version":"0.17.0","pid":65580}
+{"type":"session_start","timestamp":"2026-09-04T10:29:34.174Z","version":"0.17.0","pid":65847}
+{"type":"session_start","timestamp":"2026-09-04T10:35:19.086Z","version":"0.16.0","pid":68278}
+{"type":"session_start","timestamp":"2026-09-04T10:37:06.013Z","version":"0.16.0","pid":69664}
+{"type":"session_start","timestamp":"2026-09-04T14:22:21.441Z","version":"0.17.0","pid":28792}
+{"type":"session_start","timestamp":"2026-09-09T17:46:28.074Z","version":"0.17.1","pid":66725}
+{"type":"session_start","timestamp":"2026-09-09T18:30:06.549Z","version":"0.17.1","pid":83436}
+{"type":"session_start","timestamp":"2026-09-10T07:17:52.682Z","version":"0.17.1","pid":7436}
+{"type":"session_start","timestamp":"2026-09-10T11:46:01.411Z","version":"0.17.1","pid":91375}
+{"type":"session_start","timestamp":"2026-09-10T12:29:36.523Z","version":"0.17.1","pid":87583}
+{"type":"session_start","timestamp":"2026-09-10T12:33:23.695Z","version":"0.19.0","pid":91965}
+{"type":"session_start","timestamp":"2026-09-10T12:36:24.655Z","version":"0.19.0","pid":94380}
+{"type":"session_start","timestamp":"2026-09-10T12:57:52.117Z","version":"0.19.0","pid":19517}
+{"type":"session_start","timestamp":"2026-09-10T13:56:19.211Z","version":"0.19.0","pid":87011}
+{"type":"session_start","timestamp":"2026-09-10T14:15:32.575Z","version":"0.19.0","pid":36845}
+{"type":"session_start","timestamp":"2026-09-10T17:24:37.229Z","version":"0.19.1","pid":13679}
+{"type":"session_start","timestamp":"2026-09-11T05:05:54.728Z","version":"0.19.1","pid":3996}
+{"type":"session_start","timestamp":"2026-09-11T09:31:42.200Z","version":"0.20.0","pid":88591}
+{"type":"session_start","timestamp":"2026-09-11T11:47:48.330Z","version":"0.20.0","pid":74459}
+{"type":"session_start","timestamp":"2026-09-11T17:57:46.235Z","version":"0.20.0","pid":62663}
+{"type":"session_start","timestamp":"2026-09-11T18:05:30.381Z","version":"0.20.0","pid":68218}
+{"type":"session_start","timestamp":"2026-09-12T07:02:41.646Z","version":"0.21.0","pid":58697}
+{"type":"session_start","timestamp":"2026-09-18T09:53:26.295Z","version":"0.22.0","pid":57269}
+{"type":"session_start","timestamp":"2026-09-18T09:54:15.124Z","version":"0.22.0","pid":57767}
+{"type":"session_start","timestamp":"2026-09-18T10:02:41.719Z","version":"0.22.0","pid":59535}
+{"type":"session_start","timestamp":"2026-09-18T12:46:36.703Z","version":"0.22.0","pid":28465}
+{"type":"session_start","timestamp":"2026-09-18T13:15:13.553Z","version":"0.22.0","pid":40184}
+{"type":"session_start","timestamp":"2026-09-18T13:26:56.380Z","version":"0.22.0","pid":48599}
+{"type":"session_start","timestamp":"2026-09-18T16:19:54.429Z","version":"0.22.0","pid":3803}
+{"type":"session_start","timestamp":"2026-09-18T16:24:24.912Z","version":"0.22.0","pid":7249}
+{"type":"session_start","timestamp":"2026-09-18T16:29:25.875Z","version":"0.22.0","pid":15714}
+{"type":"session_start","timestamp":"2026-09-18T16:29:47.003Z","version":"0.22.0","pid":16413}
+{"type":"session_start","timestamp":"2026-09-18T16:33:33.351Z","version":"0.22.0","pid":19262}
+{"type":"session_start","timestamp":"2026-09-18T16:52:36.357Z","version":"0.22.0","pid":22157}
+{"type":"session_start","timestamp":"2026-09-18T16:53:01.851Z","version":"0.22.0","pid":22303}
+{"type":"session_start","timestamp":"2026-09-18T17:03:05.441Z","version":"0.22.0","pid":24862}
+{"type":"session_start","timestamp":"2026-09-18T17:29:43.197Z","version":"0.22.0","pid":33209}
+{"type":"session_start","timestamp":"2026-09-19T06:34:28.070Z","version":"0.24.0","pid":47330}
+{"type":"session_start","timestamp":"2026-09-19T06:50:34.307Z","version":"0.24.0","pid":50111}

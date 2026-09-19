@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `plamo3` GGUF used by ferrox's PLaMo-3
+"""Generate the tiny synthetic `plamo3` GGUF used by frink's PLaMo-3
 coverage test.
 
-`plamo3` is Preferred Networks' PLaMo-3. It sat on ferrox's generic GQA
+`plamo3` is Preferred Networks' PLaMo-3. It sat on frink's generic GQA
 path refusing as UNAUDITED, triaged FIXTURE-AWAY -- and that verdict was
 WRONG by one tensor name, which building this fixture is what found.
 
@@ -59,7 +59,7 @@ Everything else it pins against `plamo3.cpp`:
     rotate identically and the SWA test is about MASKING alone.
   * `attention.key_length == attention.value_length`, which the triage
     verdict asked to confirm on the fixture: llama.cpp carries
-    head_dim_q and head_dim_v separately (:25-26) and ferrox has one
+    head_dim_q and head_dim_v separately (:25-26) and frink has one
     head_dim, so a checkpoint where they differ is refused by name in
     `loader.rs` and is out of scope here.
 
@@ -110,7 +110,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-plamo3-fixture")
+    w.add_name("frink-plamo3-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

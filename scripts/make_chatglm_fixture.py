@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `chatglm` GGUF used by ferrox's ChatGLM
+"""Generate the tiny synthetic `chatglm` GGUF used by frink's ChatGLM
 coverage test.
 
 THE ARM this fixture exists for is the **fused `attn_qkv.bias`**.
@@ -7,7 +7,7 @@ THE ARM this fixture exists for is the **fused `attn_qkv.bias`**.
 fused `attn_qkv.weight` and, when it finds one, creates `attn_qkv.bias`
 beside it (llama-model.cpp:2890-2892); `build_qkv` then adds that bias
 to the fused projection BEFORE splitting it into Q, K and V
-(llama-graph.cpp:1605-1609). ferrox's `load_qkv_projections` split the
+(llama-graph.cpp:1605-1609). frink's `load_qkv_projections` split the
 fused WEIGHT and read bias only under the split `attn_q.bias` /
 `attn_k.bias` / `attn_v.bias` names, so on a real ChatGLM2/3 checkpoint
 -- which sets `add_qkv_bias: true` and stores
@@ -30,7 +30,7 @@ The rest of the graph, read off `src/models/chatglm.cpp`:
     no QK-norm, no biases other than the QKV one.
   * The graph (:75-145) is a plain sequential residual with
     `1/sqrt(n_embd_head)` (:108) and `LLM_FFN_SWIGLU, LLM_FFN_SEQ`
-    (:133) -- the fused gate+up SwiGLU ferrox already implements for
+    (:133) -- the fused gate+up SwiGLU frink already implements for
     phi3, gate first half, up second half (`ggml_swiglu`, non-swapped:
     `ggml/src/ggml-cpu/ops.cpp:3225-3229`).
   * RoPE is **NORM** (`LLM_ARCH_CHATGLM` sits in
@@ -98,7 +98,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-chatglm-fixture")
+    w.add_name("frink-chatglm-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

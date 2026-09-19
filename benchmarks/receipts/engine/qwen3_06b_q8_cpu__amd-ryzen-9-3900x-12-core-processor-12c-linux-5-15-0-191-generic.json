@@ -5,9 +5,9 @@
   "backend": "cpu",
   "backend_active": "CPU",
   "engine_env": {
-    "FERROX_CPU_INT_DOT": "1"
+    "FRINK_CPU_INT_DOT": "1"
   },
-  "ferrox_version": "0.21.0",
+  "frink_version": "0.21.0",
   "host_load_1min_end": 4.07,
   "host_load_1min_start": 1.88,
   "host_spec": {
@@ -44,26 +44,26 @@
   "size_bytes": 639446688,
   "tests": [
     {
-      "ferrox_samples": [
+      "frink_samples": [
         439.7493664289531,
         434.71301400672667,
         433.1619210089575
       ],
-      "ferrox_stddev": 2.811981752153849,
-      "ferrox_tps": 434.71301400672667,
+      "frink_stddev": 2.811981752153849,
+      "frink_tps": 434.71301400672667,
       "gap": 1.4990809545672266,
       "llama_tps": 651.67,
       "test": "pp512",
       "workload_digest": "b8d417040110e751"
     },
     {
-      "ferrox_samples": [
+      "frink_samples": [
         35.009962095654934,
         35.14889194610595,
         34.902559754904935
       ],
-      "ferrox_stddev": 0.10083887839673988,
-      "ferrox_tps": 35.009962095654934,
+      "frink_stddev": 0.10083887839673988,
+      "frink_tps": 35.009962095654934,
       "gap": 1.1459595383274999,
       "llama_tps": 40.12,
       "test": "tg128",

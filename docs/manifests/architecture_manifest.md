@@ -1,6 +1,6 @@
 # Architecture coverage manifest
 
-Generated from `ferrox_models::capability::architecture_catalog`.
+Generated from `frink_models::capability::architecture_catalog`.
 Source of truth for names: pinned llama.cpp `LLM_ARCH_NAMES`.
 
 | GGUF arch | Scope | Family | Memory | Path |

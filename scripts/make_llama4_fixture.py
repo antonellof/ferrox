@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `llama4` GGUFs used by ferrox's Llama 4
-coverage test (`crates/ferrox-models/tests/llama4_graphs.rs`).
+"""Generate the tiny synthetic `llama4` GGUFs used by frink's Llama 4
+coverage test (`crates/frink-models/tests/llama4_graphs.rs`).
 
 `llama4` is Llama 4 Scout (16 experts) / Maverick (128 experts) and the
 MobileLLM dense series (no experts). `.scratch/llama.cpp/src/models/
@@ -46,7 +46,7 @@ Variants:
   * `--128e`         128 experts (Maverick): `use_kq_norm` off
   * `--dense`        no experts (MobileLLM's hparams type): a file
                      libllama REFUSES (`llama4.cpp:49-51`, "model cannot
-                     have zero experts", measured), so ferrox refuses it too
+                     have zero experts", measured), so frink refuses it too
   * `--output`       a separate `output.weight`
 
 Usage:
@@ -89,7 +89,7 @@ def main(out_path: str, dense: bool, noswa: bool, experts: int, separate_output:
 
     n_expert = 0 if dense else experts
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-llama4-fixture")
+    w.add_name("frink-llama4-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

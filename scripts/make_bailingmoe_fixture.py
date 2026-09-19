@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `bailingmoe` GGUF used by ferrox's
+"""Generate the tiny synthetic `bailingmoe` GGUF used by frink's
 Ling/BailingMoE coverage test.
 
-`bailingmoe` is what inclusionAI's Ling models tag. It sat on ferrox's
+`bailingmoe` is what inclusionAI's Ling models tag. It sat on frink's
 generic GQA path refusing as UNAUDITED, triaged ONE MATCH ARM for one
 reason: llama.cpp READS `{arch}.leading_dense_block_count` and then never
 branches on it. `src/models/bailingmoe.cpp:5` reads the key; :39-54
@@ -26,11 +26,11 @@ Everything else it pins against `bailingmoe.cpp`:
   * A shared expert on every layer, added to the routed output before
     the residual (:139-151), sized `n_ff_exp * n_expert_shared`.
   * SOFTMAX gating, hardcoded at :133; no converter writes
-    `expert_gating_func` for this architecture, so ferrox's softmax
+    `expert_gating_func` for this architecture, so frink's softmax
     default has to be the right one.
   * `expert_weights_norm` read from METADATA (:9, and
     `conversion/bailingmoe.py:31` writes it). This file sets it
-    **false**, which is the opposite of ferrox's architecture-name
+    **false**, which is the opposite of frink's architecture-name
     default, so a decoder ignoring the key renormalises the top-k
     weights and diverges.
   * `expert_weights_scale` read from metadata (:8), set here to a value
@@ -94,7 +94,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-bailingmoe-fixture")
+    w.add_name("frink-bailingmoe-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
@@ -111,7 +111,7 @@ def main(out_path: str) -> None:
     w.add_expert_feed_forward_length(N_FF_EXP)
     w.add_expert_shared_count(N_EXPERT_SHARED)
     w.add_expert_weights_scale(EXPERT_WEIGHTS_SCALE)
-    # False, against ferrox's architecture-name default of true.
+    # False, against frink's architecture-name default of true.
     w.add_expert_weights_norm(False)
     # The inert key. Every layer below is MoE anyway.
     w.add_leading_dense_block_count(LEADING_DENSE)

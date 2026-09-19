@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `plamo` GGUF used by ferrox's
+"""Generate the tiny synthetic `plamo` GGUF used by frink's
 parallel-residual coverage test.
 
 `plamo` (PLaMo-13B) refused as a `dedicated` row for its parallel
@@ -54,7 +54,7 @@ def main(out_path: str) -> None:
         return (1.0 + rng.standard_normal(n) * 0.3).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-plamo-fixture")
+    w.add_name("frink-plamo-fixture")
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
     w.add_feed_forward_length(N_FF)

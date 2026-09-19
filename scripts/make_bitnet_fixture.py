@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `bitnet` GGUFs used by ferrox's
+"""Generate the tiny synthetic `bitnet` GGUFs used by frink's
 sub-norm coverage test.
 
 `bitnet` refused as UNAUDITED, triaged NEW CODE, on two norms INSIDE
@@ -17,7 +17,7 @@ the blocks, in slots the generic decoder did not have
     (:127-132) and the graph applies `ffn_down` itself afterwards.
 
 `grep -l 'attn_sub_norm\\|ffn_sub_norm' src/models/*.cpp` over all
-140 graphs is `bitnet.cpp` alone (measured). `crates/ferrox-models/
+140 graphs is `bitnet.cpp` alone (measured). `crates/frink-models/
 src/sub_norms.rs` is the seam.
 
 The rest of the graph is plain Llama: pre-norm RMS, NEOX-layout RoPE
@@ -39,7 +39,7 @@ tensors (`{1}`, `TENSOR_NOT_REQUIRED`, `:27-43`) that `build_lora_mm`
 multiplies the matmul result by (`llama-graph.cpp:1492-1494`). The
 CURRENT converter writes ternary weights already divided by the scale
 and emits no such tensor (`conversion/bitnet.py:23-32`); older BitNet
-exports carry them, and llama.cpp still honours them. ferrox does NOT
+exports carry them, and llama.cpp still honours them. frink does NOT
 apply them, and the test on this shape pins that it REFUSES the file
 (the tensors are unread) rather than running it at the wrong scale.
 
@@ -91,7 +91,7 @@ def main(out_path: str, with_scales: bool) -> None:
         return (1.5 + rng.standard_normal(n) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-bitnet-fixture")
+    w.add_name("frink-bitnet-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -22,7 +22,7 @@ import {
   Square,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { FerroxMark } from "@/components/logo";
+import { FrinkMark } from "@/components/logo";
 import { fmtInt } from "@/lib/format";
 import { parseThought, THOUGHT_KEY } from "@/lib/thought";
 import { cn } from "@/lib/utils";
@@ -37,7 +37,7 @@ import {
 
 // The transcript, the composer, autoscroll, branching and the abort
 // signal are assistant-ui's. What is written here is presentation plus
-// the one thing that is genuinely ferrox's: the stat line under an
+// the one thing that is genuinely frink's: the stat line under an
 // answer, which is the server's `usage` and nothing else.
 //
 // Note what is NOT used: `useMessageTiming()`. assistant-ui measures its
@@ -216,7 +216,7 @@ const AssistantMessage: FC = () => (
   <MessagePrimitive.Root className="group flex w-full flex-col gap-1">
     <div className="flex gap-3">
       <span className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-md border border-line bg-inset text-muted">
-        <FerroxMark className="size-3.5" />
+        <FrinkMark className="size-3.5" />
       </span>
       <div className="min-w-0 flex-1">
         <div className="min-w-0">
@@ -269,7 +269,7 @@ function Empty({ disabledReason }: { disabledReason: string | null }) {
   return (
     <ThreadPrimitive.Empty>
       <div className="flex flex-col items-center gap-5 px-4 py-14 text-center">
-        <FerroxMark className="size-11 text-fg" />
+        <FrinkMark className="size-11 text-fg" />
         <div className="space-y-1.5">
           <p className="text-base font-semibold tracking-tight">
             Talk to your local model

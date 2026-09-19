@@ -5,7 +5,7 @@ Guidance for agents working in this repo.
 ## What this is
 
 Pure-Rust GGUF / MoE inference engine: mmap loaders, quantized CPU +
-Metal + CUDA kernels, OpenAI-compatible `ferrox-server`.
+Metal + CUDA kernels, OpenAI-compatible `frink-server`.
 
 **The goal is to be the Rust alternative to llama.cpp**: same models,
 same command shapes, same or better performance, on the hardware people
@@ -36,7 +36,7 @@ per-head sigmoid attention gate, one row of `crate::attn_gate` beside
 `step35`'s, and the rest of its graph -- the window ARRAY with
 `rope.freq_base_swa`, per-layer head counts that SIZE the gate, a gated
 GELU FFN -- was already served, each by an existing table that had to
-gain one name. KL 7.70e-7 at the GELU-table line, and with ferrox's
+gain one name. KL 7.70e-7 at the GELU-table line, and with frink's
 GELU made to emulate ggml's f16 table the same file agrees to 6.08e-6
 (KL 3.34e-12), so the residual is llama.cpp's own approximation and the
 row is pinned at 5e-3 with that measurement beside it. Three sabotages
@@ -53,7 +53,7 @@ With them nonzero it was 0.12 off, and the cause is not in
 (`maple`, `deepseek4`, `hy_v4`, `dflash` with hyper-connections) to
 `ggml_swiglu_clamp`, which clamps the gate BEFORE the SiLU
 (`ggml/src/ggml-cpu/ops.cpp:3450-3454`), where every other graph takes
-the `else` branch and clamps the SiLU's OUTPUT. `ferrox_moe::ClampForm`
+the `else` branch and clamps the SiLU's OUTPUT. `frink_moe::ClampForm`
 is the two forms and `act_layers::CLAMP_BEFORE_SILU` the list; the two
 agree wherever `silu(x) <= limit`, so a fixture whose clamp never binds
 cannot tell them apart. Reading the graph file is not enough when the
@@ -127,12 +127,12 @@ Three things the pin move found that are not new architectures at all:
 was added while `llama-arch.cpp:155` writes `kimi-k3`, so that refusal
 could never fire on a real file; `nextn_predict_layers` is now read by
 llama.cpp's COMMON loader for every architecture (upstream 9d81721),
-which makes ferrox's seventeen-reader gate an over-refusal and is
+which makes frink's seventeen-reader gate an over-refusal and is
 recorded in `crate::mtp_blocks` as the next row; and
-`expert_used_count` is read there as scalar-OR-ARRAY, where ferrox read
+`expert_used_count` is read there as scalar-OR-ARRAY, where frink read
 a scalar and silently defaulted to 2 for the array spelling that
 `conversion/nemotron.py:574` writes for Nemotron-H Puzzle -- an
-architecture ferrox SERVES. A uniform array is honoured now and a
+architecture frink SERVES. A uniform array is honoured now and a
 varying one stops by name. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
@@ -162,12 +162,12 @@ to `gqa_norm` and the fixture matched at 9.7e-15 -- because the row
 had been sent to the GLM-5.2 MLA loader for keys `glm4.cpp` never
 reads, exactly the `glm4moe` defect on the family's dense members.
 The one thing either needs beyond the generic path is
-`ferrox-models/src/mrope.rs`: a vision export's text tower declares
+`frink-models/src/mrope.rs`: a vision export's text tower declares
 `rope.dimension_sections`, and llama.cpp's M-RoPE on text positions
 is NEOX band for band, which is `glm4moe`'s layout already (served,
 libllama byte-identical) and is NOT `glm4`'s NORM -- the converter
 permutes those weights to NEOX order, libllama's logits move by 0.72,
-and ferrox refuses the file by name. `smollm3` and EXAONE-4 32B closed
+and frink refuses the file by name. `smollm3` and EXAONE-4 32B closed
 with `exaone-moe` and are the same case, one a DedicatedOnly refusal and
 the other a refusal by name; the clamped OLMo-1 checkpoints closed with
 `dbrx` the same way.
@@ -251,7 +251,7 @@ fixture that now has a golden, and the two rows are one table with
 two columns (presence, scale on the sum); the operand its verdict said
 the router seam "does not reach" is a third variant of that seam.
 
-`arctic` closed on `ferrox-models/src/parallel_dense_ffn.rs` and a
+`arctic` closed on `frink-models/src/parallel_dense_ffn.rs` and a
 third `RouterInput` variant. `arctic.cpp:118-154` runs a dense SiLU
 FFN sized `{n_embd, n_embd}` (`:38-42`) on `ffn_norm(ffn_inp)`, the
 router AND the experts on `ffn_norm_exps(inpSA)` -- the layer INPUT
@@ -288,14 +288,14 @@ at the row site and at the batch site each turns the golden red
 
 The MLA engine's second and third goldens are `deepseek2` itself, in
 both tensor forms (`tests/deepseek2_graphs.rs`, KL 2.35e-15 and
-3.57e-15). `ferrox-models/src/mla.rs`'s `MlaKvB` is the two forms as
+3.57e-15). `frink-models/src/mla.rs`'s `MlaKvB` is the two forms as
 one enum: `Combined` (`attn_kv_b`, the legacy converter's and `plm`'s)
 expands the latent per head and attends with per-head caches
 (`deepseek2.cpp:600-635`); `Split` (`attn_k_b` / `attn_v_b`, EVERY
 DeepSeek export since the `_mla` keys existed, which the loader had
 refused as "not wired") absorbs the query through `wk_b`, attends as
 MQA over the latent `concat(c, k_pe)` and pulls the result through
-`wv_b` (`:563-598`; `ferrox-core/src/mla_absorbed.rs`, whose unit test
+`wv_b` (`:563-598`; `frink-core/src/mla_absorbed.rs`, whose unit test
 pins the two forms equal), with the cache `kv_lora_rank + qk_rope`
 wide instead of `n_heads * (qk_nope + qk_rope + v)`. `kq_scale` stays
 `1/sqrt(qk_nope + qk_rope)` for both -- the latent width is the
@@ -309,7 +309,7 @@ matrix and the split pair from ONE draw exactly as the converter
 splits them, and libllama's two branches agree on the pair to 1.79e-7,
 which is the number that says the derivation is the converter's.
 
-YaRN on that engine is `ferrox-models/src/mla_yarn.rs`, and it is
+YaRN on that engine is `frink-models/src/mla_yarn.rs`, and it is
 three places in llama.cpp read in order, because a reading of any one
 of them is wrong in a way only libllama's logits show:
 `deepseek2.cpp:34-37` DIVIDE `rope.scaling.yarn_log_multiplier` by 0.1
@@ -337,7 +337,7 @@ name. With the split tensors and YaRN both served, a real DeepSeek-V2
 / V3 export has nothing left that this engine refuses on its
 attention; what it has not had is a real file run through it.
 
-`plm` closed on `ferrox-models/src/mla_arch.rs` and `mla_q_proj.rs`, on
+`plm` closed on `frink-models/src/mla_arch.rs` and `mla_q_proj.rs`, on
 the MLA engine. `plm.cpp:84-166` is `deepseek2.cpp`'s naive MLA branch
 line for line (`grep -l ATTN_KV_A_MQA` over all 155 graphs is six
 files, `plm` the only one on no engine), and what differs is three
@@ -351,7 +351,7 @@ reach without the answer), an ungated `LLM_FFN_RELU_SQR` dense FFN
 carried ON `MlaDenseFfn` so the body cannot run it through SwiGLU), and
 a tied lm_head the graph never reads an `output.weight` for (`:23-24`;
 libllama REFUSES a file carrying one, `done_getting_tensors: wrong
-number of tensors; expected 30, got 29`, measured, so ferrox refuses it
+number of tensors; expected 30, got 29`, measured, so frink refuses it
 too rather than prefer the decoy). The head widths come from
 `attention.key_length` / `value_length` because `llama-hparams.cpp:
 259-265` fall back to them when the `_mla` keys are absent, which is
@@ -373,7 +373,7 @@ the RMS twin of OLMo-1's `LayerNormNoParams`, through the same
 after RoPE with a weightless per-head K norm, `:82-91`; decided by
 architecture because the length is ambiguous with `head_dim`; and a
 per-head RMS is invariant under RoPE, so the order is honoured and
-unobservable on this shape). `ferrox-models/src/skip_stream.rs` (the
+unobservable on this shape). `frink-models/src/skip_stream.rs` (the
 normed embedding added into every layer's output times
 `layer_output_scale`, `:52,123-126`; one `bool`, the norm at the ONE
 embedding site, the add at the end of BOTH FFN bodies through an
@@ -385,7 +385,7 @@ and multiplied (`MultiplierSupport::TALKIE`). KL 6.43e-14 and 1.47e-14
 (no gains; dropping them from the first file lands exactly on the
 second's golden); sabotaging the skip add turns four tests red.
 
-`nanbeige` closed on `ferrox-models/src/layer_loops.rs`. `nanbeige.cpp:
+`nanbeige` closed on `frink-models/src/layer_loops.rs`. `nanbeige.cpp:
 6-12` read `num_loops` / `skip_loop_final_norm`; `:19-31` set
 `n_layer_all = n_phys * n_loops` and replicate the per-layer arrays;
 `:69-73` alias `layers[i + j * n_phys] = layers[i]`; `:167-175` norm the
@@ -402,7 +402,7 @@ launches refuse a looped model (one `l` for weights and KV). KL
 3.06e-13, 4.05e-13 (`skip_loop_final_norm`), 8.70e-13 (`num_loops = 1`,
 plain Llama); sabotaging the mapping turns four tests red.
 
-`mimo2` closed on `ferrox-models/src/kv_head_dims.rs`. `conversion/
+`mimo2` closed on `frink-models/src/kv_head_dims.rs`. `conversion/
 mimo.py:154` writes `attention.value_length` from `v_head_dim` apart
 from the `attention.key_length` the base converter writes from
 `head_dim` (`192` / `128` on MiMo-V2-Flash), and `mimo2.cpp:47-48,
@@ -425,7 +425,7 @@ host bodies, the KV budget. Refusing: every fused Metal launch
 (`metal_can_serve_model`), the CUDA resident hook, the slot file, the
 KV block file (one `head_dim` in each header). The row's second half,
 `attention.value_scale` (`:14-17,180-183`, `0.707` on every export),
-is `ferrox-models/src/attn_value_scale.rs`: one reader of 155, applied
+is `frink-models/src/attn_value_scale.rs`: one reader of 155, applied
 after `wo` in the one attention tail. KL 5.42e-15 (the converter's
 fused `attn_qkv`, K rows at 12, V rows at 8), 5.42e-15 (split
 spelling; libllama byte-identical for the two), 3.49e-15 (no value
@@ -436,7 +436,7 @@ export does. Two findings. `mimo2.cpp:227` passes the SIGMOID literal
 into `build_moe_ffn`, so the key is never read: parsing every
 `build_moe_ffn` call in all 155 graphs, three pass SIGMOID, twenty-six
 SOFTMAX, nineteen the hparam (`GATING_LITERAL_ARCHITECTURES`). And the
-bisection that found the last 2e-3 of KL found ferrox honouring
+bisection that found the last 2e-3 of KL found frink honouring
 `expert_weights_scale` for EVERY architecture where llama.cpp reads
 the key in twenty per-architecture loaders and nowhere else -- the
 fixture declares `2.5`, `mimo2.cpp` never reads it, libllama's golden
@@ -444,7 +444,7 @@ is unscaled. `EXPERT_WEIGHTS_SCALE_READERS` / `EXPERT_WEIGHTS_NORM_
 READERS` are the readers, measured; no real export of a non-reader
 writes either key.
 
-`bitnet` closed on `ferrox-models/src/sub_norms.rs`. `bitnet.cpp:24,36`
+`bitnet` closed on `frink-models/src/sub_norms.rs`. `bitnet.cpp:24,36`
 require `attn_sub_norm` `{n_embd}` and `ffn_sub_norm` `{n_ff}`, two
 RMSNorms INSIDE the sublayers where the decoder's four sites are all
 outside them: `:101-106` norm the attention output BEFORE `wo` (the
@@ -457,7 +457,7 @@ FFN one on a routed layer, where `build_moe_ffn` has no such site), and
 `metal_can_serve_model` refuses every fused launch on it; the
 exhaustive destructure in `metal_attn_view` refuses the layer as well.
 The arithmetic landed where the tails already were -- `attn_out_to_
-residual_rows`, the one attention tail, and `ferrox_moe::
+residual_rows`, the one attention tail, and `frink_moe::
 run_expert_sub_normed`, which shares its gate/up half with `run_expert`
 (a new `expert_activated`) and cannot reach the fused on-device SwiGLU
 because that kernel runs `down` itself; `dense_ffn_batch` applies it
@@ -471,15 +471,15 @@ by them, and since `llama-model.cpp:1355-1440` a GENERIC pass creates
 `.scale` / `.input_scale` beside every architecture's projections (the
 NVFP4 converter writes them; the current BitNet converter folds them
 in). libllama's logits for a fixture with seven `2.0` scales differ
-from the unscaled file's, measured, so `ferrox-models/src/
+from the unscaled file's, measured, so `frink-models/src/
 weight_scales.rs` refuses either suffix by name BEFORE the
-unread-tensor gate, which `FERROX_ALLOW_UNKNOWN_TENSORS=1` could have
+unread-tensor gate, which `FRINK_ALLOW_UNKNOWN_TENSORS=1` could have
 talked past into every projection at the wrong magnitude. A real
 BitNet-b1.58-2B-4T still needs `TQ1_0` / `TQ2_0` (or `i2_s`) kernels,
-which `ferrox-gguf` inspects and refuses at execution; the row is
+which `frink-gguf` inspects and refuses at execution; the row is
 evidenced on F32 and runs a Q8_0 / F16 re-export.
 
-`smallthinker` closed on `ferrox-models/src/router_input.rs`. Every
+`smallthinker` closed on `frink-models/src/router_input.rs`. Every
 `build_moe_ffn(` call in all 155 graphs was parsed for its `probs_in`
 argument before a line was written: fifty-nine sites, four pass one.
 `smallthinker.cpp:111` computes the router logits from `inpL`, the
@@ -513,7 +513,7 @@ converter's softmax arm), 6.56e-15 (a keyed `sliding_window_pattern =
 batched FFN tails onto one `Decoder::ffn_block_batch`, because the
 seam needed an eighth fact in all of them.
 
-`mistral3` closed on `ferrox-models/src/attn_temperature.rs`. `grep -ln
+`mistral3` closed on `frink-models/src/attn_temperature.rs`. `grep -ln
 'attn_temp\|temperature_scale\|build_inp_attn_scale' src/models/*.cpp`
 over all 155 graphs is `mistral3.cpp`, `llama4.cpp` and `deepseek2.cpp`
 (three false hits recorded in the module: `grok.cpp:23` reads
@@ -550,20 +550,20 @@ dense OR MoE on every layer, and the `_shexp` tensors are created under
 an `n_ff_shexp` its hparams never set and read by no graph line; a
 `mistral3` file is a `llama` file with three keys); and `mistral3.cpp:9`
 reads `rope.scaling.yarn_log_multiplier`, whose job is to adjust YaRN's
-MAGNITUDE term -- which ferrox applied for NO architecture.
+MAGNITUDE term -- which frink applied for NO architecture.
 `llama-context.cpp:196-231` multiplies `rope.scaling.attn_factor` by
 `get_mscale(factor, 1) / get_mscale(factor, log_mul)` on top of ggml's
-`rope_yarn` term, which it cancels; ferrox's `rope_attn_factor` carried
+`rope_yarn` term, which it cancels; frink's `rope_attn_factor` carried
 the key alone, so every YaRN checkpoint on the generic path had
 attention logits low by `(1 + 0.1 ln factor)^2`, 1.30x at factor 4.
-`ferrox-models/src/yarn_magnitude.rs` folds it into the field the CPU
+`frink-models/src/yarn_magnitude.rs` folds it into the field the CPU
 helper and the Metal `mscale` uniform already read; two fixtures at
 factor 4 evidence both arms, KL 9.14e-15 and 3.45e-15, the second
 matching libllama's own `yarn_attn_factor = 1.0648` log line. Only
 `mistral3` reads the multiplier on the generic path (measured), so it
 is dead metadata everywhere else, as upstream.
 
-`apertus` and `step35` closed on `ferrox-models/src/act_layers.rs`.
+`apertus` and `step35` closed on `frink-models/src/act_layers.rs`.
 `apertus.cpp:6-9` reads `xielu.alpha_n` / `.alpha_p` / `.beta` / `.eps`
 (no architecture prefix, `llama-arch.cpp:370-373`) as REQUIRED
 `n_layer`-long arrays or one scalar broadcast, and `:132-138` hands
@@ -577,7 +577,7 @@ l) * clamp(up, -l, l)`, the routed experts from one array and the
 shared experts AND the leading dense layers from the other, because
 `build_ffn` is both; three graphs read the keys and two are on their
 own engine. `FfnActivation::Xielu` and `::SwigluClamped` CARRY their
-tables so kind and parameters cannot disagree, `ferrox_moe::GluAct`
+tables so kind and parameters cannot disagree, `frink_moe::GluAct`
 gained the two bodies -- which cost it `Eq`, and turned `gate_fn() ->
 fn(f32) -> f32` into `combine(gate, up)`, because with the gate aliased
 to up `xielu(gate) * up` is the wrong function by a factor of the input
@@ -610,11 +610,11 @@ golden upstream). Building them corrected one sentence of `apertus`'s
 verdict: `apertus.cpp:50,52` CREATE `attn_q_norm.bias` /
 `attn_k_norm.bias` and `:93,96` pass `NULL` as the bias, so they are
 never read; a fixture that carries them measures libllama's logits
-byte-identical with and without, and `ferrox-models/src/
+byte-identical with and without, and `frink-models/src/
 unread_tensors.rs` records the slot so `assert_every_tensor_consumed`
 can tell "ignored as llama.cpp ignores it" from "missing".
 
-`mellum` closed on `ferrox-models/src/swa_layers.rs`, and the
+`mellum` closed on `frink-models/src/swa_layers.rs`, and the
 EXAONE-4 32B / EXAONE-MoE / Olmo-3 over-refusal lifted with it. llama.cpp
 reads `attention.sliding_window_pattern` with `get_key_or_arr`, which
 is THREE behaviours: the scalar overload with `required = false`
@@ -638,7 +638,7 @@ with the seed on two layers and libllama honours it (`is_swa =
 1, 1, 0, 1`), KL 1.02e-14; its window-with-YaRN half, which every real
 Mellum2 declares, stays refused by name in `swa_geometry`.
 
-`ferrox-models/src/mtp_blocks.rs` landed beside it, because `mimo2`,
+`frink-models/src/mtp_blocks.rs` landed beside it, because `mimo2`,
 `step35` and the same EXAONE report named the NextN blocks too.
 `llama-model.cpp:1092` reads `block_count` into `n_layer_all`,
 `llama-hparams.cpp:280-282` defines `n_layer()` as `n_layer_all -
@@ -673,7 +673,7 @@ differs from K's, which every KV cache and attention kernel here took
 as one number until `kv_head_dims` (above). `step35` led with its clamp arrays and its half-width
 rotary on the full layers, and closed on both the same day (above).
 
-`afmoe` and `laguna` are ONE seam, `ferrox-models/src/attn_gate.rs`.
+`afmoe` and `laguna` are ONE seam, `frink-models/src/attn_gate.rs`.
 llama.cpp's `LLM_TENSOR_ATTN_GATE` is created by six of the 155 graphs
 (measured); three of them (`qwen3next`, `qwen35`, `qwen35moe`) keep the
 gated delta-net's `z` projection under that name, a different op on a
@@ -713,7 +713,7 @@ layer. One Laguna thing stays refused by name from a fixture libllama
 runs: a window together with a RoPE scaling -- the Olmo-3 rule, one
 table now for `olmo2`, `mellum` and `laguna` where it had been `arch ==
 "olmo2"`. The other, a `rope.dimension_count_swa` differing from
-`rope.dimension_count` (`ferrox-models/src/swa_geometry.rs`), was
+`rope.dimension_count` (`frink-models/src/swa_geometry.rs`), was
 refused for one day and is served since `step35` closed on the same
 two-valued width; the two `_swa` head-width keys stay refused there.
 Real Laguna-M.1 has neither; real Laguna-XS.2 has both. `mimo2`'s sinks moved off the gpt-oss NAME onto
@@ -723,10 +723,10 @@ export carries three MTP blocks inside `block_count` and a per-layer
 window ARRAY; both became seams (below), and the row closed on its
 split K/V head width the day after (above).
 
-`deci` and `openelm` are ONE seam, `ferrox-models/src/layer_shapes.rs`.
+`deci` and `openelm` are ONE seam, `frink-models/src/layer_shapes.rs`.
 llama.cpp reads `head_count`, `head_count_kv` and `feed_forward_length`
 as scalar-or-array for EVERY architecture (`llama-model.cpp:1149-1158`)
-and hands most graphs layer 0 through `LLAMA_LOAD_LOCALS`; ferrox
+and hands most graphs layer 0 through `LLAMA_LOAD_LOCALS`; frink
 carried all three as scalars that every host body read once above its
 layer loop. Before a line was written, all 155 `src/models/*.cpp` were
 scanned for `n_head(i)`, `n_head_kv(i)`, `n_ff(i)`, `n_embd_k_gqa(i)`,
@@ -758,7 +758,7 @@ Two things the fixtures found in llama.cpp itself: an FFN-free layer
 WITH attention has its attention output DISCARDED (`deci.cpp:147-149`
 `continue`s before the residual add at `:150-153`; scaling that layer's
 attention weights by 3 leaves libllama's logits byte-identical,
-measured), which ferrox refuses by name rather than pins; and if such a
+measured), which frink refuses by name rather than pins; and if such a
 layer is LAST, libllama aborts (`GGML_ASSERT(buffer)`,
 ggml-backend.cpp:194), so a real export whose final block is a no-op
 cannot run there at all. KL 1.44e-13 (Nemotron shape, one layer of
@@ -823,18 +823,18 @@ among them. A layer WITH `ffn_norm` is the sequential layer
 (`tests/stablelm_graphs.rs`). A layer WITHOUT it is the PARALLEL
 residual (`:135-137`, `cur = inpSA`: the FFN reads the normed input
 attention read and the layer sums three terms), and
-`ferrox-models/src/parallel_residual.rs` refuses it by name from a
+`frink-models/src/parallel_residual.rs` refuses it by name from a
 fixture libllama runs (its logits move by 8.85). A layer with
 `attn_q_norm` applies a per-head LAYERNORM with a DISTINCT weight per
 head (`:34-35,84-97`, `{n_embd_head_k, n_head}`, `LLM_NORM`), which
 the loader's length rule would have read as one RMS over the whole
 projection and the fused Metal attention infers the same way from the
 same length -- two wrongs that agree -- so
-`ferrox-models/src/qk_layer_norm.rs` refuses it by name too (8.73).
+`frink-models/src/qk_layer_norm.rs` refuses it by name too (8.73).
 StableLM-2-12B has both. `use_parallel_residual`, which every export
 writes, is read by NOTHING in the graph: libllama's logits with the
 key `true` are byte-identical to the file with it `false`, and a
-fixture pins that ferrox ignores it the same way. Both refusals carry
+fixture pins that frink ignores it the same way. Both refusals carry
 their reach: the parallel residual is EIGHT of 155 graphs in two
 spellings (one shared norm: `stablelm`, `phi2`, `falcon`-7B,
 `command-r`, `cohere2`, `cohere2moe`, `plamo`; two norms: `gptneox` under the
@@ -964,7 +964,7 @@ line for the same reason (`tests/phimoe_graphs.rs`). The loader's
 norm-function census listed two of five function lists; it lists all
 five now.
 
-`gpt2` and `starcoder` closed together on `ferrox-models/src/
+`gpt2` and `starcoder` closed together on `frink-models/src/
 position_embd.rs`, and they are ONE graph read side by side (`diff
 gpt2.cpp starcoder.cpp` is a size table and `head_count_kv 1`): the
 `gptneox` sequential layer with a learned `position_embd.weight`
@@ -994,14 +994,14 @@ seam was built: `grep -n f_max_alibi_bias src/models/*.cpp` over the
 the literal `8.0f` (`bloom.cpp:18`, `refact.cpp:12`), the literal at
 40 layers only (`baichuan.cpp:11-14`, the 13B; the 7B rotates and was
 audited already), and `attention.max_alibi_bias` read optional
-(`mpt.cpp:6`, `jais.cpp:5`). `ferrox-core/src/alibi.rs` is llama.cpp's
+(`mpt.cpp:6`, `jais.cpp:5`). `frink-core/src/alibi.rs` is llama.cpp's
 slope formula (`ggml-cpu/ops.cpp:5489-5508`: `n_head_log2`, `m0`,
 `m1`, the odd powers for the tail of a non-power-of-two head count),
 and the three host attention kernels -- row, paged, batched prefill --
 take the slopes as ONE additive term, `slope_h * (p_key - p_query)`
 after the scale and the softcap, where `ggml_soft_max_ext` adds
-`slope * mask`; a ferrox-core test pins the three against a naive
-reference and each other. `ferrox-models/src/alibi.rs` is the table,
+`slope * mask`; a frink-core test pins the three against a naive
+reference and each other. `frink-models/src/alibi.rs` is the table,
 and `rope_layers::RopeLayers::Never` is DERIVED from it for these rows,
 so the bias and the absence of rotation cannot disagree about
 Baichuan's layer count -- the thing the old refusal had said "no key
@@ -1042,7 +1042,7 @@ engine that had refused it for a year but on the generic path.
 residual add, `ffn_norm`, the FFN -- with a short convolution where
 attention would be on the layers whose `head_count_kv` is 0 (`:9-11`),
 so it is a THIRD `AttnShape` beside deci's two (`layer_shapes::
-AttnShape::ShortConv`, `ferrox-models/src/shortconv.rs`) rather than
+AttnShape::ShortConv`, `frink-models/src/shortconv.rs`) rather than
 a second engine. Reach measured first: `grep -l shortconv` over the
 155 graphs is `lfm2.cpp` and `lfm2moe.cpp`, ONE graph (`models.h:
 1899`); the Mamba-2 hybrids share only the rule "zero KV heads means
@@ -1073,7 +1073,7 @@ day from the DEFERRED column, which no row had left before, and the
 lesson is the cheapest kind: the row had been classified from its
 NAME. "Embedded" means edge devices; `PanguEmbeddedForCausalLM` is a
 decoder with an `lm_head`, `conversion/pangu.py` is a `TextModel`, and
-ferrox had it in the catalog as "embedding variant; deferred" AND in
+frink had it in the catalog as "embedding variant; deferred" AND in
 `embedding_model::NOT_YET` as "a decoder embedding path", two copies
 of one wrong reading. `pangu-embed.cpp` is `llama.cpp`'s graph with a
 REQUIRED `attn_output.bias` (`:37`) and NEOX RoPE: one `proj_bias`
@@ -1088,12 +1088,12 @@ in one day, which is what shows where the two differ. `granite-hybrid.
 cpp:128-142` is Granite's layer with `build_mamba2_layer`
 (`mamba-base.cpp:149-288`) where attention would be on the zero-KV
 layers, so the block is a fourth `AttnShape` (`Mamba2`,
-`ferrox-models/src/mamba2.rs`, `ferrox-core/src/mamba2.rs` for ggml's
+`frink-models/src/mamba2.rs`, `frink-core/src/mamba2.rs` for ggml's
 conv and scan steps) on the same table row `lfm2` used. What is NOT
 the same is the state: LFM2's is a window of its inputs and rode as
 the layer's KV history, which every cache consumer already knew how
 to truncate, page and fork; a Mamba state is a REDUCTION over the
-whole prefix, and `ferrox_core::recurrent_state::RecurrentState`
+whole prefix, and `frink_core::recurrent_state::RecurrentState`
 beside the cache says so in the one place it matters --
 `KvCache::truncate` REFUSES a middle position (`can_truncate_to`), the
 prefix cache does not store such a cache, `--model-draft` refuses
@@ -1104,8 +1104,8 @@ llama.cpp's `llama_memory_recurrent::seq_rm` refuses `p0 > 0` for the
 same reason. Two measurements: `ssm_conv1d.bias` is
 `TENSOR_NOT_REQUIRED` at `granite-hybrid.cpp:63` and `ggml_add`ed
 unconditionally at `mamba-base.cpp:222`, so libllama SEGFAULTS on a
-file without it and ferrox requires it; and the Granite
-`rope.scaling.finetuned` refusal, which had said "ferrox has no way to
+file without it and frink requires it; and the Granite
+`rope.scaling.finetuned` refusal, which had said "frink has no way to
 express unrotated" for four days while `RopeLayers::Never` had
 existed for one, is served (`rope_finetuned::unrotated`), because
 `conversion/granite.py:253-256` writes the key FALSE for every
@@ -1170,7 +1170,7 @@ of the 155 graphs is served; `jamba`, `plamo2` and `mamba` are
 `build_mamba_layer` (Mamba-1) and said so.
 
 `plamo2` (PLaMo-2 1B / 2B / 8B) closed on 2026-09-18 on its own SSM
-spelling, `ferrox-models/src/plamo2_ssm.rs`: Mamba-1's dt / B / C path
+spelling, `frink-models/src/plamo2_ssm.rs`: Mamba-1's dt / B / C path
 (one projection of the conv output, REQUIRED weighted norms) in the
 order B, C, dt, feeding Mamba-2's per-head scan (dt, A, D per head,
 `head_dim = d_inner / n_heads`, `Decay::PerHead`), z and x interleaved
@@ -1193,7 +1193,7 @@ The finding is llama.cpp's: `llama-model.cpp:1189-1201` seed `n_rot`
 from layer 0's head count and set it to 0 when that is 0, so libllama
 runs every current PLaMo-2 export UNROTATED (`print_info: n_rot = 0`,
 measured; 1.3 in the logits), and `rope.dimension_count` cannot
-restore it because that read sits inside the same branch. ferrox
+restore it because that read sits inside the same branch. frink
 rotates, as `modeling_plamo.py` does and as `:239,245` were written
 to; the golden is the same weights with `head_count` scalar, an
 equally valid file libllama rotates, and the unrotated logits are
@@ -1201,17 +1201,17 @@ kept beside it as a number. The real checkpoint also needed the
 `plamo2` TOKENIZER (`tokenizer/plamo2.rs`, a port of
 `llm_tokenizer_plamo2`, `llama-vocab.cpp:1351-1616`: a suffix-table
 segmenter searched backwards, `<0xXX>` byte fallback), which
-`ferrox parity` holds byte-identical to libllama on 1,264 tokens of
+`frink parity` holds byte-identical to libllama on 1,264 tokens of
 the corpus, CJK and emoji included. On the one public GGUF
 (`mmnga/plamo-2-1b-gguf`, an older conversion with a scalar
-`head_count`) libllama itself returns all-NaN logits; ferrox answers
+`head_count`) libllama itself returns all-NaN logits; frink answers
 "Paris. Paris is the capital of France."
 
 `jamba`, `mamba` and `mamba2` closed next on that block and on one
-rule. `ferrox-models/src/mamba1.rs` is `build_mamba_layer`
+rule. `frink-models/src/mamba1.rs` is `build_mamba_layer`
 (`mamba-base.cpp:4-148`) once: the same conv step and the same scan
 kernel as Mamba-2's with `n_head = d_inner`, `head_dim = 1` and a
-per-STATE decay (`ferrox_core::mamba2::Decay::PerState`, the kernel's
+per-STATE decay (`frink_core::mamba2::Decay::PerState`, the kernel's
 `src3->ne[0] != 1` arm, one `exp` per state element), dt / B / C from
 one projection of the conv output, the RMS norms on them when the
 three weights exist (Jamba, REQUIRED) or `ssm.dt_b_c_rms` sets them
@@ -1239,10 +1239,10 @@ the "hybrid engine" had been a scaffold FOR since 2026-09-01: 852
 lines of `gdn.rs` ported from a Python reference, 915 of
 `hybrid_gguf_loader.rs`, a stub that refused everything, and not one
 libllama golden between them. The block went on the seam the Mamba
-rows had just built: `ferrox-core/src/gdn.rs` is the autoregressive
+rows had just built: `frink-core/src/gdn.rs` is the autoregressive
 delta rule as `delta-net-base.cpp:289-365` computes it (decay, the
 state's prediction, the beta-scaled error, the rank-one update, the
-read-out with the scaled query), `ferrox-models/src/gdn.rs` is
+read-out with the scaled query), `frink-models/src/gdn.rs` is
 `qwen35.cpp:236-317` around it, `AttnShape::Gdn` is the site, and the
 state rides on the cache as every other recurrent block's. Two things
 the port had wrong that only a golden shows: Qwen3.5's V heads read
@@ -1278,7 +1278,7 @@ graph in llama.cpp is served.
 `llama4` (Llama 4 Scout / Maverick) closed on 2026-09-14, and it is
 the row that says "read the graph AND the helper it calls":
 `llama4.cpp` has four things on top of Llama, and the one that cost
-the most was not in it. `ferrox-models/src/chunked_swa.rs` is the
+the most was not in it. `frink-models/src/chunked_swa.rs` is the
 new seam: `llama4.cpp:13-14` set `LLAMA_SWA_TYPE_CHUNKED` at a
 literal 8192 (the file's value is never read, and a declared ZERO is
 the branch libllama ABORTS on, `llama-graph.cpp:159`, refused by
@@ -1304,7 +1304,7 @@ that arm is a refusal). The fourth thing is `llama-graph.cpp:1947`:
 multiplied into the expert's INPUT before `mul_mat_id` where every
 other graph multiplies the output -- SwiGLU is not homogeneous, the
 fixture's logits move by 0.86 between the two, and
-`ferrox-models/src/routed_weight_site.rs` scales the row per slot at
+`frink-models/src/routed_weight_site.rs` scales the row per slot at
 the two host sites that gather a routed input. Building it found
 `route_top_k_sigmoid` renormalising whatever `norm_topk_prob` said:
 every sigmoid row before this one declared the key true, so the
@@ -1315,19 +1315,19 @@ the last of 8200 positions across the chunk boundary on both bodies
 the test red; a zero expert count is refused as `llama4.cpp:49-51`
 refuse it. The engine stub that had refused the row is deleted.
 
-`ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
+`frink-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what
 the seam is: `grep -l 'ATTN_OUT, "bias"'` over the 155 graphs is 33
 files and `FFN_UP, "bias"` 27, MOST of them OPTIONAL -- `llama.cpp`'s
 own graph, `granite`, `deci`, `mistral3`, `minicpm`, `nemotron` create
 the biases `TENSOR_NOT_REQUIRED` and `build_ffn` / `build_attn` add
-them when present -- so a `llama` file WITH biases was one ferrox
+them when present -- so a `llama` file WITH biases was one frink
 refused as carrying unread tensors while llama.cpp ran it. The
 arithmetic is the same in every graph (`up_b` / `gate_b` before the
 activation, `down_b` after `down`, `wo_b` after `wo` and after `wo_s`),
 so it lives in two slots -- `AttnWeights::o_bias` in the ONE attention
 tail, where gpt-oss's bias moved from its side table, and
-`MoeWeights::dense_bias` (`ferrox_moe::DenseBias`,
+`MoeWeights::dense_bias` (`frink_moe::DenseBias`,
 `run_expert_biased`, whose gate/up projections come from the same
 `gate_up_projections` the unbiased body uses) in the row and batched
 dense bodies -- and the per-architecture fact is which graphs CREATE
@@ -1341,7 +1341,7 @@ goldens (`tests/proj_bias_graphs.rs`): `jais2` 6.6e-13, a `llama` with
 all four biases 2.7e-13 (the one file that exercises `ffn_gate.bias`),
 `starcoder2` and `codeshell` at 4.7e-7 / 4.7e-6 KL with 3e-3 / 8e-3
 max deltas that are ENTIRELY llama.cpp's f16 GELU table -- with
-ferrox's GELU made to emulate the table (input and output rounded to
+frink's GELU made to emulate the table (input and output rounded to
 f16) both agree to 2e-13 / 1e-12 -- and `nemotron_biases`, refused the
 PR before, at 2.1e-13.
 
@@ -1350,14 +1350,14 @@ topology: no `attn_norm` and no `ffn_norm` tensor, both sublayers
 reading the raw residual, each branch's output normed before its
 residual add. Reading `olmo2.cpp:45-52,92,160-182` beside
 `exaone4.cpp:60-67,118,152-169` gives the same graph line for line, so
-they got one implementation (`ferrox-models/src/norm.rs`) and a
+they got one implementation (`frink-models/src/norm.rs`) and a
 fixture each. One sub-case stays refused by name rather than swept in --
 an `olmo2` with both a window and a RoPE scaling; EXAONE-4 32B, whose
 full-attention layers get no RoPE at all, was the other and closed on
 2026-09-11 (below). `olmo` (OLMo-1) is a
 THIRD shape, pre-norm with a non-parametric LayerNorm, and closed on
 2026-09-10 as a third variant of the same enum; the type is
-`ferrox-models/src/norm.rs`'s `NormOp` now rather than `PreNorm`,
+`frink-models/src/norm.rs`'s `NormOp` now rather than `PreNorm`,
 because `Decoder::final_norm` is one too -- OLMo-1's final norm has no
 weights either, and the fused Metal stacks had `Some(&self.final_norm)`
 written into them unconditionally. Its `attention.clamp_kqv` stayed a
@@ -1378,7 +1378,7 @@ the same kind of reason: they differ in the FFN, not in the four scalar
 multipliers llama.cpp applies to them, and `granite-moe.cpp` has no
 graph of its own at all (`models.h:1583-1591` is
 `using graph = llama_model_granite::graph`).
-`ferrox-models/src/scalar_multipliers.rs` implements the multipliers
+`frink-models/src/scalar_multipliers.rs` implements the multipliers
 once, parameterised, and `capability::unsupported_scaling_keys` -- which
 still refuses those keys everywhere else -- is now DERIVED from that
 same table instead of restated beside it. That derivation found a live
@@ -1417,9 +1417,9 @@ deliberately absent) and the attention scale comes from a fifth key,
 plus the existing softcap, no new attention code. Two more of the seven
 (`router_logit_softcapping`, `attention.temperature_length`) are read
 by llama.cpp and applied NOWHERE in its graph -- measured, no other
-reference under `src/` -- so ferrox neither applies nor refuses them.
+reference under `src/` -- so frink neither applies nor refuses them.
 `dbrx` closed the same day on the three blockers its verdict named, and
-one of them is why `ferrox-models/src/norm_sites.rs` exists:
+one of them is why `frink-models/src/norm_sites.rs` exists:
 `blk.N.attn_output_norm` is `dbrx`'s PRE-FFN norm (`dbrx.cpp:34,110-113`)
 and `grok`'s POST-attention norm (`grok.cpp:62,143-148`), one tensor
 name feeding two different sites, decided by architecture. The loader
@@ -1428,7 +1428,7 @@ it is one table now, read at all five. Both rows are GeGLU-or-clamp
 shaped in their evidence: DBRX KL 3.4e-12; Grok KL 4.7e-10 and 1.6e-10
 on the no-key and all-keys fixtures, at the GeGLU tolerance because
 llama.cpp's f16 GELU table is the approximate side -- measured by
-making ferrox's GELU emulate the table, at which point both files agree
+making frink's GELU emulate the table, at which point both files agree
 to 1e-7. Grok-2's parallel dense FFN (`grok.cpp:171-184`) was refused
 by name from a fixture that has it until `arctic` closed on the same
 seam (`parallel_dense_ffn.rs`, above); the fixture has a golden now.
@@ -1442,7 +1442,7 @@ is `is_swa(il)` around the same two `ggml_rope_ext` calls, and
 disjunct false -- identical, not similar. `smollm3.cpp:5,69` is another
 variant of the same enum, `(il + 1) % 4 != 0`. llama.cpp gates rotation
 this way in SIX architectures, always from a literal and never from a
-GGUF key, and `ferrox-models/src/rope_layers.rs` is one table for all
+GGUF key, and `frink-models/src/rope_layers.rs` is one table for all
 six; `smallthinker`, `afmoe` and `llama4` are in it, the first two
 closed later on other seams, and `llama4` still refuses for other
 things and its verdict says so. The durable part is
@@ -1478,7 +1478,7 @@ closed it only halfway: the fused `attn_qkv.bias` really is shared, but
 `qwen.cpp:33-35` also halves every FFN matrix, which cost no logits and
 made `expert_ffn_dim` twice the real width. `plamo3` could never have
 loaded a real checkpoint, because it is the only architecture upstream
-whose post-norms use the two-argument `LLM_TN` overload and ferrox asked for the wrong spelling;
+whose post-norms use the two-argument `LLM_TN` overload and frink asked for the wrong spelling;
 a gate refused every file carrying `attention.sliding_window_pattern` as
 unimplemented while the feature was already implemented, which made the
 loader's own read of that key unreachable; llama.cpp's own
@@ -1550,7 +1550,7 @@ never once predicted production; it subtracts its own launch cost
 now, and is still only good for comparing kernel variants. And it
 records the bug that nearly shipped with the device attention: the
 first version encoded it on a CONCURRENT encoder whose tail expects
-a serial one, and the model generated FLUENT NONSENSE while `ferrox
+a serial one, and the model generated FLUENT NONSENSE while `frink
 parity` stayed MATCH, because parity reads the first token and the
 first token is prefill. Nothing in the suite compares a DECODE step
 against a reference; a greedy 100-token generation against the same
@@ -1580,11 +1580,11 @@ bisection is recorded in `tests/nomic_bert_graphs.rs` with what it
 eliminated (a uniform softmax still differs; f16 K/V does not explain
 it).
 
-Do not read the architecture catalog as a support matrix. `ferrox
+Do not read the architecture catalog as a support matrix. `frink
 parity` is the oracle: its tokenizer half matches llama.cpp on every
 local checkpoint libllama can load, and its logit half MATCHES on
 Q8_0/IQ4_NL while DRIFTING on K-quants — for a known reason that is not
-a ferrox bug (`docs/plans/llama-cpp-gap-inventory.md` §10).
+a frink bug (`docs/plans/llama-cpp-gap-inventory.md` §10).
 
 Capabilities: `docs/FEATURES.md`. Models & speed ledger: `docs/MODELS.md`,
 `benchmarks/RESULTS.md`. Planned: `docs/ROADMAP.md`.
@@ -1592,13 +1592,13 @@ Capabilities: `docs/FEATURES.md`. Models & speed ledger: `docs/MODELS.md`,
 | Doc | Role |
 |---|---|
 | `docs/FEATURES.md` | capabilities overview |
-| `docs/CLI.md` | `ferrox` flags + `ferrox chat` |
+| `docs/CLI.md` | `frink` flags + `frink chat` |
 | `docs/MODELS.md` | what runs / what doesn’t |
 | `docs/API.md` | OpenAI compatibility matrix |
-| `docs/AGENTS_COOKBOOK.md` | point IDEs at `ferrox-server` |
+| `docs/AGENTS_COOKBOOK.md` | point IDEs at `frink-server` |
 | `docs/CONFIG.md` | env vars |
-| `benchmarks/RESULTS.md` | tok/s vs llama.cpp (Gap = llama/ferrox); `ferrox bench` ledger |
-| `benchmarks/README.md` | how `ferrox bench` / `llama-bench` is measured |
+| `benchmarks/RESULTS.md` | tok/s vs llama.cpp (Gap = llama/frink); `frink bench` ledger |
+| `benchmarks/README.md` | how `frink bench` / `llama-bench` is measured |
 | `docs/ROADMAP.md` | planned work |
 | `docs/plans/README.md` | **the plan index and priority order** |
 | `docs/plans/north-star.md` | the goal, and how plans are ranked against it |
@@ -1612,33 +1612,33 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
 cargo build --workspace --features cuda
-cargo test -p ferrox-cuda --features cuda -- --ignored   # needs GPU
+cargo test -p frink-cuda --features cuda -- --ignored   # needs GPU
 
-cargo build -p ferrox-cli -p ferrox-server --features metal
-cargo test -p ferrox-metal --features metal -- --ignored   # needs Metal
+cargo build -p frink-cli -p frink-server --features metal
+cargo test -p frink-metal --features metal -- --ignored   # needs Metal
 
-# Completion (also: ferrox run -m …)
-./target/debug/ferrox -m model.gguf -p "Hi" -n 64 --temp 0 --no-cnv
-./target/debug/ferrox -m model.gguf -p "Hi" -n 64 --ngl 99   # Metal
+# Completion (also: frink run -m …)
+./target/debug/frink -m model.gguf -p "Hi" -n 64 --temp 0 --no-cnv
+./target/debug/frink -m model.gguf -p "Hi" -n 64 --ngl 99   # Metal
 
-./target/debug/ferrox presets | archs | caps | inspect <gguf> | inspect-plan <gguf>
-./target/debug/ferrox smoke <preset> | run-kimi <dir>
-./target/debug/ferrox chat --url http://127.0.0.1:8383   # needs ferrox-server
+./target/debug/frink presets | archs | caps | inspect <gguf> | inspect-plan <gguf>
+./target/debug/frink smoke <preset> | run-kimi <dir>
+./target/debug/frink chat --url http://127.0.0.1:8383   # needs frink-server
 
-FERROX_MODEL_PATH=model.gguf FERROX_ADDR=127.0.0.1:8383 ./target/debug/ferrox-server
+FRINK_MODEL_PATH=model.gguf FRINK_ADDR=127.0.0.1:8383 ./target/debug/frink-server
 
 # Bench vs llama-bench (no HTTP). Models: benchmarks/suite.json
-./target/release/ferrox bench -m model.gguf -p 512 -n 128 --compare
-./target/release/ferrox bench --suite --fit-host --skip-missing
-./target/release/ferrox bench --suite --id llama32_3b_q4km --backend metal
-./target/release/ferrox bench --render
+./target/release/frink bench -m model.gguf -p 512 -n 128 --compare
+./target/release/frink bench --suite --fit-host --skip-missing
+./target/release/frink bench --suite --id llama32_3b_q4km --backend metal
+./target/release/frink bench --render
 ```
 
 Fixtures and golden values were generated and cross-validated with
 independent NumPy references.
 
 Tests are mostly `#[cfg(test)]` next to the code. Integration:
-`crates/ferrox-models/tests/gguf_roundtrip.rs`. Never un-ignore CUDA /
+`crates/frink-models/tests/gguf_roundtrip.rs`. Never un-ignore CUDA /
 Metal hardware tests without a real GPU.
 
 ## How to write code here
@@ -1650,11 +1650,11 @@ Re-measured 2026-09-10, against the 2026-09-03 numbers:
 
 | File | Was | Now | |
 |---|---|---|---|
-| `ferrox-server/src/lib.rs` | 9628 | **9775** | grew |
-| `ferrox-metal/src/gpu.rs` | 8935 | **9018** | grew |
-| `ferrox-metal/src/attn.rs` | 9331 | **8715** | shrank |
-| `ferrox-quant/src/lib.rs` | 8239 | **8242** | flat |
-| `ferrox-models/src/decoder.rs` | 6752 | **6780** | grew |
+| `frink-server/src/lib.rs` | 9628 | **9775** | grew |
+| `frink-metal/src/gpu.rs` | 8935 | **9018** | grew |
+| `frink-metal/src/attn.rs` | 9331 | **8715** | shrank |
+| `frink-quant/src/lib.rs` | 8239 | **8242** | flat |
+| `frink-models/src/decoder.rs` | 6752 | **6780** | grew |
 
 The per-layer shape wave (2026-09-11) left `decoder.rs` at 6842 and
 `loader.rs` at 5005: the seam itself is a 700-line new file
@@ -1663,7 +1663,7 @@ The per-layer shape wave (2026-09-11) left `decoder.rs` at 6842 and
 attention bodies still had to be edited in place, and each of those
 edits is a labelled block around 400 lines nobody has yet split out.
 The per-layer activation wave (2026-09-11, later) left `decoder.rs` at
-7068 and `loader.rs` at 5250, and moved `ferrox-moe/src/lib.rs` from
+7068 and `loader.rs` at 5250, and moved `frink-moe/src/lib.rs` from
 2150 to 2043: `GluAct` left it for `glu_act.rs` BEFORE the fourth and
 fifth variants were added, which is the rule working; the two seams
 are new files (`act_layers.rs`, `unread_tensors.rs`); and what
@@ -1684,14 +1684,14 @@ adding four sampler steps to three routes, and `decoder.rs` crept up
 again. Nothing shrinks on its own.
 
 What did work is not in that table, because the files left it:
-`ferrox-quant/src/repack.rs` was 6446 lines and is now a directory of
-ten; `ferrox-models/src/sampling.rs` went 1569 to 894 with four
-submodules beside it; `ferrox-cuda/src/mul_mm.rs` is 865 with its kinds
+`frink-quant/src/repack.rs` was 6446 lines and is now a directory of
+ten; `frink-models/src/sampling.rs` went 1569 to 894 with four
+submodules beside it; `frink-cuda/src/mul_mm.rs` is 865 with its kinds
 in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 155 architectures and ferrox has 93
+Those files are why llama.cpp has 155 architectures and frink has 93
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model
@@ -1720,7 +1720,7 @@ reading: a benchmark receipt carrying `backend: "cpu"` beside
 two, for **13 of 13** published CPU rows; `KINDS` and the host-check
 tool's fixed shape list, where adding the K-quants made the tool panic
 on the first one and check NOTHING for a day while still exiting green;
-and `FERROX_CPU_INT_DOT`, a default that was correct on the
+and `FRINK_CPU_INT_DOT`, a default that was correct on the
 architecture its kernels were written for and cost the other one 4x to
 8.8x of decode.
 
@@ -1743,11 +1743,11 @@ Rules that follow from that:
   collapsed onto one `attn_block` taking a `KvStep`.
 - **Dead code is a liability, not an asset.** Delete on sight unless it
   serves a named roadmap theme; if it does, wire it or say where it is
-  going. `ferrox-edge` was 5,400 uncalled lines and is now dissolved.
+  going. `frink-edge` was 5,400 uncalled lines and is now dissolved.
 - **A gate that cannot fire is worse than no gate**, because it reads as
   coverage. Check that a refusal's condition is reachable at all: this
   repo shipped one keyed on a GGUF spelling nothing writes.
-- **No new crate for something one crate uses.** `ferrox-edge` became a
+- **No new crate for something one crate uses.** `frink-edge` became a
   crate instead of an integration and half of it was never called.
 
 Rust specifics this repo holds to:
@@ -1788,7 +1788,7 @@ PR.
   `cpu_cores_effective == cpu_cores`, so no co-tenant shares the CPU.
   Four instances cost $0.49. Destroy them the moment the receipts are
   copied back, and confirm with `vastai show instances`.
-- **A load average cannot see one busy core.** `ferrox bench`'s
+- **A load average cannot see one busy core.** `frink bench`'s
   `--max-load 2.0` guard passed for an entire day while one of six
   cores was pegged, because one core does not move a six-core average
   enough to trip it. The guard is necessary and not sufficient: check
@@ -1801,7 +1801,7 @@ PR.
   day of work at a host-side cost that did not exist and produced a PR
   measured 22% SLOWER. Sample repeatedly, and sample while the thing
   runs.
-- **Verify the flag did what it says, from the artifact.** `ferrox
+- **Verify the flag did what it says, from the artifact.** `frink
   bench --n-gpu-layers 0` is documented as forcing CPU and did not:
   the backend is decided once per process and cached, so the flag
   arrived too late. Read `backend_active` in the receipt, not the flag
@@ -1824,7 +1824,7 @@ PR.
 - **Check what the kernel is actually limited BY, before optimising
   anything in it.** Convert the measurement into the resource: for a
   decode matvec, `weights_bytes * tok/s` is achieved memory bandwidth,
-  and that number is one line of arithmetic. ferrox reaches **5.3%** of
+  and that number is one line of arithmetic. frink reaches **5.3%** of
   an RTX 3060's 360 GB/s where llama.cpp reaches **60.4%**, so decode
   is limited by memory-request concurrency. A port of llama.cpp's
   `dp4a` inner loop was written, verified correct on hardware, and
@@ -1845,41 +1845,41 @@ PR.
 - **Agents do not tag, publish, force-push, rent hardware, or
   benchmark.** They implement and open a PR; verification on real
   hardware is the parent session's, and a kernel merges only after
-  `cargo test -p ferrox-cuda --features cuda -- --ignored` has run on a
+  `cargo test -p frink-cuda --features cuda -- --ignored` has run on a
   GPU.
 
 ## Architecture
 
 ```
-ferrox-gguf + ferrox-quant
-        → ferrox-core (WeightMatrix, RoPE, GQA, KV; optional cuda/metal)
-        → ferrox-moe
-        → ferrox-models (loader, Decoder, Kimi/GLM/DS4 stacks)
-        → ferrox-cli / ferrox-server
+frink-gguf + frink-quant
+        → frink-core (WeightMatrix, RoPE, GQA, KV; optional cuda/metal)
+        → frink-moe
+        → frink-models (loader, Decoder, Kimi/GLM/DS4 stacks)
+        → frink-cli / frink-server
 
-ferrox-api  (routes + wire DTOs, serde-only) → ferrox-server + clients
+frink-api  (routes + wire DTOs, serde-only) → frink-server + clients
 ```
 
 **The FreeToken port** (Apache-2.0; see `docs/THIRD_PARTY_NOTICES.md`,
 which is a licence obligation and must stay accurate) is a Rust port of
 FreeToken's host-side decision logic. It used to be a crate of its own,
-`ferrox-edge`; it now lives in the crates that use it, and the parts
+`frink-edge`; it now lives in the crates that use it, and the parts
 nothing would ever use are deleted.
 
-- **`ferrox-core`** holds the MoE expert-residency half, beside
+- **`frink-core`** holds the MoE expert-residency half, beside
   `expert_store`: `expert_cache`, `expert_slots` (the `SlotDevice`
   seam), `expert_pool` (its CUDA implementation), `expert_budget`,
   `qstar`, `bench_profile`, `residency`, `placement`. `expert_store` is
   the SINGLE holder of the expert byte budget -- on unified memory two
   budgets are the same RAM counted twice.
-- **`ferrox-server::policy`** holds the serving half: the two parsers,
+- **`frink-server::policy`** holds the serving half: the two parsers,
   the radix prefix cache, anchor/window slide, scheduler, serving stats,
   maintenance, pool, rebuild, outbox, footprint, effort probing.
 
 Wired today: the parsers, the stop-string withhold rule, the radix
 prefix cache over paged KV, effort probing, stats, maintenance, outbox,
 footprint, and the scheduler's status reporting. STILL GROUNDWORK, and
-this is the gap that matters most: the whole `ferrox-core` expert
+this is the gap that matters most: the whole `frink-core` expert
 residency stack holds the policy for running a model larger than memory
 (`docs/plans/out-of-core-moe.md`) and nothing executes it except a
 compile-only CUDA pool whose hardware test is `#[ignore]`d.
@@ -1889,7 +1889,7 @@ would close it, at its declaration in `policy/mod.rs`. That
 `allow(dead_code)` list is meant to be read as a to-do, not as cover.
 
 Load path: GGUF mmap → keep quantized → fused dequant+dot →
-RMSNorm → GQA(+RoPE) → MoE/dense FFN. Serving: `FERROX_MODEL_PATH`
+RMSNorm → GQA(+RoPE) → MoE/dense FFN. Serving: `FRINK_MODEL_PATH`
 GGUF or Kimi dir; generation on `spawn_blocking`.
 
 Presets `glm_5_2` / `deepseek_v4_pro` / `kimi_k3` are sketches,

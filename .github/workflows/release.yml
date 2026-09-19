@@ -58,16 +58,16 @@ jobs:
             CLI_FEATURES="${{ matrix.features }}"
             SERVER_FEATURES="${{ matrix.features }}"
           fi
-          cargo build --release --locked -p ferrox-cli \
+          cargo build --release --locked -p frink-cli \
             --target "${{ matrix.target }}" \
             --features "${CLI_FEATURES}"
           SERVER_ARGS=()
           if [[ -n "${SERVER_FEATURES}" ]]; then
             SERVER_ARGS=(--features "${SERVER_FEATURES}")
           fi
-          # Still shipped so an existing `ferrox-server` on someone's
+          # Still shipped so an existing `frink-server` on someone's
           # PATH keeps working after an upgrade.
-          cargo build --release --locked -p ferrox-server \
+          cargo build --release --locked -p frink-server \
             --target "${{ matrix.target }}" \
             "${SERVER_ARGS[@]}"
 
@@ -82,12 +82,12 @@ jobs:
             TAG="${GITHUB_REF_NAME}"
           fi
           # Strip leading v from versioned asset names only for display; keep tag as-is.
-          ASSET="ferrox-${TAG}-${{ matrix.asset_suffix }}"
+          ASSET="frink-${TAG}-${{ matrix.asset_suffix }}"
           STAGE="dist/${ASSET}"
           mkdir -p "${STAGE}"
           BIN_DIR="target/${{ matrix.target }}/release"
-          cp "${BIN_DIR}/ferrox" "${BIN_DIR}/ferrox-server" "${STAGE}/"
-          chmod +x "${STAGE}/ferrox" "${STAGE}/ferrox-server"
+          cp "${BIN_DIR}/frink" "${BIN_DIR}/frink-server" "${STAGE}/"
+          chmod +x "${STAGE}/frink" "${STAGE}/frink-server"
           tar -C dist -czf "${ASSET}.tar.gz" "${ASSET}"
           shasum -a 256 "${ASSET}.tar.gz" | tee "${ASSET}.tar.gz.sha256"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
@@ -139,7 +139,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: Ferrox ${{ steps.tag.outputs.tag }}
+          name: Frink ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           files: |
             release-assets/*
@@ -147,22 +147,22 @@ jobs:
             ## Install
 
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/install.sh | bash
+            curl -fsSL https://raw.githubusercontent.com/antonellof/frink/main/scripts/install.sh | bash
             ```
 
             Or pin a version:
 
             ```bash
-            FERROX_VERSION=${{ steps.tag.outputs.tag }} \
-              curl -fsSL https://raw.githubusercontent.com/antonellof/ferrox/main/scripts/install.sh | bash
+            FRINK_VERSION=${{ steps.tag.outputs.tag }} \
+              curl -fsSL https://raw.githubusercontent.com/antonellof/frink/main/scripts/install.sh | bash
             ```
 
             ## Prebuilt archives
 
             | Asset | Notes |
             | --- | --- |
-            | `ferrox-${{ steps.tag.outputs.tag }}-darwin-arm64.tar.gz` | macOS Apple Silicon, Metal |
-            | `ferrox-${{ steps.tag.outputs.tag }}-linux-x86_64.tar.gz` | Linux x86_64, CPU |
+            | `frink-${{ steps.tag.outputs.tag }}-darwin-arm64.tar.gz` | macOS Apple Silicon, Metal |
+            | `frink-${{ steps.tag.outputs.tag }}-linux-x86_64.tar.gz` | Linux x86_64, CPU |
 
             CUDA and other hosts: build from source (`--features cuda`).
         env:

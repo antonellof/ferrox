@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `falcon` GGUFs used by ferrox's Falcon
+"""Generate the tiny synthetic `falcon` GGUFs used by frink's Falcon
 coverage test.
 
 `falcon` (Falcon-7B, Falcon-40B, Falcon-180B) refused as a `dedicated`
@@ -72,7 +72,7 @@ def main(out_path: str, forty_b: bool) -> None:
         return (0.5 + rng.standard_normal(n) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-falcon-fixture")
+    w.add_name("frink-falcon-fixture")
     w.add_context_length(CTX)
     w.add_tensor_data_layout("jploski")
     w.add_embedding_length(N_EMBD)

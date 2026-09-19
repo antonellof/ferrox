@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `apertus` GGUF used by ferrox's per-layer
+"""Generate the tiny synthetic `apertus` GGUF used by frink's per-layer
 activation-parameter coverage test.
 
 `apertus` (Swiss AI Apertus-8B / 70B) was triaged NEW CODE on one fact:
@@ -57,14 +57,14 @@ What this fixture pins:
 `--scalar` writes the same weights with each of the four keys as ONE
 scalar instead of an array. `get_key_or_arr` broadcasts it to every
 layer (llama-model-loader.cpp:469-478), so libllama must run this file
-with layer 0's parameters on both layers; the test pins that ferrox
+with layer 0's parameters on both layers; the test pins that frink
 does the same and that the two files' logits differ.
 
 `--qk-norm-bias` adds `attn_q_norm.bias` and `attn_k_norm.bias` on
 every layer. apertus.cpp:50,52 CREATE both (`TENSOR_NOT_REQUIRED`) and
 :93,96 pass `NULL` as the bias to `build_norm`, so they are loaded and
 never read; the test measures that libllama's logits do not move and
-pins that ferrox leaves them deliberately unread rather than applying
+pins that frink leaves them deliberately unread rather than applying
 or refusing them.
 
 Weights are pseudo-random from a fixed seed so the files are byte-stable.
@@ -117,7 +117,7 @@ def main(out_path: str, variant: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name(f"ferrox-apertus-fixture{variant.replace('--', '-') if variant else ''}")
+    w.add_name(f"frink-apertus-fixture{variant.replace('--', '-') if variant else ''}")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

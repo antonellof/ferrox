@@ -14,7 +14,7 @@ whose §7 listed seven things that were silently wrong. All seven are
 fixed:
 
 - The repetition penalty compounded as `penalty^n`, and temperature ran
-  before the truncation filters. Both were live on every `ferrox run` at
+  before the truncation filters. Both were live on every `frink run` at
   the defaults
 - `phi3` windowed every layer where llama.cpp windows none
 - `logit_bias` was dropped on `/v1/chat/completions`, and JSON-object
@@ -38,7 +38,7 @@ notes.**
 llama.cpp seeds its sampler with every prompt token before the first
 draw (`tools/server/server-context.cpp:386-390`, and `llama-cli` does
 the same), so `penalty_last_n` slides over the tail of
-`prompt ++ generated`. ferrox slid it over `generated` alone. Same
+`prompt ++ generated`. frink slid it over `generated` alone. Same
 checkpoint, same flags, same prompt, different text.
 
 A token that occurs in the prompt is now penalised on its FIRST
@@ -50,10 +50,10 @@ divergence because it is a DEFINITION, not a default. This project
 already carries one deliberate deviation, `--repeat-penalty` defaulting
 to 1.1 against llama.cpp's 1.0, and that one is visible on a typed flag.
 This was the same flag meaning a different thing: invisible from the
-command line, and invisible to `ferrox parity`, which compares logits
+command line, and invisible to `frink parity`, which compares logits
 and tokenizers rather than sampled text.
 
-It also closed a five-way disagreement inside ferrox. The window was a
+It also closed a five-way disagreement inside frink. The window was a
 `&[usize]` and five call sites chose four different answers, with
 `kimi_generate` quietly the only one that matched llama.cpp.
 `PenaltyWindow` has no constructor taking a single slice, so a caller
@@ -98,7 +98,7 @@ that genuinely have none say `&[]` visibly in the diff.
   lossless at every temperature. Measured on a 3B target with a 1B
   drafter: 40 tokens in 12 verification steps, acceptance length 3.33
 - **llama.cpp's `-hf user/repo:QUANT`** on `run`, `serve` and
-  `download`, with a cache under `FERROX_CACHE`. Plus the server flags a
+  `download`, with a cache under `FRINK_CACHE`. Plus the server flags a
   copied `llama-server` command carries: `-c`, `--api-key`,
   `--api-key-file`, `--alias`, `--ctk`, `--hf-file`, and `--jinja` /
   `--no-warmup` / `--flash-attn` accepted rather than fatal
@@ -138,14 +138,14 @@ Everything open, as of 2026-09-02:
 
 | # | What | Blocked on |
 |---|---|---|
-| [#27](https://github.com/antonellof/ferrox/issues/27) | CPU decode is scheduling-bound. **Measured 2026-09-04 on quiet rented hosts.** On 20-core aarch64 the persistent pool is **+123% at 3B and +87% at 8B**, which takes decode from losing to llama.cpp to BEATING it (23.14 vs 17.86, 12.41 vs 9.06). On 10-core x86 it is +49/+23/+15%. Still opt-in behind `FERROX_CPU_POOL=spin` | A decision, not a measurement. The pool regresses 37% at 135M on aarch64, reproducibly on a quiet host, so the default cannot simply flip. Needs a size or work rule, which is what `MIN_TASK_MACS` was |
-| [#128](https://github.com/antonellof/ferrox/issues/128) | Decode carries a fixed per-token cost of roughly 60 ms that no thread count or pool removes: 135M runs at 13 to 15 tok/s on 4, 8 and 19 aarch64 threads while llama.cpp does 190 to 204 | Finding what the constant IS. It is flat in thread count, so it is not fork-join, and flat in model size, so it is not arithmetic |
-| [#126](https://github.com/antonellof/ferrox/issues/126) | `ferrox bench --n-gpu-layers 0` does not force CPU, and `bench_suite.rs` uses that flag for every published `cpu` row, so the ledger's CPU numbers may include Metal | Nothing. The backend decision is cached in a `OnceLock` before the flag can apply; the fix is to stop having two answers |
-| [#127](https://github.com/antonellof/ferrox/issues/127) | x86_64 CPU throughput looks ~10x off llama.cpp (3B Q4_K_M at 1.03 tok/s on 10 Broadwell cores), and `benchmarks/RESULTS.md` has no x86 row to show it | A `llama-bench` comparison on the same x86 host, then finding whether the AVX2 arms are reached at all |
-| [#29](https://github.com/antonellof/ferrox/issues/29) | A forced `tool_choice` reaches ten of the eleven wire formats. `muse_glimmer` still answers 501 | A muse-glimmer checkpoint or its chat template. The block is already an element grammar this can write; what is missing is which recipient name the template addresses a tool with, and how much of the channel header the rendered prompt already wrote |
-| [#61](https://github.com/antonellof/ferrox/issues/61) | No KV store evicts behind a sliding window, so Gemma-3-4B holds 9.1 GB where 1.6 GB would do | Splitting `KvCache::seq_len` into positions and rows first. The design and the ordered steps are in the issue |
-| [#70](https://github.com/antonellof/ferrox/issues/70) | `ferrox quantize` writes Q8_0, Q4_K_S/M, Q5_K_S/M and Q6_K byte-identically to llama.cpp, with or without `--imatrix`, and refuses the rest by name; `ferrox imatrix` produces the matrix | Q2_K/Q3_K and the IQ-tier encoders. Steps 2 to 4 are in the issue |
-| [#82](https://github.com/antonellof/ferrox/issues/82) | Rerank scores are the head minus its pooler, so a thresholding client gets a range that never fires | A converter that keeps `bert.pooler.dense`, which ferrox can now write. Ordering is unaffected |
+| [#27](https://github.com/antonellof/frink/issues/27) | CPU decode is scheduling-bound. **Measured 2026-09-04 on quiet rented hosts.** On 20-core aarch64 the persistent pool is **+123% at 3B and +87% at 8B**, which takes decode from losing to llama.cpp to BEATING it (23.14 vs 17.86, 12.41 vs 9.06). On 10-core x86 it is +49/+23/+15%. Still opt-in behind `FRINK_CPU_POOL=spin` | A decision, not a measurement. The pool regresses 37% at 135M on aarch64, reproducibly on a quiet host, so the default cannot simply flip. Needs a size or work rule, which is what `MIN_TASK_MACS` was |
+| [#128](https://github.com/antonellof/frink/issues/128) | Decode carries a fixed per-token cost of roughly 60 ms that no thread count or pool removes: 135M runs at 13 to 15 tok/s on 4, 8 and 19 aarch64 threads while llama.cpp does 190 to 204 | Finding what the constant IS. It is flat in thread count, so it is not fork-join, and flat in model size, so it is not arithmetic |
+| [#126](https://github.com/antonellof/frink/issues/126) | `frink bench --n-gpu-layers 0` does not force CPU, and `bench_suite.rs` uses that flag for every published `cpu` row, so the ledger's CPU numbers may include Metal | Nothing. The backend decision is cached in a `OnceLock` before the flag can apply; the fix is to stop having two answers |
+| [#127](https://github.com/antonellof/frink/issues/127) | x86_64 CPU throughput looks ~10x off llama.cpp (3B Q4_K_M at 1.03 tok/s on 10 Broadwell cores), and `benchmarks/RESULTS.md` has no x86 row to show it | A `llama-bench` comparison on the same x86 host, then finding whether the AVX2 arms are reached at all |
+| [#29](https://github.com/antonellof/frink/issues/29) | A forced `tool_choice` reaches ten of the eleven wire formats. `muse_glimmer` still answers 501 | A muse-glimmer checkpoint or its chat template. The block is already an element grammar this can write; what is missing is which recipient name the template addresses a tool with, and how much of the channel header the rendered prompt already wrote |
+| [#61](https://github.com/antonellof/frink/issues/61) | No KV store evicts behind a sliding window, so Gemma-3-4B holds 9.1 GB where 1.6 GB would do | Splitting `KvCache::seq_len` into positions and rows first. The design and the ordered steps are in the issue |
+| [#70](https://github.com/antonellof/frink/issues/70) | `frink quantize` writes Q8_0, Q4_K_S/M, Q5_K_S/M and Q6_K byte-identically to llama.cpp, with or without `--imatrix`, and refuses the rest by name; `frink imatrix` produces the matrix | Q2_K/Q3_K and the IQ-tier encoders. Steps 2 to 4 are in the issue |
+| [#82](https://github.com/antonellof/frink/issues/82) | Rerank scores are the head minus its pooler, so a thresholding client gets a range that never fires | A converter that keeps `bert.pooler.dense`, which frink can now write. Ordering is unaffected |
 
 Closed on 2026-09-02 and worth knowing about: the GGUF parser hardening
 (#24, #25, #26, #30, #31, #32), `max_tokens` reaching
@@ -208,7 +208,7 @@ this is stale.
    usable on a box that today handles Q4, or an 8B. Most of what
    follows serves this.
 2. **RAM and VRAM optimization.** Residency planning already exists
-   (`ferrox inspect-plan`). What is missing is acting on it hard enough
+   (`frink inspect-plan`). What is missing is acting on it hard enough
    to change which models fit: tighter KV (`turbo3`, quantized CTK),
    streaming expert residency, and not materializing activations
    nothing reads.
@@ -229,7 +229,7 @@ this is stale.
    `response_format: json_schema`, through the same converter a forced
    `tool_choice` compiles its arguments with. What is left is a forced
    `tool_choice` on the eight wire formats that are not JSON-object
-   shaped ([#29](https://github.com/antonellof/ferrox/issues/29)), and
+   shaped ([#29](https://github.com/antonellof/frink/issues/29)), and
    MCP invocation.
 6. **Docker images**, so evaluating any of this stops requiring a Rust
    toolchain.
@@ -250,7 +250,7 @@ this is stale.
 **Serving**
 
 - Tool calling: the OpenAI `tools` / `tool_choice` request and response
-  shape. *Eleven wire formats now parse* (`ferrox-server::policy::parser::tool_call`),
+  shape. *Eleven wire formats now parse* (`frink-server::policy::parser::tool_call`),
   every call in a response rather than the first, and a reasoning
   model's chain of thought comes back as `reasoning_content`. Five of
   the eleven stream `tool_calls[].index` argument deltas.
@@ -293,15 +293,15 @@ this is stale.
 
 The ported FreeToken serving policy (see [`FEATURES.md`](FEATURES.md))
 is complete and tested. It no longer lives in a crate of its own: the
-serving half is `ferrox-server::policy` and the MoE expert-residency
-half is in `ferrox-core` beside `expert_store`. Roughly half of it
+serving half is `frink-server::policy` and the MoE expert-residency
+half is in `frink-core` beside `expert_store`. Roughly half of it
 now drives something: the two output parsers, the withhold rule, the
 effort/thinking probe, the request ring, the batcher's status and pool
 accounting, the two maintenance endpoints, the DeepSeek-V4 KV tier
 sizing, and `radix`, which shares KV pages between prompts on the
 paged-KV path. `FEATURES.md` has the per-module split.
 
-Closed since the last pass: `ferrox bench-bw` measures this host's
+Closed since the last pass: `frink bench-bw` measures this host's
 CPU-MoE bandwidth and writes the profile `qstar` reads, so a deployment
 no longer has to take the unbenchmarked one-fetch-per-step default
 (the PCIe half still needs a CUDA benchmark host). `POST
@@ -311,9 +311,9 @@ restart, validated by `policy::pool` and rolled back by
 
 Still waiting on a consumer:
 
-- Drive expert residency from `ferrox_core::expert_cache` and the `q*`
-  split, which needs the other half FreeToken has and ferrox does not:
-  a *persistent* GPU expert cache (`ferrox-moe::run_expert_placed`
+- Drive expert residency from `frink_core::expert_cache` and the `q*`
+  split, which needs the other half FreeToken has and frink does not:
+  a *persistent* GPU expert cache (`frink-moe::run_expert_placed`
   re-uploads every weight matrix per call) and a CPU MoE path that can
   run concurrently with a device copy
 - Make paged KV, and the radix cache riding on it, correct on **CUDA**.
@@ -330,9 +330,9 @@ Still waiting on a consumer:
 - Make prefix reuse work on the continuous-batching path. Paged KV and
   continuous batching are separate switches and the sharing only
   happens under the first
-- Size the pools with `ferrox_core::expert_budget::plan_cache_budget` at
+- Size the pools with `frink_core::expert_budget::plan_cache_budget` at
   load, not only when a rebuild asks for a new geometry
-- Find consumers for `ferrox_core::placement` and `residency`, and for
+- Find consumers for `frink_core::placement` and `residency`, and for
   `policy::anchor`'s `prefill_slide`. The multi-currency prefix cache
   (`cache_manager`, `radix::swa`, `radix::hybrid`, `window_pool`,
   `state_pool`), the cache report renderer and the process supervisor
@@ -341,11 +341,11 @@ Still waiting on a consumer:
   and why it went
 - Publish into the radix tree from the continuous batcher too.
   `batch_scheduler` adopts from the tree (`acquire_paged_caches`) but
-  never calls `publish_to_radix`, so under `FERROX_CONTINUOUS_BATCHING=1`
+  never calls `publish_to_radix`, so under `FRINK_CONTINUOUS_BATCHING=1`
   prefix sharing is adopt-only and the tree is filled by nothing
 
 A full recursive re-read of the reference (six readers over its 435
-files, checked against every ferrox crate rather than against the port's
+files, checked against every frink crate rather than against the port's
 own scope) found 34 further items, now tracked individually in the plan
 below. One of them is a correctness bug in shipped code rather than an
 omission: `route_top_k_grouped` implements "k from every group" where

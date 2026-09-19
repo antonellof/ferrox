@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `mellum` GGUF used by ferrox's
+"""Generate the tiny synthetic `mellum` GGUF used by frink's
 per-layer sliding-window ARRAY coverage test.
 
 `mellum` refused as UNAUDITED, triaged NEW CODE, for two things. The
@@ -7,7 +7,7 @@ first is the Olmo-3 rule -- `src/models/mellum.cpp:128-142` ropes the
 sliding layers with the model's YaRN switched OFF (`freq_scale = 1.0`,
 `ext_factor = 0.0`, `attn_factor = 1.0`) while :143-154 rope the full
 layers with it on -- and that stays a REFUSAL BY NAME
-(`crates/ferrox-models/src/swa_geometry.rs`) for a file that declares
+(`crates/frink-models/src/swa_geometry.rs`) for a file that declares
 both a window and a RoPE scaling, which every real Mellum2 export does
 (`JetBrains/Mellum2-12B-A2.5B-*`: `sliding_window: 1024`, YaRN factor
 16 on `full_attention`). The second is THIS fixture's subject:
@@ -16,10 +16,10 @@ SCALAR overload of `get_key_or_arr` first and, when that returns false,
 through the ARRAY overload -- so a per-layer bool array is the layout
 the graph runs, and `conversion/mellum.py:28` ALWAYS writes one
 (`[t == "sliding_attention" for t in layer_types]`). Until 2026-09-11
-ferrox refused the array form for every architecture.
+frink refused the array form for every architecture.
 
 `mellum` is the only architecture on the generic path whose graph
-HONOURS the array (`crates/ferrox-models/src/swa_layers.rs` has the
+HONOURS the array (`crates/frink-models/src/swa_layers.rs` has the
 census: the other readers are `gemma4` / `gemma4-assistant` on their
 own engine and `dflash`, `step35`, `mimo2`, `cohere2moe`, which refuse
 for other things), which is why the seam's honoured branch is
@@ -30,11 +30,11 @@ rows this task was aimed at.
 last-dense, [T, T, T, F] over four layers; this file writes
 [T, T, F, T], which differs on layers 2 AND 3. A loader that ignored the
 array and kept the seed -- which is exactly what llama.cpp does for
-`exaone-moe` and what ferrox must NOT do here -- would window layer 2
+`exaone-moe` and what frink must NOT do here -- would window layer 2
 and not layer 3, and the golden sees it: the window is 3 tokens against
 a six-token prompt, so which layers mask is visible in the logits.
 
-The rest is machinery ferrox already had, carried so that the row's
+The rest is machinery frink already had, carried so that the row's
 other half is measured rather than assumed:
 
   * NEOX RoPE (`llama_model_rope_type`, LLM_ARCH_MELLUM in the
@@ -93,7 +93,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-mellum-fixture")
+    w.add_name("frink-mellum-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

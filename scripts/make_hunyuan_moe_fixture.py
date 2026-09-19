@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `hunyuan-moe` GGUF used by ferrox's
+"""Generate the tiny synthetic `hunyuan-moe` GGUF used by frink's
 Hunyuan-A13B coverage test.
 
-`hunyuan-moe` sat on ferrox's generic GQA path refusing as UNAUDITED,
+`hunyuan-moe` sat on frink's generic GQA path refusing as UNAUDITED,
 triaged ONE MATCH ARM for one reason, and this fixture is what makes the
 arm checkable: it norms Q and K **after** RoPE.
 `src/models/hunyuan-moe.cpp:93` and `:104` call `ggml_rope_ext`, and only
 then `:110` and `:115` call `build_norm` on K and Q. Every architecture
-ferrox had audited before this norms first, so the fixture's QK-norm
+frink had audited before this norms first, so the fixture's QK-norm
 weights are deliberately far from 1.0: swapping the two operations moves
 the logits by orders of magnitude more than the comparison tolerance.
 
@@ -82,7 +82,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-hunyuan-moe-fixture")
+    w.add_name("frink-hunyuan-moe-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

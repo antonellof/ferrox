@@ -87,7 +87,7 @@ def main(out_path: str, deep: bool = False) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-hrm-text-fixture")
+    w.add_name("frink-hrm-text-fixture")
     # The BLOCK COUNT is the expanded slot count (`:22-23`), not the
     # number of blocks the file holds.
     w.add_block_count(n_slot)

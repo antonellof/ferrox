@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `gptneox` GGUFs used by ferrox's
+"""Generate the tiny synthetic `gptneox` GGUFs used by frink's
 parallel-residual coverage test.
 
 `gptneox` (Pythia, GPT-NeoX-20B, Dolly-v2) refused as a `dedicated` row
@@ -62,7 +62,7 @@ def main(out_path: str, sequential: bool) -> None:
         return (0.5 + rng.standard_normal(n) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-gptneox-fixture")
+    w.add_name("frink-gptneox-fixture")
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
     w.add_block_count(N_LAYER)

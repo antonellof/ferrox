@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `deepseek` (V1) GGUF used by ferrox's
+"""Generate the tiny synthetic `deepseek` (V1) GGUF used by frink's
 DeepSeek-V1 coverage test.
 
 Not to be confused with `make_deepseek2_fixture.py`: `deepseek` is
 DeepSeek-MoE-16B / DeepSeek-Coder-V1, a plain GQA MoE, while `deepseek2`
 is the MLA family and runs on a dedicated stack.
 
-`deepseek` sat on ferrox's generic GQA path refusing as UNAUDITED,
+`deepseek` sat on frink's generic GQA path refusing as UNAUDITED,
 triaged ONE MATCH ARM for its routing renormalisation, and this fixture
 is what makes the arm checkable:
 
@@ -16,7 +16,7 @@ is what makes the arm checkable:
     `DeepseekModel` (:124-217) never writes
     `{arch}.expert_weights_norm`; only `DeepseekV2Model` does (:354).
     **So this file deliberately carries no `expert_weights_norm` key**,
-    exactly like a real DeepSeek-V1 GGUF, and ferrox has to get the
+    exactly like a real DeepSeek-V1 GGUF, and frink has to get the
     answer from `NO_TOPK_RENORMALIZE_ARCHITECTURES`. Adding the key here
     would make the test pass without exercising the arm at all.
   * Leading dense layers ARE honoured on this architecture
@@ -89,7 +89,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-deepseek-fixture")
+    w.add_name("frink-deepseek-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

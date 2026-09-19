@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `qwen3moe` GGUF used by ferrox's Qwen3-MoE
+"""Generate the tiny synthetic `qwen3moe` GGUF used by frink's Qwen3-MoE
 coverage test.
 
 `qwen3moe` is what Qwen3-30B-A3B / Qwen3-235B-A22B tag, which makes it
 one of the most-run MoE architectures on consumer hardware, and it sat on
-ferrox's *generic* GQA path with no evidence behind it. This fixture is
+frink's *generic* GQA path with no evidence behind it. This fixture is
 the evidence.
 
 It is deliberately small (2 layers, 32-wide, 6 experts) and carries every
@@ -78,7 +78,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-qwen3moe-fixture")
+    w.add_name("frink-qwen3moe-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -551,8 +551,8 @@ export function ModelsScreen() {
               <>Download one below, or drop a file into that directory.</>
             ) : (
               <>
-                Set <code className="font-mono">FERROX_MODEL_PATH</code> or{" "}
-                <code className="font-mono">FERROX_MODEL_DIR</code> and restart
+                Set <code className="font-mono">FRINK_MODEL_PATH</code> or{" "}
+                <code className="font-mono">FRINK_MODEL_DIR</code> and restart
                 the server.
               </>
             )}

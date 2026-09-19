@@ -4,7 +4,7 @@ The published table is **[`RESULTS.md`](RESULTS.md)**. It is generated
 and holds nothing else, so never edit it by hand.
 
 Everything a generator cannot produce — measurements taken without a
-receipt, before/after studies against ferrox itself, and the sections
+receipt, before/after studies against frink itself, and the sections
 that predate the code they describe — is in
 **[`HISTORY.md`](HISTORY.md)**.
 
@@ -24,7 +24,7 @@ and no sampler in the loop.
 | | |
 |---|---|
 | Measures | kernels alone |
-| Driver | `ferrox bench` (Rust) |
+| Driver | `frink bench` (Rust) |
 | Compared against | `llama-bench` |
 | Raw numbers | [`receipts/engine/`](receipts/engine/) |
 | Workload | `pp512` / `tg128`, synthetic tokens |
@@ -37,21 +37,21 @@ Suite definition: [`suite.json`](suite.json).
 ## Run
 
 ```bash
-cargo build -p ferrox-cli --release --features metal
+cargo build -p frink-cli --release --features metal
 
 # one model, with the llama.cpp comparison run for you
-./target/release/ferrox bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+./target/release/frink bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   -p 512 -n 128 -r 3 --compare
 
 # every suite.json entry × backends, then re-render RESULTS.md
-./target/release/ferrox bench --suite --fit-host --skip-missing
+./target/release/frink bench --suite --fit-host --skip-missing
 
 # one suite id (or one backend across the suite)
-./target/release/ferrox bench --suite --id llama32_3b_q4km --backend metal
-./target/release/ferrox bench --suite --backend cpu --fit-host --skip-missing
+./target/release/frink bench --suite --id llama32_3b_q4km --backend metal
+./target/release/frink bench --suite --backend cpu --fit-host --skip-missing
 
 # re-render RESULTS.md from existing receipts, measuring nothing
-./target/release/ferrox bench --render
+./target/release/frink bench --render
 ```
 
 `--suite` reads [`suite.json`](suite.json) and runs each entry in a
@@ -71,23 +71,23 @@ as `{id}_{backend}.json`. A run that fails leaves the previous receipt
 in place instead of overwriting it. `--render` rewrites the engine table
 in `RESULTS.md` between HTML markers and leaves the Open notes alone.
 
-## Batched throughput (`ferrox batched-bench`)
+## Batched throughput (`frink batched-bench`)
 
-`ferrox bench` is one sequence. `ferrox batched-bench` is
+`frink bench` is one sequence. `frink batched-bench` is
 `llama-batched-bench`: throughput against the number of parallel
 sequences, through the continuous batcher's engine seams
 (`forward_batch_last_host_kv` per prompt, `forward_multi_seq` per
-decode step) with no HTTP. Same ten columns as upstream, so a ferrox
+decode step) with no HTTP. Same ten columns as upstream, so a frink
 table and a llama.cpp table paste side by side.
 
 ```bash
-./target/release/ferrox batched-bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
+./target/release/frink batched-bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   -c 2048 -npp 128,512 -ntg 128 -npl 1,2,4,8
 llama-batched-bench -m models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf \
   -c 2048 -npp 128,512 -ntg 128 -npl 1,2,4,8
 ```
 
-It runs under the same contract as `ferrox bench`: the quiet-host,
+It runs under the same contract as `frink bench`: the quiet-host,
 thermal and free-memory bars below (the memory bar counts the largest
 row's KV on top of the weights), one discarded warmup per row that
 must agree with the timed pass on both input and output, and a receipt
@@ -181,7 +181,7 @@ Append an object to `models[]` in [`suite.json`](suite.json):
 Put the GGUF under `models/` (path is repo-relative), then:
 
 ```bash
-./target/release/ferrox bench --suite --id my_model_q4km --fit-host --skip-missing
+./target/release/frink bench --suite --id my_model_q4km --fit-host --skip-missing
 ```
 
 ### Thread counts are not forced, on purpose
@@ -194,7 +194,7 @@ every barrier. On Host B, `llama-bench` on SmolLM2-135M Q8_0 measures
 346 tok/s at `-t 4` and 176 at `-t 10`.
 
 This suite used to force `-t 10` on both engines, which handicapped
-llama.cpp by 2–4× and flattered ferrox. **CPU comparisons taken before
+llama.cpp by 2–4× and flattered frink. **CPU comparisons taken before
 that fix are not usable.** Letting each engine choose its own default is
 the comparison that means something.
 
@@ -209,7 +209,7 @@ in one session and count rounds won, instead of comparing two batches:
 
 ```bash
 for round in 1 2 3 4; do
-  for bin in ./ferrox-base ./ferrox-new; do
+  for bin in ./frink-base ./frink-new; do
     $bin bench -m model.gguf -p 512 -n 0 -r 3
   done
 done
@@ -217,29 +217,29 @@ done
 
 ## Gap convention
 
-`Gap` = `llama / ferrox`.
+`Gap` = `llama / frink`.
 
 | Gap | Meaning |
 |---|---|
-| &lt; 1.0 | ferrox faster |
+| &lt; 1.0 | frink faster |
 | ~1.00× | parity (within ~5%) |
-| &gt; 1.0 | ferrox slower |
+| &gt; 1.0 | frink slower |
 
-Prose elsewhere ("1.56× faster") states the inverse when ferrox wins.
+Prose elsewhere ("1.56× faster") states the inverse when frink wins.
 Never quote a ratio that has no matching file under
 [`receipts/engine/`](receipts/engine/).
 
-## Env (ferrox)
+## Env (frink)
 
 | Var | Typical |
 |---|---|
-| `FERROX_METAL` | `1` (Metal), `0` for CPU runs |
-| `FERROX_METAL_ATTN` | `1` |
-| `FERROX_METAL_FA_VEC` | default **on** for `head_dim` in {64,96,128,256}, `0` = legacy GQA |
-| `FERROX_CTK` | `f16` unless the row says otherwise |
-| `FERROX_CPU_INT_DOT` | **on by default** in both binaries, `0` opts out |
-| `FERROX_CPU_THREADS` | unset = performance cores (6 on Host B) |
-| `FERROX_CUDA_GQA` / `FERROX_CUDA_GRAPH` | CUDA path (not Host B) |
+| `FRINK_METAL` | `1` (Metal), `0` for CPU runs |
+| `FRINK_METAL_ATTN` | `1` |
+| `FRINK_METAL_FA_VEC` | default **on** for `head_dim` in {64,96,128,256}, `0` = legacy GQA |
+| `FRINK_CTK` | `f16` unless the row says otherwise |
+| `FRINK_CPU_INT_DOT` | **on by default** in both binaries, `0` opts out |
+| `FRINK_CPU_THREADS` | unset = performance cores (6 on Host B) |
+| `FRINK_CUDA_GQA` / `FRINK_CUDA_GRAPH` | CUDA path (not Host B) |
 
 Full list: [`docs/CONFIG.md`](../docs/CONFIG.md).
 
@@ -248,9 +248,9 @@ Full list: [`docs/CONFIG.md`](../docs/CONFIG.md).
 Host B is Metal/CPU only. On a CUDA host:
 
 ```bash
-cargo build -p ferrox-cli --release --features cuda
-./target/release/ferrox bench -m model.gguf --n-gpu-layers 99 --compare
-./target/release/ferrox bench --suite --fit-host --skip-missing --backend cuda
+cargo build -p frink-cli --release --features cuda
+./target/release/frink bench -m model.gguf --n-gpu-layers 99 --compare
+./target/release/frink bench --suite --fit-host --skip-missing --backend cuda
 ```
 
 Record the GPU and driver whenever you quote a CUDA number. There is
@@ -261,33 +261,33 @@ covers it. See [`docs/ROADMAP.md`](../docs/ROADMAP.md).
 ## Serving (HTTP)
 
 Engine benches measure kernels alone. Serving benches measure a running
-`ferrox-server` over the OpenAI-compatible HTTP API: chat template,
+`frink-server` over the OpenAI-compatible HTTP API: chat template,
 tokenizer, sampler, SSE streaming, and (on Metal by default) continuous
 batching.
 
 | | |
 |---|---|
 | Measures | end-to-end HTTP latency and throughput |
-| Driver | `ferrox serve-bench` (Rust) or [`pi-agent-tests`](../../pi-agent-tests/) harness |
+| Driver | `frink serve-bench` (Rust) or [`pi-agent-tests`](../../pi-agent-tests/) harness |
 | Compared against | — (no llama.cpp HTTP twin in-tree) |
 | Raw numbers | [`receipts/serving/`](receipts/serving/) |
 | Workload | streaming chat/completions, concurrency sweeps |
 
 ```bash
 # install script binary (Metal build on macOS)
-ferrox serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
+frink serve -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf -dev metal -ngl all &
 
-./target/release/ferrox serve-bench --requests 64 --concurrency 8 --output-len 128
-./target/release/ferrox serve-bench --concurrency 16 --json
+./target/release/frink serve-bench --requests 64 --concurrency 8 --output-len 128
+./target/release/frink serve-bench --concurrency 16 --json
 ```
 
 Rules for meaningful numbers: see [`docs/CLI.md`](../docs/CLI.md)
 (`serve-bench` section). Temperature 0, exact output length, and
-positional TTFT/TPOT split are enforced in `ferrox_edge::bench_client`.
+positional TTFT/TPOT split are enforced in `frink_edge::bench_client`.
 
 ### Metal continuous batching (0.15.3)
 
-Host B, **Llama-3.2-3B-Instruct Q4_K_M**, CB auto-on, `ferrox 0.15.3`:
+Host B, **Llama-3.2-3B-Instruct Q4_K_M**, CB auto-on, `frink 0.15.3`:
 
 | Workload | Concurrency | OK | Aggregate tok/s | Mean TTFT |
 |---|---|---|---|---|
@@ -297,8 +297,8 @@ Host B, **Llama-3.2-3B-Instruct Q4_K_M**, CB auto-on, `ferrox 0.15.3`:
 | | 8 | 16/16 | **24.4** | 957 ms |
 | sequential stream (`max_tokens=128`) | 1 | 8/8 | — | **118 ms** |
 
-Receipts (from [`pi-agent-tests/ferrox_parallel_bench.py`](../../pi-agent-tests/ferrox_parallel_bench.py)
-and [`ferrox_stream_bench.py`](../../pi-agent-tests/ferrox_stream_bench.py)):
+Receipts (from [`pi-agent-tests/frink_parallel_bench.py`](../../pi-agent-tests/frink_parallel_bench.py)
+and [`frink_stream_bench.py`](../../pi-agent-tests/frink_stream_bench.py)):
 [`llama32_3b_q4km_metal_cb_parallel_0.15.3.json`](receipts/serving/llama32_3b_q4km_metal_cb_parallel_0.15.3.json),
 [`llama32_3b_q4km_metal_cb_stream_0.15.3.json`](receipts/serving/llama32_3b_q4km_metal_cb_stream_0.15.3.json).
 See also [`pi-agent-tests/README.md`](../../pi-agent-tests/README.md).

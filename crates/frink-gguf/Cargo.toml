@@ -1,0 +1,17 @@
+[package]
+name = "frink-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "GGUF mmap loader for the Frink inference engine"
+readme = "README.md"
+keywords = ["gguf", "llm", "mmap", "parser", "frink"]
+categories = ["parser-implementations", "encoding"]
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+memmap2 = { workspace = true }

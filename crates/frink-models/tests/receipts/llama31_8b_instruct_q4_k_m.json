@@ -1,0 +1,34 @@
+{
+  "id": "llama31-8b-instruct-q4_k_m",
+  "checkpoint": {
+    "repo": "lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF",
+    "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+    "sha256": "f2be3e1a239c12c9f3f01a962b11fb2807f8032fdb63b0a5502ea42ddef55e44",
+    "bytes": 4920739168
+  },
+  "oracle": {
+    "engine": "llama-server",
+    "note": "brew llama.cpp on Apple M2 Pro; top-1 at forced continuation was token 3146 (` **`)"
+  },
+  "frink_commit_fixed": "ddc3489",
+  "prompt": {
+    "chat_template": "Llama3",
+    "rendered": "<|start_header_id|>user<|end_header_id|>\n\nWhat are the capital of all european countries? please list all.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHere is a list of all the capitals of all the countries in the world:\n\n1.",
+    "token_ids": [128000, 128006, 882, 128007, 271, 3923, 527, 279, 6864, 315, 682, 87019, 5961, 30, 4587, 1160, 682, 13, 128009, 128006, 78191, 128007, 271, 8586, 374, 264, 1160, 315, 682, 279, 94099, 315, 682, 279, 5961, 304, 279, 1917, 25, 271, 16, 13]
+  },
+  "checks": [
+    {
+      "name": "forced_continuation_no_early_eos",
+      "context_len": 42,
+      "forbid_top1": [128009],
+      "require_in_top5": [3146, 95733, 220],
+      "note": "Before RopeLayout::Norm fix, greedy top-1 was <|eot_id|> (128009). After fix, Europe-capitals continuation (space/Albania/` **`) without EOS."
+    },
+    {
+      "name": "greedy_prefix_europe",
+      "max_new_tokens": 25,
+      "decoded_substring": "Albania",
+      "forbid_decoded_substring": "countries in the world"
+    }
+  ]
+}

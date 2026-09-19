@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `cohere2` GGUFs used by ferrox's Command-R7B
+"""Generate the tiny synthetic `cohere2` GGUFs used by frink's Command-R7B
 coverage test.
 
 `cohere2` (Command-R7B, Command-A) refused as a `dedicated` row for its
@@ -39,7 +39,7 @@ Shapes:
     (layers 0 and 2 slide), to pin that the scalar key is honoured.
   * `--no-window`: the key `:13` REQUIRES left out. libllama refuses the
     file (`key not found in model: cohere2.attention.sliding_window`,
-    measured); ferrox refuses it by name too.
+    measured); frink refuses it by name too.
 
 Usage:
     PYTHONPATH=/path/to/llama.cpp/gguf-py \\
@@ -82,7 +82,7 @@ def main(out_path: str, pattern_key: bool, no_window: bool) -> None:
         return (1.0 + rng.standard_normal(n) * 0.3).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-cohere2-fixture")
+    w.add_name("frink-cohere2-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

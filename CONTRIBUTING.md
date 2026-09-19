@@ -36,12 +36,12 @@ CI's Linux `clippy` job compiles the same fallbacks, so this is about
 finding them a round trip earlier, not about a check CI lacks.
 
 The `cuda` feature must keep compiling without a GPU or CUDA toolkit
-present: `cargo clippy -p ferrox-cli -p ferrox-server --features cuda`.
+present: `cargo clippy -p frink-cli -p frink-server --features cuda`.
 CI also builds that CLI/server chain and, on `macos-latest`, compiles
-`cargo clippy -p ferrox-metal -p ferrox-cli --features metal`. Hardware
+`cargo clippy -p frink-metal -p frink-cli --features metal`. Hardware
 kernel tests stay `#[ignore]`d on hosted CI.
 
-CI builds `ferrox-cli --features serve` too, which is what the release
+CI builds `frink-cli --features serve` too, which is what the release
 tarball ships: `serve` on Linux and `serve metal` on macOS. That gate
 was added after noticing a break confined to `serve` could reach users
 through the install script with CI green.
@@ -57,19 +57,19 @@ that touches `ui/src/lib/`.
 - New quant kernels need independent goldens, not only self-parity.
 - A hardware claim names the machine it was measured on, or says
   compile-tested only.
-- Speed numbers come from `ferrox bench --suite` against `llama-bench`,
+- Speed numbers come from `frink bench --suite` against `llama-bench`,
   with no HTTP in the loop. `benchmarks/suite.json` drives the runs and
   `benchmarks/RESULTS.md` is generated from them, so never edit that
   table by hand. To measure a new model, add an entry to `suite.json`,
   put the GGUF under `models/`, then run
-  `ferrox bench --suite --id <id> --fit-host --skip-missing`.
+  `frink bench --suite --id <id> --fit-host --skip-missing`.
 - A run that stops before timing anything is telling you the host is
   busy, hot, or short on free memory. Fix the host rather than reaching
   for `--max-load 0`, which turns off all three checks and produces a
   number nobody may publish. `benchmarks/README.md` has each one.
 - Never force a thread count on either engine. llama.cpp defaults to
   performance cores and loses 2-4x above them, so pinning both to the
-  same count flatters ferrox instead of making the comparison fair.
+  same count flatters frink instead of making the comparison fair.
 - Run-to-run spread on Apple Silicon is around 20%. A claim under that
   needs an interleaved A/B: alternate the two binaries round by round in
   one session and count rounds won. Two batches of runs will not do it.

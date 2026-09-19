@@ -1,0 +1,38 @@
+[package]
+name = "frink-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Pure-Rust GGUF / MoE inference engine: mmap loaders, quantized CPU + Metal + CUDA kernels"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "quantization", "moe"]
+categories = ["science", "algorithms"]
+
+# The front door on crates.io. `frink` itself is taken by an unrelated
+# crate, so this is the name the project is published under; it
+# re-exports the workspace so a dependent needs one line in Cargo.toml
+# instead of six. The binary lives in `frink-cli`
+# (`cargo install frink-cli` installs it as `frink`) and is
+# deliberately NOT duplicated here -- two crates shipping a binary
+# called `frink` would fight over the same path in ~/.cargo/bin.
+
+[dependencies]
+frink-gguf = { workspace = true }
+frink-quant = { workspace = true }
+frink-core = { workspace = true }
+frink-moe = { workspace = true }
+frink-models = { workspace = true }
+frink-safetensors = { workspace = true }
+frink-api = { workspace = true, optional = true }
+
+[features]
+default = []
+# Route constants and wire DTOs, for writing a client against
+# frink-server without depending on the server itself.
+api = ["dep:frink-api"]
+# Apple Metal kernels. Apple Silicon only.
+metal = ["frink-core/metal", "frink-models/metal"]
+# CUDA/NVRTC kernels. Needs a CUDA toolkit at build time.
+cuda = ["frink-core/cuda", "frink-models/cuda"]

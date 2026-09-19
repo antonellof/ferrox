@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `seed_oss` GGUF used by ferrox's Seed-OSS
+"""Generate the tiny synthetic `seed_oss` GGUF used by frink's Seed-OSS
 coverage test.
 
-`seed_oss` is ByteDance's Seed-OSS-36B. It sat on ferrox's generic GQA
+`seed_oss` is ByteDance's Seed-OSS-36B. It sat on frink's generic GQA
 path refusing as UNAUDITED, triaged ONE MATCH ARM: it stores its
 **pre-FFN** norm as `blk.N.post_attention_norm.weight` and carries no
 `blk.N.ffn_norm.weight` at all, which is gpt-oss's slot and not Gemma's
@@ -71,7 +71,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-seed-oss-fixture")
+    w.add_name("frink-seed-oss-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

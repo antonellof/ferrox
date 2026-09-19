@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `minicpm` GGUFs used by ferrox's MiniCPM
+"""Generate the tiny synthetic `minicpm` GGUFs used by frink's MiniCPM
 coverage test.
 
 MiniCPM was never an UNAUDITED row. It was refused BY NAME, and the
@@ -17,7 +17,7 @@ hparams.f_logit_scale     = hparams.n_embd ? (256.0f / float(hparams.n_embd)) : 
 and only THEN (`:12-14`) lets the file override them, each with
 `required = false`. So a MiniCPM export that declares none of the three
 keys is still scaled by all three, and a gate that looks for the keys
-sees an ordinary file. That is why ferrox refused the architecture
+sees an ordinary file. That is why frink refused the architecture
 string rather than detecting the feature, and it is why the DEFAULT
 fixture this script writes declares **no scaling key at all**: a fixture
 that declared them would pass with or without the hook and would prove
@@ -47,7 +47,7 @@ Two differences from Granite, both load-bearing:
   * **No `attention.scale`.** `minicpm.cpp:3-24` contains no
     `LLM_KV_ATTENTION_SCALE`, so `hparams.f_attention_scale` keeps its
     `0.0f` and `granite.cpp:225` falls back to `1/sqrt(n_embd_head)`.
-    Neither file here writes that key, and ferrox still refuses it for
+    Neither file here writes that key, and frink still refuses it for
     this architecture.
   * **The RoPE switch is unreachable.** Granite's graph gates RoPE
     entirely on `hparams.rope_finetuned` (`granite.cpp:206`), and
@@ -136,7 +136,7 @@ def main(out_path: str, declared: bool, attention_scale: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-minicpm-fixture")
+    w.add_name("frink-minicpm-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
@@ -158,7 +158,7 @@ def main(out_path: str, declared: bool, attention_scale: bool) -> None:
     # logit by 256/n_embd, still multiplies every branch output by
     # 1.4/sqrt(n_layer), and still multiplies every embedding row by 12.
     # `minicpm.attention.scale` is never written by either variant:
-    # MiniCPM does not read that key, and ferrox refuses a file that
+    # MiniCPM does not read that key, and frink refuses a file that
     # declares it.
     if declared:
         w.add_logit_scale(DECLARED_LOGIT_SCALE)
@@ -166,10 +166,10 @@ def main(out_path: str, declared: bool, attention_scale: bool) -> None:
         w.add_embedding_scale(DECLARED_EMBEDDING_SCALE)
 
     # `--attention-scale` writes the ONE key of the four that MiniCPM
-    # does not read, to prove ferrox's refusal of it is reachable rather
+    # does not read, to prove frink's refusal of it is reachable rather
     # than decorative. llama.cpp loads such a file and ignores the key
     # (`hparams.f_attention_scale` is never assigned from it, so
-    # `granite.cpp:225` still uses `1/sqrt(n_embd_head)`); ferrox stops,
+    # `granite.cpp:225` still uses `1/sqrt(n_embd_head)`); frink stops,
     # because honouring a number its own reference discards is the same
     # class of wrong as dropping one it applies. No golden goes with
     # this file -- it is never expected to load.
@@ -210,7 +210,7 @@ def main(out_path: str, declared: bool, attention_scale: bool) -> None:
         w.add_tensor(p + "attn_k.weight", rnd(n_embd_kv, N_EMBD) * 4.0)
         w.add_tensor(p + "attn_v.weight", rnd(n_embd_kv, N_EMBD))
         # NOTE: no `attn_output.bias`. minicpm.cpp:49 makes it optional
-        # and ferrox would DROP it, so a fixture carrying one would be
+        # and frink would DROP it, so a fixture carrying one would be
         # refused by the unread-tensor gate rather than compared.
         w.add_tensor(p + "attn_output.weight", rnd(N_EMBD, n_embd_q) * 6.0)
 

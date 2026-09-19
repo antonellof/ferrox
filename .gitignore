@@ -7,7 +7,7 @@ Cargo.lock.bak
 __pycache__/
 *.pyc
 /vast-receipts/
-ferrox-journal.log*
+frink-journal.log*
 /.scratch-logitcheck/
 /.scratch/
 
@@ -28,7 +28,7 @@ models/
 data/
 .env
 
-# Ferrox Studio frontend (source in ui/, standalone app).
+# Frink Studio frontend (source in ui/, standalone app).
 # `npm run build` output is NOT committed: the server no longer embeds
 # the UI, so nothing here ships inside a Rust crate.
 /ui/node_modules/
@@ -43,6 +43,6 @@ data/
 .git-msg.*
 
 # Server-side chat transcripts written at runtime by
-# FERROX_CONVERSATIONS_DIR (default ./ferrox-conversations). Seven were
+# FRINK_CONVERSATIONS_DIR (default ./frink-conversations). Seven were
 # committed by accident in 56a0d48 while testing chat fixes locally.
-ferrox-conversations/
+frink-conversations/

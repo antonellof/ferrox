@@ -1,13 +1,13 @@
 # Features
 
-Ferrox is a pure-Rust GGUF inference engine for dense and MoE models.
+Frink is a pure-Rust GGUF inference engine for dense and MoE models.
 Weights stay quantized when the file is mmapped, and dequantization
 happens inside the matvec. Backends: CPU, Apple Metal, and CUDA.
 
 ## Models
 
 Measured against llama.cpp on the same host and the same GGUF with
-`ferrox bench`. Gap = `llama / ferrox`, so anything under 1 means Ferrox
+`frink bench`. Gap = `llama / frink`, so anything under 1 means Frink
 is faster.
 
 - **Dense GQA**: TinyLlama, Llama 3.2, SmolLM2, Qwen2.5/Qwen3,
@@ -37,7 +37,7 @@ is faster.
 - **Gemma-4**: dedicated engine (per-layer embeddings, shared KV,
   SWA/full), an SPM-style `gemma4` BPE tokenizer, and the `<|turn>` chat
   wrap. Dense only: the MoE router is ported and tested
-  (`ferrox_moe::route_gemma4_moe`) but the loader still expects
+  (`frink_moe::route_gemma4_moe`) but the loader still expects
   `ffn_gate.weight`, so a MoE Gemma-4 GGUF does not load yet.
 - **MiniMax**, and the two architectures are not one thing.
   `minimax-m2` (MiniMax-M2) builds ordinary dense GQA with whole-vector
@@ -49,7 +49,7 @@ is faster.
   genuinely unimplemented, and the blocker is MiniMax Sparse Attention:
   a per-layer indexer driving its own KV cache with position-to-cell
   maps, plus `SWIGLU_OAI` and shared experts. The block-sparse block
-  selection (`ferrox_core::block_sparse`) is the smallest piece of that
+  selection (`frink_core::block_sparse`) is the smallest piece of that
   and is the only piece ported. Neither is blocked on MTP draft heads,
   which no MiniMax GGUF can carry: `gguf-py`'s tensor lists for both
   have no `NEXTN_*` entry, so the writer physically cannot emit one.
@@ -60,7 +60,7 @@ is faster.
   9-11` marks a layer recurrent when its `head_count_kv` is 0, and
   `:192-208` runs one residual topology for both kinds, so the short
   convolution is a third answer to "what is this layer's attention"
-  (`layer_shapes::AttnShape::ShortConv`, `ferrox_models::shortconv`)
+  (`layer_shapes::AttnShape::ShortConv`, `frink_models::shortconv`)
   rather than a second engine: `attn_norm`, `in_proj` split into `b,
   c, x`, a causal depthwise conv of width `shortconv.l_cache` over
   `b * x` with the previous inputs as the state, `c *` the result,
@@ -81,9 +81,9 @@ is faster.
   `head_count_kv` is 0 and `:128-142` runs Granite's layer with the
   Mamba-2 block (`mamba-base.cpp:149-288`) where attention would be, so
   it is a fourth answer to "what is this layer's attention"
-  (`layer_shapes::AttnShape::Mamba2`, `ferrox_models::mamba2`,
-  `ferrox_core::mamba2` for the conv and scan steps as ggml computes
-  them). The state is a `RecurrentState` (`ferrox_core::
+  (`layer_shapes::AttnShape::Mamba2`, `frink_models::mamba2`,
+  `frink_core::mamba2` for the conv and scan steps as ggml computes
+  them). The state is a `RecurrentState` (`frink_core::
   recurrent_state`) beside the layer's cache on all three backings:
   cloned and cleared with it, refused a truncate to a middle position
   (`KvCache::can_truncate_to`), so the prefix cache does not store such
@@ -114,10 +114,10 @@ is faster.
 - **Qwen3.5 dense** (`qwen35`: 0.8B / 2B / 4B / 9B / 27B), audited
   against libllama on 2026-09-14 (`tests/qwen35_graphs.rs`, KL 4.1e-13,
   4.1e-13 with `attention.recurrent_layers`, 5.7e-13 with a separate
-  `output.weight`). The gated delta net (`ferrox_core::gdn` is the
+  `output.weight`). The gated delta net (`frink_core::gdn` is the
   autoregressive delta rule as `delta-net-base.cpp:289-365` computes
   it, V heads TILED over K heads as `llama-model.cpp:524-526` says;
-  `ferrox_models::gdn` is `qwen35.cpp:236-317` around it: the fused
+  `frink_models::gdn` is `qwen35.cpp:236-317` around it: the fused
   q/k/v projection, the `z` gate, `sigmoid(beta)`, `softplus(alpha +
   dt) * A`, the causal conv with SiLU, per-head l2 norms with the RMS
   epsilon, `rms_norm(o) * silu(z)` per head) is a block where
@@ -127,7 +127,7 @@ is faster.
   (`attn_gate::Q_INTERLEAVED_GATE_ARCHS`: the gate rides interleaved
   with the query and is split after the projection, so a quantized
   `wq` stays one matrix), with per-head QK norm and partial IMROPE
-  (NEOX band for band on text positions, `ferrox_models::mrope`); the
+  (NEOX band for band on text positions, `frink_models::mrope`); the
   pre-FFN norm is stored as `post_attention_norm` (`norm_sites`). The
   1.8k-line GDN scaffold that had never met libllama is deleted.
   `qwen35moe` (Qwen3.5-35B-A3B and up) is the same layers with
@@ -139,22 +139,22 @@ is faster.
 - **Ternary-Bonsai-2-27B** (PrismML's `PTQ1_0` export of a `qwen35`
   graph with a folded Hadamard rotation), verified on the REAL
   checkpoint on 2026-09-18 against PrismML's llama.cpp fork (the only
-  libllama that reads the format): `ferrox parity` first-token KL
+  libllama that reads the format): `frink parity` first-token KL
   2.1e-5 CPU, 2.3e-5 Metal decode, 2.2e-6 through the Metal GEMM,
   tokenizer MATCH (`pre=qwen35`, a `qwen2` pattern with marks kept in
-  letter runs). `PTQ1_0` (ggml type 143) is `ferrox_quant::ternary`:
+  letter runs). `PTQ1_0` (ggml type 143) is `frink_quant::ternary`:
   128 weights a block, five trits a byte in `qs[24]`, four in `qh[2]`,
   the f16 scale LAST, decoded with the fork's `((q * 3^n) mod 256) *
   3 >> 8` trick; `TQ1_0` is the same codec with the other layout. On
-  Metal (`ferrox-metal/src/ternary.rs`) the matvec is the fork's
+  Metal (`frink-metal/src/ternary.rs`) the matvec is the fork's
   byte-owning shape (eight lanes a block, the trit peeled on the float
   pipe as `floor(3^{n+1} u) - 3 floor(3^n u)`, the byte's dot collapsed
   to five activation coefficients staged once for four rows) and the
   GEMM is one dequant functor spliced into the shared simdgroup body.
   The Hadamard (`prism.hadamard.*`: block 1024, explicit signs per
   input width, `W' = W S H`) is `WeightMatrix::Folded` over
-  `ferrox_core::weight_matrix::hadamard` and read from the file by
-  `ferrox_models::hadamard_fold`: the activation is permuted, signed
+  `frink_core::weight_matrix::hadamard` and read from the file by
+  `frink_models::hadamard_fold`: the activation is permuted, signed
   and transformed before every launch of a listed weight, the
   `token_embd` row restored after its lookup, `ssm_out`'s input
   permuted tiled-to-grouped first. Building it found four defects on
@@ -164,7 +164,7 @@ is faster.
   and `apply_gpu_batch`'s GEMM dispatch each carried a hand-written
   kind match that lacked Q5_0 as well (so Q5_0 gate/up ran as two
   launches and Q5_0 prefill as N matvecs while the kernel registry
-  recorded a GEMM hit), and `ferrox bench` refused every hybrid model
+  recorded a GEMM hit), and `frink bench` refused every hybrid model
   because its cache probe read KV rows on a recurrent layer. Speed on
   the M2 Pro, back to back on a quiet box: pp128 43.1 / tg32 11.17
   against the fork's 66.8 / 11.46, up from 2.9 / 2.4 at first light,
@@ -191,7 +191,7 @@ is faster.
   to `5b59b83`, 792 commits, fifteen new graphs). Both were triaged ONE
   MATCH ARM the same day and both cost what that class is supposed to
   cost, a table row and a fixture. `spark2_5` is a per-head sigmoid
-  attention gate (`spark2-5.cpp:41,97-105`, `ferrox_models::attn_gate`
+  attention gate (`spark2-5.cpp:41,97-105`, `frink_models::attn_gate`
   beside `step35`'s row) on a llama with a window ARRAY, per-layer head
   counts that SIZE the gate, and a gated GELU FFN -- KL 7.70e-7, which
   is llama.cpp's f16 GELU table and nothing else (3.34e-12 with the
@@ -200,19 +200,19 @@ is faster.
   does not show: `llama-graph.cpp:2228` sends it to
   `ggml_swiglu_clamp`, which clamps the gate BEFORE the SiLU where
   every other graph clamps the SiLU's output, so
-  `ferrox_moe::ClampForm` is two forms and
+  `frink_moe::ClampForm` is two forms and
   `act_layers::CLAMP_BEFORE_SILU` the list. The two agree wherever
   `silu(x) <= limit`, which is why the fixture's clamp binds on two
   layers of four. Building them found `expert_feed_forward_length`
   read as a scalar where upstream reads scalar-or-array, silently
   sizing every expert at `feed_forward_length / n_experts_used` for any
   file that writes the array -- which `conversion/nemotron.py:573`
-  does for Nemotron-H Puzzle, an architecture ferrox serves.
+  does for Nemotron-H Puzzle, an architecture frink serves.
 - **Llama 4: Scout and Maverick** (`llama4`), audited against libllama
   on 2026-09-14 (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16- and
   128-expert shapes, and the last of 8200 positions across the chunk
   boundary on the prefill and row bodies). The CHUNKED window
-  (`ferrox_models::chunked_swa`: `llama4.cpp:13-14` set
+  (`frink_models::chunked_swa`: `llama4.cpp:13-14` set
   `LLAMA_SWA_TYPE_CHUNKED` at a literal 8192, and a query at `p` sees
   the `p % 8192 + 1` keys of its own chunk, `ModelConfig::
   layer_window_for_query`, with the batched prefill taking a per-query
@@ -232,8 +232,8 @@ is faster.
 - **Mamba-1: Jamba, Mamba, FalconMamba; and pure Mamba-2** (`jamba`,
   `mamba`, `mamba2`), audited against libllama on 2026-09-14
   (`tests/mamba_graphs.rs`, KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13).
-  `ferrox_models::mamba1` is `build_mamba_layer` once: the selective
-  scan with a per-state decay (`ferrox_core::mamba2::Decay::PerState`),
+  `frink_models::mamba1` is `build_mamba_layer` once: the selective
+  scan with a per-state decay (`frink_core::mamba2::Decay::PerState`),
   dt / B / C from one projection with the RMS norms Jamba's weights
   carry or FalconMamba's `ssm.dt_b_c_rms` sets weightless, dt projected
   up with its bias. `ssm_block::SsmBlock` is the one value the decoder
@@ -248,7 +248,7 @@ is faster.
   1.3e-13 / 6.2e-13 / 3.2e-13). Attention AND the Mamba-2 block on
   every layer, in parallel on the same `attn_norm` output, summed
   before the residual (`falcon-h1.cpp:137-161`;
-  `ferrox_models::mamba2::PARALLEL_WITH_ATTENTION`,
+  `frink_models::mamba2::PARALLEL_WITH_ATTENTION`,
   `ModelConfig::parallel_ssm`): the layer's cache holds the attention
   rows and the block's state, attention counts the positions, and
   `Decoder::parallel_ssm_rows` / `add_parallel_ssm` are the one pair
@@ -265,17 +265,17 @@ is faster.
   ONE residual topology rather than two: neither has an `attn_norm` or
   an `ffn_norm` tensor, both sublayers read the raw residual, and each
   branch's output is normed before its residual add
-  (`ferrox_models::norm`). One sub-case stays refused by name -- an
+  (`frink_models::norm`). One sub-case stays refused by name -- an
   `olmo2` carrying both a sliding window and a RoPE scaling (Olmo-3).
   EXAONE-4 32B was the other and runs since 2026-09-11 (next item).
 - **Per-layer RoPE: EXAONE-4 32B, EXAONE-MoE and SmolLM3**, audited
   against libllama on 2026-09-11 as ONE rule. llama.cpp gates rotation
-  per layer in six architectures and ferrox could not say so, which
+  per layer in six architectures and frink could not say so, which
   cost `exaone-moe` and `smollm3` an outright refusal and EXAONE-4 32B
   a refusal by name. `exaone4.cpp:116` and `exaone-moe.cpp:136,155-161`
   are the same predicate (`exaone-moe.cpp:4` pins `swa_type` to
   STANDARD, which makes `exaone4`'s `|| swa_type == NONE` vacuous);
-  `smollm3.cpp:5,69` is `(il + 1) % 4 != 0`. `ferrox_models::rope_layers`
+  `smollm3.cpp:5,69` is `(il + 1) % 4 != 0`. `frink_models::rope_layers`
   holds the table for all six, `ModelConfig::layer_rope` answers `None`
   for an unrotated layer so no rotation site can take the base and the
   divisors without answering the third question, and both fused Metal
@@ -286,7 +286,7 @@ is faster.
   window its file declares, and `nextn_predict_layers` (MTP blocks
   inside `block_count`) was refused nowhere and was then refused
   everywhere; it is SKIPPED now, as llama.cpp skips it, for the
-  seventeen graphs that read the key (`ferrox_models::mtp_blocks`), on
+  seventeen graphs that read the key (`frink_models::mtp_blocks`), on
   the generic path and all four dedicated loaders, and still refused by
   name elsewhere.
 - **The per-layer sliding-window ARRAY.** `attention.sliding_window_
@@ -295,14 +295,14 @@ is faster.
   `olmo2`, twelve more), honoured where it reads the array overload
   (`mimo2`, `step35`, `gemma4`; a scalar there is a broadcast bool, not
   a period), and scalar-then-array for `mellum` / `cohere2moe`.
-  `ferrox_models::swa_layers` is one table and one enum behind
+  `frink_models::swa_layers` is one table and one enum behind
   `ModelConfig::layer_sliding_window(il)`. Every real EXAONE-4 32B,
   EXAONE-MoE and Olmo-3 export carries the array and was refused over a
   value llama.cpp never reads; `mellum` is audited on it, with its
   window-plus-YaRN case (every real Mellum2) refused by name.
 - **Projection biases on the dense path, and with them StarCoder2
   (`starcoder2`), CodeShell (`codeshell`) and Jais-2 (`jais2`).**
-  `ferrox_models::proj_bias`: `attn_output.bias` after `wo` and the
+  `frink_models::proj_bias`: `attn_output.bias` after `wo` and the
   dense FFN's `ffn_{up,gate,down}.bias` where `build_ffn` adds them, for
   exactly the architectures whose graph creates the tensors (33 and 27
   of 155, measured, most OPTIONAL -- a `llama` file with biases used to
@@ -316,14 +316,14 @@ is faster.
   (`tests/stablelm_graphs.rs`). The graph's two other shapes, both
   decided by tensor presence and both StableLM-2-12B, are refused by
   name from fixtures libllama runs: a layer with no `ffn_norm` is the
-  PARALLEL residual (`ferrox_models::parallel_residual`, served since
+  PARALLEL residual (`frink_models::parallel_residual`, served since
   the next PR, below), and a layer with `attn_q_norm` is a
   per-head LAYERNORM with a distinct weight per head
-  (`ferrox_models::qk_layer_norm`; three graphs). `use_parallel_
+  (`frink_models::qk_layer_norm`; three graphs). `use_parallel_
   residual` is dead metadata upstream and ignored here, pinned.
 - **The parallel residual, and with it GPT-NeoX / Pythia (`gptneox`)
   and PLaMo (`plamo`).** `x + attn(norm(x)) + ffn(norm(x))`:
-  `ferrox_models::parallel_residual` is one table for the eight graphs
+  `frink_models::parallel_residual` is one table for the eight graphs
   that build it (measured over all 155), in its two spellings -- the FFN
   reading its own norm of the layer input (`gptneox` under
   `use_parallel_residual`, Falcon-40B under `attn_norm_2`) or the vector
@@ -344,7 +344,7 @@ is faster.
   it), a tied lm_head, NORM RoPE at base 8e6. KL 1.0e-15
   (`tests/command_r_graphs.rs`). Command-R+ (64 layers) carries the
   per-head LayerNorm QK norm llama.cpp REQUIRES at that depth and is
-  refused by name (`ferrox_models::qk_layer_norm`) from a 64-layer
+  refused by name (`frink_models::qk_layer_norm`) from a 64-layer
   fixture libllama runs.
 - **Falcon (`falcon`): Falcon-7B, 40B and 180B run.** Both of
   `falcon.cpp`'s shapes, decided per layer by one optional tensor: 7B is
@@ -395,7 +395,7 @@ is faster.
   learned position table.** `position_embd.weight` `{n_embd,
   n_ctx_train}` is gathered at the position and ADDED to the token
   embedding before layer 0 (`gpt2.cpp:19,74-77`), and the graph calls
-  no `ggml_rope`: `ferrox_models::position_embd` (three graphs of 155
+  no `ggml_rope`: `frink_models::position_embd` (three graphs of 155
   create the tensor on the generic path, `mpt`'s optional beside its
   ALiBi) adds row `pos` at the one embedding site, and
   `rope_layers::RopeLayers::Never` is the rule that rotates nothing (not
@@ -408,12 +408,12 @@ is faster.
   line; dropping the table or rotating the layers diverges by more
   than 1.
 - **ALiBi, and with it Refact (`refact`), BLOOM (`bloom`), MPT (`mpt`),
-  Jais (`jais`) and Baichuan-13B.** `ferrox_core::alibi::slopes` is
+  Jais (`jais`) and Baichuan-13B.** `frink_core::alibi::slopes` is
   llama.cpp's per-head slope formula (`ggml-cpu/ops.cpp:5489-5508`), and
   the three host attention kernels (row, paged, batched prefill) take
   the slopes as an additive `slope_h * (p_key - p_query)` on every
   score after the scale and the softcap, where `ggml_soft_max_ext` adds
-  `slope * mask`; `ferrox_models::alibi` is the table of the five
+  `slope * mask`; `frink_models::alibi` is the table of the five
   graphs and where each gets `f_max_alibi_bias` (the literal 8 for
   `bloom` / `refact`, the literal at 40 layers only for `baichuan`,
   `attention.max_alibi_bias` for `mpt` / `jais`), and
@@ -441,7 +441,7 @@ is faster.
 - **GLM-4-0414 / GLM-Z1 / GLM-OCR (`glm4`) on the generic path**,
   audited against libllama at KL 9.7e-15 with no code change: the row
   had been sent to the GLM-5.2 MLA loader for keys its graph never
-  reads. `ferrox_models::mrope` decides what a vision export's text
+  reads. `frink_models::mrope` decides what a vision export's text
   tower (`rope.dimension_sections`) means per architecture: served as
   NEOX for `glm4moe` (llama.cpp's M-RoPE on text positions, measured
   byte-identical), refused for `glm4` (converter-permuted weights, 0.72
@@ -457,16 +457,16 @@ is faster.
   which is what llama.cpp's M-RoPE computes on text positions (measured
   byte-identical).
 - **MLA with the absorption optimization, and DeepSeek-2 checked
-  against libllama in both tensor forms.** `ferrox_models::mla::MlaKvB`:
+  against libllama in both tensor forms.** `frink_models::mla::MlaKvB`:
   the combined `attn_kv_b` (legacy exports, `plm`) and the split
   `attn_k_b` / `attn_v_b` (every DeepSeek export since the `_mla` keys),
   the latter attending over a latent cache `kv_lora_rank + qk_rope` wide
-  (`ferrox_core::mla_absorbed`). KL 2.35e-15 and 3.57e-15
+  (`frink_core::mla_absorbed`). KL 2.35e-15 and 3.57e-15
   (`tests/deepseek2_graphs.rs`). YaRN as DeepSeek-V2 and V3 declare it
-  is `ferrox_models::mla_yarn`, three more goldens at 1e-15.
+  is `frink_models::mla_yarn`, three more goldens at 1e-15.
 - **A dense FFN summed with the routed experts, and a routed branch
   fed from the layer input**, and with them Arctic (`arctic`) and
-  Grok-2. `ferrox_models::parallel_dense_ffn` is the table of the two
+  Grok-2. `frink_models::parallel_dense_ffn` is the table of the two
   graphs that sum a dense FFN with their experts (presence, scale on
   the sum), served through the shared-expert slot under the dense
   names; `RouterInput::NormedLayerInput` is Arctic's router and experts
@@ -476,8 +476,8 @@ is faster.
   Metal MoE launch refuses both.
 - **PLM on the MLA engine, and the engine's first cross-engine
   evidence.** `plm` (PLM-1.8B) is DeepSeek-2's MLA attention on a dense
-  model; `ferrox_models::mla_arch` is the table of the three ways it
-  differs (a direct `attn_q` -- `ferrox_models::mla_q_proj`, which the
+  model; `frink_models::mla_arch` is the table of the three ways it
+  differs (a direct `attn_q` -- `frink_models::mla_q_proj`, which the
   lite DeepSeek-V2 layer counts take too, where the loader had refused
   them for a key llama.cpp never reads; an ungated ReLU-squared dense
   FFN carried on `MlaDenseFfn`; a tied lm_head whose decoy
@@ -490,24 +490,24 @@ is faster.
   stream and two projection gains**, and with them Talkie (`talkie`).
   `NormOp::RmsNoParams` for a file with no norm tensor at all;
   `QkNormStyle::PerHeadScalar` for an `attn_q_norm` of one scalar per
-  head with a weightless K norm; `ferrox_models::skip_stream` for the
+  head with a weightless K norm; `frink_models::skip_stream` for the
   normed embedding added into every layer's output times
   `layer_output_scale`; and `attn_output.scale` / `ffn_down.scale`, the
   two per-tensor companions its converter writes, applied as
-  `build_lora_mm` applies them (`ferrox_models::weight_scales` serves
+  `build_lora_mm` applies them (`frink_models::weight_scales` serves
   those two and still refuses the rest). The fused Metal launches
   refuse the model.
 - **The same physical layers run more than once**, and with it Nanbeige
   (`nanbeige`). `num_loops` makes the logical layer count `n_phys *
   n_loops`, each logical layer with its own KV cache over shared
   weights, and `output_norm` between the passes unless
-  `skip_loop_final_norm`. `ferrox_models::layer_loops`: `Decoder::layers`
+  `skip_loop_final_norm`. `frink_models::layer_loops`: `Decoder::layers`
   stays physical, `n_layers` is logical, one mapping serves the host
   bodies, and the loop norm sits at the end of both FFN bodies. The
   fused Metal launches refuse a looped model.
 - **A V head width that differs from the K head width**, and with it
   MiMo-V2 (`mimo2`: `head_dim: 192, v_head_dim: 128` on every export).
-  `ferrox_models::kv_head_dims` admits the pair for the one generic-path
+  `frink_models::kv_head_dims` admits the pair for the one generic-path
   architecture whose converter writes them apart and keeps refusing it,
   naming llama.cpp's assert, for everyone else. `KvCache` and
   `PagedKvStore` size V by its own width, the single-query and batched
@@ -515,7 +515,7 @@ is faster.
   fused-QKV cut read it; every fused Metal launch, the CUDA resident
   hook, the slot file and the KV block file refuse a split model, so
   MiMo-V2 runs on the host paths. Its `attention.value_scale` is
-  `ferrox_models::attn_value_scale`, one reader of 155. Building it
+  `frink_models::attn_value_scale`, one reader of 155. Building it
   found `expert_weights_scale` / `expert_weights_norm` honoured for
   every architecture where llama.cpp reads them in twenty loaders; the
   loader's `EXPERT_WEIGHTS_*_READERS` tables are the measurement.
@@ -525,19 +525,19 @@ is faster.
   two sites the generic decoder's four norm slots did not have; one
   graph of 155 creates either tensor (measured), so
   `ModelConfig::block_sub_norms` is a `bool` the loader and the Metal
-  predicate both read (`ferrox_models::sub_norms`). Applied in the one
+  predicate both read (`frink_models::sub_norms`). Applied in the one
   attention tail and the one dense FFN row body; every fused Metal
   launch refuses the model. Per-projection `.scale` / `.input_scale`
   companions, which llama.cpp multiplies in for every architecture and
   the NVFP4 and older BitNet converters write, are refused by name
-  (`ferrox_models::weight_scales`) rather than run at the wrong
+  (`frink_models::weight_scales`) rather than run at the wrong
   magnitude. A real BitNet-b1.58 still needs `TQ1_0` / `TQ2_0`
   kernels; a Q8_0 or F16 re-export runs.
 - **The MoE router operand**, and with it every SmallThinker
   (`smallthinker`). `smallthinker.cpp:111` routes on `inpL`, the
   residual stream as it enters the layer, before `attn_norm` and before
   attention; every other MoE graph on this engine routes on the normed
-  FFN input the experts read. `ferrox_models::router_input` is the
+  FFN input the experts read. `frink_models::router_input` is the
   table (fifty-nine `build_moe_ffn` call sites parsed, four pass a
   precomputed `probs_in`, one on this engine differs in the operand),
   `Decoder::router_operand` the one place the operand is captured, and
@@ -551,7 +551,7 @@ is faster.
   "attention temperature tuning" as a GGUF key: llama.cpp multiplies Q
   after RoPE by `log(floor(pos / floor) + 1) * scale + 1` per token,
   and the floor is `n_ctx_orig_yarn` -- `context_length` unless the
-  YaRN key overrides it. `ferrox_models::attn_temperature` is one value
+  YaRN key overrides it. `frink_models::attn_temperature` is one value
   behind `ModelConfig::attn_temperature`, applied on the three host
   bodies and fenced off the fused Metal launches; three graphs of 155
   build the input (measured), and the two on other engines are
@@ -560,7 +560,7 @@ is faster.
 - **YaRN's magnitude term**, for every architecture. `rope_attn_factor`
   now carries `rope.scaling.attn_factor` times llama.cpp's
   `get_mscale(factor, 1) / get_mscale(factor, yarn_log_multiplier)`
-  (`ferrox_models::yarn_magnitude`), which it did not before: a YaRN
+  (`frink_models::yarn_magnitude`), which it did not before: a YaRN
   checkpoint was roped at the right frequencies and attended with
   logits low by `(1 + 0.1 ln factor)^2`. Same field, so the CPU helper
   and the Metal `mscale` uniform both carry it.
@@ -574,7 +574,7 @@ is faster.
   argmax` had `Some(&self.final_norm)` written into them
   unconditionally. **A file declaring a positive
   `olmo.attention.clamp_kqv` still stops**: llama.cpp clamps Q, K and V
-  by it (`llama-graph.cpp:1611-1652`) and ferrox clamps no projection
+  by it (`llama-graph.cpp:1611-1652`) and frink clamps no projection
   anywhere, so OLMo-7B loads and OLMo-1.7-7B, whose `clip_qkv` is 8.0,
   does not.
 - **MiniCPM**, which was refused by NAME rather than as unaudited,
@@ -588,7 +588,7 @@ is faster.
   `attention.scale`, and a file declaring one is still refused.
 - **ChatGLM and Qwen-1**, both audited against libllama on 2026-09-10
   and both closed by the same arm: the *fused* `blk.N.attn_qkv.bias`.
-  ferrox split a fused `attn_qkv.weight` and then looked for the bias
+  frink split a fused `attn_qkv.weight` and then looked for the bias
   only under the split `attn_q.bias` names, so ChatGLM2/3's
   `add_qkv_bias: true` and Qwen-1's required bias were dropped and every
   Q, K and V projection ran unbiased. `chatglm` also exercises PARTIAL
@@ -600,7 +600,7 @@ is faster.
   example), Gemma-2, Phi-3, Llama-3.1, and GLM4 when the tensors are
   there. None of these are in the published suite. Note Yi loads as
   `llama`, which is what its GGUF declares -- the `yi` architecture
-  string does not exist in llama.cpp and ferrox refuses it by name,
+  string does not exist in llama.cpp and frink refuses it by name,
   saying so.
 - **MoE routing bias** (`exp_probs_b`, DeepSeek-V3's aux-loss-free
   selection bias) plus `expert_weights_scale` and
@@ -616,7 +616,7 @@ is faster.
   hyperparameters, not tensors, so the check for unread tensors never
   sees them: before this, a Granite checkpoint would have loaded and
   answered at a scale it was never trained at. One implementation
-  (`ferrox_models::scalar_multipliers`), parameterised by architecture,
+  (`frink_models::scalar_multipliers`), parameterised by architecture,
   serves all three rows.
 - **Every other architecture's scalar multipliers still stop the load**,
   from a list derived from that same table rather than restated beside
@@ -624,7 +624,7 @@ is faster.
   stops with an error naming the key. A Granite file declaring
   `rope.scaling.finetuned = false` RUNS unrotated since 2026-09-14, as
   llama.cpp runs it (`rope_layers::RopeLayers::Never`,
-  `ferrox_models::rope_finetuned`): every Granite-4.0 hybrid export
+  `frink_models::rope_finetuned`): every Granite-4.0 hybrid export
   writes the key false, and the fixture that had evidenced the refusal
   matches its libllama golden.
 - **Cohere2 MoE** (`cohere2moe`, the 49-layer 30B-A3B), audited
@@ -655,7 +655,7 @@ Full matrix: [`MODELS.md`](MODELS.md) ·
 
 | Backend | Capabilities |
 |---|---|
-| **CPU** | Dense and MoE. int8×int8 matvec on by default (`FERROX_CPU_INT_DOT=0` opts out), interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot, pool sized to performance cores |
+| **CPU** | Dense and MoE. int8×int8 matvec on by default (`FRINK_CPU_INT_DOT=0` opts out), interleaved Q4_Kx8 / Q8_0x4 GEMV, Q8_0x4 batch GEMM for prefill, Q5/Q6 int-dot, pool sized to performance cores |
 | **Metal** | FA-vec attention (decode d=64/96/128/256, prefill d=128/256), concurrent FFN/QKV encode, MoE Concurrent with fused groups, `MemRanges`, `mul_mm_id` prefill, quantized KV (`q8_0` / `turbo8` / `fp8` / `turbo4`) |
 | **CUDA** | Matvec, resident weights, FFN fuse (`--features cuda`), batched GEMMs for `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `Q3_K`, `IQ4_NL`, `IQ4_XS` and `MXFP4` (verified on an RTX 3090, 2026-09-15), and a resident dense prefill stack (norms, QKV bias, QK norm, RoPE, causal GQA, SwiGLU, residuals on the device; K/V rows back to the host cache) |
 | **Vulkan** | `Q8_0` matvec only, no GEMM (`--features vulkan`). A beachhead, not a backend: see below |
@@ -672,20 +672,20 @@ real backend needs. `docs/plans/vulkan-beachhead-verdict.md` has the
 sizing: a full Vulkan backend is 15 to 25k lines.
 
 **The CUDA GEMM has run, and it is now the limit.** Its hardware test
-passes every kind and shape on an RTX 3090 and `ferrox verify
+passes every kind and shape on an RTX 3090 and `frink verify
 --backend cuda` is token-identical to the CPU on Q4_K_M, Q5_K_M, Q6_K,
 Q8_0 and IQ4_XS checkpoints (2026-09-15). It also keeps the
-thread-by-thread scalar twin held against `ferrox-quant`'s independent
+thread-by-thread scalar twin held against `frink-quant`'s independent
 dequantize-then-GEMM, and the host harness that executes the emitted
 CUDA C against a barrier shim
-(`crates/ferrox-cuda/tools/mul_mm_host_check/run.sh`), zero mismatches
+(`crates/frink-cuda/tools/mul_mm_host_check/run.sh`), zero mismatches
 across **11 kinds, 33 shapes and 75,042 compared positions**. Below
 the width threshold a single token stays on the matvec kernels.
 
 **CUDA prefill is resident and on the tensor cores, and still 4x
 off.** A dense layer used to be seven synchronous round trips with
 everything else on the host: 3.1 GB over PCIe per Llama-3.2-3B pp512
-step, two thirds of the step by `nsys`. `ferrox_cuda::prefill` runs a
+step, two thirds of the step by `nsys`. `frink_cuda::prefill` runs a
 run of dense layers on the device with one upload and one download of
 the hidden batch (#259), and `mul_mm_tc` puts the GEMM on `mma.sync`
 with f16 operands on `sm_80` and up (#261): pp512 on that model went
@@ -700,7 +700,7 @@ string, instead of quietly greying a control out.
 ## CLI
 
 llama.cpp-style completion flags (`-m`, `-p`, `-n`, `-ngl`, `--ctk`, …),
-plus `ferrox chat`, `ferrox pull` (Hugging Face Hub), `inspect`, `archs`,
+plus `frink chat`, `frink pull` (Hugging Face Hub), `inspect`, `archs`,
 and `presets`. See [`CLI.md`](CLI.md).
 
 Constrained decoding is on the CLI too: `--grammar`, `--grammar-file`
@@ -720,16 +720,16 @@ and the dedicated engines refuse by name; on Metal an adapted model runs
 on the per-matrix path rather than the fused stacks. See
 [`CLI.md`](CLI.md#lora-adapters) and [`API.md`](API.md#lora-adapters).
 
-`ferrox perplexity` is the quality axis: corpus evaluation using
+`frink perplexity` is the quality axis: corpus evaluation using
 llama.cpp's method, agreeing with `llama-perplexity` to within a fifth
 of one standard error on five checkpoints. Where the two differ, the gap
 is monotone in the quant and has the sign the documented `vec_dot_type`
-difference predicts. `ferrox quantize` writes **`Q8_0`, `Q4_K_S`,
+difference predicts. `frink quantize` writes **`Q8_0`, `Q4_K_S`,
 `Q4_K_M`, `Q5_K_S`, `Q5_K_M` and `Q6_K` byte-identically** to
 `llama_model_quantize()`, with or without an importance matrix
 (`--imatrix`, 311 of 311 tensors identical to `llama-quantize
 --imatrix` on a BF16 Qwen3-0.6B for all five targets tried), and
-refuses every other target by name. `ferrox imatrix` is
+refuses every other target by name. `frink imatrix` is
 `llama-imatrix`: same file format in both directions, so either tool's
 matrix feeds either quantizer.
 **The claim that Q4_K could never be byte-identical was wrong**, and it
@@ -762,7 +762,7 @@ host sampler would not have chosen (GitHub issue #170).
 `--repeat-penalty 1.0` or `--repeat-last-n 0` gets the fold back and
 is also what makes a run token-identical to llama.cpp's defaults.
 
-`ferrox bench -m model.gguf` works like `llama-bench`: the same `pp512`
+`frink bench -m model.gguf` works like `llama-bench`: the same `pp512`
 and `tg128` workloads, reported as a median with a population stddev.
 Add `--compare` to run `llama-bench` alongside it and print the gap.
 `--suite` drives every entry in
@@ -772,13 +772,13 @@ Add `--compare` to run `llama-bench` alongside it and print the gap.
 
 ## Server
 
-Two ways to start the same server. `ferrox serve` is a subcommand of the
+Two ways to start the same server. `frink serve` is a subcommand of the
 main binary behind an optional `serve` feature, off by default for
 `cargo install` because it pulls in 98 crates a completion-only user
-does not need. `ferrox-server` is that same server as its own
+does not need. `frink-server` is that same server as its own
 executable, and both parse identical arguments through identical code.
 The prebuilt release binary is built with `serve`, so the downloaded
-`ferrox` does both.
+`frink` does both.
 
 OpenAI-compatible HTTP API:
 
@@ -790,14 +790,14 @@ OpenAI-compatible HTTP API:
   longer ends it
 - Embeddings. A real encoder checkpoint (BGE / E5 / GTE class, anything
   whose `tokenizer.ggml.model` is `bert`) can be the loaded model:
-  `FERROX_MODEL_PATH=bge-small-en-v1.5-q8_0.gguf` serves `/v1/embeddings`
+  `FRINK_MODEL_PATH=bge-small-en-v1.5-q8_0.gguf` serves `/v1/embeddings`
   and the six generating routes answer **501 naming the model**, not a
   missing tensor. Pooling comes from the checkpoint's own
   `pooling_type` (NONE / MEAN / CLS / LAST; RANK refuses, it is a
   classification head rather than a pooling rule, and a rank-head
   checkpoint belongs on `/v1/rerank` instead). A decoder GGUF still
   pools its hidden states (mean/last) as before, and
-  `FERROX_EMBEDDING_MODEL_PATH` runs an encoder side-by-side with a
+  `FRINK_EMBEDDING_MODEL_PATH` runs an encoder side-by-side with a
   generative model in one process
 - Reranking. A `bert` checkpoint carrying a rank head (`cls`,
   `cls.output`, `cls.norm`, `classifier.output_labels`) is served by
@@ -811,11 +811,11 @@ OpenAI-compatible HTTP API:
   pooler is back: llama.cpp's converter deletes `bert.pooler.dense`
   from every BERT reranker, so the converter's output scores on about
   plus or minus 0.2 where the checkpoint was trained to produce about
-  plus or minus 11 (#82). `ferrox splice-pooler` writes a GGUF that
+  plus or minus 11 (#82). `frink splice-pooler` writes a GGUF that
   carries the pooler, tied to the checkpoint by the classifier both
   files hold rather than by a name; on the spliced file every score
   is within 0.051 of HuggingFace across four query sets. A file
-  without the pooler still serves, with `ferrox_score_head:
+  without the pooler still serves, with `frink_score_head:
   classifier(cls)` on every response, so a client can tell which range
   it is reading
 - Anthropic Messages: `POST /v1/messages` streaming and buffered
@@ -862,7 +862,7 @@ OpenAI-compatible HTTP API:
 - Paged KV: shared page storage many requests read through a block
   table, with a radix tree over reference-counted page groups so
   conversations off one system prompt share its KV rather than each
-  holding a copy. Off unless `FERROX_PAGED_KV_BLOCKS` is set. It used to
+  holding a copy. Off unless `FRINK_PAGED_KV_BLOCKS` is set. It used to
   be refused on a GPU backend, where it returned fluent wrong tokens; the
   cause was a Metal prefill leaving K/V on the device and filling the
   host cache with placeholders that the paged prefill then copied into
@@ -882,14 +882,14 @@ OpenAI-compatible HTTP API:
   window from `attention.sliding_window` /
   `attention.sliding_window_pattern` and drops the rows behind it, while
   the full-attention layers keep everything. Off unless
-  `FERROX_KV_WINDOW` is set, and it turns itself off under Metal
+  `FRINK_KV_WINDOW` is set, and it turns itself off under Metal
   attention, on a draft model, and beside the prefix cache. Output is
   token-identical with it on or off, asserted on logits as well as token
   ids against gemma-2-2b-it-Q4_K_M. `--ctx-size auto` and the pre-load
   admission check are priced against the same per-layer residency the
   stores evict with, so the saving is context a user is actually offered
   rather than memory nothing spends. See [`CONFIG.md`](CONFIG.md)
-- `ferrox serve-bench`: concurrency, TTFT, TPOT and queueing numbers
+- `frink serve-bench`: concurrency, TTFT, TPOT and queueing numbers
   for a live server, with the methodology (positional split, pooled
   nearest-rank percentiles, whole-run throughput) tested socket-free.
   Host B receipts for Metal CB at 0.15.3:
@@ -912,19 +912,19 @@ OpenAI-compatible HTTP API:
 
 ## Edge-native MoE serving: what is real here
 
-FreeToken describes an edge-native MoE serving engine, and ferrox ports
+FreeToken describes an edge-native MoE serving engine, and frink ports
 its host-side policy (Apache-2.0, see
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)). That policy now lives in
 the crates that use it rather than in a crate of its own: the expert
-residency stack in `ferrox-core` beside `expert_store`, and the serving
-policy in `ferrox-server::policy`.
+residency stack in `frink-core` beside `expert_store`, and the serving
+policy in `frink-server::policy`.
 
-This table is what ferrox actually does against that description,
+This table is what frink actually does against that description,
 checked against the code rather than asserted. The gap is the roadmap.
 
-| Capability | In ferrox today |
+| Capability | In frink today |
 |---|---|
-| Bandwidth-adaptive CPU/GPU co-execution (`q*`) | **Partial.** `qstar::BandwidthProfile` is in `ferrox-core` and used by `ferrox bench-bw`, a measurement tool. The serving path does not consult it. |
+| Bandwidth-adaptive CPU/GPU co-execution (`q*`) | **Partial.** `qstar::BandwidthProfile` is in `frink-core` and used by `frink bench-bw`, a measurement tool. The serving path does not consult it. |
 | Full-layer double-buffered prefill streaming | **Built, not wired.** Kept for the out-of-core work, which names it. |
 | Global LRU expert caching | **Yes, and now singular.** `expert_store` is wired into both decode paths and proven bit-identical to resident at a 1-byte budget. The second, competing cache and its separate byte budget were folded in beside it. |
 | Graph-compatible execution | **No.** Execution is eager. `ExecutionPlan` is built and read by nothing. |
@@ -936,9 +936,9 @@ checked against the code rather than asserted. The gap is the roadmap.
 | NVFP4 / FP8 | **No.** Neither is parsed. |
 | DeepSeek-V4-Flash, GLM-5.2, Kimi K3 | **Loaders and primitives only.** Nothing has run end to end on a real checkpoint. |
 | OpenAI + Anthropic compatible APIs | **Yes**, both, plus Responses. Tool calls parsed in eleven wire formats. |
-| NVIDIA RTX 30/40/50 | **Runs, measured, behind.** Receipts on a GTX 1080, an RTX 3060 and an RTX 3090; correct by `ferrox verify`; prefill about 4x and decode 2x to 5x off llama.cpp. No GPU in CI. |
+| NVIDIA RTX 30/40/50 | **Runs, measured, behind.** Receipts on a GTX 1080, an RTX 3060 and an RTX 3090; correct by `frink verify`; prefill about 4x and decode 2x to 5x off llama.cpp. No GPU in CI. |
 
-Two honest notes. Ferrox runs on Apple Metal, which that description
+Two honest notes. Frink runs on Apple Metal, which that description
 does not cover, and Metal is where it is fastest: every `pp512` row is
 0.99x to 1.09x against llama.cpp and **every one of the 16** comparable
 `tg128` rows is faster. And the single largest gap is not on this table:
@@ -955,7 +955,7 @@ and testable without a GPU. Each module takes measured numbers and
 returns a decision.
 
 It lives in the crates that use it: the serving half in
-`ferrox-server::policy`, the MoE expert-residency half in `ferrox-core`
+`frink-server::policy`, the MoE expert-residency half in `frink-core`
 beside `expert_store`, which is the single holder of the expert byte
 budget.
 
@@ -964,7 +964,7 @@ budget.
 | Module | Decides | Where it runs |
 |---|---|---|
 | `parser` | where reasoning ends and the answer begins, and which tool was called in which format | `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, streaming and buffered |
-| `detokenize` | what text is safe to stream after one more token | the stop-string withhold rule, which `ferrox-server`'s `StopMatcher` delegates to so there is one implementation |
+| `detokenize` | what text is safe to stream after one more token | the stop-string withhold rule, which `frink-server`'s `StopMatcher` delegates to so there is one implementation |
 | `radix` | which prefix of a new prompt is already computed, page-keyed and node-sharing | the paged-KV serving path, where it shares KV pages between prompts by reference count |
 | `anchor` | how far a window may slide, and where a tool call pins it so the next agentic turn rejoins rather than recomputes | the paged-KV serving path, on both the private generate loop and the continuous batcher |
 | `scheduler` | admission, chunked-prefill sizing, and what a chunk reserves | the continuous batcher's status and pool accounting |
@@ -974,12 +974,12 @@ budget.
 | `pool` | how VRAM splits between the expert cache and KV, and how it is re-split live | the target geometry `POST /v1/cache/rebuild` validates against |
 | `rebuild` · `outbox` · `footprint` | whether a re-split rolls back, what a stop receipt is worth, what this process really occupies | the same two admin endpoints |
 | `deepseek_v4_budget` | per-layer KV tier sizing, and which compressor each layer runs (none / CSA / HCA) | the DeepSeek-V4 decoder |
-| `bench_profile` · `bench_client` | when a measured bandwidth profile may be trusted, and what a serving benchmark may report | `ferrox bench-bw` and `ferrox serve-bench` |
+| `bench_profile` · `bench_client` | when a measured bandwidth profile may be trusted, and what a serving benchmark may report | `frink bench-bw` and `frink serve-bench` |
 
 ### Complete, tested, and waiting for a consumer
 
 `qstar` (the `q*` bandwidth split), `expert_cache`, `expert_slots`,
-`expert_budget`, `placement` and `residency`, all in `ferrox-core`.
+`expert_budget`, `placement` and `residency`, all in `frink-core`.
 Each is covered by unit tests and none of them is on a serving path.
 Do not read a benchmark as evidence for any of them.
 [`plans/out-of-core-moe.md`](plans/out-of-core-moe.md) is what they are
@@ -988,20 +988,20 @@ largest thing they would buy.
 
 `expert_slots` sits closest to real memory: it executes the expert
 cache's copy plans against a bounded slot pool, and a warm decode step
-copies zero bytes on a host pool. `ferrox-core`'s `CudaExpertPool`
+copies zero bytes on a host pool. `frink-core`'s `CudaExpertPool`
 implements its `SlotDevice` trait under `--features cuda`, and that pool
 is compile-verified with its hardware test left `#[ignore]`d, so on a
 real card the property is written down and not yet measured. A host
 `SlotDevice` (`HostSlotMemory`) also exists; a Metal one does not, and
 that is the concrete gap.
 
-Inside `ferrox-server::policy`, the modules carrying an unwired half
+Inside `frink-server::policy`, the modules carrying an unwired half
 name the roadmap item that would close it, at their declaration in
-`policy/mod.rs`. `grep -n "allow(dead_code)" crates/ferrox-server/src/policy/mod.rs`
+`policy/mod.rs`. `grep -n "allow(dead_code)" crates/frink-server/src/policy/mod.rs`
 is the list of what still owes a caller.
 
-Ferrox Studio, the web UI in [`ui/`](../ui), is a separate app that
-talks to this API over HTTP. `ferrox-server` does not serve it, and
+Frink Studio, the web UI in [`ui/`](../ui), is a separate app that
+talks to this API over HTTP. `frink-server` does not serve it, and
 `GET /` on it is a 404.
 
 See [`API.md`](API.md) and [`AGENTS_COOKBOOK.md`](AGENTS_COOKBOOK.md).

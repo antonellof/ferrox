@@ -1,7 +1,7 @@
 """Independent numpy reference for the gemma fixture, run twice:
 once with exact tanh-GELU and once with ggml's f16 lookup-table GELU.
 
-Answers one question: is the ~4e-5 gap between ferrox and llama.cpp on
+Answers one question: is the ~4e-5 gap between frink and llama.cpp on
 this fixture the GELU table (GGML_GELU_FP16, ggml/src/ggml-cpu/vec.h:46)
 or something structural?
 """
@@ -10,7 +10,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, "/Users/d695663/Desktop/Dev/ferrox/.scratch/llama.cpp/gguf-py")
+sys.path.insert(0, "/Users/d695663/Desktop/Dev/frink/.scratch/llama.cpp/gguf-py")
 import gguf  # noqa: E402
 
 PATH = sys.argv[1]

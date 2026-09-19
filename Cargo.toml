@@ -1,18 +1,18 @@
 [workspace]
 members = [
-    "crates/ferrox-api",
-    "crates/ferrox-gguf",
-    "crates/ferrox-safetensors",
-    "crates/ferrox-quant",
-    "crates/ferrox-core",
-    "crates/ferrox-moe",
-    "crates/ferrox-models",
-    "crates/ferrox-cli",
-    "crates/ferrox-server",
-    "crates/ferrox-cuda",
-    "crates/ferrox-metal",
-    "crates/ferrox-vulkan",
-    "crates/ferrox-inference",
+    "crates/frink-api",
+    "crates/frink-gguf",
+    "crates/frink-safetensors",
+    "crates/frink-quant",
+    "crates/frink-core",
+    "crates/frink-moe",
+    "crates/frink-models",
+    "crates/frink-cli",
+    "crates/frink-server",
+    "crates/frink-cuda",
+    "crates/frink-metal",
+    "crates/frink-vulkan",
+    "crates/frink-inference",
 ]
 resolver = "2"
 
@@ -20,8 +20,8 @@ resolver = "2"
 version = "0.25.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/antonellof/ferrox"
-homepage = "https://github.com/antonellof/ferrox"
+repository = "https://github.com/antonellof/frink"
+homepage = "https://github.com/antonellof/frink"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -38,38 +38,38 @@ axum = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # The only outbound HTTP client in the workspace, used by
-# ferrox-server's /admin/download (see crates/ferrox-server/src/hub.rs).
+# frink-server's /admin/download (see crates/frink-server/src/hub.rs).
 # Blocking by design -- it runs on spawn_blocking beside the file
 # writes it feeds -- and default-features = false so it brings rustls
 # and webpki-roots rather than a second async runtime.
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
-# SHA-256 for KV-block content addressing (ferrox-core::kv_block). Pure
+# SHA-256 for KV-block content addressing (frink-core::kv_block). Pure
 # Rust, no C toolchain; used for cache identity, not for security.
 sha2 = { version = "0.10", default-features = false }
-# Jinja2 evaluator for `tokenizer.chat_template` (crates/ferrox-models/src/chat_template.rs).
+# Jinja2 evaluator for `tokenizer.chat_template` (crates/frink-models/src/chat_template.rs).
 # `loop_controls` for `{% break %}`/`{% continue %}`, which real templates use.
 minijinja = { version = "2.21", features = ["loop_controls", "json"] }
 # `statvfs` only, for the KV disk tier's free-space budget
-# (ferrox-core::kv_disk). std has no portable free-space call, and the
+# (frink-core::kv_disk). std has no portable free-space call, and the
 # alternative -- letting the filesystem be the thing that says "full" --
 # is exactly what that budget exists to avoid. Already in the tree via
 # memmap2/rayon; the probe is injectable, so nothing else depends on it.
 libc = "0.2"
 
 # Internal crates — path for local builds, version for crates.io.
-ferrox-api = { version = "0.25.0", path = "crates/ferrox-api" }
-ferrox-gguf = { version = "0.25.0", path = "crates/ferrox-gguf" }
-ferrox-quant = { version = "0.25.0", path = "crates/ferrox-quant" }
-ferrox-safetensors = { version = "0.25.0", path = "crates/ferrox-safetensors" }
-ferrox-cuda = { version = "0.25.0", path = "crates/ferrox-cuda" }
-ferrox-metal = { version = "0.25.0", path = "crates/ferrox-metal" }
-ferrox-vulkan = { version = "0.25.0", path = "crates/ferrox-vulkan" }
-ferrox-core = { version = "0.25.0", path = "crates/ferrox-core" }
-ferrox-moe = { version = "0.25.0", path = "crates/ferrox-moe" }
-ferrox-models = { version = "0.25.0", path = "crates/ferrox-models" }
-ferrox-inference = { version = "0.25.0", path = "crates/ferrox-inference" }
-# Only ferrox-cli depends on this, and only behind its optional `serve`
+frink-api = { version = "0.25.0", path = "crates/frink-api" }
+frink-gguf = { version = "0.25.0", path = "crates/frink-gguf" }
+frink-quant = { version = "0.25.0", path = "crates/frink-quant" }
+frink-safetensors = { version = "0.25.0", path = "crates/frink-safetensors" }
+frink-cuda = { version = "0.25.0", path = "crates/frink-cuda" }
+frink-metal = { version = "0.25.0", path = "crates/frink-metal" }
+frink-vulkan = { version = "0.25.0", path = "crates/frink-vulkan" }
+frink-core = { version = "0.25.0", path = "crates/frink-core" }
+frink-moe = { version = "0.25.0", path = "crates/frink-moe" }
+frink-models = { version = "0.25.0", path = "crates/frink-models" }
+frink-inference = { version = "0.25.0", path = "crates/frink-inference" }
+# Only frink-cli depends on this, and only behind its optional `serve`
 # feature. The server's dependency set is a strict superset of the CLI's
 # (+98 crates, +6 MB), so an unconditional dependency would make
-# `cargo install ferrox-cli` compile an HTTP and TLS stack it never runs.
-ferrox-server = { version = "0.25.0", path = "crates/ferrox-server" }
+# `cargo install frink-cli` compile an HTTP and TLS stack it never runs.
+frink-server = { version = "0.25.0", path = "crates/frink-server" }

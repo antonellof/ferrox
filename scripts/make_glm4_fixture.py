@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `glm4` GGUFs used by ferrox's GLM-4-0414
+"""Generate the tiny synthetic `glm4` GGUFs used by frink's GLM-4-0414
 coverage test.
 
-`glm4` is what GLM-4-0414 (9B, 32B), GLM-Z1 and GLM-OCR tag. ferrox
+`glm4` is what GLM-4-0414 (9B, 32B), GLM-Z1 and GLM-OCR tag. frink
 dispatched it to the GLM-5.2 MLA loader, which asks for
 `attention.q_lora_rank` and three more MLA keys `src/models/glm4.cpp`
 never reads (`:3-9` read `layer_norm_rms_epsilon`, the optional
@@ -30,7 +30,7 @@ the graph is (`glm4.cpp:97-176`):
 carries (`conversion/glm.py:26-27`); llama.cpp then rotates with
 `LLAMA_ROPE_TYPE_MROPE` (llama-model.cpp:2699) over weights the
 converter PERMUTED to NEOX order (`glm.py:53-73,78-85`), so the file's
-correct rotation is NEOX and the base file's is NORM. ferrox's rope
+correct rotation is NEOX and the base file's is NORM. frink's rope
 layout is decided per architecture, not per file, so that file is
 REFUSED by name; libllama runs it (measured), which is what makes the
 refusal a refusal and not an excuse.
@@ -73,7 +73,7 @@ def main(out_path: str, mrope: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-glm4-fixture")
+    w.add_name("frink-glm4-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `exaone4` GGUF used by ferrox's EXAONE-4
+"""Generate the tiny synthetic `exaone4` GGUF used by frink's EXAONE-4
 coverage test.
 
 `exaone4` is LG AI Research's EXAONE 4.0, and it is NOT the audited
@@ -17,7 +17,7 @@ branch's OUTPUT before the residual add (:152-155, :166-169).
     out     = ffn_inp + ffn_post_norm(ffn(ffn_inp))
 
 Identical to `olmo2.cpp:92,160-165,169,177-182`. The two rows share ONE
-implementation in ferrox (`crates/ferrox-models/src/norm.rs`), and
+implementation in frink (`crates/frink-models/src/norm.rs`), and
 this fixture and `olmo2_tiny.gguf` are what prove they are the same
 graph rather than two that look alike.
 
@@ -27,7 +27,7 @@ What differs from `olmo2`, and why this row needs its own fixture:
     `{n_embd_head_k}`, and :127-128 applies them to what `build_qkv` has
     ALREADY reshaped to 3-D (llama-graph.cpp:1656-1658), so the RMS is
     taken per head. `olmo2` norms the 2-D projection over its whole
-    width. Same topology, opposite QK-norm style -- and ferrox picks
+    width. Same topology, opposite QK-norm style -- and frink picks
     between the two off the weight LENGTH, so this fixture is what
     checks the length it derives from a real per-head file.
   * Applied BEFORE RoPE (:127-128 precede :132-138).
@@ -56,7 +56,7 @@ the key below 64 layers" from "the key was absent". The 32B's window is
 deliberately NARROWER than the six-token prompt, so the mask is
 exercised too rather than being a no-op at this size.
 
-The rule itself is `ferrox-models/src/rope_layers.rs`, shared with
+The rule itself is `frink-models/src/rope_layers.rs`, shared with
 `exaone-moe`, `smollm3`, `smallthinker`, `afmoe` and `llama4`.
 
 Weights are pseudo-random from a fixed seed so the file is byte-stable.
@@ -135,7 +135,7 @@ def main(out_path: str, n_layer: int = DEFAULT_N_LAYER) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-exaone4-fixture")
+    w.add_name("frink-exaone4-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `talkie` GGUFs used by ferrox's
+"""Generate the tiny synthetic `talkie` GGUFs used by frink's
 weightless-norm / skip-stream coverage test.
 
 `talkie` refused as UNAUDITED, triaged NEW CODE, on four things
@@ -32,7 +32,7 @@ an "inverse RoPE" sign flip into the Q/K weights (`talkie.py:33-43`),
 which changes the file and not the graph, so a fixture need not
 imitate it.
 
-`crates/ferrox-models/src/skip_stream.rs` and the `NormOp::RmsNoParams`
+`crates/frink-models/src/skip_stream.rs` and the `NormOp::RmsNoParams`
 / `QkNormStyle::PerHeadScalar` variants are the seams. `--no-gains`
 omits the two `.scale` tensors (a hand-written shape the converter
 never produces) so that the test can pin that the gains are read and
@@ -83,7 +83,7 @@ def main(out_path: str, gains: bool) -> None:
         return (1.5 + rng.standard_normal(shape) * 0.5).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-talkie-fixture")
+    w.add_name("frink-talkie-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `mimo2` GGUFs used by ferrox's split
+"""Generate the tiny synthetic `mimo2` GGUFs used by frink's split
 K/V head-width coverage test.
 
 `mimo2` (MiMo-V2-Flash, every real export) refused as UNAUDITED,
@@ -14,8 +14,8 @@ small thing beside it (`src/models/mimo2.cpp`):
     from the two widths, `:132-140,152-154` view Q/K at `n_embd_head_k`
     and V at `n_embd_head_v`, and `wo` is `{n_embd_head_v * n_head,
     n_embd}` (`:52`). Every KV cache, attention kernel and projection
-    check in ferrox took ONE head width; the loader refused the file.
-    `crates/ferrox-models/src/kv_head_dims.rs` is the seam.
+    check in frink took ONE head width; the loader refused the file.
+    `crates/frink-models/src/kv_head_dims.rs` is the seam.
   * **`attention.value_scale`** (`:14-17`): when the key is present
     and not 1.0, `:180-183` multiply the attention output AFTER `wo` by
     it. `mimo.py:163-165` writes it from `attention_value_scale`;
@@ -104,7 +104,7 @@ def main(out_path: str, split: bool, value_scale: bool) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-mimo2-fixture")
+    w.add_name("frink-mimo2-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)

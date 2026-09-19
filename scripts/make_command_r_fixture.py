@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `command-r` GGUFs used by ferrox's Command-R
+"""Generate the tiny synthetic `command-r` GGUFs used by frink's Command-R
 coverage test.
 
 `command-r` (Command-R 35B, Aya-23) refused as a `dedicated` row for its
@@ -73,7 +73,7 @@ def main(out_path: str, plus: bool, no_logit_scale: bool) -> None:
         return (1.0 + rng.standard_normal(shape) * 0.3).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-command-r-fixture")
+    w.add_name("frink-command-r-fixture")
     w.add_block_count(n_layer)
     w.add_context_length(CTX)
     w.add_embedding_length(n_embd)

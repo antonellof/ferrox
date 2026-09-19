@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `plamo2` GGUFs used by ferrox's PLaMo-2
-coverage test (`crates/ferrox-models/tests/plamo2_graphs.rs`).
+"""Generate the tiny synthetic `plamo2` GGUFs used by frink's PLaMo-2
+coverage test (`crates/frink-models/tests/plamo2_graphs.rs`).
 
 `plamo2` is PLaMo-2 (1B / 2B / 8B, Preferred Networks): a hybrid whose
 layers with `head_count_kv 0` run PLaMo-2's own state-space block
@@ -46,13 +46,13 @@ converter writes `head_count` as an ARRAY with 0 on every SSM layer
 every current export with `n_rot = 0` and rotates NOTHING (measured:
 `print_info: n_rot = 0`; the logits move by 1.3 against the same
 weights rotated). `rope.dimension_count` does not restore it -- that
-read is inside the same `n_head() > 0` branch. ferrox rotates, as the
+read is inside the same `n_head() > 0` branch. frink rotates, as the
 model does. The default fixture is the converter's spelling (both
 arrays); `--scalar-heads` writes `head_count 4` as a scalar with the
 KV array alone marking the SSM layers, which is an equally valid
 llama.cpp file (`plamo2.cpp:19` reads only `n_head_kv(i)`) whose
 `n_rot` seeds to `head_dim`. That file's libllama golden is the
-rotated graph on the real layer order, and it is what ferrox must
+rotated graph on the real layer order, and it is what frink must
 match on BOTH files.
 
 Weights are pseudo-random from a fixed seed so the files are byte-stable.
@@ -109,7 +109,7 @@ def main(out_path: str, suffixed_norms: bool, scalar_heads: bool) -> None:
         return base + ".weight" if suffixed_norms else base
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-plamo2-fixture")
+    w.add_name("frink-plamo2-fixture")
     w.add_vocab_size(N_VOCAB)
     w.add_head_count(heads_per_layer)
     w.add_head_count_kv(kv_per_layer)

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Regenerate the chat-template goldens in `crates/ferrox-models/tests/templates/`.
+"""Regenerate the chat-template goldens in `crates/frink-models/tests/templates/`.
 
 Every `*.jinja` in that directory is the verbatim `tokenizer.chat_template`
 string of a real GGUF in `models/`, read straight out of the file's metadata.
 This script renders each one through **real jinja2**, configured exactly the
 way the two engines that actually render chat templates configure it, and
 writes the bytes next to the template as `*.expected` / `*.system.expected`.
-`crates/ferrox-models/tests/chat_template_real_gguf.rs` then asserts that
-ferrox's minijinja evaluator produces those same bytes.
+`crates/frink-models/tests/chat_template_real_gguf.rs` then asserts that
+frink's minijinja evaluator produces those same bytes.
 
 That is the point of the file: the goldens are produced by an independent
 implementation, not by the code under test, so a regression in
-`ferrox_models::chat_template` cannot quietly rewrite its own expectations.
+`frink_models::chat_template` cannot quietly rewrite its own expectations.
 
 ## The reference configuration
 
@@ -30,7 +30,7 @@ the bug these goldens caught (TinyLlama).
 ## Deliberately not covered here
 
 `tools`. jinja2's stock `tojson` sorts keys, transformers' replacement does
-not, and llama.cpp's refuses `sort_keys=true` outright. ferrox sorts, because
+not, and llama.cpp's refuses `sort_keys=true` outright. frink sorts, because
 `serde_json::Map` is a `BTreeMap` without the workspace-wide `preserve_order`
 feature, so the author's key order is already gone by the time the filter
 runs. Pinning tool goldens here would pin that disagreement as if it were
@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover
     sys.exit("needs jinja2: pip install jinja2")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TPL = os.path.join(HERE, os.pardir, "crates", "ferrox-models", "tests", "templates")
+TPL = os.path.join(HERE, os.pardir, "crates", "frink-models", "tests", "templates")
 
 # Kept byte-identical with `chat_template_real_gguf.rs`.
 CONVERSATION = [
@@ -127,7 +127,7 @@ def main():
             except jinja2.exceptions.TemplateError as exc:
                 # A template that refuses this conversation shape (Mistral
                 # v0.2 rejects a system role) is itself a pinned behaviour:
-                # ferrox must surface the refusal, never a guessed framing.
+                # frink must surface the refusal, never a guessed framing.
                 text = str(exc)
                 target, other = raise_path, out_path
             if check:

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate the tiny synthetic `xverse` GGUF used by ferrox's XVERSE
+"""Generate the tiny synthetic `xverse` GGUF used by frink's XVERSE
 coverage test.
 
-`xverse` is Shenzhen Yuanxiang's XVERSE-7B/13B/65B. It sat on ferrox's
+`xverse` is Shenzhen Yuanxiang's XVERSE-7B/13B/65B. It sat on frink's
 generic GQA path refusing as UNAUDITED, triaged FIXTURE-AWAY: nothing
 about the graph is new, so the only thing missing was evidence.
 
@@ -74,7 +74,7 @@ def main(out_path: str) -> None:
         return (rng.standard_normal(shape) * 0.25).astype(np.float32)
 
     w = gguf.GGUFWriter(out_path, ARCH)
-    w.add_name("ferrox-xverse-fixture")
+    w.add_name("frink-xverse-fixture")
     w.add_block_count(N_LAYER)
     w.add_context_length(CTX)
     w.add_embedding_length(N_EMBD)
