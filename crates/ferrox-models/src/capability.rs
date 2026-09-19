@@ -2990,10 +2990,19 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 DeferredEncoderEmbedding,
                 "encoder/embedding; deferred",
             ),
+            // Served since 2026-09-19 on the SAME encoder as `bert`:
+            // its two deltas from that graph are NEOX RoPE on Q/K
+            // (`bert.cpp:126-133`) and a gated SiLU FFN (`:195-201`),
+            // both read from the architecture through
+            // `bert_gguf_loader::ENCODER_ARCHS` and checked against
+            // llama.cpp's own pooled embedding
+            // (`tests/nomic_bert_graphs.rs`). Deferred from the
+            // DECODER path, as `bert` is: neither has an output head.
             (
                 "nomic-bert",
                 DeferredEncoderEmbedding,
-                "encoder/embedding; deferred",
+                "encoder; no output head, so never a decoder -- served by \
+                 ferrox_models::EmbeddingModel on /v1/embeddings",
             ),
             (
                 "nomic-bert-moe",

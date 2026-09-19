@@ -25,8 +25,16 @@ use crate::tokenizer::{GgufWordPieceTokenizer, SpecialTokens, TokenizerLoadError
 /// that this crate does not have. Used to refuse *by name* instead of
 /// with a generic "unsupported".
 const NOT_YET: &[(&str, &str)] = &[
-    ("nomic-bert", "RoPE on Q/K and a gated FFN"),
-    ("nomic-bert-moe", "RoPE, a gated FFN and MoE expert layers"),
+    // `nomic-bert` was HERE until 2026-09-19: its two deltas from
+    // `bert` -- NEOX RoPE on Q/K and a gated SiLU FFN -- are
+    // `bert_encoder::BertFfn` and `BertHparams::rope_theta`, read from
+    // the architecture through `bert_gguf_loader::ENCODER_ARCHS` and
+    // checked against llama.cpp's own pooled embedding
+    // (`tests/nomic_bert_graphs.rs`).
+    (
+        "nomic-bert-moe",
+        "a second FFN shape on its MoE layers (moe_every_n_layers)",
+    ),
     ("jina-bert-v2", "GEGLU and a second attention norm"),
     ("jina-bert-v3", "RoPE and per-projection QK norm"),
     ("neo-bert", "per-projection QK norm"),
@@ -82,7 +90,7 @@ pub enum EmbedError {
     NotYetImplemented { arch: String, needs: &'static str },
     #[error(
         "architecture {0:?} is not an embedding model this build knows. \
-         Only {BERT_ARCH:?} is implemented"
+         `ferrox_models::bert_gguf_loader::ENCODER_ARCHS` is the list it serves"
     )]
     NotAnEmbeddingModel(String),
     #[error(
@@ -167,7 +175,10 @@ impl EmbeddingModel {
         let arch = ferrox_gguf::TensorSource::metadata_str(&file, "general.architecture")
             .ok_or_else(|| LoadError::MissingHparam("general.architecture".into()))?
             .to_string();
-        if arch != BERT_ARCH {
+        if !crate::bert_gguf_loader::ENCODER_ARCHS
+            .iter()
+            .any(|(a, _)| *a == arch)
+        {
             return Err(match NOT_YET.iter().find(|(a, _)| *a == arch) {
                 Some((_, needs)) => EmbedError::NotYetImplemented { arch, needs },
                 None => EmbedError::NotAnEmbeddingModel(arch),
@@ -212,6 +223,13 @@ impl EmbeddingModel {
             arch,
             name,
         })
+    }
+
+    /// The encoder's hyper-parameters, including the two facts that
+    /// differ between the architectures on `bert.cpp`'s graph: the
+    /// rotation and the FFN shape (`crate::bert_encoder::BertFfn`).
+    pub fn hparams(&self) -> Option<&crate::bert_encoder::BertHparams> {
+        self.encoder.bert_hparams()
     }
 
     pub fn architecture(&self) -> &str {
@@ -421,10 +439,18 @@ mod tests {
             .map(|p| p.gguf_name)
             .collect();
         registry.sort_unstable();
+        // The rows this module can be handed: the ones it serves
+        // (`ENCODER_ARCHS`) plus the ones it refuses BY NAME
+        // (`NOT_YET`). Both halves, because a row in neither would be
+        // routed here and then answer with a generic error.
         let mut known: Vec<&str> = NOT_YET
             .iter()
             .map(|(a, _)| *a)
-            .chain(std::iter::once(BERT_ARCH))
+            .chain(
+                crate::bert_gguf_loader::ENCODER_ARCHS
+                    .iter()
+                    .map(|(a, _)| *a),
+            )
             .collect();
         known.sort_unstable();
         assert_eq!(

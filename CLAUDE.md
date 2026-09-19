@@ -1564,6 +1564,22 @@ wait on the command buffer, aimed at 0.166 ms of wake-up, measured
 3.7 tok/s against 7.1 -- polling the status through objc takes the
 core the host work needs. Both are recorded where the code is.
 
+`nomic-bert` (nomic-embed-text v1 / v1.5) embeds since 2026-09-19, and
+it is the first row closed on the ENCODER rather than the decoder: the
+audit that ranked the work put the embedding family above the exotic
+new architectures, because `/v1/embeddings` has users and MiniMax-01
+has 456B parameters. It shares `bert.cpp`'s graph and differs in two
+lines -- NEOX RoPE on Q/K where `bert` adds a position table, and a
+gated SiLU FFN where `bert`'s is an ungated GELU --
+`bert_gguf_loader::ENCODER_ARCHS` is the table, and the row found
+something the existing parity test had attributed to quantization: on
+an F32 fixture the two engines agree EXACTLY with the attention
+switched off and differ by ~3e-4 with it on, which is not the Q8_0
+activation story `tests/bert_llama_cpp_parity.rs` tells. The
+bisection is recorded in `tests/nomic_bert_graphs.rs` with what it
+eliminated (a uniform softmax still differs; f16 K/V does not explain
+it).
+
 Do not read the architecture catalog as a support matrix. `ferrox
 parity` is the oracle: its tokenizer half matches llama.cpp on every
 local checkpoint libllama can load, and its logit half MATCHES on

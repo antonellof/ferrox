@@ -79,6 +79,23 @@ pub struct BertHparams {
     pub n_ctx_train: usize,
     pub n_token_types: usize,
     pub layer_norm_eps: f32,
+    /// NEOX RoPE on Q and K instead of a learned position table:
+    /// `Some(theta)` for the architectures `bert.cpp:126-133` rotates
+    /// (`nomic-bert`, `nomic-bert-moe`, `jina-bert-v3`), `None` for
+    /// `bert` itself, which adds `position_embd` at `:90` instead.
+    ///
+    /// One field for both facts on purpose: a file cannot have a
+    /// position table AND a rotation here, because upstream decides
+    /// both from the architecture and never reads the table for a
+    /// rotating one -- measured, libllama's load log never names
+    /// `position_embd` for `nomic-bert`.
+    pub rope_theta: Option<f32>,
+    /// How many of each head's channels rotate
+    /// (`{arch}.rope.dimension_count`), `head_dim` when the key is
+    /// absent. Only read when [`Self::rope_theta`] is `Some`.
+    pub rope_dim: usize,
+    /// The FFN this architecture runs (`bert.cpp:179-201`).
+    pub ffn: BertFfn,
     pub pooling: PoolingType,
     /// `[CLS]` / `[SEP]`, from `tokenizer.ggml.bos_token_id` and
     /// `tokenizer.ggml.seperator_token_id` (upstream's spelling of the
@@ -96,6 +113,22 @@ impl BertHparams {
 /// One transformer block's weights. Biases that llama.cpp marks
 /// `TENSOR_NOT_REQUIRED` are `Option`, so a checkpoint without them is
 /// run without them rather than with a silently fabricated zero vector.
+/// The two FFN shapes `bert.cpp` builds on this graph for the
+/// architectures ferrox serves.
+///
+/// `bert` and `nomic-bert-moe`'s dense layers take the ungated GELU
+/// with both biases (`:179-187`); `nomic-bert` takes the gated SiLU
+/// with none (`:195-201`, the final `else`). The variant is the
+/// architecture's, read once at load, so a layer body cannot ask
+/// "is there a gate tensor" and answer differently on two files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BertFfn {
+    /// `down(gelu(up(x)))`, biases where the file has them.
+    GeluSeq,
+    /// `down(silu(gate(x)) * up(x))`, no biases.
+    SwigluPar,
+}
+
 pub struct BertLayer {
     pub wq: WeightMatrix,
     pub bq: Option<Vec<f32>>,
@@ -110,6 +143,8 @@ pub struct BertLayer {
     pub attn_out_norm_b: Vec<f32>,
     pub ffn_up: WeightMatrix,
     pub ffn_up_b: Option<Vec<f32>>,
+    /// `ffn_gate`, present exactly for [`BertFfn::SwigluPar`].
+    pub ffn_gate: Option<WeightMatrix>,
     pub ffn_down: WeightMatrix,
     pub ffn_down_b: Option<Vec<f32>>,
     /// `layer_output_norm`, applied after the FFN residual.
@@ -127,7 +162,9 @@ pub struct BertEncoder {
     /// added anywhere. Loading only row 0 — what this held before — is
     /// what made a rerank pair score both halves as Sentence A.
     pub type_embd: Option<Vec<Vec<f32>>>,
-    pub pos_embd: WeightMatrix,
+    /// The learned position table, `None` for a rotating architecture
+    /// (see [`BertHparams::rope_theta`]).
+    pub pos_embd: Option<WeightMatrix>,
     pub tok_norm_w: Vec<f32>,
     pub tok_norm_b: Vec<f32>,
     pub layers: Vec<BertLayer>,
@@ -217,6 +254,10 @@ impl BertEncoder {
 }
 
 impl TextEncoder for BertEncoder {
+    fn bert_hparams(&self) -> Option<&BertHparams> {
+        Some(&self.hp)
+    }
+
     fn n_embd(&self) -> usize {
         self.hp.n_embd
     }
@@ -308,10 +349,17 @@ impl TextEncoder for BertEncoder {
                 return Err(EncodeError::TokenOutOfRange { id: t, vocab_size });
             }
             let tok = self.tok_embd.dequant_row(t as usize);
-            let pos = self.pos_embd.dequant_row(i);
             let row = &mut h[i * d..(i + 1) * d];
-            for (j, slot) in row.iter_mut().enumerate() {
-                *slot = tok[j] + pos[j];
+            match &self.pos_embd {
+                Some(table) => {
+                    let pos = table.dequant_row(i);
+                    for (j, slot) in row.iter_mut().enumerate() {
+                        *slot = tok[j] + pos[j];
+                    }
+                }
+                // A rotating architecture adds no table here;
+                // `bert.cpp:90` is gated on `arch == LLM_ARCH_BERT`.
+                None => row.copy_from_slice(&tok),
             }
             if let Some(table) = &self.type_embd {
                 let seg = segments.map(|s| s[i]).unwrap_or(0);
@@ -344,6 +392,24 @@ impl TextEncoder for BertEncoder {
             add_bias_rows(&mut k, self.hp.n_head_kv * head_dim, layer.bk.as_ref());
             add_bias_rows(&mut v, self.hp.n_head_kv * head_dim, layer.bv.as_ref());
 
+            if let Some(theta) = self.hp.rope_theta {
+                // `bert.cpp:126-133`, NEOX (`llama_model_rope_type`),
+                // over the first `rope_dim` channels of every head and
+                // at the row's own position -- the same rotation the
+                // decoder path applies, on both Q and K.
+                let rot = self.hp.rope_dim.min(head_dim);
+                for (pos, row) in q.chunks_exact_mut(self.hp.n_head * head_dim).enumerate() {
+                    for head in row.chunks_exact_mut(head_dim) {
+                        ferrox_core::attention::apply_rope(&mut head[..rot], pos, theta);
+                    }
+                }
+                for (pos, row) in k.chunks_exact_mut(self.hp.n_head_kv * head_dim).enumerate() {
+                    for head in row.chunks_exact_mut(head_dim) {
+                        ferrox_core::attention::apply_rope(&mut head[..rot], pos, theta);
+                    }
+                }
+            }
+
             let attn =
                 bidirectional_attention(&q, &k, &v, n, self.hp.n_head, self.hp.n_head_kv, head_dim);
 
@@ -361,12 +427,29 @@ impl TextEncoder for BertEncoder {
                 self.hp.layer_norm_eps,
             );
 
-            // (5) plain GELU MLP; the FFN residual is over `x`, i.e.
-            // over the post-norm value, not over the layer input.
+            // (5) the architecture's MLP; the FFN residual is over
+            // `x`, i.e. over the post-norm value, not over the layer
+            // input.
             let mut up = layer.ffn_up.apply_batch(&x, n);
             add_bias_rows(&mut up, self.hp.n_ff, layer.ffn_up_b.as_ref());
-            for a in up.iter_mut() {
-                *a = gelu(*a);
+            match (self.hp.ffn, &layer.ffn_gate) {
+                (BertFfn::GeluSeq, _) => {
+                    for a in up.iter_mut() {
+                        *a = gelu(*a);
+                    }
+                }
+                (BertFfn::SwigluPar, Some(gate)) => {
+                    let g = gate.apply_batch(&x, n);
+                    for (a, gv) in up.iter_mut().zip(g.iter()) {
+                        *a *= ferrox_core::matmul::silu(*gv);
+                    }
+                }
+                // Unreachable through the loader, which builds the
+                // pair together; spelled so a third FFN has to answer
+                // here rather than silently running GELU.
+                (BertFfn::SwigluPar, None) => {
+                    return Err(EncodeError::MissingGate { layer: 0 });
+                }
             }
             let mut down = layer.ffn_down.apply_batch(&up, n);
             add_bias_rows(&mut down, d, layer.ffn_down_b.as_ref());
@@ -424,6 +507,7 @@ mod tests {
         let tok_norm_b = r.vec(D);
         let layers = (0..n_layer)
             .map(|_| BertLayer {
+                ffn_gate: None,
                 wq: r.matrix(D, D),
                 bq: Some(r.vec(D)),
                 wk: r.matrix(D, D),
@@ -444,6 +528,9 @@ mod tests {
             .collect();
         BertEncoder {
             hp: BertHparams {
+                rope_theta: None,
+                rope_dim: 0,
+                ffn: BertFfn::GeluSeq,
                 arch: "bert".into(),
                 n_layer,
                 n_embd: D,
@@ -459,7 +546,7 @@ mod tests {
             },
             tok_embd,
             type_embd,
-            pos_embd,
+            pos_embd: Some(pos_embd),
             tok_norm_w,
             tok_norm_b,
             layers,
@@ -503,7 +590,11 @@ mod tests {
             .enumerate()
             .map(|(i, &t)| {
                 let tok = m.tok_embd.dequant_row(t as usize);
-                let pos = m.pos_embd.dequant_row(i);
+                let pos = m
+                    .pos_embd
+                    .as_ref()
+                    .expect("the reference model has a table")
+                    .dequant_row(i);
                 let ty = m
                     .type_embd
                     .as_ref()

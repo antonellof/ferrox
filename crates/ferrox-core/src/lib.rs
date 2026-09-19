@@ -40,6 +40,7 @@ pub mod expert_pool;
 pub mod expert_slots;
 pub mod expert_store;
 pub mod gdn;
+pub mod lightning;
 
 /// The delta rule over a chunk of tokens: one state pass per chunk.
 pub mod gdn_chunk;
