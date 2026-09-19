@@ -269,6 +269,12 @@ pub fn rope_layers(
         // after the 2026-08-04 pin; `tests/no_rope_layer_graphs.rs`
         // carries the fixture, whose layer 2 is the unrotated one.
         "maple" => RopeLayers::SlidingOnly,
+        // `muse-glimmer.cpp:88` is `const bool use_rope =
+        // hparams.is_swa(il)` with the comment "RoPE runs on the SWA
+        // layers, NoPE on full ones", and `:19` reads the window as a
+        // REQUIRED key, so the rule is unconditional here as it is for
+        // `cohere2` and `maple`.
+        "muse-glimmer" => RopeLayers::SlidingOnly,
         // `cohere2moe.cpp:192` adds `|| il < n_layer_dense_lead`
         // (`:177-179`: "dense-prefix full-attention layers use RoPE");
         // `:13` reads the window REQUIRED as `cohere2` does, so

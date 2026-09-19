@@ -324,7 +324,7 @@ impl Decoder {
         Self::apply_parallel_sum_scale(layer, &mut ffn_out);
         Self::apply_down_scale(layer, &mut ffn_out);
         if let Some(post) = &layer.attn.post_ffn_norm {
-            ffn_out = rms_norm(&ffn_out, post, self.config.rms_norm_eps);
+            ffn_out = rms_norm(&ffn_out, post, self.config.post_norm_eps());
         }
         residual_add(hidden, &ffn_out, self.config.residual_scale);
         Self::apply_skip_stream(layer, hidden, skip, 1, hidden_dim);
@@ -530,7 +530,7 @@ impl Decoder {
             if let Some(post) = &layer.attn.post_ffn_norm {
                 ffn_batch = ffn_batch
                     .chunks(hidden_dim)
-                    .flat_map(|row| rms_norm(row, post, config.rms_norm_eps))
+                    .flat_map(|row| rms_norm(row, post, config.post_norm_eps()))
                     .collect();
             }
             residual_add(hidden_batch, &ffn_batch, config.residual_scale);
@@ -568,7 +568,7 @@ impl Decoder {
             Self::apply_parallel_sum_scale(layer, &mut ffn_out);
             Self::apply_down_scale(layer, &mut ffn_out);
             if let Some(post) = &layer.attn.post_ffn_norm {
-                ffn_out = rms_norm(&ffn_out, post, config.rms_norm_eps);
+                ffn_out = rms_norm(&ffn_out, post, config.post_norm_eps());
             }
             let hidden_row = &mut hidden_batch[b * hidden_dim..(b + 1) * hidden_dim];
             residual_add(hidden_row, &ffn_out, config.residual_scale);

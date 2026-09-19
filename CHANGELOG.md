@@ -60,6 +60,22 @@ are the ones worth reading twice.
   reference's own approximation, measured rather than assumed
   (`tests/gated_attention_graphs.rs`).
 
+- **`muse-glimmer` runs**, the fourth row closed against the moved pin
+  and two norm facts nothing else upstream has.
+  `src/models/muse-glimmer.cpp:69` norms the EMBEDDINGS with a
+  weightless RMS (`bloom`'s embedding norm, the only other one of the
+  155 graphs, has a weight; every other weightless RMS is a layer
+  slot), and `:63` runs the post-attention and post-FFN norms at a
+  LITERAL eps of 1e-8 where the pre-norms use the model's key.
+  `norm_sites::WEIGHTLESS_EMBEDDING_NORM` and
+  `norm::POST_NORM_EPS_LITERAL` are the tables,
+  `ModelConfig::post_norm_eps()` the one accessor the three host
+  post-norm sites read, and every fused Metal launch and the CUDA
+  prefill refuse a model whose two epsilons differ because each bakes
+  one epsilon into its kernel. The fixture declares the model epsilon
+  four orders larger than the literal, so the two cannot be swapped
+  without moving the logits (`tests/muse_glimmer_graphs.rs`).
+
 - **`granite_swa` runs (Granite 4.1)**, the third row closed against
   the moved pin and the first architecture anywhere that lets the FILE
   say which layers rotate. `src/models/granite-swa.cpp:43` reads

@@ -1014,6 +1014,13 @@ impl Decoder {
             && !config.weightless_qk_norm
             // No fused kernel adds a per-key bias (`crate::alibi`).
             && config.alibi_max_bias.is_none()
+            // Every fused launch takes ONE epsilon for the whole layer;
+            // `muse-glimmer.cpp:63` runs its post-norms at a literal
+            // 1e-8 and its pre-norms at the model's
+            // (`crate::norm::POST_NORM_EPS_LITERAL`), so a model whose
+            // two epsilons differ stays on the host rather than having
+            // its post-norms silently run at the wrong one.
+            && config.post_norm_eps() == config.rms_norm_eps
             // Every fused launch takes ONE head width for K and V (the
             // KV buffers, the attention tile, the `wo` fold); MiMo-V2's
             // split widths stay on the host (`crate::kv_head_dims`).

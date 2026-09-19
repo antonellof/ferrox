@@ -407,7 +407,7 @@ impl Decoder {
             let hidden = post.len();
             projected = projected
                 .chunks(hidden)
-                .flat_map(|row| rms_norm(row, post, self.config.rms_norm_eps))
+                .flat_map(|row| rms_norm(row, post, self.config.post_norm_eps()))
                 .collect();
         }
         projected

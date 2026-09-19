@@ -138,6 +138,24 @@ pub const ATTN_NORM_2_FEEDS_ATTENTION: &[&str] = &["falcon"];
 /// ([`NormSites::function`]), so `bloom`'s is the biased LayerNorm.
 pub const EMBEDDING_NORM_ARCHITECTURES: &[&str] = &["bloom"];
 
+/// Architectures that norm the token embeddings with a WEIGHTLESS RMS:
+/// `build_norm(inpL, nullptr, nullptr, LLM_NORM_RMS, -1)` before layer
+/// 0, with no `token_embd_norm` tensor to load.
+///
+/// `muse-glimmer.cpp:69` is the one (measured over the 155 graphs on
+/// 2026-09-19, the same scan that found the weightless RMS in
+/// `hrm-text.cpp`, which norms INSIDE its layers and not here). It is
+/// a separate table from [`EMBEDDING_NORM_ARCHITECTURES`] because the
+/// two answer different questions -- "is there a tensor" and "is there
+/// a norm" -- and `bloom`'s site has a weight where this one has none.
+pub const WEIGHTLESS_EMBEDDING_NORM: &[&str] = &["muse-glimmer"];
+
+/// Does this architecture norm its embeddings without a weight? See
+/// [`WEIGHTLESS_EMBEDDING_NORM`].
+pub fn weightless_embedding_norm(arch: &str) -> bool {
+    WEIGHTLESS_EMBEDDING_NORM.contains(&arch)
+}
+
 /// Architectures whose OUTPUT norm is stored under the embedding-norm
 /// NAME: `token_embd_norm.weight` is `LLM_TENSOR_OUTPUT_NORM_LFM2`
 /// (`llama-arch.cpp:384`, "fix for wrong tensor name"), created at
