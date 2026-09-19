@@ -15,6 +15,139 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-19
+
+### Added
+
+- **A recurrent decoder layer end to end in ONE Metal submission**
+  (`ferrox-metal/src/gdn_branch.rs`, `gdn_head.rs`,
+  `ferrox-models/src/fused_layer.rs`,
+  `decoder/fused_recurrent.rs`): `attn_norm`, the four projections, the
+  two gates, the causal convolution with its SiLU, the per-head l2
+  norms, the delta rule, the gated output norm, the folded rotation,
+  `ssm_out`, the residual add, `ffn_norm`, the SwiGLU FFN and the
+  second residual add. Nothing returns to the host inside a layer.
+
+  And then a RUN of layers: consecutive recurrent layers hand each
+  other a residual stream the host never looks at, and one Metal queue
+  is ordered, so they commit back to back against one device buffer and
+  wait ONCE (`GdnRun`). Qwen3.5 puts a full-attention layer every
+  fourth, so the runs are three layers long.
+
+  Bonsai-2-27B decode, `tg32`, interleaved on one M2 Pro:
+
+  | | tok/s | command buffers waited on, per token |
+  |---|---|---|
+  | branch on the host | 7.10 | 192 |
+  | branch fused | 7.27 | 192 |
+  | whole layer fused | 7.95 | 144 |
+  | head fused too | 8.93 | 97 |
+  | runs of three | **10.12** | **69** |
+
+  Which layers this serves is answered in two halves, because they
+  fail for different reasons. `LayerFfnParts::for_layer` answers for
+  the WEIGHTS and destructures `MoeWeights` with no `..`, so a field
+  added to that struct does not compile until somebody says whether
+  this path serves it -- which caught two fields on its first build.
+  `Decoder::fused_layer_parts` answers for the MODEL: a residual
+  scale, a skip stream, a gpt-oss block, an FFN-free block or a
+  non-SwiGLU activation each take the host bodies.
+
+- **The chunked gated delta rule on the device**
+  (`ferrox-metal/src/gdn_chunk.rs`), which a prefill batch takes above
+  32 rows. Three earlier attempts to put this recurrence on the GPU
+  lost, and they share a cause that is not "the GPU is bad at this":
+  every one moved the 3.1 MB state once per ROW, which is 38 GB for a
+  128-token prefill whatever it computes. Chunking removes that, and
+  only then is there anything for a GPU to be good at.
+
+  | rows | 8 | 32 | 64 | 128 | 512 | 1201 |
+  |---|---|---|---|---|---|---|
+  | host | 1.24 | 3.43 | 5.48 | 10.43 | 43.38 | 96.10 ms |
+  | device | 1.13 | 2.49 | 2.48 | 5.41 | 13.86 | 32.15 ms |
+
+  The first version read 1.05x at 512 rows: `m[t]` and `n[t]` are
+  per-thread arrays indexed by a loop bounded by the RUNTIME chunk
+  length, so the compiler could not unroll it and spilled both into
+  device memory. Padding the tiles to the compile-time `CHUNK` and
+  running every hot loop to that constant is 50 GFLOP/s to 160.
+
+- **The blocked prefill attention on the GPU for layers the fused
+  attention block cannot take** (`Decoder::prefill_attention_blocked`).
+  `launch_gqa_prefill_host_ex` had existed with no caller outside its
+  own tests, while the layers that want it -- Bonsai's sixteen, whose Q
+  is gated -- fell all the way back to the Rayon kernel.
+
+- **`ferrox-metal/src/scratch_pool.rs`**, shared-storage buffers reused
+  across launches. A launch that allocates its own scratch pays Metal
+  for it every time, and the `FERROX_METAL_GPU_TIMING` ledger cannot
+  see that because it times `commit` to completion.
+
+- **`QuantKind::metal_kind_name`**, exhaustive with no `_` arm, and
+  `ferrox-models/src/metal_launch.rs`, which asks the BACKEND's own
+  table by that name.
+
+### Changed
+
+- **Prefill on Bonsai: 36.5 to 43.1 tok/s** on a 2420-token prompt
+  (interleaved: 36.49, 36.60 base; 41.27, 41.66 with the device
+  recurrence; 43.04, 43.12 with the device attention). Prefill's host
+  side is finished -- a `sample` of it has nothing above the noise, and
+  what remains is the GEMM.
+- **Four keys per read of a state row** in the host chunked rule.
+  Chunking traded 1.5x the multiply-adds for a 32nd of the traffic, so
+  the step became compute-bound and a row dotted against one vector at
+  a time left the pipeline waiting on the load: 18.1 ms sequential and
+  13.0 chunked becomes 10.6.
+- **The device delta step reads the state COALESCED.** It gave each
+  thread a whole state ROW and walked it, so adjacent threads touched
+  addresses `head_dim` floats apart and every 128-byte transaction
+  carried 4 useful bytes. That is why the three earlier device attempts
+  measured no better than six CPU cores. A head width that is not a
+  power of two is refused, since the reduction halves its stride from
+  it.
+- **`RecurrentState::conv` is page-aligned**, as `ssm` already was, so
+  a kernel wraps the host's bytes instead of copying 11.8 MB a token.
+- **The PTQ1_0 matvec** requests four rows' bytes before decoding any,
+  takes one aligned 16-bit load for the two adjacent bytes a lane owns,
+  and is back to four rows a threadgroup -- the reference's own
+  geometry, and what its FFN shapes measure fastest at.
+- **The prefill GEMM submission is timed** like every other, so a
+  batch's GPU time no longer reads as host time in the ledger.
+
+### Fixed
+
+- **`Q5_0` and `PTQ1_0` were unreachable from every fused Metal path in
+  `ferrox-models`.** `ferrox_metal::gpu::MATVEC_KINDS` served both
+  while a hand-written match in `decoder.rs` listed six kinds and
+  neither, so the fused recurrent branch silently refused the very
+  model it was written for. Two tables that had to agree with nothing
+  enforcing it -- this repo's dominant bug shape, for the fifth
+  recorded time.
+- **The PTQ1_0 bandwidth probe reported roughly a third of the truth.**
+  It measured wall time around an entire command buffer, so on small
+  shapes most of the number was host cost. It now measures that cost on
+  a shape whose kernel is negligible and reports the rest net of it --
+  which reversed a conclusion that had already been committed. Even
+  net, it is only good for comparing kernel variants: nine experiments
+  were run against it and it has never predicted production.
+
+### Documentation
+
+- `docs/plans/gdn-resident-state.md` carries the floor this work ran
+  into and every dead end with its number. **A decode token's GPU time
+  is 88.8 ms and the reference's WHOLE token is 86.7 to 87.3**, so
+  removing every remaining submission and every host microsecond
+  converges to 11.26 tok/s against the reference's 11.45 to 11.54.
+  Scheduling cannot reach parity from here; the ~3% that is left is in
+  the PTQ1_0 matvec's inner loop. Recorded against it: three
+  measured-neutral memory hypotheses, two concurrency schemes (a
+  scope-Buffers encoder at 10.10 against 10.20, and a resource-scoped
+  one that is correct and FLAT), and the reason -- one matvec already
+  dispatches 4352 threadgroups and fills the part, so a second finds no
+  idle capacity. The per-stage breakdown is there too: per recurrent
+  layer the head is 0.286 ms, the branch 0.251 and the FFN 0.762.
+
 ### Added
 
 - **The chunked gated delta rule** (`ferrox_core::gdn_chunk`), which a
