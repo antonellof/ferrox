@@ -401,15 +401,19 @@ unsafe fn encode_layer(
         qkv_buf,
         conv_out,
     )?;
-    // Q and K only: V is the convolution's output as it stands.
-    encode_l2_norm_heads(encoder, device, conv_out, 0, h.head_dim, h.n_k_heads, w.eps)?;
+    // Q and K only, and in ONE dispatch: they are the first
+    // `2 * n_k_heads` heads of the `[q | k | v]` buffer the convolution
+    // wrote, contiguous, and V is that output as it stands. Two
+    // dispatches over disjoint halves of one buffer also read as a
+    // conflict to any barrier scheme that is per-buffer, so this
+    // removes a dispatch AND a false dependency.
     encode_l2_norm_heads(
         encoder,
         device,
         conv_out,
-        key_dim,
+        0,
         h.head_dim,
-        h.n_k_heads,
+        2 * h.n_k_heads,
         w.eps,
     )?;
     encode_delta_step_at(

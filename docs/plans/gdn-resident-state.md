@@ -459,6 +459,11 @@ back NEUTRAL:
   four outstanding requests instead of one. 1.004 to 0.980 ms.
 - **One aligned 16-bit load for the two adjacent bytes a lane owns**,
   five loads to four. 0.980 to 0.943 ms.
+- **The two l2 norms as ONE dispatch.** Q and K are the first
+  `2 * n_k_heads` heads of the convolution's `[q | k | v]` output,
+  contiguous, so one call does both: one fewer dispatch a layer, and
+  one fewer false dependency for any barrier scheme that is per-buffer.
+  This one is kept.
 - **Eight rows per threadgroup instead of four**, halving the activation
   re-reads, which the arithmetic said were 4.6x the weight traffic
   (every threadgroup reads the whole 20 KB activation, 4352 times for
@@ -481,6 +486,16 @@ measured non-result below.
 
 ## Measured non-results, so they are not tried again
 
+- The fused recurrent layer on a concurrent encoder with RESOURCE-scoped
+  barriers (`MemRanges::begin_op`, every dispatch declaring what it
+  reads and writes, a barrier only on a real conflict), which is the
+  form the scope-Buffers attempt below said might pay. It produced
+  WRONG results -- both oracle tests red, the branch by 0.4% and the
+  whole layer by a factor of two -- and the missing dependency was not
+  found. The declared sets are recorded in the commit that reverts it,
+  so the next attempt starts from them rather than from nothing. It is
+  a non-result twice over: unfinished, and aimed at an overlap whose
+  full-barrier version had already measured slower.
 - The fused recurrent layer on a CONCURRENT encoder
   (`computeCommandEncoderWithDispatchType`), with scope-Buffers
   barriers only between stages that depend on each other, so `qkv` runs
