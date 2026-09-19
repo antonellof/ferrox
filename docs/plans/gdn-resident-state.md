@@ -536,6 +536,37 @@ back NEUTRAL:
   Sixteen and thirty-two rows are worse still (0.822 and 0.911 net),
   which is register spill.
 
+### The per-stage breakdown, from PRODUCTION
+
+The probe does not predict production, but three production
+configurations measured across this work do, because each differs from
+the next by exactly one stage. Their `FERROX_METAL_GPU_TIMING` averages
+subtract:
+
+| stage of a recurrent layer | GPU | bytes | achieved |
+|---|---|---|---|
+| head: `attn_norm` + the four projections | 0.286 ms | 19.4 MB | 67.8 GB/s |
+| branch: twelve small dispatches + `ssm_out` | 0.251 ms | 13.1 MB | 52.2 GB/s |
+| FFN: three matvecs | 0.762 ms | 58.5 MB | 76.8 GB/s |
+| **layer** | **1.299 ms** | 90.9 MB | 70.0 GB/s |
+
+`gdn-branch` is the first row measured alone (0.251), `gdn-layer` the
+branch plus the FFN (1.013), `gdn-layer-full` all three (1.299).
+
+Times 48 recurrent layers that is 62.4 ms, plus 23.9 for the sixteen
+attention layers: 86.2 ms of GPU a token, which is the 88.8 the ledger
+reports, within the noise.
+
+So the FFN is the fastest of the three per byte and the branch the
+slowest -- and the branch's 13.1 MB includes 6.2 MB of recurrent state
+and twelve dispatches whose fixed cost is about 8 microseconds each,
+some 0.1 ms of its 0.251. That is ~4.8 ms a token of pure dispatch
+overhead, the largest single identified inefficiency left, and
+halving it is worth about 2.4 ms: 10.12 to roughly 10.4 tok/s. Still
+not parity, and it is the biggest item on the list.
+
+Whoever picks this up starts here rather than at the probe.
+
 ### The probe, fixed, and still not predictive
 
 Those three were measured against a raw wall-clock number that includes
