@@ -565,11 +565,6 @@ mod tests {
         assert!(err.to_string().contains("xielu.alpha_p"), "{err}");
     }
 
-    /// The clamp tables: each site reads its own array, a zero entry is
-    /// plain SwiGLU on that site alone, and the whole-model answer is
-    /// `None` even when every entry is zero, because the variant is per
-    /// layer by type.
-    #[test]
     /// The clamp FORM is decided by architecture, and the two forms
     /// are different functions wherever the clamp binds.
     ///
@@ -602,6 +597,11 @@ mod tests {
         assert!((before.combine(0.5, 1.0) - after.combine(0.5, 1.0)).abs() < 1e-7);
     }
 
+    /// The clamp tables: each site reads its own array, a zero entry is
+    /// plain SwiGLU on that site alone, and the whole-model answer is
+    /// `None` even when every entry is zero, because the variant is per
+    /// layer by type.
+    #[test]
     fn the_clamp_arrays_are_read_per_site_and_zero_means_plain_swiglu() {
         let mut cfg = base_config();
         cfg.n_layers = 3;
