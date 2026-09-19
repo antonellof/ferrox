@@ -71,6 +71,19 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo fmt --all --check
 
+      # crates.io rate-limits the creation of NEW crate NAMES: a burst
+      # of about five, then one per ten minutes. Publishing a new
+      # VERSION of an existing crate is not limited, so this only bites
+      # on a rename or a first release -- measured on 2026-09-19, when
+      # the Ferrox -> Frink rename uploaded five crates and then took
+      # `429 Too Many Requests: You have published too many new crates
+      # in a short period of time`.
+      #
+      # The step below skips what is already on the index, so the fix is
+      # to re-run this workflow on that cadence until every crate is
+      # published; thirteen crates take roughly eighty minutes. Note
+      # that `dry_run` DEFAULTS TO TRUE on a manual dispatch, so a
+      # re-run needs `-f dry_run=false` or it uploads nothing.
       - name: Publish
         shell: bash
         env:
