@@ -10,6 +10,41 @@ inventory.md` (2026-09-01) was written the same way and one of its own
 rows turned out to be wrong; a count nobody can re-run is a claim, not
 a measurement.
 
+## Update, same day: four of the twelve new rows closed
+
+`spark2_5`, `maple`, `granite_swa` and `muse-glimmer` are audited
+against libllama built from the moved pin (`tests/
+gated_attention_graphs.rs`, `no_rope_layer_graphs.rs`,
+`granite_swa_graphs.rs`, `muse_glimmer_graphs.rs`). Three of the four
+cost a table row and a fixture, which is what their verdicts said they
+would; the fourth, `maple`, cost one more thing its own graph file does
+not show (`llama-graph.cpp:2228` sends it to `ggml_swiglu_clamp`, which
+clamps the gate BEFORE the SiLU).
+
+The seams that landed with them, each a census of one or two graphs:
+`RopeLayers::FileMask` (the first upstream graph that lets the FILE say
+which layers rotate), `ferrox_moe::ClampForm`,
+`norm_sites::WEIGHTLESS_EMBEDDING_NORM`,
+`norm::POST_NORM_EPS_LITERAL`.
+
+Two defects came out of the same work, both in the class this repo
+calls silent-wrong: `expert_used_count` and
+`expert_feed_forward_length` are read with `get_key_or_arr` upstream
+for EVERY architecture, and ferrox read each as a scalar -- so the
+array spelling that `conversion/nemotron.py` writes for Nemotron-H
+Puzzle, an architecture ferrox serves, fell into a default (top-2, and
+`feed_forward_length / n_experts_used`). Both are honoured when uniform
+and refused by name when they vary.
+
+**What is left of the twelve**: `graniteswitch` (a per-token adapter
+selection), `hrm_text` (two streams and a cycle schedule -- `zH`/`zL`
+recombined at every stack boundary, `hrm-text.cpp:183-196`),
+`minimax-01` (lightning attention as a recurrent block), `bailingmoe3`
+/ `kimi-k3` (MLA + KDA hybrids), `dots3note` / `hy_v4` (DSA and
+hyper-connections), `qwen4exp` (delta-net over a hybrid memory index),
+and the two TTS rows. Each needs a block that does not exist here yet,
+which is the honest reason the cheap ones went first.
+
 ## 0. The one-line answer
 
 Against the llama.cpp this repo PINS, ferrox serves **every text
