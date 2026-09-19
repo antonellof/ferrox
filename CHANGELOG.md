@@ -60,6 +60,19 @@ are the ones worth reading twice.
   reference's own approximation, measured rather than assumed
   (`tests/gated_attention_graphs.rs`).
 
+- **`neo-bert` and `eurobert` embed**, together, because they are ONE
+  topology: `neo-bert.cpp:59-118` and `eurobert.cpp:55-114` are RMSNorm
+  BEFORE each block, a bare residual after it, and one final norm --
+  where every other row on this loader is LayerNorm AFTER each add.
+  `bert_encoder::BertTopology` is the two shapes and
+  `bert_gguf_loader::EncoderSpec` the three columns they differ in: the
+  QKV spelling (fused for `neo-bert`, split for `eurobert`), the FFN's
+  (a `2 * n_ff`-wide `ffn_up` against a separate `ffn_gate`), the
+  rotation (NORM against NEOX) and the tensor the final norm is stored
+  under (`enc.output_norm` against `output_norm`). They read the RMS
+  epsilon key where the post-norm rows read the LayerNorm one, which is
+  the same fact said twice and is why the key is chosen by topology.
+
 - **`jina-bert-v2` embeds (jina-embeddings-v2 base / small)**, the row
   on `bert.cpp`'s graph whose position is neither a table nor a
   rotation: `jina-bert-v2.cpp:5` sets `f_max_alibi_bias = 8.0f` as a

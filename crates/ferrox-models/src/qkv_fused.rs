@@ -67,6 +67,14 @@ impl FusedQkvRows {
         }
     }
 
+    /// The spans directly, for a caller with no `ModelConfig`: the
+    /// BERT-family encoder, whose `neo-bert` row carries the fused
+    /// spelling and whose K and V are always the same width
+    /// (`neo-bert.cpp:29`).
+    pub(crate) fn from_widths(q: usize, kv: usize) -> Self {
+        Self { q, k: kv, v: kv }
+    }
+
     /// Total rows a fused `attn_qkv` tensor must have, and the length a
     /// fused `attn_qkv.bias` must have.
     pub(crate) fn total(self) -> usize {
@@ -164,7 +172,15 @@ pub(crate) fn load_fused_or_split_qkv(
 /// Quantized storage is sliced by row range with no dequantization, so
 /// Q/K/V stay on the quantized (Metal-capable) matvec path; any other
 /// storage is widened once and split.
-fn split_fused_weight(
+/// Split a fused `attn_qkv` into Q, K and V by ROW SPANS, keeping the
+/// quantized bytes when the spans fall on block boundaries and
+/// dequantizing when they do not.
+///
+/// `pub(crate)` for the BERT-family encoder, whose `neo-bert` row
+/// carries the fused spelling (`neo-bert.cpp:29`) and which builds no
+/// `ModelConfig` -- so it passes the spans directly rather than
+/// through [`FusedQkvRows::of`].
+pub(crate) fn split_fused_weight(
     fused: &WeightMatrix,
     rows: FusedQkvRows,
 ) -> Result<(WeightMatrix, WeightMatrix, WeightMatrix), LoadError> {
