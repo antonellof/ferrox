@@ -25,6 +25,14 @@ use crate::tokenizer::{GgufWordPieceTokenizer, SpecialTokens, TokenizerLoadError
 /// that this crate does not have. Used to refuse *by name* instead of
 /// with a generic "unsupported".
 const NOT_YET: &[(&str, &str)] = &[
+    // `jina-bert-v3` was HERE until 2026-09-19, refused for "RoPE and
+    // per-projection QK norm". The first half is served
+    // (`nomic-bert`'s rotation) and the second half was WRONG:
+    // `jina-bert-v3.cpp:25-43` creates no `attn_q_norm` at all, so the
+    // QK-norm branch of the shared graph (`bert.cpp:109-123`) is dead
+    // for it. A verdict read from the graph's branches rather than
+    // from the architecture's own loader named a blocker it does not
+    // have.
     // `nomic-bert` was HERE until 2026-09-19: its two deltas from
     // `bert` -- NEOX RoPE on Q/K and a gated SiLU FFN -- are
     // `bert_encoder::BertFfn` and `BertHparams::rope_theta`, read from
@@ -36,7 +44,6 @@ const NOT_YET: &[(&str, &str)] = &[
         "a second FFN shape on its MoE layers (moe_every_n_layers)",
     ),
     ("jina-bert-v2", "GEGLU and a second attention norm"),
-    ("jina-bert-v3", "RoPE and per-projection QK norm"),
     ("neo-bert", "per-projection QK norm"),
     (
         "modern-bert",

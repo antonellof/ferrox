@@ -1,10 +1,19 @@
-//! `nomic-bert` (nomic-embed-text v1 / v1.5) against llama.cpp's own
-//! pooled embedding, on a synthetic fixture.
+//! The BERT-family encoders against llama.cpp's own pooled embedding,
+//! on synthetic fixtures: `nomic-bert` and `jina-bert-v3`.
 //!
-//! # What this row is
+//! # What these rows are
 //!
-//! `nomic-bert` shares `src/models/bert.cpp`'s graph with `bert` and
-//! differs in exactly two lines of it:
+//! `src/models/bert.cpp`'s graph serves several architectures, and the
+//! ones ferrox builds differ from `bert` in two lines of it and
+//! nothing else. `bert_gguf_loader::ENCODER_ARCHS` is the table:
+//!
+//! | arch | rotation | FFN |
+//! |---|---|---|
+//! | `bert` | learned position table | ungated GELU, both biases |
+//! | `nomic-bert` | NEOX RoPE on Q/K | gated SiLU, no biases |
+//! | `jina-bert-v3` | NEOX RoPE on Q/K | ungated GELU, both biases |
+//!
+//! `nomic-bert` differs from `bert` in exactly two lines:
 //!
 //!   * **RoPE on Q and K** (`:126-133`, NEOX by
 //!     `llama_model_rope_type`), where `bert` adds a learned position
@@ -77,6 +86,49 @@ const NOMIC_GOLDEN: [f32; 32] = [
     -0.011955578,
 ];
 
+/// llama.cpp's MEAN-pooled embedding for `"hello world"` on
+/// `jina_bert_v3_tiny.gguf`, un-normalized.
+const JINA_V3_GOLDEN: [f32; 32] = [
+    -0.67560554,
+    0.19488943,
+    0.47437486,
+    -2.4178503,
+    -0.30169535,
+    -0.31104457,
+    0.12225819,
+    -1.6278875,
+    -0.6008126,
+    0.21150663,
+    2.5187652,
+    -1.4892101,
+    -0.47848803,
+    -0.28579736,
+    0.9464601,
+    1.0431744,
+    -0.37948397,
+    0.18413225,
+    1.6074077,
+    -2.496784,
+    -0.44237632,
+    1.1085048,
+    1.0128899,
+    0.43405753,
+    -0.16862528,
+    0.31937033,
+    -1.0025164,
+    -0.060127847,
+    1.1103966,
+    -0.7716639,
+    -0.3838148,
+    0.96059936,
+];
+
+fn fixture_named(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
 fn fixture() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nomic_bert_tiny.gguf")
 }
@@ -109,6 +161,39 @@ fn nomic_bert_matches_llama_cpp_pooled_embedding() {
     // explanation does not cover it and the question is recorded here
     // rather than answered.
     assert!(worst < 5e-3, "max |ferrox - llama.cpp| = {worst}");
+}
+
+/// `jina-bert-v3` is the third architecture on this graph, and it is
+/// the OTHER combination: `nomic-bert`'s rotation with `bert`'s
+/// ungated GELU FFN.
+///
+/// Its own tensor loader (`jina-bert-v3.cpp:25-43`) creates no
+/// position table and no QK-norm tensors, so the two branches of the
+/// shared graph that could have differed are settled by what the file
+/// holds -- which is why the row cost one line of
+/// `bert_gguf_loader::ENCODER_ARCHS` and a fixture.
+#[test]
+fn jina_bert_v3_matches_llama_cpp_pooled_embedding() {
+    let model = EmbeddingModel::from_gguf_path(fixture_named("jina_bert_v3_tiny.gguf"))
+        .expect("load the jina-bert-v3 fixture");
+    let hp = model.hparams().expect("a BERT-family encoder");
+    assert_eq!(hp.arch, "jina-bert-v3");
+    assert_eq!(hp.rope_theta, Some(1000.0), "it rotates");
+    assert_eq!(
+        hp.ffn,
+        ferrox_models::bert_encoder::BertFfn::GeluSeq,
+        "bert.cpp:179-187 includes JINA_BERT_V3 in the ungated GELU arm"
+    );
+    let ours = model.embed("hello world", false).expect("embed");
+    let mut worst = 0.0f32;
+    for (a, b) in ours.iter().zip(&JINA_V3_GOLDEN) {
+        worst = worst.max((a - b).abs());
+    }
+    // Wider than the gated row's line for a reason that is measured
+    // elsewhere in this tree: this FFN is GELU, and llama.cpp computes
+    // GELU from a 65536-entry f16 table
+    // (`tests/proj_bias_graphs.rs` carries the same class at 1e-2).
+    assert!(worst < 1e-2, "max |ferrox - llama.cpp| = {worst}");
 }
 
 /// The two facts reached the encoder, and they came from the
