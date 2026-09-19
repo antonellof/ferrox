@@ -60,6 +60,21 @@ are the ones worth reading twice.
   reference's own approximation, measured rather than assumed
   (`tests/gated_attention_graphs.rs`).
 
+- **`jina-bert-v2` embeds (jina-embeddings-v2 base / small)**, the row
+  on `bert.cpp`'s graph whose position is neither a table nor a
+  rotation: `jina-bert-v2.cpp:5` sets `f_max_alibi_bias = 8.0f` as a
+  LITERAL and `bert.cpp:78-80` builds no positions for it at all. The
+  bias is SYMMETRIC on an encoder -- `llama-graph.cpp:442` fills a
+  non-causal model's mask with `-|p0 - p1|` where the decoder's is
+  `p_key - p_query` -- so the encoder computes its own rather than
+  calling the decoder's row helper, over the slopes
+  `ferrox_core::alibi` already builds. With it: GEGLU in BOTH
+  spellings (a separate `ffn_gate`, or one fused into a
+  `2 * n_ff`-wide `ffn_up` whose first half is the gate, decided per
+  FILE at `bert.cpp:189`), the whole-projection QK LayerNorm
+  (`:109-123`, not per head) and the second attention norm
+  (`:156-159`), both optional and both carried by the fixture.
+
 - **`jina-bert-v3` embeds (jina-embeddings-v3)**, one line of
   `bert_gguf_loader::ENCODER_ARCHS` after `nomic-bert`: it reuses
   `llama_model_bert::graph` verbatim (`models.h:314-322`) and is the

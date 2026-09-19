@@ -123,6 +123,43 @@ const JINA_V3_GOLDEN: [f32; 32] = [
     0.96059936,
 ];
 
+/// llama.cpp's MEAN-pooled embedding for `"hello world"` on
+/// `jina_bert_v2_tiny.gguf`, un-normalized.
+const JINA_V2_GOLDEN: [f32; 32] = [
+    0.27334905,
+    -0.38287723,
+    -0.8778778,
+    1.4703183,
+    1.1156274,
+    -0.31832957,
+    -1.5785532,
+    1.2068794,
+    -0.8358101,
+    -0.76573783,
+    -0.2442192,
+    -0.3482085,
+    -0.011384547,
+    -1.1329051,
+    0.96807116,
+    0.6340127,
+    0.6995489,
+    0.16578382,
+    -1.0536755,
+    0.7068157,
+    -1.1811839,
+    -1.0217535,
+    -0.10069026,
+    0.2300063,
+    -2.3862777,
+    -0.0014972091,
+    0.24693376,
+    -0.28318134,
+    -0.8058681,
+    0.21487659,
+    -0.81692284,
+    -1.3321261,
+];
+
 fn fixture_named(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -193,6 +230,45 @@ fn jina_bert_v3_matches_llama_cpp_pooled_embedding() {
     // elsewhere in this tree: this FFN is GELU, and llama.cpp computes
     // GELU from a 65536-entry f16 table
     // (`tests/proj_bias_graphs.rs` carries the same class at 1e-2).
+    assert!(worst < 1e-2, "max |ferrox - llama.cpp| = {worst}");
+}
+
+/// `jina-bert-v2` is the row on this graph whose position is neither a
+/// table nor a rotation.
+///
+/// `jina-bert-v2.cpp:5` sets `f_max_alibi_bias = 8.0f` as a LITERAL
+/// and `bert.cpp:78-80` builds no `inp_pos` for it, so ALiBi is the
+/// only place position enters -- and it is SYMMETRIC here, because
+/// `llama-graph.cpp:442` fills a non-causal model's mask with
+/// `-|p0 - p1|` where the decoder's is `p_key - p_query`.
+///
+/// The fixture also carries the two optional norms upstream creates
+/// for this architecture and no other on the graph (the whole-
+/// projection QK LayerNorm at `bert.cpp:109-123` and the second
+/// attention norm at `:156-159`), and the FUSED GEGLU spelling: one
+/// `2 * n_ff`-wide `ffn_up` whose first half is the gate.
+#[test]
+fn jina_bert_v2_matches_llama_cpp_pooled_embedding() {
+    let model = EmbeddingModel::from_gguf_path(fixture_named("jina_bert_v2_tiny.gguf"))
+        .expect("load the jina-bert-v2 fixture");
+    let hp = model.hparams().expect("a BERT-family encoder");
+    assert_eq!(hp.arch, "jina-bert-v2");
+    assert_eq!(hp.rope_theta, None, "no rotation");
+    assert_eq!(
+        hp.ffn,
+        ferrox_models::bert_encoder::BertFfn::GegluFusedUp,
+        "no ffn_gate tensor, so the gate is fused into ffn_up"
+    );
+    let slopes = hp.alibi_slopes.as_ref().expect("alibi at a literal 8.0");
+    assert_eq!(slopes.len(), 4);
+    assert!(slopes[0] > slopes[3], "the slopes decrease per head");
+
+    let ours = model.embed("hello world", false).expect("embed");
+    let mut worst = 0.0f32;
+    for (a, b) in ours.iter().zip(&JINA_V2_GOLDEN) {
+        worst = worst.max((a - b).abs());
+    }
+    // GELU again, so the GELU-table line rather than the gated row's.
     assert!(worst < 1e-2, "max |ferrox - llama.cpp| = {worst}");
 }
 
