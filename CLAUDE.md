@@ -1395,30 +1395,38 @@ PTQ1_0 matvec returned zeros on its first run because
 had been quietly running Q5_0 through their fallbacks for two weeks
 while the capability table and the kernel registry said otherwise.
 Each is derived from the one table now, with a test that holds it.
-The speed gap that remains is **10.1 vs 11.5 tok/s decode** and
+The speed gap that remains is **11.17 vs 11.46 tok/s decode** and
 **43.1 vs 66.8 prefill** on the M2 Pro, measured back to back on a
-quiet box at the reference's own `tg32` shape, and by 0.24.0 it is no
-longer the shape it looked. Prefill's HOST side is finished: the
-gated delta-net recurrence runs chunked (the state read once per
-CHUNK of rows, not once per row) and then on the device, and the
-blocked attention the fused block refuses now runs on the GPU too;
-a `sample` of a prefill has nothing host-side above the noise.
-Decode went 7.1 to 10.1 by collapsing command buffers: a recurrent
-layer is ONE submission end to end -- `attn_norm`, the four
+quiet box at the reference's own `tg32` shape, and decode is at
+**97.5%** of it. Prefill's HOST side is finished: the gated delta-net
+recurrence runs chunked (the state read once per CHUNK of rows, not
+once per row) and then on the device, and the blocked attention the
+fused block refuses now runs on the GPU too; a `sample` of a prefill
+has nothing host-side above the noise.
+
+Decode went 7.1 to 11.17 by collapsing command buffers, and the
+count is the whole story: 192 waits a token, then 69, then 20. A
+recurrent layer is ONE submission end to end -- `attn_norm`, the four
 projections, the gates, the convolution, the l2 norms, the delta
 rule, the gated norm, the rotation, `ssm_out`, the residual, the FFN
-norm, the FFN, the residual -- and consecutive recurrent layers
-commit back to back against one device buffer and wait ONCE, 192
-waits a token down to 69.
+norm, the FFN, the residual. Consecutive recurrent layers commit back
+to back against one device buffer and wait ONCE. Then the attention
+layer stopped having submissions of its own: its TAIL rides in the
+next run's command buffer, its PROJECTIONS ride in the previous
+one's, and the attention itself reads a device KV mirror
+(`KvCache::metal_attn`), so a four-layer group on a hybrid is one
+submission and one wait with no host step inside it.
 
-**And that lever is now spent, with a number.** A decode token's GPU
-time is 88.8 ms; the reference's WHOLE token is 86.7 to 87.3. So
-removing every remaining submission and every host microsecond
-converges to 11.26 tok/s, below the reference: scheduling cannot
-reach parity from here, and neither can the device-resident attention
-layer that is the obvious next fusion (priced at 11.22). What is left
-is ~3% in the PTQ1_0 matvec's inner loop, and
-`docs/plans/gdn-resident-state.md` records what has already been
+**Decode is FLAT with context now, which it was not.** 11.17 / 11.19
+/ 11.16 at 32 / 300 / 600 tokens, against the reference's 11.46 /
+11.50. The slope it used to have -- 11.1 at 32 and 10.95 at 300 --
+was a host attention whose work grows with `seq_len`, and the shape
+of the curve is worth more than the tok/s: a number that is flat
+where the reference is flat says the remaining difference is a
+constant, not an algorithm.
+
+What is left is that constant, ~3% in the PTQ1_0 matvec's inner loop,
+and `docs/plans/gdn-resident-state.md` records what has already been
 eliminated against it -- three measured-neutral memory hypotheses, two
 concurrency schemes (one slower, one correct and flat, because a
 single matvec already dispatches 4352 threadgroups and fills the
@@ -1426,7 +1434,15 @@ part), and the per-stage breakdown (head 0.286 ms, branch 0.251, FFN
 0.762 per recurrent layer). It also records that the bandwidth probe
 those hypotheses were aimed at reports a third of the truth and has
 never once predicted production; it subtracts its own launch cost
-now, and is still only good for comparing kernel variants.
+now, and is still only good for comparing kernel variants. And it
+records the bug that nearly shipped with the device attention: the
+first version encoded it on a CONCURRENT encoder whose tail expects
+a serial one, and the model generated FLUENT NONSENSE while `ferrox
+parity` stayed MATCH, because parity reads the first token and the
+first token is prefill. Nothing in the suite compares a DECODE step
+against a reference; a greedy 100-token generation against the same
+build with the device path off is what caught it, and that comparison
+should be a test.
 
 Two earlier levers are worth as much as the ones that worked: the
 device-side Hadamard bought 9% of decode and COST 6% of prefill,
