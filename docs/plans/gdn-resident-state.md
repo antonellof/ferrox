@@ -399,6 +399,26 @@ Waits a token: 51 to 36. Interleaved at a 300-token context:
 `Decoder::attn_tail_launch` the one builder, so the standalone launch
 and the run cannot disagree about the fold width or the refusals.
 
+## The attention head rides in the previous run
+
+The mirror of the tail. An attention layer reads `attn_norm(hidden)`
+and projects Q, K and V from it, and `hidden` is what the recurrent run
+before it just finished writing. So the run encodes that norm and those
+three matvecs at its END and `finish_with_head` returns all four to the
+host for its one wait (`GdnRun::attn_head`). The host still does the
+attention itself -- the KV lives there -- but it starts with q, k and v
+already in hand.
+
+Waits a token: 36 to **20**. Interleaved:
+
+    tg32   11.11 / 11.06 tok/s   with       10.69  without
+    n300   10.95
+
+`Decoder::project_qkv` is the projection split out of `attn_block`, so
+the precomputed path and the ordinary one cannot compute it two ways;
+`attn_block_tail` takes the three vectors when the run made them and
+projects when it did not.
+
 ## The limit, which is not where this plan assumed
 
 Our GPU time for a decode token is **88.8 ms**. The reference's WHOLE
@@ -422,7 +442,8 @@ left of it precisely so nobody spends a fifth round finding that out.
 |---|---|---|---|---|
 | before the tail was fused | 69 | 11.7 ms | 100.5 ms | 10.29 |
 | the attention TAIL fused (`wo` + residual + norm + FFN) | 51 | 8.7 ms | 97.5 ms | 10.59 |
-| **the tail riding in the next run, today** | **36** | **6.1 ms** | **94.9 ms** | **10.6 - 10.8** |
+| the tail riding in the next run | 36 | 6.1 ms | 94.9 ms | 10.6 - 10.8 |
+| **the head riding in the previous one, today** | **20** | **3.4 ms** | **~90 ms** | **11.06 - 11.17** |
 | the attention LAYER fused | 37 | 6.3 ms | 95.1 ms | 10.52 |
 | the whole token as ONE run | 2 | 0.3 ms | 89.1 ms | 11.22 |
 | **the floor, at today's kernels** | 0 | 0 | **88.8 ms** | **11.26** |

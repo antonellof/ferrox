@@ -18,6 +18,14 @@ use crate::layer_shapes::AttnShape;
 use crate::ssm_block::SsmBlock;
 use ferrox_core::recurrent_state::RecurrentState;
 
+/// The Q/K/V a recurrent run encoded for the attention layer that
+/// follows it, and which layer they belong to.
+///
+/// Carried one loop iteration by the decode body, so that layer does
+/// not project them again in a submission of its own
+/// (`ferrox_metal::gdn_branch::GdnRun::attn_head`).
+pub(crate) type PendingQkv = Option<(usize, (Vec<f32>, Vec<f32>, Vec<f32>))>;
+
 impl Decoder {
     /// Layer `l` end to end in one submission, or `None` when either
     /// half refuses and the host bodies run it.
@@ -102,6 +110,7 @@ impl Decoder {
         start: usize,
         hidden: &mut Vec<f32>,
         kv_caches: &mut [ferrox_core::KvCache],
+        pending: &mut PendingQkv,
     ) -> Option<usize> {
         // How far the run reaches: consecutive layers this path serves
         // whole. Asked BEFORE anything is submitted, because a run that
@@ -118,7 +127,10 @@ impl Decoder {
         }
         let mut run = ferrox_metal::gdn_branch::GdnRun::start(hidden).ok()?;
         self.run_layers(&mut run, start, end, kv_caches)?;
-        *hidden = run.finish().ok()?;
+        let head = self.encode_next_attn_head(&mut run, end, kv_caches.len());
+        let (out, qkv) = run.finish_with_head().ok()?;
+        *hidden = out;
+        *pending = head.then_some(qkv).flatten().map(|q| (end, q));
         Some(end)
     }
 
@@ -137,6 +149,7 @@ impl Decoder {
         branch: &[f32],
         hidden: &mut Vec<f32>,
         kv_caches: &mut [ferrox_core::KvCache],
+        pending: &mut PendingQkv,
     ) -> Option<usize> {
         let (out_proj, fold_branch, ffn, launches) = self.attn_tail_launch(l, layer, branch)?;
         let mut end = l + 1;
@@ -159,8 +172,32 @@ impl Decoder {
         let _ = ffn;
         layer.moe.record_activations_dense();
         self.run_layers(&mut run, l + 1, end, kv_caches)?;
-        *hidden = run.finish().ok()?;
+        let head = self.encode_next_attn_head(&mut run, end, kv_caches.len());
+        let (out, qkv) = run.finish_with_head().ok()?;
+        *hidden = out;
+        *pending = head.then_some(qkv).flatten().map(|q| (end, q));
         Some(end)
+    }
+
+    /// The NEXT layer's Q/K/V projections at the end of `run`, when
+    /// that layer is an attention layer this path serves. `false` when
+    /// there is nothing to encode, and then `finish` returns no head.
+    #[cfg(feature = "metal")]
+    fn encode_next_attn_head(
+        &self,
+        run: &mut ferrox_metal::gdn_branch::GdnRun,
+        next: usize,
+        n_layers: usize,
+    ) -> bool {
+        if next >= n_layers {
+            return false;
+        }
+        let layer = self.layer_for(next);
+        let Some((norm, q, k, v, fold_x)) = self.attn_head_launch(next, layer) else {
+            return false;
+        };
+        run.attn_head(norm, self.config.rms_norm_eps, &q, &k, &v, fold_x.as_ref())
+            .is_ok()
     }
 
     /// Appends layers `start..end` to `run`. The ONE place a recurrent
