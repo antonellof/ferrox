@@ -9,7 +9,7 @@
 //! with a NULL `ffn_gate_inp`. Every other MoE body in ferrox routed on
 //! the normed FFN input, which is the `build_moe_ffn` default and what
 //! the experts read. The reach was MEASURED before a line was written
-//! (`ferrox_models::router_input` has the table): four of 140 graphs
+//! (`ferrox_models::router_input` has the table): four of 155 graphs
 //! pass `probs_in`, and this is the only one on the generic path whose
 //! operand differs. The other two: `LLM_FFN_RELU` experts with a REAL
 //! gate (`ggml_reglu_split`, `FfnActivation::Reglu` -- NOT `arcee`'s

@@ -29,7 +29,7 @@
 //! # Reach -- MEASURED, not read off one file
 //!
 //! `grep -l 'attn_sub_norm\|ffn_sub_norm' src/models/*.cpp` over all
-//! 140 graphs (2026-09-12) is `bitnet.cpp`. `LLM_TENSOR_ATTN_SUB_NORM`
+//! 155 graphs (2026-09-12) is `bitnet.cpp`. `LLM_TENSOR_ATTN_SUB_NORM`
 //! and `LLM_TENSOR_FFN_SUB_NORM` (`llama-arch.cpp:510-511`) are created
 //! by no other `load_arch_tensors`. So [`SUB_NORM_ARCHS`] has one row,
 //! and the fact is a `bool` rather than an enum: there is no second

@@ -119,7 +119,7 @@ pub const POST_NORMS_UNDER_GROK_NAMES: &[&str] = &["grok"];
 /// `attn_norm_2` and the pre-FFN slot is `attn_norm`. Decided PER LAYER
 /// by tensor presence, which is why it is [`NormSites::for_layer`] and
 /// not a row of [`NormSites::for_arch`]. Measured: `grep -l attn_norm_2
-/// src/models/*.cpp` over all 140 is `falcon`, `bert`, `jina-bert-v2`
+/// src/models/*.cpp` over all 155 is `falcon`, `bert`, `jina-bert-v2`
 /// (encoders, a post-norm there), `rwkv6` / `rwkv7` / `eagle3` (other
 /// engines); one generic-path graph.
 pub const ATTN_NORM_2_FEEDS_ATTENTION: &[&str] = &["falcon"];
@@ -130,7 +130,7 @@ pub const ATTN_NORM_2_FEEDS_ATTENTION: &[&str] = &["falcon"];
 ///
 /// `bloom`: `bloom.cpp:25-26` create `tok_norm` / `tok_norm_b`
 /// REQUIRED and `:77-80` norm `inpL` with them, `LLM_NORM`, right after
-/// `build_inp_embd`. Measured over all 140 graphs: `bloom` is the one
+/// `build_inp_embd`. Measured over all 155 graphs: `bloom` is the one
 /// decoder on the generic path; `bert` / `nomic-bert` / `nomic-bert-moe`
 /// / `jina-bert-v2` / `jina-bert-v3` / `modern-bert` are the encoder
 /// engine, `rwkv6` / `rwkv7` / `wavtokenizer-dec` their own. The site

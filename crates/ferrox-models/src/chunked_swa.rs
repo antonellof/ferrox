@@ -7,7 +7,7 @@
 //! layer's visible span RESETS at every chunk boundary, where a sliding
 //! one slides.
 //!
-//! One graph of 140 sets it (`grep -l SWA_TYPE_CHUNKED src/models/
+//! One graph of 155 sets it (`grep -l SWA_TYPE_CHUNKED src/models/
 //! *.cpp` is `llama4.cpp:13`), from LITERALS: `n_swa = 8192`, a
 //! 3-chunked-1-full period of 4, and the attention temperature's three
 //! constants, on the branch a file takes unless it declares

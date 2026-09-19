@@ -4,7 +4,7 @@
 //! ([`crate::layer_shapes::AttnShape::Mamba1`]) or on every layer of a
 //! pure Mamba model.
 //!
-//! Called by three graphs of 140 (measured: `grep -n build_mamba_layer
+//! Called by three graphs of 155 (measured: `grep -n build_mamba_layer
 //! src/models/*.cpp` is `jamba.cpp:128`, `mamba.cpp:106` and, in its
 //! own spelling, `plamo2.cpp`), so this is ONE body:
 //!

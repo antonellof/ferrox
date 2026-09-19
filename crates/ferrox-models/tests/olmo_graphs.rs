@@ -20,7 +20,7 @@
 //! `crate::norm::NormOp::LayerNormNoParams`.
 //!
 //! **The shared cause everyone hoped for is not there, and that is a
-//! measurement.** Every `build_norm` call in all 140 of llama.cpp's
+//! measurement.** Every `build_norm` call in all 155 of llama.cpp's
 //! `src/models/*.cpp` graphs was scanned for a null weight argument.
 //! Three calls pass one to `LLM_NORM`, and all three are `olmo.cpp`;
 //! `talkie.cpp` passes one to `LLM_NORM_RMS` at five sites, which is a

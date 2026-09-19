@@ -17,7 +17,7 @@
 //!
 //! The census is measured, not remembered: `grep -n
 //! LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN src/models/*.cpp` over all
-//! 140 graphs. Twenty-two read the key. Five read only the array
+//! 155 graphs. Twenty-two read the key. Five read only the array
 //! ([`PER_LAYER_ARRAY_READERS`]), two try the scalar and fall back to
 //! the array ([`SCALAR_THEN_ARRAY_READERS`]), and the other fifteen read
 //! only the scalar. An architecture that reads the key in NO form

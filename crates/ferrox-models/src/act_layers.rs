@@ -215,9 +215,17 @@ impl SwigluClamps {
 }
 
 /// Architectures on the generic path whose graph READS the two clamp
-/// arrays: `grep -l LLM_KV_SWIGLU_CLAMP src/models/*.cpp` is
-/// `step35.cpp`, `deepseek4.cpp` and `dflash.cpp`, and the last two are
-/// on ferrox's own DeepSeek-4 engine. For every other architecture the
+/// arrays: `grep -l LLM_KV_SWIGLU_CLAMP src/models/*.cpp` was
+/// `step35.cpp`, `deepseek4.cpp` and `dflash.cpp` over the then-140
+/// graphs, and the last two are on ferrox's own DeepSeek-4 engine.
+/// Re-measured over 155 on 2026-09-19 it is SIX: `bailingmoe3`,
+/// `hy-v4` and `maple` read them too, all three refused today for
+/// other reasons, and `maple`'s verdict says the clamp is the one
+/// thing it does NOT need work for -- the verdict deliberately spells
+/// it "the SwiGLU clamp arrays" rather than the key, because
+/// `tests/unaudited_triage.rs`'s guard greps blockers for the key name
+/// and would read a SERVED mention as a missing one. For every other
+/// architecture the
 /// arrays stay zero-filled upstream whatever the file says, so the
 /// keys are dead metadata there and ferrox ignores them the same way.
 pub const SWIGLU_CLAMP_READERS: &[&str] = &["step35"];

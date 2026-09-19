@@ -22,7 +22,7 @@
 //! # Reach
 //!
 //! `grep -n 'ggml_rms_norm(ctx0, Qcur' src/models/*.cpp` over all
-//! 140 graphs: `llama4.cpp:184` and `llama.cpp:164`, the latter under
+//! 155 graphs: `llama4.cpp:184` and `llama.cpp:164`, the latter under
 //! the same `hparams.use_kq_norm`, which NOTHING but `llama4.cpp:43`
 //! assigns (`grep -rn use_kq_norm src/`), so it is dead on the `llama`
 //! graph. One reachable graph, so the fact is a `bool` on

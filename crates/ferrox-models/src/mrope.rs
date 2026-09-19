@@ -27,7 +27,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! `grep -l ROPE_DIMENSION_SECTIONS src/models/*.cpp` over all 140
+//! `grep -l ROPE_DIMENSION_SECTIONS src/models/*.cpp` over all 155
 //! graphs is eleven files. On the generic path: `glm4` and `glm4moe`
 //! (above) and `ernie4-5.cpp:5`, which reads the sections into hparams
 //! and rotates with `ggml_rope_ext` unconditionally (`llama-model.cpp:

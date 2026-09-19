@@ -10,7 +10,7 @@
 //! by the first and V rows by the second (`n_embd_k_gqa` /
 //! `n_embd_v_gqa`), scores with the first (`1/sqrt(n_embd_head_k)`),
 //! and reads `wo` as `{n_embd_head_v * n_head, n_embd}`. Eighty-nine of
-//! the 140 graphs then assert the two EQUAL (`GGML_ASSERT(n_embd_head
+//! the 155 graphs then assert the two EQUAL (`GGML_ASSERT(n_embd_head
 //! == hparams.n_embd_head_v())`, measured 2026-09-12); the rest use
 //! both names and would run either way.
 //!

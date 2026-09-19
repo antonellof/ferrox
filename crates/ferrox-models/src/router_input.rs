@@ -14,7 +14,7 @@
 //!
 //! # Who passes `probs_in` -- MEASURED, not read off one file
 //!
-//! Every `build_moe_ffn(` call in all 140 `src/models/*.cpp` was parsed
+//! Every `build_moe_ffn(` call in all 155 `src/models/*.cpp` was parsed
 //! for its `gate_inp` and `probs_in` arguments (2026-09-11). Fifty-nine
 //! call sites; four pass a precomputed `probs_in`:
 //!
@@ -51,7 +51,7 @@
 //! experts read that same vector, while the layer's dense FFN
 //! (`:118-132`, `crate::parallel_dense_ffn`) reads the ordinary
 //! `ffn_norm(ffn_inp)`. `grep -l FFN_NORM_EXPS src/models/*.cpp` over
-//! all 140 graphs is `arctic.cpp` (2026-09-12), so
+//! all 155 graphs is `arctic.cpp` (2026-09-12), so
 //! [`RouterInput::NormedLayerInput`] has one row and carries the fact
 //! that distinguishes it from `smallthinker`'s: the EXPERTS read it
 //! too ([`RouterInput::experts_read_router_operand`]). The bodies

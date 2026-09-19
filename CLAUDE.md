@@ -12,15 +12,43 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-18. **93** architectures run with
-evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
-engines, and everything else REFUSES. The "loads and is WRONG" class is
-closed: the generic path is opt-in, so an unaudited architecture stops
-instead of guessing.
+Honest position, re-audited 2026-09-19 against a MOVED PIN. **93**
+architectures run with evidence (`capability::AUDITED_GENERIC_GQA`), 4
+more have dedicated engines, and everything else REFUSES. The "loads
+and is WRONG" class is closed: the generic path is opt-in, so an
+unaudited architecture stops instead of guessing.
 
-The 2 unaudited refusals are now TRIAGED, and the refusal says which of
-three things is missing: **0 are a fixture away, 0 are one match arm
-away**, 1 needs new code, 1 is unknown with the question stated. Five
+**The refusing count went UP on 2026-09-19, from 2 to 10, and that is
+what parity with a moving target looks like.** The pinned llama.cpp was
+six weeks and 792 commits old; moving it to `5b59b83` brought fifteen
+new graphs, of which twelve are text generation. Eight are generic-path
+candidates and are triaged (`granite_swa`, `graniteswitch`,
+`muse-glimmer`, `maple`, `spark2_5`, `hrm_text`, `minimax-01`,
+`qwen4exp`), four need an attention this engine does not have and are
+refused by name (`bailingmoe3`, `dots3note`, `hy_v4`, `kimi-k3`), and
+two are text-to-speech. A count that only ever fell would mean nobody
+was reading upstream. `docs/plans/parity-audit-2026-09-19.md` is the
+re-measurement, llama.cpp AND vLLM.
+
+So the ten triaged refusals say which of three things is missing: **0
+are a fixture away, 2 are one match arm away** (`maple` needs one
+`rope_layers` row, `spark2_5` one `attn_gate` row -- the cheapest work
+in the tree), 7 need new code, 1 is unknown with the question stated.
+Before the pin moved both cheap classes were EMPTY, which is the state
+to get back to.
+
+Three things the pin move found that are not new architectures at all:
+`kimi_k3` had been spelled with an UNDERSCORE in the catalog since it
+was added while `llama-arch.cpp:155` writes `kimi-k3`, so that refusal
+could never fire on a real file; `nextn_predict_layers` is now read by
+llama.cpp's COMMON loader for every architecture (upstream 9d81721),
+which makes ferrox's seventeen-reader gate an over-refusal and is
+recorded in `crate::mtp_blocks` as the next row; and
+`expert_used_count` is read there as scalar-OR-ARRAY, where ferrox read
+a scalar and silently defaulted to 2 for the array spelling that
+`conversion/nemotron.py:574` writes for Nemotron-H Puzzle -- an
+architecture ferrox SERVES. A uniform array is honoured now and a
+varying one stops by name. Five
 one-match-arm rows closed on 2026-09-02, seven fixture-away rows on
 2026-09-03, `gemma`, `hunyuan-dense` and `ernie4_5-moe` on 2026-09-09,
 and `olmo2`, `exaone4`, `chatglm`, `qwen`, the three Granite rows and
@@ -76,7 +104,7 @@ MiniCPM defaults hook, the `NormOp` enum, the norm-slot decision -- by
 one column, and the clamp `dbrx` needed closed a third row's
 refusal-by-name with it. The sixth is both lessons and a correction:
 `deci` and `openelm` closed TOGETHER on the per-layer shape seam, whose
-reach was MEASURED across all 140 graphs before it was built, and
+reach was MEASURED across all 155 graphs before it was built, and
 `arcee` closed ALONE because the verdict that said it shared a cause
 with `plm` had been read from one file and not the other. The seventh
 is the sixth's lesson applied to the sixth's leftovers: the shape seam
@@ -110,7 +138,7 @@ is the same measurement answering ONE for a different reason:
 `smallthinker`'s router MECHANISM (a precomputed `probs_in`) is shared
 with three graphs and its CAUSE (routing on the raw layer input) with
 none on this engine. The twelfth is the smallest reach there is:
-`bitnet` closed ALONE, 7 to 6, on two norm slots one graph of 140
+`bitnet` closed ALONE, 7 to 6, on two norm slots one graph of 155
 creates, and the seam is a `bool` because there is no second shape to
 name. The same day's OTHER reading did not close a row and is worth
 as much: `grovemoe`'s graph, read against `modeling_grove_moe.py`,
@@ -124,7 +152,7 @@ one generic-path converter plus the MLA engine, which had carried the
 pair since it existed. The fourteenth, `nanbeige`, 5 to 4, is the
 verdict's last sentence taken literally: "it is the copy that has no
 home" closed as a mapping, not a copy. The fifteenth, `talkie`, 4 to
-3, is four seams for one row, each one graph of 140, so none could be
+3, is four seams for one row, each one graph of 155, so none could be
 built for anything else and all four landed together. The sixteenth,
 `plm`, 3 to 2, closed on an engine that already had its attention: the
 work was a table of the three ways it differs from DeepSeek-2 and the
@@ -226,7 +254,7 @@ attention; what it has not had is a real file run through it.
 
 `plm` closed on `ferrox-models/src/mla_arch.rs` and `mla_q_proj.rs`, on
 the MLA engine. `plm.cpp:84-166` is `deepseek2.cpp`'s naive MLA branch
-line for line (`grep -l ATTN_KV_A_MQA` over all 140 graphs is six
+line for line (`grep -l ATTN_KV_A_MQA` over all 155 graphs is six
 files, `plm` the only one on no engine), and what differs is three
 things, one table: a DIRECT `attn_q` (`plm.cpp:32`; `deepseek2.cpp:
 104-115` creates the same when `q_lora_rank == 0`, and `:8,11-13`
@@ -277,7 +305,7 @@ second's golden); sabotaging the skip add turns four tests red.
 `n_layer_all = n_phys * n_loops` and replicate the per-layer arrays;
 `:69-73` alias `layers[i + j * n_phys] = layers[i]`; `:167-175` norm the
 residual with `output_norm` after every pass but the last unless the
-flag skips it. One graph of 140 reads either key. The weights are
+flag skips it. One graph of 155 reads either key. The weights are
 shared and the KV is not: `Decoder::layers` stays physical,
 `ModelConfig::n_layers` is the logical count every KV cache and
 per-layer table is sized by, `Decoder::layer_for(l)` /
@@ -312,7 +340,7 @@ host bodies, the KV budget. Refusing: every fused Metal launch
 (`metal_can_serve_model`), the CUDA resident hook, the slot file, the
 KV block file (one `head_dim` in each header). The row's second half,
 `attention.value_scale` (`:14-17,180-183`, `0.707` on every export),
-is `ferrox-models/src/attn_value_scale.rs`: one reader of 140, applied
+is `ferrox-models/src/attn_value_scale.rs`: one reader of 155, applied
 after `wo` in the one attention tail. KL 5.42e-15 (the converter's
 fused `attn_qkv`, K rows at 12, V rows at 8), 5.42e-15 (split
 spelling; libllama byte-identical for the two), 3.49e-15 (no value
@@ -321,7 +349,7 @@ window array with `rope.freq_base_swa`, sinks, sigmoid routing with
 `exp_probs_b`, partial NEOX RoPE and MoE on every layer, as a real
 export does. Two findings. `mimo2.cpp:227` passes the SIGMOID literal
 into `build_moe_ffn`, so the key is never read: parsing every
-`build_moe_ffn` call in all 140 graphs, three pass SIGMOID, twenty-six
+`build_moe_ffn` call in all 155 graphs, three pass SIGMOID, twenty-six
 SOFTMAX, nineteen the hparam (`GATING_LITERAL_ARCHITECTURES`). And the
 bisection that found the last 2e-3 of KL found ferrox honouring
 `expert_weights_scale` for EVERY architecture where llama.cpp reads
@@ -337,7 +365,7 @@ RMSNorms INSIDE the sublayers where the decoder's four sites are all
 outside them: `:101-106` norm the attention output BEFORE `wo` (the
 other side of that matmul from Gemma's `post_attention_norm`) and
 `:127-141` call `build_ffn` with a NULL down, norm `silu(gate) * up`,
-and apply `ffn_down` by hand. `grep -l` for either tensor over all 140
+and apply `ffn_down` by hand. `grep -l` for either tensor over all 155
 graphs is `bitnet.cpp`, so `ModelConfig::block_sub_norms` is a `bool`
 with two readers: the loader REQUIRES the pair on it (and refuses the
 FFN one on a routed layer, where `build_moe_ffn` has no such site), and
@@ -367,7 +395,7 @@ which `ferrox-gguf` inspects and refuses at execution; the row is
 evidenced on F32 and runs a Q8_0 / F16 re-export.
 
 `smallthinker` closed on `ferrox-models/src/router_input.rs`. Every
-`build_moe_ffn(` call in all 140 graphs was parsed for its `probs_in`
+`build_moe_ffn(` call in all 155 graphs was parsed for its `probs_in`
 argument before a line was written: fifty-nine sites, four pass one.
 `smallthinker.cpp:111` computes the router logits from `inpL`, the
 residual as it ENTERS the layer, before `attn_norm` and before
@@ -402,7 +430,7 @@ seam needed an eighth fact in all of them.
 
 `mistral3` closed on `ferrox-models/src/attn_temperature.rs`. `grep -ln
 'attn_temp\|temperature_scale\|build_inp_attn_scale' src/models/*.cpp`
-over all 140 graphs is `mistral3.cpp`, `llama4.cpp` and `deepseek2.cpp`
+over all 155 graphs is `mistral3.cpp`, `llama4.cpp` and `deepseek2.cpp`
 (three false hits recorded in the module: `grok.cpp:23` reads
 `temperature_length` and applies it nowhere, `dflash` / `deepseek4`
 name a hyper-connection TENSOR, `plamo3.cpp:140` is a local). All three
@@ -456,7 +484,7 @@ is dead metadata everywhere else, as upstream.
 `n_layer`-long arrays or one scalar broadcast, and `:132-138` hands
 layer `il`'s four to `ggml_xielu` over its `ffn_up` output, ungated,
 with the softplus folded at graph build; `grep -l ggml_xielu` over the
-140 graphs is that one file. `step35.cpp:28-29` reads
+155 graphs is that one file. `step35.cpp:28-29` reads
 `swiglu_clamp_exp` / `_shexp` as OPTIONAL arrays and llama.cpp's
 GENERIC `build_moe_ffn` (`llama-graph.cpp:2146-2164`) and `build_ffn`
 (`:1751-1768`) apply layer `il`'s entry above `1e-6` as `min(silu(gate),
@@ -533,7 +561,7 @@ n_layer_nextn`, `llama-graph.cpp:1433` builds every graph over
 `n_layer()`, and each tensor loader creates the trailing blocks
 `TENSOR_SKIP` (`exaone-moe.cpp:52-57`, `mimo2.cpp:51-52`). Only the
 SEVENTEEN graphs that read `nextn_predict_layers` subtract (`grep -l`
-over all 140, `NEXTN_READERS`); a nonzero key on any other stays
+over all 155, `NEXTN_READERS`); a nonzero key on any other stays
 refused, where upstream would run every block and then fail on the
 unread `nextn.*` tensors. `ModelConfig::n_layers` is the trunk and
 `n_mtp_blocks` the rest, the skipped tensors are marked deliberately
@@ -561,7 +589,7 @@ as one number until `kv_head_dims` (above). `step35` led with its clamp arrays a
 rotary on the full layers, and closed on both the same day (above).
 
 `afmoe` and `laguna` are ONE seam, `ferrox-models/src/attn_gate.rs`.
-llama.cpp's `LLM_TENSOR_ATTN_GATE` is created by six of the 140 graphs
+llama.cpp's `LLM_TENSOR_ATTN_GATE` is created by six of the 155 graphs
 (measured); three of them (`qwen3next`, `qwen35`, `qwen35moe`) keep the
 gated delta-net's `z` projection under that name, a different op on a
 different engine, which is why the seam is keyed by architecture and
@@ -615,7 +643,7 @@ llama.cpp reads `head_count`, `head_count_kv` and `feed_forward_length`
 as scalar-or-array for EVERY architecture (`llama-model.cpp:1149-1158`)
 and hands most graphs layer 0 through `LLAMA_LOAD_LOCALS`; ferrox
 carried all three as scalars that every host body read once above its
-layer loop. Before a line was written, all 140 `src/models/*.cpp` were
+layer loop. Before a line was written, all 155 `src/models/*.cpp` were
 scanned for `n_head(i)`, `n_head_kv(i)`, `n_ff(i)`, `n_embd_k_gqa(i)`,
 `n_embd_v_gqa(i)`, `n_rot(i)` and the `_arr` fields, in both the tensor
 loader and the graph: 22 files read one somewhere, 17 honour one in
@@ -673,7 +701,7 @@ close finds its FFN already named.
 `olmo` is the exception that says what the rule is really made of. It
 closed ALONE, and before writing a line of code the question "what else
 shares this cause" was answered by MEASUREMENT rather than by hope:
-every `build_norm` call in all 140 of llama.cpp's `src/models/*.cpp`
+every `build_norm` call in all 155 of llama.cpp's `src/models/*.cpp`
 graphs was scanned for a null weight argument, and all three hits are
 `olmo.cpp`. So there was no second row to take, and knowing that in
 advance is worth as much as a shared cause would have been -- the six
@@ -722,7 +750,7 @@ StableLM-2-12B has both. `use_parallel_residual`, which every export
 writes, is read by NOTHING in the graph: libllama's logits with the
 key `true` are byte-identical to the file with it `false`, and a
 fixture pins that ferrox ignores it the same way. Both refusals carry
-their reach: the parallel residual is EIGHT of 140 graphs in two
+their reach: the parallel residual is EIGHT of 155 graphs in two
 spellings (one shared norm: `stablelm`, `phi2`, `falcon`-7B,
 `command-r`, `cohere2`, `cohere2moe`, `plamo`; two norms: `gptneox` under the
 key, `falcon`-40B under `attn_norm_2`), and the per-head QK LayerNorm
@@ -776,7 +804,7 @@ it norms the layer input for ATTENTION while `attn_norm` keeps feeding
 the FFN, so the two tensor names are crossed relative to gptneox's.
 `norm_sites::ATTN_NORM_2_FEEDS_ATTENTION` crosses the two pre-norm
 slots on exactly the layers that carry it (`NormSites::for_layer`; one
-graph of 140 on the generic path, measured), and the 7B fixture proved
+graph of 155 on the generic path, measured), and the 7B fixture proved
 the first table row wrong before any code ran: it had said "parallel
 WHEN `attn_norm_2` is present", and a 7B file refused to load its
 missing `ffn_norm`. KL 3.8e-8 and 1.9e-7 at the f16 GELU-table line
@@ -784,7 +812,7 @@ missing `ffn_norm`. KL 3.8e-8 and 1.9e-7 at the f16 GELU-table line
 more than 1. `phi2` (Phi-2, Phi-1.5) followed on 2026-09-14 on the ONE
 slot its reason had named: `output.bias` on the LM head
 (`phi2.cpp:22,136`, REQUIRED; `proj_bias::OUTPUT_BIAS_CREATORS` is
-three graphs of 140, `phimoe` required and `qwen2` optional). It is
+three graphs of 155, `phimoe` required and `qwen2` optional). It is
 `Decoder::output_bias`, added in `decoder::lm_head::Logits` -- the one
 place the head's post-projection transforms already ran, before the
 multiplier and the cap because it belongs to the matmul -- and
@@ -816,7 +844,7 @@ recorded on the SAME `parallel_sum_scale` field Grok-2's sum scale
 fills, so the FFN bodies apply one scale at one site whichever names
 the dense branch came from), and the norm FUNCTION decided by the
 FILE (`:4-11,166`: `LLM_NORM` unless `layer_norm_rms_epsilon` is
-present and nonzero; `norm::NORM_BY_RMS_EPS_KEY`, one graph of 140,
+present and nonzero; `norm::NORM_BY_RMS_EPS_KEY`, one graph of 155,
 `ModelConfig::norm_function` the one field every site reads). The
 thing the reason had not named: `:23` reads `nextn_predict_layers`
 BEFORE `:35` reads the window array, so `n_layer()` there is the
@@ -837,7 +865,7 @@ has no graph of its own (`models.h:632`, `using graph =
 llama_model_phi3::graph`), and `phi3.cpp:99-102,137-139,174-177` pass
 each norm's bias to `LLM_NORM_RMS`; `phi3` never creates one, so its
 files take the plain RMS and `phimoe`'s take `NormOp::RmsBias`,
-`capability::BIASED_RMS_NORM`, one graph of 140 on the generic path
+`capability::BIASED_RMS_NORM`, one graph of 155 on the generic path
 (measured: `chameleon` passes NULL there, `deepseek32` / `glm-dsa` are
 other engines). Its two projection biases were slots already
 (`attn_output.bias`, `output.bias`), so the row is one `NormFunction`
@@ -857,7 +885,7 @@ gpt2.cpp starcoder.cpp` is a size table and `head_count_kv 1`): the
 `gptneox` sequential layer with a learned `position_embd.weight`
 `{n_embd, n_ctx_train}` gathered at `inp_pos` and ADDED to the token
 embedding before layer 0 (`gpt2.cpp:19,74-77`), and no `ggml_rope`
-anywhere. Reach measured over the 140: three generic-path graphs
+anywhere. Reach measured over the 155: three generic-path graphs
 create the tensor (`mpt`'s OPTIONAL beside its ALiBi, recorded), four
 encoders. The seam is two facts: the table added at the ONE embedding
 site (`Decoder::embed_token` takes `pos` now, so no caller can embed
@@ -877,7 +905,7 @@ dropped bias being implemented rather than the row being edited.
 ALiBi closed the rest of the `LLAMA_ROPE_TYPE_NONE` group the same
 day, FIVE rows on one seam, and the count was measured before the
 seam was built: `grep -n f_max_alibi_bias src/models/*.cpp` over the
-140 is seven files, five on the generic path, in THREE spellings --
+155 is seven files, five on the generic path, in THREE spellings --
 the literal `8.0f` (`bloom.cpp:18`, `refact.cpp:12`), the literal at
 40 layers only (`baichuan.cpp:11-14`, the 13B; the 7B rotates and was
 audited already), and `attention.max_alibi_bias` read optional
@@ -895,7 +923,7 @@ Baichuan's layer count -- the thing the old refusal had said "no key
 could see". Every fused Metal launch and the CUDA resident attention
 refuse a model with a bias. Each row then had one more thing, and each
 was a table entry: `bloom` norms its EMBEDDINGS (`token_embd_norm`,
-`norm_sites::EMBEDDING_NORM_ARCHITECTURES`, the one decoder of 140
+`norm_sites::EMBEDDING_NORM_ARCHITECTURES`, the one decoder of 155
 that does), `jais` passes `kq_scale = 1/d` (`jais.cpp:83`, the one
 graph with a literal other than `1/sqrt(d)`;
 `capability::attention_scale_override`), `mpt` clamps
@@ -931,7 +959,7 @@ attention would be on the layers whose `head_count_kv` is 0 (`:9-11`),
 so it is a THIRD `AttnShape` beside deci's two (`layer_shapes::
 AttnShape::ShortConv`, `ferrox-models/src/shortconv.rs`) rather than
 a second engine. Reach measured first: `grep -l shortconv` over the
-140 graphs is `lfm2.cpp` and `lfm2moe.cpp`, ONE graph (`models.h:
+155 graphs is `lfm2.cpp` and `lfm2moe.cpp`, ONE graph (`models.h:
 1899`); the Mamba-2 hybrids share only the rule "zero KV heads means
 recurrent", and `layer_shapes::ZeroKvLayer` is that rule as a table --
 the same two counts had been deci's `Linear` for every architecture,
@@ -1053,7 +1081,7 @@ two-argument `LLM_TN` spelling (`:80`, `blk.N.ffn_norm` with no
 `plamo3`. KL 1.3e-13 / 6.2e-13 (no `ssm_norm`) / 3.2e-13
 (`tests/falcon_h1_graphs.rs`); running the block on a fresh state
 every token turns six tests red. Every `build_mamba2_layer` caller
-of the 140 graphs is served; `jamba`, `plamo2` and `mamba` are
+of the 155 graphs is served; `jamba`, `plamo2` and `mamba` are
 `build_mamba_layer` (Mamba-1) and said so.
 
 `plamo2` (PLaMo-2 1B / 2B / 8B) closed on 2026-09-18 on its own SSM
@@ -1114,7 +1142,7 @@ keeps its output (`mamba.cpp:88`). Jamba is the hybrid: Mamba-1 where
 the KV array is 0, attention with NO RoPE elsewhere (`jamba.cpp:98`),
 and the FFN dense or MoE PER LAYER by whether the file has a router
 (`:89-101,152`; `moe_interleave::DENSE_LAYER_BY_ROUTER_ABSENCE`, one
-loader of 140 that reads the file for it), softmax with `norm_w =
+loader of 155 that reads the file for it), softmax with `norm_w =
 false`. KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13
 (`tests/mamba_graphs.rs`), the Mamba-1 rows at the `orion` tolerance
 class because `d_inner` one-element heads each take their own `exp`;
@@ -1182,8 +1210,8 @@ that existed: the temperature 0.1 / 8192 / 1.0 from literals
 NOT rotate (`AttnTemperature::unrotated_layers_only`); a weightless
 per-head RMS on Q and K AFTER RoPE on the layers that do, for every
 expert count but 128 (`llama4.cpp:43,182-188`; `weightless_qk_norm`,
-a `bool`, one reachable graph of 140); and the interleave step,
-honoured because `llama4.cpp:64` is the ONE tensor loader of 140
+a `bool`, one reachable graph of 155); and the interleave step,
+honoured because `llama4.cpp:64` is the ONE tensor loader of 155
 that branches on it (`moe_interleave::
 INTERLEAVE_STEP_HONOURED_BY_LOADER`; ERNIE's does not, which is why
 that arm is a refusal). The fourth thing is `llama-graph.cpp:1947`:
@@ -1204,7 +1232,7 @@ refuse it. The engine stub that had refused the row is deleted.
 
 `ferrox-models/src/proj_bias.rs` closed `starcoder2`, `codeshell` and
 `jais2` the same day, and it is the reach measurement that says what
-the seam is: `grep -l 'ATTN_OUT, "bias"'` over the 140 graphs is 33
+the seam is: `grep -l 'ATTN_OUT, "bias"'` over the 155 graphs is 33
 files and `FFN_UP, "bias"` 27, MOST of them OPTIONAL -- `llama.cpp`'s
 own graph, `granite`, `deci`, `mistral3`, `minicpm`, `nemotron` create
 the biases `TENSOR_NOT_REQUIRED` and `build_ffn` / `build_attn` add
@@ -1380,8 +1408,8 @@ out of that key (`granite.cpp:33-35`) can only be reached by a
 hand-written file -- which is why it landed as a refusal with a fixture
 that actually carries the key rather than as a gate nobody could fire.
 `unaudited_triage` carries the verdict and the
-llama.cpp line that decides it. llama.cpp hand-writes 140
-per-architecture graphs; `decoder.rs` is 6752 lines and that is why the
+llama.cpp line that decides it. llama.cpp hand-writes 155
+per-architecture graphs (140 at the 2026-08-04 pin, 155 at `5b59b83`); `decoder.rs` is 6752 lines and that is why the
 counts differ.
 
 **Ternary-Bonsai-2-27B ran on the real checkpoint on 2026-09-18**, the
@@ -1562,7 +1590,7 @@ in two directories. Each of those splits happened because somebody was
 about to add to the file and split it first. That is the whole
 mechanism, and it is the only one that has ever worked here.
 
-Those files are why llama.cpp has 140 architectures and ferrox has 53
+Those files are why llama.cpp has 155 architectures and ferrox has 93
 proven. Adding a model means editing a 6750-line file, so nobody adds
 one. The same decode layer used to be written out about ELEVEN times
 across `decoder.rs` and `attn.rs`, which has already lost EIGHT model

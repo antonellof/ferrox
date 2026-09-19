@@ -15,6 +15,71 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+### Changed
+
+- **The llama.cpp pin moved from 2026-08-04 to `5b59b83`** -- 792
+  commits, fifteen new graphs -- and every census that is a grep over
+  `src/models/*.cpp` was re-run against the new tree rather than having
+  its denominator edited. Most answers are unchanged and now say 155
+  where they said 140. Four changed, and each is corrected where it is
+  claimed: the attention gate is FIFTEEN graphs, not six
+  (`crate::attn_gate`); `attn_kv_a_mqa` is ten, not six
+  (`crate::mla_q_proj`); the SwiGLU clamp arrays are read by six, not
+  three (`crate::act_layers`); and the weightless RMSNorm is three
+  architectures, not `talkie` alone (`capability::
+  NON_PARAMETRIC_RMS_NORM`).
+
+- **The count of triaged refusals went UP, 2 to 10**, because twelve of
+  the fifteen new graphs are text generation. Eight are generic-path
+  candidates and are triaged with the llama.cpp line that decides each
+  (`granite_swa`, `graniteswitch`, `muse-glimmer`, `maple`, `spark2_5`,
+  `hrm_text`, `minimax-01`, `qwen4exp`); four need an attention this
+  engine does not have and are refused by name (`bailingmoe3`,
+  `dots3note`, `hy_v4`, `kimi-k3`); two are text-to-speech and are
+  deferred with the audio scope. **Two of the eight are ONE MATCH ARM**
+  -- `maple` needs one `rope_layers` row and `spark2_5` one `attn_gate`
+  row -- so that class is not empty for the first time since
+  2026-09-12.
+
+### Fixed
+
+- **`expert_used_count` is scalar OR an array, and the array spelling
+  silently became 2.** `llama-model.cpp:1266` reads the key with
+  `get_key_or_arr` in llama.cpp's COMMON loader, for every
+  architecture, and `conversion/nemotron.py:574` writes a list for
+  Nemotron-H Puzzle -- whose architecture, `nemotron_h`, ferrox serves.
+  ferrox read a scalar, got `None` for an array, and fell into a
+  default of top-2 on every layer whatever the file said. A uniform
+  array is now that value; a varying one stops by name, because the MoE
+  layer carries one top-k for the model and routing every layer to the
+  first entry would answer something else.
+
+- **`kimi_k3` in the architecture catalog was spelled with an
+  underscore** while `llama-arch.cpp:155` writes `kimi-k3`, so the
+  refusal naming the Kimi loader could not fire on any real file and a
+  Kimi-K3 export got the unknown-architecture message instead. ferrox's
+  own preset and Kimi loader had the hyphen all along.
+
+### Documentation
+
+- `docs/plans/parity-audit-2026-09-19.md`: a re-measurement against
+  BOTH reference engines. Against the moved llama.cpp pin the
+  text-generation gap is the twelve new rows above; the remaining
+  scopes are encoder/embedding (11), multimodal (10), diffusion (4) and
+  audio (3). Against vLLM the architecture count is the wrong
+  comparison (HF class names, several per GGUF architecture) and the
+  gap is in serving features, where the finding is that **speculative
+  decoding is built, lossless, tested and unreachable from the
+  server** -- `ferrox_models::speculative` has one caller,
+  `ferrox-cli`, while `ferrox-server` carries an acceptance-rate metric
+  with no producer.
+
+- `crate::mtp_blocks` records that upstream now reads
+  `nextn_predict_layers` centrally for every architecture (commit
+  9d81721), which makes ferrox's seventeen-reader gate an
+  over-refusal, and says what closing it needs: a libllama golden built
+  from the moved pin on an architecture outside the seventeen.
+
 ## [0.25.0] - 2026-09-19
 
 ### Added

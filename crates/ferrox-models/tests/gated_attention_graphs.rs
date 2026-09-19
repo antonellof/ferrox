@@ -17,7 +17,7 @@
 //! input Q/K/V read, multiplies the attention output after the
 //! softmax-weighted V sum and before `wo`, and a per-head value
 //! broadcasts over its head's `head_dim` channels. Six of llama.cpp's
-//! 140 graphs create the tensor; the other three (`qwen3next`, `qwen35`,
+//! 155 graphs create the tensor; the other three (`qwen3next`, `qwen35`,
 //! `qwen35moe`) store the gated delta-net's `z` projection under the
 //! same name, a different op on a different engine
 //! (`attn_gate::GDN_Z_GATE_ARCHS`).

@@ -54,7 +54,7 @@ use ferrox_core::mamba2::{conv_step, scan_step, Decay, ScanDims};
 /// on every layer, both reading the same `attn_norm` output, the two
 /// outputs summed before the residual add: `falcon-h1.cpp:137-161`
 /// (`:12` marks every layer recurrent AND every layer has heads). One
-/// graph of 140 (measured: the other three `build_mamba2_layer` callers
+/// graph of 155 (measured: the other three `build_mamba2_layer` callers
 /// branch on the layer kind). Such a layer is `AttnShape::Gqa` with
 /// `AttnWeights::mamba2` set, and the block keeps its state on the
 /// same cache the attention rows live in without counting positions

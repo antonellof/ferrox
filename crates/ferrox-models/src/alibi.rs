@@ -14,7 +14,7 @@
 //!
 //! # Reach -- MEASURED
 //!
-//! `grep -n f_max_alibi_bias src/models/*.cpp` over all 140 graphs
+//! `grep -n f_max_alibi_bias src/models/*.cpp` over all 155 graphs
 //! (2026-09-14) is seven files, in three spellings:
 //!
 //! | arch | where the bias comes from | line |

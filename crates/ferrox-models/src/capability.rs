@@ -98,7 +98,7 @@ pub enum QkNormStyle {
 
 /// Architectures whose Q/K norm is the per-head RMSNorm with one weight
 /// row per head ([`QkNormStyle::PerHeadDistinct`]). Measured over the
-/// 140 graphs: `attn_q_norm` created `{n_embd_head_k, n_head}` in five
+/// 155 graphs: `attn_q_norm` created `{n_embd_head_k, n_head}` in five
 /// (`chameleon`, `command-r`, `stablelm`, which norm with LLM_NORM and
 /// are `crate::qk_layer_norm`'s; `talkie`, whose weight is `{1,
 /// n_head}`; and `plamo2`, the one RMS row).
@@ -111,7 +111,7 @@ pub fn uses_per_head_distinct_qk_norm(arch: &str) -> bool {
 
 /// Architectures whose Q norm weight is one scalar per head and whose K
 /// norm has no weight ([`QkNormStyle::PerHeadScalar`]). Measured:
-/// `attn_q_norm` created `{1, n_head}` in one of 140 graphs,
+/// `attn_q_norm` created `{1, n_head}` in one of 155 graphs,
 /// `talkie.cpp:26`.
 pub const PER_HEAD_SCALAR_QK_GAIN: &[&str] = &["talkie"];
 
@@ -669,7 +669,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // activation (sigmoid / softplus), in the width (per element / per
     // head / decided by the tensor's shape) and in whether the tensor
     // may be absent. Read side by side before being called one cause:
-    // the three graphs, six create sites measured over all 140.
+    // the three graphs, six create sites measured over all 155.
     //
     // `afmoe` (afmoe.cpp:73,120,154,183-185): sigmoid, per element,
     // REQUIRED. The other afmoe-only fact is `:120`, `sqrt(n_embd)` on
@@ -739,7 +739,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // which llama-graph.cpp:163-167 turns into `log(floor(pos /
     // floor_scale) + 1) * scale + 1` per token and the graph multiplies
     // into Q after RoPE; `crate::attn_temperature` is the seam, with
-    // the census (three graphs of 140 build the input, this the only
+    // the census (three graphs of 155 build the input, this the only
     // generic-path one) and the floor resolved as `llama-model.cpp:
     // 1164-1165` resolves it -- `context_length` first, the YaRN key
     // over it -- which the second fixture measures. Two corrections
@@ -756,7 +756,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // logits from `inpL`, the raw layer input before `attn_norm` and
     // before attention, and `:151-161` passes them into `build_moe_ffn`
     // as a precomputed `probs` with a NULL `ffn_gate_inp`. Four graphs
-    // of 140 pass `probs_in` (measured, `crate::router_input`); this is
+    // of 155 pass `probs_in` (measured, `crate::router_input`); this is
     // the only one on the generic path whose operand is not the normed
     // FFN input the experts read. `RouterInput::RawLayerInput`, captured
     // in ONE function (`Decoder::router_operand`) where each host body
@@ -783,7 +783,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // attention output BEFORE `wo` (the other side of that matmul from
     // Gemma's `post_attention_norm`), and `:127-141` call `build_ffn`
     // with a NULL down projection, norm the `silu(gate) * up` product,
-    // and apply `ffn_down` by hand. One graph of 140 has either tensor
+    // and apply `ffn_down` by hand. One graph of 155 has either tensor
     // (measured, `crate::sub_norms`). `ModelConfig::block_sub_norms` is
     // the one fact: the loader REQUIRES the pair on it, every fused
     // Metal launch refuses on it, and the arithmetic sits in the one
@@ -815,7 +815,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // Metal launch, the CUDA resident hook, the slot file and the KV
     // block file refuse a model whose two widths differ. Its second
     // half, `attention.value_scale` (`:14-17,180-183`, 0.707 on every
-    // export), is `crate::attn_value_scale`: one reader of 140,
+    // export), is `crate::attn_value_scale`: one reader of 155,
     // applied after `wo` in the one attention tail. Everything else the
     // row needs had landed: the per-layer `head_count_kv` array, the
     // per-layer window array with `rope.freq_base_swa`, sinks by
@@ -873,7 +873,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // n_phys * n_loops` and replicate the per-layer arrays, `:69-73`
     // alias `layers[i + j * n_phys] = layers[i]`, and `:167-175` norm
     // the residual with `output_norm` after every pass but the last
-    // unless the flag skips it. One graph of 140 reads either key
+    // unless the flag skips it. One graph of 155 reads either key
     // (measured, `crate::layer_loops`). The weights are shared and the
     // KV is not, and the seam says that rather than copying weights:
     // `Decoder::layers` stays physical, `ModelConfig::n_layers` is the
@@ -889,7 +889,7 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // plain path every real export without looping takes.
     "nanbeige",
     // tests/skip_stream_graphs.rs: `talkie`, NEW CODE on FOUR things,
-    // each one graph of 140 (measured). No norm weights: every
+    // each one graph of 155 (measured). No norm weights: every
     // `build_norm` is `(x, nullptr, nullptr, LLM_NORM_RMS)` (`talkie.cpp:
     // 50,68,90,110,137`) -- `NormOp::RmsNoParams`, the RMS twin of
     // OLMo-1's `LayerNormNoParams`, through the same `NormFunction`
@@ -1289,12 +1289,26 @@ pub fn uses_non_parametric_layer_norm(arch: &str) -> bool {
 /// site: no `attn_norm`, `ffn_norm` or `output_norm` tensor in the file.
 ///
 /// The RMS twin of [`NON_PARAMETRIC_LAYER_NORM`], and measured the same
-/// way: every `build_norm` call with a null weight across all 140
+/// way: every `build_norm` call with a null weight across all 155
 /// graphs is `olmo.cpp` (three, `LLM_NORM`) and `talkie.cpp` (five,
 /// `LLM_NORM_RMS`: the embeddings at `:50`, `attn_norm` at `:68`, the K
 /// norm at `:90`, `ffn_norm` at `:110`, the final norm at `:137`).
 /// `NormOp::RmsNoParams` is the function; `crate::skip_stream` is the
 /// rest of `talkie`.
+///
+/// **Re-measured 2026-09-19, when the pin moved to `5b59b83`, and the
+/// answer CHANGED**: two graphs that landed upstream in the six weeks
+/// since the last census pass a null weight to `LLM_NORM_RMS` too --
+/// `hrm-text.cpp` at three sites (`:107,144,162`) and
+/// `muse-glimmer.cpp` at one (`:69`, the embeddings). So the function
+/// is no longer one architecture's, and `talkie` is no longer the
+/// hoped-for lone row; both new ones refuse for OTHER reasons today
+/// (`capability::NEOX_ROPE_TRIAGED`, `NORM_ROPE_TRIAGED`) and neither
+/// is admitted here, because a name in this list is a promise that
+/// every norm site of that architecture is served, which nobody has
+/// checked for either. `muse-glimmer`'s is also the first WEIGHTLESS
+/// norm at the EMBEDDING site, where `crate::norm_sites`' row is
+/// `bloom`'s weighted one.
 pub const NON_PARAMETRIC_RMS_NORM: &[&str] = &["talkie"];
 
 /// See [`NON_PARAMETRIC_RMS_NORM`].
@@ -1548,6 +1562,51 @@ fn deferred_scope(name: &'static str, scope: ArchScope, reason: &'static str) ->
 /// `every_unaudited_generic_architecture_is_triaged_or_listed_as_pending`
 /// between them enforce.
 const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
+    // --- Landed upstream AFTER the 2026-08-04 pin, read on 2026-09-19
+    // when the pin moved to `5b59b83` (792 commits, 15 new graphs).
+    // None of the four below has a fixture yet; each says what it
+    // needs, measured against the graph, not guessed from the name.
+    (
+        "granite_swa",
+        TriageClass::NewCode,
+        "TWO small per-layer tables, not a new block -- which is why this is NEW CODE and \
+         not one arm. Granite's four multipliers (`src/models/granite-swa.cpp:7-10`) are \
+         `crate::scalar_multipliers`, its optional projection biases (`:79,100-102`) are \
+         `crate::proj_bias`, its window ARRAY (`:17`) is `crate::swa_layers`, its attention \
+         sinks are `AttnWeights::sinks` and its shared expert is served -- so what is left \
+         is (1) `expert_used_count` read as an ARRAY at `n_layer_all` length (`:14`), where \
+         ferrox carries one `n_experts_used` for the model, and (2) `attention.rope_pattern` \
+         (`:41`), a per-layer rotate/do-not-rotate ARRAY, where `crate::rope_layers` decides \
+         the same fact from a per-ARCHITECTURE rule and reads no key. The second is the \
+         one to be careful with: a table that answers from the architecture cannot express \
+         a file that says something else, and this is the first upstream graph that lets \
+         the FILE decide. `granite4.deepstack_mapping` (`:27-40`) belongs to Granite-4 \
+         Vision and no text export writes it",
+    ),
+    (
+        "graniteswitch",
+        TriageClass::NewCode,
+        "a per-token ADAPTER selection. `src/models/granite-switch.cpp` threads an `adapter_ids` \
+         tensor through the layer body so each token's FFN reads a different expert \
+         adapter, which is a second indexing dimension the MoE layer here does not have \
+         (ferrox routes tokens to experts; this routes them to adapters OF an expert). \
+         Its other half is small and named: `:9-12` read `rope.scaling.finetuned` and fill \
+         `rope_pattern` with it, which is `rope_finetuned::unrotated` plus the per-layer \
+         array `granite_swa` needs",
+    ),
+    (
+        "muse-glimmer",
+        TriageClass::NewCode,
+        "two nameable pieces, both about norms. (1) `src/models/muse-glimmer.cpp:69` norms the \
+         EMBEDDING with a WEIGHTLESS RMS -- `crate::norm_sites`'s embedding-norm row is \
+         `bloom`'s weighted one and `NormOp::RmsNoParams` is a LAYER slot, so the pair does \
+         not exist yet. (2) `:140-141,166-167` apply the post-attention and post-FFN norms \
+         at a LITERAL eps of 1e-8 (`:63`), not the model's `f_norm_rms_eps`, so an eps that \
+         is one field per model cannot spell it. Everything else it has is served: the \
+         sigmoid attention gate (`:100-135`, `crate::attn_gate`), RoPE on the sliding \
+         layers only (`:88`, `RopeLayers::SlidingOnly`), the `logit_scale` multiply and \
+         the final tanh softcap (`:184-193`)",
+    ),
     // `ernie4_5-moe` was HERE, ONE MATCH ARM on
     // `{arch}.interleave_moe_layer_step`. Building its fixture found the
     // arm is not implementable against a reference: llama.cpp's tensor
@@ -1604,7 +1663,7 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // shared-expert slot under the dense names plus the row's scale on
     // the sum, whose second row is Grok-2, refused by name until then --
     // and the branch operand `ffn_norm_exps(inpSA)` is
-    // `RouterInput::NormedLayerInput`, one graph of 140. The verdict had
+    // `RouterInput::NormedLayerInput`, one graph of 155. The verdict had
     // said `router_input` "does not reach it" because the operand feeds
     // a whole expert bank; it reaches it as a third variant carrying
     // that fact (`experts_read_router_operand`).
@@ -1694,6 +1753,66 @@ const NO_UPSTREAM_ARCH: &str =
 /// Triaged rows of the generic **NEOX**-RoPE group. Same rules as
 /// [`NORM_ROPE_TRIAGED`].
 const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
+    // --- Landed upstream AFTER the 2026-08-04 pin (see the NORM group).
+    (
+        "maple",
+        TriageClass::OneMatchArm,
+        "ONE `crate::rope_layers` table row. `src/models/maple.cpp:88` rotates inside `if \
+         (hparams.is_swa(il))` and nowhere else, which is `RopeLayers::SlidingOnly`, the \
+         rule `exaone-moe` and `cohere2` already use. Everything else in the graph is \
+         served and was checked line by line: the window array and `rope.freq_base_swa` \
+         (`:4-11`, `crate::swa_layers`), the per-head QK RMSNorm at `{head_dim}` (`:84-88`, \
+         `QkNormStyle::PerHead`), softmax routing with `norm_w = true` (`:128`), the \
+         per-layer `expert_feed_forward_length` ARRAY (`:6`, `LayerShapes`), and the SwiGLU \
+         clamp arrays llama.cpp's generic `build_moe_ffn` applies, which \
+         `crate::act_layers` already serves (`:11`)",
+    ),
+    (
+        "spark2_5",
+        TriageClass::OneMatchArm,
+        "ONE `crate::attn_gate` table row. `src/models/spark2-5.cpp:41` creates `attn_gate` at \
+         `{n_embd, n_head}` and `:97-105` sigmoid it and multiply it into the attention \
+         output per HEAD before `wo` -- `GateAct::Sigmoid` with `GateWidth::PerHead`, the \
+         pair `step35` already admits, so the seam needs the name and nothing else. The \
+         rest is a llama with a window array and `rope.freq_base_swa` (`:5-12`), per-layer \
+         head counts (`:33-37`, `LayerShapes`) and a gated GELU FFN (`:124`, \
+         `GluAct::Geglu`)",
+    ),
+    (
+        "hrm_text",
+        TriageClass::NewCode,
+        "two transformer stacks replayed over one token stream. `src/models/hrm-text.cpp:8-10` read \
+         `hrm.layers_per_stack`, `hrm.h_cycles` and `hrm.l_cycles`; the graph runs the LOW \
+         stack `l_cycles` times and the HIGH stack once per H cycle, each stack being \
+         `layers_per_stack` layers with WEIGHTLESS RMS norms (`:107,144,162`) and a \
+         sigmoid attention gate (`:113-134`). `crate::layer_loops` is the same IDEA -- \
+         weights replayed, KV logical, `Decoder::layer_for` the one mapping -- with ONE \
+         loop count over ALL layers, where this is two counts over two disjoint stacks \
+         that alternate, so the mapping is different and the seam does not stretch to it \
+         without being re-read. `:478` also takes a prefix-LM flag it does not implement",
+    ),
+    (
+        "minimax-01",
+        TriageClass::NewCode,
+        "lightning attention as a RECURRENT block. `src/models/minimax-01.cpp:9-17` mark the \
+         recurrent layers from `attention.recurrent_layers` or a \
+         `full_attention_interval`, exactly the two-key shape `crate::gdn::recurrent_layers` \
+         reads for Qwen3.5, so the LAYER seam (`AttnShape`, the state on the KV cache, the \
+         `ZeroKvLayer` rule) is the one this repo already has. What is new is the BLOCK: a \
+         linear attention with its own decay and normalisation, plus `attn_norm_2` \
+         (`src/models/minimax-01.cpp`, the only new graph that carries it) and a REQUIRED \
+         `residual_scale`",
+    ),
+    (
+        "qwen4exp",
+        TriageClass::NewCode,
+        "the largest graph upstream has (`src/models/qwen4exp.cpp`, 1297 lines). A gated delta-net (`:1`, \
+         `build_layer_attn_linear`, the fourth caller of the helper `crate::gdn` serves \
+         for the other three) over a hybrid memory INDEX (`llama-memory-hybrid-idx.h`, a \
+         new memory class), with an attention gate, MoE, and an IMROPE rotation. The \
+         delta-net half is the seam ferrox has; the memory index is not, and it decides \
+         which state a layer reads",
+    ),
     // `mellum` was HERE, NEW CODE on two things. The first -- its
     // sliding layers roped with the model's YaRN switched OFF
     // (`mellum.cpp:128-142`), the Olmo-3 rule -- is a REFUSAL BY NAME
@@ -2583,9 +2702,48 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             "kimi-linear",
             "use ferrox_models::kimi_decoder / kimi_loader, not the generic GQA Decoder",
         ));
+        // `kimi-k3`, with a HYPHEN. This row spelled it `kimi_k3` until
+        // 2026-09-19, and `src/llama-arch.cpp:155` writes
+        // `{ LLM_ARCH_KIMI_K3, "kimi-k3" }` -- so the refusal could not
+        // fire on any real file, and a Kimi-K3 export fell through to
+        // the unknown-architecture message instead of the one naming
+        // its loader. ferrox's own preset and Kimi loader
+        // (`ferrox-cli/src/main.rs:509`, `kimi_gguf_loader.rs:1022`)
+        // had the hyphen all along, which is the disagreement this
+        // repo keeps paying for: two spellings of one name with
+        // nothing comparing them.
         v.push(dedicated(
-            "kimi_k3",
-            "use ferrox_models::kimi_decoder / kimi_loader, not the generic GQA Decoder",
+            "kimi-k3",
+            "use ferrox_models::kimi_decoder / kimi_loader, not the generic GQA Decoder. \
+             Upstream's own graph (src/models/kimi-k3.cpp:3-12, new since the 2026-08-04 \
+             pin) is kimi-linear's KDA + MLA hybrid plus five things it lists itself: \
+             cross-layer residual attention, a latent MoE, a `situ` activation in place of \
+             SwiGLU everywhere, a sigmoid gate on the MLA output, and a full-rank KDA gate",
+        ));
+        // Landed upstream after the pin, each needing an attention this
+        // engine does not have; `dedicated` rather than a triaged
+        // generic row because the generic decoder is not a candidate.
+        v.push(dedicated(
+            "bailingmoe3",
+            "MLA and KDA in one model (src/models/bailingmoe3.cpp:5-14: the `_mla` key \
+             lengths, `attention.kv_lora_rank`, an SSM conv kernel and `kda.head_dim`). \
+             The MLA half is ferrox_models::mla; the KDA half is a linear-attention block \
+             the gated-delta-net seam does not cover, and the two alternate by layer",
+        ));
+        v.push(dedicated(
+            "dots3note",
+            "a DSA indexer in front of an absorbed MLA (src/models/dots3note.cpp:2-3 \
+             includes llama-kv-cache-dsa.h; its own header says it is deepseek32.cpp's \
+             indexer with step35.cpp's head-wise output gate). ferrox's DSA lives in the \
+             GLM-5.2 engine and its MLA in ferrox_models::mla; this needs the pair plus \
+             the gate",
+        ));
+        v.push(dedicated(
+            "hy_v4",
+            "independent hyper-connections: several residual streams reduced before each \
+             layer and redistributed after (src/models/hy-v4.cpp:6-8, the DeepSeek-V4 \
+             hyper-connection layout without the comb term), over a DSA cache. Every \
+             decoder here carries ONE residual stream",
         ));
         // Qwen3.5 dense (`qwen35`: 0.8B / 2B / 4B / 9B / 27B) left the
         // hybrid group on 2026-09-14: the gated delta net is a block
@@ -2792,6 +2950,14 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 DeferredAudio,
                 "audio tokenizer; deferred",
             ),
+            // Landed upstream after the 2026-08-04 pin. Both are
+            // text-to-speech: `pockettts.cpp` is a small LayerNorm
+            // decoder that emits audio codes, `qwen3tts.cpp` is a
+            // three-line shim over it. Deferred with the audio scope
+            // rather than triaged as text generation, because what
+            // they need is an audio OUTPUT path, not a decoder arm.
+            ("pockettts", DeferredAudio, "text-to-speech; deferred"),
+            ("qwen3tts", DeferredAudio, "text-to-speech; deferred"),
             (
                 "eagle3",
                 EnumOnly,
@@ -3275,7 +3441,7 @@ pub fn swa_rope_scale_follows_model(arch: &str) -> bool {
 /// True when this architecture's graph multiplies every token
 /// embedding by `sqrt(n_embd)` as ARITHMETIC, reading no key for it.
 ///
-/// Measured over all 140 `src/models/*.cpp` for
+/// Measured over all 155 `src/models/*.cpp` for
 /// `ggml_scale(ctx0, inpL, sqrtf(...n_embd...))`: every Gemma graph
 /// (`gemma.cpp:49`, `gemma2.cpp:70`, `gemma3.cpp:93`, `gemma3n.cpp:104`,
 /// `gemma4.cpp:155`, `gemma-embedding.cpp:85`) and exactly ONE other,
@@ -3326,7 +3492,7 @@ pub fn embeddings_scaled_by_sqrt_n_embd(arch: &str, family: DecoderFamily) -> bo
 /// passes `kq_scale = 1.0f / float(n_embd_head)` -- `1/d`, not
 /// `1/sqrt(d)` (Jais's muP attention) -- to `build_attn` on every layer.
 /// Measured: `grep -n "1.0f/float(n_embd_head)" src/models/*.cpp` over
-/// all 140 graphs is that one file.
+/// all 155 graphs is that one file.
 pub fn attention_scale_override(
     arch: &str,
     n_layers: usize,
@@ -3735,7 +3901,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 2,
+            seen == 10,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -3755,7 +3921,7 @@ mod audit_tests {
              `olmo` closed on the non-parametric LayerNorm (`crate::norm`, \
              tests/olmo_graphs.rs). `olmo` is the FIRST NEW CODE row to close on its own, \
              and it says something the other closures do not: its cause is not shared. \
-             Every `build_norm` call in llama.cpp's 140 graphs was scanned for a null \
+             Every `build_norm` call in llama.cpp's 155 graphs was scanned for a null \
              weight and all three hits are `olmo.cpp`, so this variant was never going to \
              take a second row with it -- see `NON_PARAMETRIC_LAYER_NORM`. `gemma` was the \
              last fixture-away row and `chatglm` the last one-match-arm row, so BOTH \
@@ -3797,7 +3963,7 @@ mod audit_tests {
              lifted Laguna-XS.2's `rope.dimension_count_swa` refusal by name with it, and \
              10 until `mistral3` closed on the per-position attention temperature \
              (`crate::attn_temperature`, tests/attn_temperature_graphs.rs) -- the reach \
-             measured first: three graphs of 140 build the input, `llama4` from literals \
+             measured first: three graphs of 155 build the input, `llama4` from literals \
              on its own engine and `deepseek2` / `mistral4` on the MLA engine, which \
              REFUSES the key by name now where it dropped it; and its `yarn_log_multiplier` \
              half found YaRN's magnitude term missing for EVERY architecture \
@@ -3809,28 +3975,28 @@ mod audit_tests {
              `GluAct::ReluSqr` from `GluAct::Reglu`, because the one variant that had \
              served `arcee` by aliasing would have skipped a real gate, and 8 until \
              `bitnet` closed on the two norms INSIDE the blocks (`crate::sub_norms`, \
-             tests/sub_norm_graphs.rs) -- the reach measured first: one graph of 140 \
+             tests/sub_norm_graphs.rs) -- the reach measured first: one graph of 155 \
              creates either tensor, so the seam is a `bool` and it closed alone, and 7 \
              until `mimo2` closed on the split K/V head width (`crate::kv_head_dims`, \
              tests/split_kv_head_dim_graphs.rs) -- the reach measured over the fourteen \
              converters that write `value_length`: three write it apart from \
              `key_length`, two on the MLA engine, one here, and 6 until `nanbeige` closed \
              on the layer loop (`crate::layer_loops`, tests/layer_loop_graphs.rs) -- one \
-             graph of 140 reads `num_loops`, and the seam is a mapping from logical to \
+             graph of 155 reads `num_loops`, and the seam is a mapping from logical to \
              physical layer rather than a copy of the weights, and 5 until `talkie` closed \
              on four things at once (`crate::skip_stream`, `NormOp::RmsNoParams`, \
              `QkNormStyle::PerHeadScalar`, the two served `.scale` companions; \
-             tests/skip_stream_graphs.rs), each one graph of 140, and 4 until `plm` closed \
+             tests/skip_stream_graphs.rs), each one graph of 155, and 4 until `plm` closed \
              on the MLA engine (`crate::mla_arch`, `crate::mla_q_proj`, tests/plm_graphs.rs) \
-             -- the reach measured first: six graphs of 140 create `attn_kv_a_mqa`, three \
+             -- the reach measured first: six graphs of 155 create `attn_kv_a_mqa`, three \
              have a direct `attn_q` beside it, and on this engine that is `plm` and every \
              lite `deepseek2`, which the loader had refused for a key llama.cpp does not \
              read; the fixture is the engine's FIRST libllama golden, and 3 until `arctic` \
              closed on the parallel dense + MoE layer (`crate::parallel_dense_ffn`, \
              `RouterInput::NormedLayerInput`, tests/parallel_dense_ffn_graphs.rs) -- the reach \
-             measured first: two graphs of 140 sum a dense FFN with their routed output, and \
+             measured first: two graphs of 155 sum a dense FFN with their routed output, and \
              the other, Grok-2, had been refused by name from a fixture that now has a golden; \
-             the branch operand is one graph of 140 and a third variant of the seam \
+             the branch operand is one graph of 155 and a third variant of the seam \
              `smallthinker` opened. \
              What is left is 1 NEW CODE (`grovemoe`) and one UNKNOWN (`phi4`). The NEW CODE rows \
              that have closed are `olmo2`, `exaone4`, the three Granite rows, `exaone-moe`, \
@@ -3846,7 +4012,18 @@ mod audit_tests {
              `mimo2`'s is shared with the MLA engine, which has carried the two widths \
              since it existed, `nanbeige`'s and `talkie`'s with nothing, `plm`'s with \
              the lite DeepSeek-V2 checkpoints on the same engine, and `arctic`'s with \
-             Grok-2, whose refusal by name lifted with it"
+             Grok-2, whose refusal by name lifted with it. \
+             THEN THE COUNT WENT BACK UP, 2 to 10, and that is the honest shape of \
+             parity with a moving target: the pinned llama.cpp was six weeks and 792 \
+             commits old on 2026-09-19, and moving the pin to `5b59b83` added fifteen \
+             graphs. Eight of them are generic-path candidates and are triaged here \
+             (`granite_swa`, `graniteswitch`, `muse-glimmer`, `maple`, `spark2_5`, \
+             `hrm_text`, `minimax-01`, `qwen4exp`); four need an attention this engine \
+             does not have and are `dedicated` refusals (`bailingmoe3`, `dots3note`, \
+             `hy_v4`, `kimi-k3`); two are text-to-speech and are deferred with the audio \
+             scope. TWO of the eight are ONE MATCH ARM -- `maple` needs one \
+             `crate::rope_layers` row and `spark2_5` one `crate::attn_gate` row -- so \
+             that class is not empty any more, and it is the cheapest work in the tree"
         );
     }
 

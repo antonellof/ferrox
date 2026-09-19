@@ -7,13 +7,13 @@
 //! `ffn_norm(ffn_inp)`, added to `ffn_inp`; the router AND the experts
 //! on `ffn_norm_exps(inpSA)` (`:45,135-152`), the residual stream as
 //! it ENTERS the layer under a SECOND per-layer weight; the two summed
-//! (`:154`). Grok-2 (`grok.cpp:171-184`) is the other graph of 140 that
+//! (`:154`). Grok-2 (`grok.cpp:171-184`) is the other graph of 155 that
 //! sums a dense FFN with its experts -- on the same `cur` the router
 //! reads, GELU, the sum scaled by `sqrt(2)/2` -- and had been refused
 //! by name from `grok_dense_ffn_tiny.gguf`. The two are one table,
 //! `ferrox_models::parallel_dense_ffn` (presence, sum scale), served
 //! through the shared-expert slot; Arctic's operand is
-//! `RouterInput::NormedLayerInput`, one graph of 140.
+//! `RouterInput::NormedLayerInput`, one graph of 155.
 //!
 //! | fixture | what it isolates |
 //! |---|---|

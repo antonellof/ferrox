@@ -27,8 +27,19 @@
 //! activation and the ADMISSIBLE widths, and the loader reads the width
 //! off the tensor and refuses a width the table does not admit.
 //!
-//! **Measured before built.** Six of the 140 `src/models/*.cpp` create
-//! `LLM_TENSOR_ATTN_GATE`. The other three -- `qwen3next.cpp:92,335`,
+//! **Measured before built.** Six of the then-140 `src/models/*.cpp`
+//! created `LLM_TENSOR_ATTN_GATE`; re-measured on 2026-09-19 against
+//! the moved pin it is FIFTEEN of 155, and the nine new ones all
+//! landed upstream in one six-week window -- `bailingmoe3`,
+//! `dots3note`, `hrm-text`, `hy-v4`, `kimi-k3`, `minimax-01`,
+//! `muse-glimmer`, `qwen4exp`, `spark2-5`. Every one of the nine is a
+//! refusal today (`capability::NORM_ROPE_TRIAGED` /
+//! `NEOX_ROPE_TRIAGED` / the `dedicated` rows), and `spark2_5` is the
+//! cheapest row in the tree because it needs ONE line of the table
+//! below: sigmoid, per head, required, `src/models/spark2-5.cpp:41,
+//! 97-105`. A gate that is one table row away should not be a
+//! refusal for long. The other three of the original six --
+//! `qwen3next.cpp:92,335`,
 //! `qwen35.cpp:82,241`, `qwen35moe.cpp:88,265` -- store the gated
 //! delta-net's `z` projection under the same name, sized
 //! `{n_embd, value_dim}` and consumed by `build_norm_gated` on the

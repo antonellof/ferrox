@@ -7,7 +7,7 @@
 //! `ffn_sub_norm` (`:36`, `{n_ff}`) on `silu(gate) * up` BEFORE
 //! `ffn_down` (`:127-141`). Neither is Gemma's post-norm, which sits on
 //! the other side of the projection. The reach was MEASURED before a
-//! line was written (`ferrox_models::sub_norms`): one graph of 140
+//! line was written (`ferrox_models::sub_norms`): one graph of 155
 //! creates either tensor, so the seam is one `bool` on `ModelConfig`
 //! read by the loader (the pair is REQUIRED) and by the Metal
 //! predicate (every fused launch refuses), and the arithmetic sits in

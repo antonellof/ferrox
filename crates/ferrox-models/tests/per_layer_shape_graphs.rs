@@ -11,7 +11,7 @@
 //! `ModelConfig` carried all three as scalars that every host body read
 //! once above its layer loop.
 //!
-//! **Measured before built.** All 140 `src/models/*.cpp` were scanned
+//! **Measured before built.** All 155 `src/models/*.cpp` were scanned
 //! for `n_head(i)`, `n_head_kv(i)`, `n_ff(i)`, `n_embd_k_gqa(i)`,
 //! `n_embd_v_gqa(i)`, `n_rot(i)` and the `_arr` fields:
 //! `layer_shapes::PER_LAYER_SHAPE_ARCHS` is the result, with what each
