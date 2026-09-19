@@ -183,7 +183,7 @@ impl Decoder {
     /// that layer is an attention layer this path serves. `false` when
     /// there is nothing to encode, and then `finish` returns no head.
     #[cfg(feature = "metal")]
-    fn encode_next_attn_head(
+    pub(crate) fn encode_next_attn_head(
         &self,
         run: &mut ferrox_metal::gdn_branch::GdnRun,
         next: usize,
@@ -203,7 +203,7 @@ impl Decoder {
     /// Appends layers `start..end` to `run`. The ONE place a recurrent
     /// layer joins a run, whatever began it.
     #[cfg(feature = "metal")]
-    fn run_layers(
+    pub(crate) fn run_layers(
         &self,
         run: &mut ferrox_metal::gdn_branch::GdnRun,
         start: usize,
@@ -231,7 +231,10 @@ impl Decoder {
     /// and the run entry ask, so they cannot disagree about which layers
     /// are fusable.
     #[cfg(feature = "metal")]
-    fn fused_layer_parts(&self, l: usize) -> Option<(&crate::gdn::Gdn, &[f32], LayerFfnParts<'_>)> {
+    pub(crate) fn fused_layer_parts(
+        &self,
+        l: usize,
+    ) -> Option<(&crate::gdn::Gdn, &[f32], LayerFfnParts<'_>)> {
         let layer = self.layer_for(l);
         let shape = self.config.layer_shape(l);
         if !matches!(shape.attention, AttnShape::Gdn)

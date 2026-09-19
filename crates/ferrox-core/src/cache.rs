@@ -137,6 +137,25 @@ pub struct KvCache {
     pub v_head_dim: usize,
     pub k: Vec<f32>, // [rows, n_kv_heads, head_dim], flattened
     pub v: Vec<f32>, // [rows, n_kv_heads, v_head_dim], flattened
+    /// This sequence's KV on the Metal device, when a layer's attention
+    /// runs there.
+    ///
+    /// It lives HERE and not on the model because it is per-sequence
+    /// state: two requests in flight have two histories, and a mirror
+    /// hung off a shared `Decoder` would hand one sequence the other's
+    /// keys. Travelling with the cache also means the lifecycle is the
+    /// cache's.
+    ///
+    /// It is a MIRROR, not the authority: `k` and `v` above stay
+    /// complete, so truncation, the prefix cache, a slot file and every
+    /// host reader go on working untouched. It is used only to attend,
+    /// and only while its own `seq_len` equals the cache's `rows()`.
+    /// Anything that moves a cache backwards -- a truncate, a restored
+    /// prefix, a clone -- leaves the two disagreeing and the next use
+    /// re-uploads from `k`/`v` rather than trusting it. One upload, in
+    /// exchange for not having to find every such place.
+    #[cfg(feature = "metal")]
+    pub metal_attn: Option<ferrox_metal::attn::MetalKvBuffers>,
     /// Positions this sequence has consumed.
     ///
     /// **Not the same thing as the number of rows in `k`/`v`**, and the
@@ -207,6 +226,8 @@ impl Clone for KvCache {
             // and pretending otherwise would let the clone's
             // `positions` be read as a row count again.
             window: self.window,
+            #[cfg(feature = "metal")]
+            metal_attn: None,
             recurrent: self.recurrent.clone(),
         }
     }
@@ -271,6 +292,16 @@ impl KvCache {
     /// the batched prefill learned in #37: read the cursor, do not keep
     /// a copy of it.
     #[inline]
+    /// The positions this cache was pre-allocated for, when it was.
+    ///
+    /// A device-side mirror of the KV needs a fixed buffer, so it can
+    /// only be made for a cache that already knows how far it can
+    /// grow; an unbounded one takes the host path
+    /// (`crate::decoder::device_attention`).
+    pub fn capacity_positions(&self) -> Option<usize> {
+        self.planned_capacity
+    }
+
     pub fn rows(&self) -> usize {
         let k_width = self.k_width();
         if k_width == 0 {
@@ -308,6 +339,8 @@ impl KvCache {
             planned_capacity: None,
             pool_state: None,
             window: None,
+            #[cfg(feature = "metal")]
+            metal_attn: None,
             recurrent: None,
         }
     }
@@ -336,6 +369,8 @@ impl KvCache {
             planned_capacity: Some(max_seq_len),
             pool_state: None,
             window: None,
+            #[cfg(feature = "metal")]
+            metal_attn: None,
             recurrent: None,
         }
     }
@@ -394,6 +429,8 @@ impl KvCache {
                 blocks_held: blocks_needed,
             }),
             window: None,
+            #[cfg(feature = "metal")]
+            metal_attn: None,
             recurrent: None,
         })
     }

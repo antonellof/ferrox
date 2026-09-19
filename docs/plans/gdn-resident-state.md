@@ -419,6 +419,46 @@ the precomputed path and the ordinary one cannot compute it two ways;
 `attn_block_tail` takes the three vectors when the run made them and
 projects when it did not.
 
+## The attention on the device, and decode stops sloping
+
+The last host step in a decode token was the attention itself, because
+the KV lived on the host. `KvCache::metal_attn` is the sequence's own
+device mirror -- per-sequence, because two requests in flight have two
+histories and a mirror hung off a shared `Decoder` would hand one the
+other's keys. The host `k`/`v` stay authoritative, so truncation, the
+prefix cache, slot files and every host reader are untouched; the
+mirror is trusted only while its `seq_len` equals the cache's `rows()`
+and re-uploads from the authority whenever it does not.
+
+`launch_attn_layer` then does the whole layer in one command buffer --
+the KV append, the attention, the sigmoid gate, `wo`, the residual, the
+FFN norm, the FFN, the residual -- and `GdnRun::attn_layer` puts that
+at the head of a run, so a four-layer group (one attention, three
+recurrent) is ONE wait with nothing in it returning to the host.
+
+Waits a token: 20, and the shape of the curve changed:
+
+| tokens | before | after | reference |
+|---|---|---|---|
+| 32 | 11.06 - 11.17 | **11.17** | 11.46 |
+| 300 | 10.95 | **11.19** | 11.50 |
+| 600 | -- | **11.16** | -- |
+
+It is FLAT now, which is the point: the reference was flat and this
+engine sloped, and the slope was exactly a host attention whose work
+grows with `seq_len`.
+
+**The bug worth recording cost an hour and would have shipped.** The
+first version encoded this on a CONCURRENT encoder, and
+`encode_attn_tail` was written for one that orders its own dispatches.
+The model generated fluent nonsense -- and `ferrox parity` stayed
+MATCH, because parity reads the FIRST token, which is prefill, and this
+path is decode. Nothing in the test suite covers a decode step against
+a reference. What caught it was reading the generated text, and what
+proves the fix is a greedy 100-token generation compared against the
+same build with the device path off: byte-identical. That comparison
+should be a test, and it is the gap this plan leaves behind.
+
 ## The limit, which is not where this plan assumed
 
 Our GPU time for a decode token is **88.8 ms**. The reference's WHOLE
@@ -443,7 +483,8 @@ left of it precisely so nobody spends a fifth round finding that out.
 | before the tail was fused | 69 | 11.7 ms | 100.5 ms | 10.29 |
 | the attention TAIL fused (`wo` + residual + norm + FFN) | 51 | 8.7 ms | 97.5 ms | 10.59 |
 | the tail riding in the next run | 36 | 6.1 ms | 94.9 ms | 10.6 - 10.8 |
-| **the head riding in the previous one, today** | **20** | **3.4 ms** | **~90 ms** | **11.06 - 11.17** |
+| the head riding in the previous one | 20 | 3.4 ms | ~90 ms | 11.06 - 11.17 |
+| **the attention on the device too, today** | **20** | **3.4 ms** | **~89 ms** | **11.16 - 11.19, flat** |
 | the attention LAYER fused | 37 | 6.3 ms | 95.1 ms | 10.52 |
 | the whole token as ONE run | 2 | 0.3 ms | 89.1 ms | 11.22 |
 | **the floor, at today's kernels** | 0 | 0 | **88.8 ms** | **11.26** |

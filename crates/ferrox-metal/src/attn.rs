@@ -1426,7 +1426,7 @@ impl MetalKvBuffers {
         self.capacity
     }
 
-    fn elems_per_token(&self) -> usize {
+    pub(crate) fn elems_per_token(&self) -> usize {
         self.n_kv_heads * self.head_dim
     }
 

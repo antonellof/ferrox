@@ -45,6 +45,28 @@ kernel void f32_to_f16(
 /// `head_dim` elements is normalized independently with the shared
 /// `weight[head_dim]`. One simdgroup per head (head_dim ≤ 256 → ≤ 8
 /// elements/lane), matching ggml's RMS_NORM on a [head_dim, n_head] view.
+/// `x *= sigmoid(g)`, in place: the gate a Qwen3.5 attention layer
+/// applies to its attention output before `wo`
+/// (`ferrox_models::attn_gate::apply_interleaved_gate`, the same
+/// arithmetic). Its own kernel rather than `silu_mul`'s, because that
+/// one multiplies by `g * sigmoid(g)` and the factor of `g` is the
+/// whole difference.
+const SIGMOID_MUL_KERNEL_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void sigmoid_mul_f32(
+    device float* x [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        x[i] *= 1.0f / (1.0f + exp(-g[i]));
+    }
+}
+"#;
+
 const SILU_MUL_KERNEL_SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -327,6 +349,43 @@ pub(crate) fn encode_silu_mul(
         encoder,
         MTLSize {
             width: n_tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// `x *= sigmoid(g)` in place over `n` elements.
+pub(crate) fn encode_sigmoid_mul(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    x: &ProtocolObject<dyn MTLBuffer>,
+    g: &ProtocolObject<dyn MTLBuffer>,
+    n: u32,
+) -> Result<(), MetalError> {
+    let pipe = ensure_pipeline(device, SIGMOID_MUL_KERNEL_SRC, "sigmoid_mul_f32")?;
+    encoder.setComputePipelineState(&pipe.0);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(x), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(g), 0, 1);
+        let mut n_u = n;
+        encoder.setBytes_length_atIndex(
+            NonNull::new(&mut n_u as *mut u32 as *mut _).unwrap(),
+            4,
+            2,
+        );
+    }
+    let tg = 256usize;
+    dispatch_counted(
+        encoder,
+        MTLSize {
+            width: (n as usize).div_ceil(tg),
             height: 1,
             depth: 1,
         },
