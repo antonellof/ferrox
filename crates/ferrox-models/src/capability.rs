@@ -750,6 +750,16 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // expert widths, the per-head QK norm and the clamp arrays beside
     // it, with layer 2 the unrotated one.
     "maple",
+    // tests/granite_swa_graphs.rs: `granite_swa` (Granite 4.1), the
+    // third row closed against the moved pin. Its blockers were two
+    // per-layer tables: the `expert_used_count` ARRAY, which the
+    // loader reads scalar-or-array since the pin moved, and
+    // `attention.rope_pattern`, the FIRST upstream graph that lets the
+    // file say which layers rotate (`RopeLayers::FileMask`). The
+    // fixture's rope pattern and window array disagree about which
+    // layer is special, so a loader that read one into the other is
+    // caught.
+    "granite_swa",
     // tests/attn_temperature_graphs.rs: `mistral3` (mistral3.cpp:5,
     // 14-17, 153-156), every Ministral-3 export. Its one blocker was
     // the PER-POSITION ATTENTION TEMPERATURE, `attention.temperature_scale`,
@@ -1583,23 +1593,17 @@ const NORM_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // when the pin moved to `5b59b83` (792 commits, 15 new graphs).
     // None of the four below has a fixture yet; each says what it
     // needs, measured against the graph, not guessed from the name.
-    (
-        "granite_swa",
-        TriageClass::NewCode,
-        "TWO small per-layer tables, not a new block -- which is why this is NEW CODE and \
-         not one arm. Granite's four multipliers (`src/models/granite-swa.cpp:7-10`) are \
-         `crate::scalar_multipliers`, its optional projection biases (`:79,100-102`) are \
-         `crate::proj_bias`, its window ARRAY (`:17`) is `crate::swa_layers`, its attention \
-         sinks are `AttnWeights::sinks` and its shared expert is served -- so what is left \
-         is (1) `expert_used_count` read as an ARRAY at `n_layer_all` length (`:14`), where \
-         ferrox carries one `n_experts_used` for the model, and (2) `attention.rope_pattern` \
-         (`:41`), a per-layer rotate/do-not-rotate ARRAY, where `crate::rope_layers` decides \
-         the same fact from a per-ARCHITECTURE rule and reads no key. The second is the \
-         one to be careful with: a table that answers from the architecture cannot express \
-         a file that says something else, and this is the first upstream graph that lets \
-         the FILE decide. `granite4.deepstack_mapping` (`:27-40`) belongs to Granite-4 \
-         Vision and no text export writes it",
-    ),
+    // `granite_swa` (Granite 4.1) was HERE for one PR, NEW CODE on two
+    // small per-layer tables, and is audited now: the
+    // `expert_used_count` ARRAY is read scalar-or-array by the loader
+    // (a fix that came out of the same pin move), and
+    // `attention.rope_pattern` is `RopeLayers::FileMask` -- the first
+    // upstream graph that lets the FILE say which layers rotate, one
+    // line of 155 (`rope_layers::ROPE_PATTERN_READERS`). Everything
+    // else it needed was served and each table gained one name: the
+    // four Granite multipliers, the window ARRAY, the REQUIRED
+    // per-layer sinks, the optional projection biases and the
+    // `attention.scale` override. `tests/granite_swa_graphs.rs`.
     (
         "graniteswitch",
         TriageClass::NewCode,
@@ -2405,6 +2409,22 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `rope_layers::RopeLayers::Never` as the other half of each.
         // `tests/rope_layout.rs`'s `LLAMA_NO_ROPE` pins that a row of
         // that group reaches the generic path ONLY under `Never`.
+        // `granite_swa` was NEW CODE in `NORM_ROPE_TRIAGED` for one PR
+        // on its two per-layer tables and is audited now
+        // (`tests/granite_swa_graphs.rs`). NORM RoPE:
+        // `llama_model_rope_type` puts LLM_ARCH_GRANITE_SWA in the
+        // NORM group, which `tests/rope_layout.rs` pins.
+        v.push(prof(
+            "granite_swa",
+            TextGeneration,
+            StandardGqa,
+            KvIswa,
+            RopeLayout::Norm,
+            ArchPath::GenericGqa {
+                rope: RopeLayout::Norm,
+            },
+            WholeVector,
+        ));
         // `maple` was ONE MATCH ARM in `NEOX_ROPE_TRIAGED` for one PR
         // on the per-layer RoPE gate and is audited now on
         // `crate::rope_layers` (`tests/no_rope_layer_graphs.rs`). It is
@@ -3945,7 +3965,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 8,
+            seen == 7,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -4072,8 +4092,11 @@ mod audit_tests {
              `maple.cpp` alone could have found: `llama-graph.cpp:2228` sends four \
              architectures, `maple` among them, to `ggml_swiglu_clamp`, which clamps the \
              gate BEFORE the SiLU where every other graph clamps the SiLU's output \
-             (`ferrox_moe::ClampForm`). That is why 10 is 8, and why a fixture whose \
-             clamp never binds would have passed while the model was wrong"
+             (`ferrox_moe::ClampForm`). `granite_swa` closed the same day too, on \
+             `RopeLayers::FileMask` -- `attention.rope_pattern`, one line of 155 and the \
+             FIRST upstream graph that lets the FILE say which layers rotate -- so the \
+             count is 7, and the three rows that closed were the three cheapest of the \
+             eight the pin brought in"
         );
     }
 

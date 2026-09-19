@@ -78,6 +78,8 @@ pub const ATTN_OUT_BIAS_CREATORS: &[(&str, Presence)] = &[
     ("ernie4_5", Presence::Optional),
     ("gpt-oss", Presence::Required),
     ("gpt2", Presence::Required),
+    // `granite-swa.cpp:79`, optional as every Granite row's is.
+    ("granite_swa", Presence::Optional),
     ("gptneox", Presence::Required),
     ("granite", Presence::Optional),
     ("granitehybrid", Presence::Optional),
@@ -110,6 +112,9 @@ pub const FFN_BIAS_CREATORS: &[(&str, Presence, bool)] = &[
     ("gpt2", Presence::Required, false),
     ("gptneox", Presence::Required, false),
     ("granite", Presence::Optional, true),
+    // `granite-swa.cpp:100-102`, the dense branch only (its MoE branch
+    // creates no expert biases, as `granite.cpp`'s does not).
+    ("granite_swa", Presence::Optional, true),
     ("granitehybrid", Presence::Optional, true),
     ("granite-hybrid", Presence::Optional, true),
     ("granitemoe", Presence::Optional, true),

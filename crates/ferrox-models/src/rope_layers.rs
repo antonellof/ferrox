@@ -81,7 +81,11 @@ pub enum NoRopePhase {
 /// The default is [`RopeLayers::All`] and it is what every audited
 /// architecture but four gets. A variant is only ever added by reading
 /// a `use_rope` in `src/models/`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Not `Copy`: [`RopeLayers::FileMask`] carries one entry per layer,
+/// read from the GGUF. Every other variant is a rule; that one is
+/// data, and it is the first time llama.cpp lets the FILE decide which
+/// layers rotate rather than deriving it from a literal.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RopeLayers {
     /// Every layer rotates: llama.cpp writes no gate at all.
     #[default]
@@ -108,6 +112,21 @@ pub enum RopeLayers {
     /// n_layer_dense_lead`. The dense prefix is full attention with
     /// RoPE, the full-attention layers past it get none.
     SlidingOrLeadingDense { n_dense_lead: usize },
+    /// The layers the FILE says rotate: `{arch}.attention.rope_pattern`,
+    /// one entry per layer, nonzero meaning "rotate"
+    /// (`llama-hparams.cpp:333-343`, `llama_hparams::has_rope`).
+    ///
+    /// `grep -rn LLM_KV_ATTENTION_ROPE_PATTERN src/models/*.cpp` over
+    /// the 155 graphs is `granite-swa.cpp:43` alone (measured
+    /// 2026-09-19), and `llama-model.cpp:1314` fills the array with 1
+    /// for every architecture first, so an absent key is
+    /// [`RopeLayers::All`] and this variant is only ever built from a
+    /// key that is present.
+    ///
+    /// `graniteswitch` fills the SAME array from a scalar
+    /// (`rope.scaling.finetuned`, `granite-switch.cpp:9-12`), which is
+    /// `crate::rope_finetuned`'s all-or-nothing answer and not this.
+    FileMask(std::sync::Arc<[bool]>),
     /// One layer in every `step` does not rotate,
     /// `hparams.n_no_rope_layer_step`.
     NoRopeEvery {
@@ -129,13 +148,19 @@ impl RopeLayers {
     /// the `ModelConfig`'s answer and restating it here would be two
     /// structures that must agree about one thing.
     #[inline]
-    pub fn rotates(self, layer_idx: usize, layer_slides: bool) -> bool {
+    pub fn rotates(&self, layer_idx: usize, layer_slides: bool) -> bool {
         match self {
             Self::All => true,
             Self::Never => false,
             Self::SlidingOnly => layer_slides,
+            // Out of range is `true`, not a panic: `llama-hparams.cpp:
+            // 344` aborts there and a decoder that asked about a layer
+            // it does not have is a bug in the caller, not in the
+            // file. The loader has already refused an array of the
+            // wrong length (`crate::layer_shapes::read_u64_per_layer`).
+            Self::FileMask(mask) => mask.get(layer_idx).copied().unwrap_or(true),
             Self::SlidingOrLeadingDense { n_dense_lead } => {
-                layer_slides || layer_idx < n_dense_lead
+                layer_slides || layer_idx < *n_dense_lead
             }
             Self::NoRopeEvery { step, phase } => {
                 let step = step.get();
@@ -187,6 +212,24 @@ const fn step(n: usize) -> NonZeroUsize {
 ///
 /// `n_layers` is here for exactly one row: `smallthinker.cpp:108`
 /// rotates everything when its step equals the layer count.
+/// The architectures whose graph reads `{arch}.attention.rope_pattern`,
+/// with the line: `grep -rn LLM_KV_ATTENTION_ROPE_PATTERN
+/// src/models/*.cpp` over the 155 graphs (2026-09-19).
+///
+/// A name here means the FILE decides, and
+/// [`RopeLayers::FileMask`] is built from the key when it is present.
+/// For every other architecture the key is dead metadata, exactly as
+/// upstream treats it: `llama-model.cpp:1314` fills the array with 1
+/// before any per-architecture loader runs, and only these graphs read
+/// it back.
+pub const ROPE_PATTERN_READERS: &[(&str, &str)] =
+    &[("granite_swa", "src/models/granite-swa.cpp:43")];
+
+/// Does `arch`'s graph read the per-layer rotate array?
+pub fn reads_rope_pattern(arch: &str) -> bool {
+    ROPE_PATTERN_READERS.iter().any(|(a, _)| *a == arch)
+}
+
 pub fn rope_layers(
     arch: &str,
     n_layers: usize,
