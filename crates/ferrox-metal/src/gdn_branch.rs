@@ -717,6 +717,11 @@ pub struct GdnRun {
     last: Option<objc2::rc::Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     rows: usize,
     submissions: usize,
+    /// The NEXT attention layer's projections, when they were encoded
+    /// at the end of this run: the scratch holding `q`, `k` and `v`,
+    /// and their lengths. `finish` reads them back with the hidden
+    /// state, so the host gets all four for one wait.
+    head: Option<(crate::scratch_pool::Scratch, usize, usize)>,
 }
 
 impl GdnRun {
@@ -732,6 +737,7 @@ impl GdnRun {
             last: None,
             rows: hidden.len(),
             submissions: 0,
+            head: None,
         })
     }
 
@@ -894,33 +900,126 @@ impl GdnRun {
         Ok(())
     }
 
+    /// The NEXT layer's `attn_norm` and its Q/K/V projections, at the
+    /// END of this run.
+    ///
+    /// An attention layer reads `attn_norm(hidden)` and projects it,
+    /// and `hidden` is what this run just finished writing. Doing it
+    /// here costs no wait of its own: the host gets `q`, `k` and `v`
+    /// back from [`Self::finish`] alongside the residual stream, and
+    /// its attention can start immediately.
+    ///
+    /// The Q projection is whatever width the caller's launch says --
+    /// a gated Q is double width and the caller splits it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_head(
+        &mut self,
+        norm: &[f32],
+        norm_eps: f32,
+        q: &MatvecLaunch<'_>,
+        k: &MatvecLaunch<'_>,
+        v: &MatvecLaunch<'_>,
+        fold_x: Option<&FoldPlan<'_>>,
+    ) -> Result<(), MetalError> {
+        let hidden = self.rows;
+        if norm.len() != hidden || self.head.is_some() {
+            return Err(MetalError::CommandFailed);
+        }
+        let shared = shared_metal()?;
+        let device = &shared.device;
+        // normed, then q, k, v.
+        let sc = crate::scratch_pool::Scratch::take(device, &[hidden, q.rows, k.rows, v.rows])
+            .ok_or(MetalError::BufferAllocFailed)?;
+        let normed = sc.buf(0);
+        let norm_w = crate::gpu::resident_f32_buffer(device, norm)?;
+        let (q_w, k_w, v_w) = (
+            resident_weight_buffer(device, q.weights)?,
+            resident_weight_buffer(device, k.weights)?,
+            resident_weight_buffer(device, v.weights)?,
+        );
+        let signs = match fold_x.and_then(|p| p.signs) {
+            None => None,
+            Some(sg) => {
+                // SAFETY: a `&[f32]` viewed as its own bytes, read only.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(sg.as_ptr() as *const u8, std::mem::size_of_val(sg))
+                };
+                Some(resident_weight_buffer(device, bytes)?)
+            }
+        };
+        let cmd_buf = shared
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandFailed)?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?;
+        crate::norm::encode_rms_norm(
+            &encoder,
+            device,
+            self.hidden.buf(0),
+            &norm_w.buffer,
+            normed,
+            hidden as u32,
+            norm_eps,
+        )?;
+        if let Some(plan) = fold_x {
+            plan.check(hidden)?;
+            crate::hadamard::encode_fold(
+                &encoder,
+                device,
+                normed,
+                hidden,
+                plan,
+                signs.as_ref().map(|b| &*b.buffer),
+            )?;
+        }
+        encode_matvec(&encoder, device, q, &q_w, normed, sc.buf(1))?;
+        encode_matvec(&encoder, device, k, &k_w, normed, sc.buf(2))?;
+        encode_matvec(&encoder, device, v, &v_w, normed, sc.buf(3))?;
+        encoder.endEncoding();
+        cmd_buf.commit();
+        self.last = Some(cmd_buf);
+        self.submissions += 1;
+        self.head = Some((sc, q.rows, k.rows));
+        Ok(())
+    }
+
     /// Waits for every layer committed so far and returns the residual
     /// stream.
     pub fn finish(self) -> Result<Vec<f32>, MetalError> {
+        Ok(self.finish_with_head()?.0)
+    }
+
+    /// [`Self::finish`], also returning the Q/K/V that
+    /// [`Self::attn_head`] encoded, when it did.
+    #[allow(clippy::type_complexity)]
+    pub fn finish_with_head(
+        self,
+    ) -> Result<(Vec<f32>, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>), MetalError> {
+        let read = |buf: &ProtocolObject<dyn MTLBuffer>, n: usize| -> Vec<f32> {
+            // SAFETY: shared storage of exactly `n` floats, written by
+            // kernels the wait below has completed.
+            unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const f32, n).to_vec() }
+        };
         let Some(last) = &self.last else {
             // SAFETY: shared storage of exactly `rows` floats, written
             // by `start` and by nothing since.
-            return Ok(unsafe {
-                std::slice::from_raw_parts(
-                    self.hidden.buf(0).contents().as_ptr() as *const f32,
-                    self.rows,
-                )
-                .to_vec()
-            });
+            return Ok((read(self.hidden.buf(0), self.rows), None));
         };
         // One queue is ordered, so waiting for the LAST buffer waits
         // for every buffer before it.
         let clock = crate::timing::SubmitClock::start();
         crate::timing::note_wait(last, "gdn-run", self.submissions, 32, clock);
-        // SAFETY: shared storage of exactly `rows` floats, written by
-        // kernels this call has now waited for.
-        Ok(unsafe {
-            std::slice::from_raw_parts(
-                self.hidden.buf(0).contents().as_ptr() as *const f32,
-                self.rows,
+        let hidden = read(self.hidden.buf(0), self.rows);
+        let head = self.head.as_ref().map(|(sc, q_rows, k_rows)| {
+            (
+                read(sc.buf(1), *q_rows),
+                read(sc.buf(2), *k_rows),
+                read(sc.buf(3), *k_rows),
             )
-            .to_vec()
-        })
+        });
+        Ok((hidden, head))
     }
 }
 

@@ -2661,6 +2661,11 @@ impl Decoder {
             // way.
             #[allow(unused_mut, unused_assignments)]
             let mut fused_through = 0usize;
+            // The Q/K/V a recurrent run encoded for the attention layer
+            // that follows it, carried one iteration so that layer does
+            // not project them again in a submission of its own.
+            #[cfg(feature = "metal")]
+            let mut pending_qkv: crate::decoder::fused_recurrent::PendingQkv = None;
             #[allow(clippy::needless_range_loop)]
             for l in 0..kv_caches.len() {
                 if l < fused_through {
@@ -2671,7 +2676,9 @@ impl Decoder {
                 // wait ONCE, which is the submission count the decode
                 // gap is made of (`docs/plans/gdn-resident-state.md`).
                 #[cfg(feature = "metal")]
-                if let Some(end) = self.fused_recurrent_run(l, &mut hidden, kv_caches) {
+                if let Some(end) =
+                    self.fused_recurrent_run(l, &mut hidden, kv_caches, &mut pending_qkv)
+                {
                     fused_through = end;
                     continue;
                 }
@@ -3098,8 +3105,27 @@ impl Decoder {
                 };
                 #[cfg(not(feature = "metal"))]
                 let tail = attn_block::AttnTail::apply();
-                let projected =
-                    self.attn_block_tail(l, layer, &normed, pos, KvStep::Decode(&mut *cache), tail);
+                // The projections the preceding run encoded for THIS
+                // layer, if it did: then nothing here projects again.
+                #[cfg(feature = "metal")]
+                let precomputed = match pending_qkv.take() {
+                    Some((at, qkv)) if at == l => Some(qkv),
+                    // A run encoded a head for a different layer than
+                    // the one we reached, which only a refusal in
+                    // between can cause: drop it rather than use it.
+                    _ => None,
+                };
+                #[cfg(not(feature = "metal"))]
+                let precomputed = None;
+                let projected = self.attn_block_tail(
+                    l,
+                    layer,
+                    &normed,
+                    pos,
+                    KvStep::Decode(&mut *cache),
+                    tail,
+                    precomputed,
+                );
                 #[cfg(feature = "metal")]
                 if let Some(branch) = deferred {
                     // The tail feeds the recurrent layers after it, so
@@ -3111,6 +3137,7 @@ impl Decoder {
                         &branch,
                         &mut hidden,
                         kv_caches,
+                        &mut pending_qkv,
                     ) {
                         fused_through = end;
                         continue;

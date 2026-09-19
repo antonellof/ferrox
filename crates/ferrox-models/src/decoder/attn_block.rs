@@ -88,6 +88,43 @@ impl AttnTail<'_> {
 }
 
 impl Decoder {
+    /// The three projections, on whichever backend serves them.
+    ///
+    /// A separate function because a recurrent RUN can encode them at
+    /// its end for the attention layer that follows
+    /// (`GdnRun::attn_head`), and then this is not called at all --
+    /// but when it is, it must be the same arithmetic.
+    fn project_qkv(layer: &LayerWeights, normed: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        {
+            if let Some(mut outs) = ferrox_core::WeightMatrix::apply_gpu_multi(
+                &[&layer.attn.q_proj, &layer.attn.k_proj, &layer.attn.v_proj],
+                normed,
+            ) {
+                let v = outs.pop().unwrap();
+                let k = outs.pop().unwrap();
+                let q = outs.pop().unwrap();
+                (q, k, v)
+            } else {
+                ferrox_core::weight_matrix::WeightMatrix::apply_three(
+                    &layer.attn.q_proj,
+                    &layer.attn.k_proj,
+                    &layer.attn.v_proj,
+                    normed,
+                )
+            }
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        {
+            ferrox_core::weight_matrix::WeightMatrix::apply_three(
+                &layer.attn.q_proj,
+                &layer.attn.k_proj,
+                &layer.attn.v_proj,
+                normed,
+            )
+        }
+    }
+
     /// One layer's attention block for ONE row: QKV projection, the
     /// three QKV biases, the two QK norms, RoPE's `mscale`, per-head
     /// RoPE, `attention_scale`, the KV push and attend (with the
@@ -116,7 +153,7 @@ impl Decoder {
         pos: usize,
         kv: KvStep<'_>,
     ) -> Option<Vec<f32>> {
-        self.attn_block_tail(layer_idx, layer, normed, pos, kv, AttnTail::apply())
+        self.attn_block_tail(layer_idx, layer, normed, pos, kv, AttnTail::apply(), None)
     }
 
     /// [`Self::attn_block`] with the choice of who applies `wo`.
@@ -126,6 +163,7 @@ impl Decoder {
     /// projections, the biases, the two QK norms, RoPE, the scale, the
     /// temperature, the KV push, the attend, the gates -- identically.
     /// A second copy of it is how this file lost eight model features.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attn_block_tail(
         &self,
         layer_idx: usize,
@@ -134,6 +172,7 @@ impl Decoder {
         pos: usize,
         mut kv: KvStep<'_>,
         #[cfg_attr(not(feature = "metal"), allow(unused_variables))] tail: AttnTail<'_>,
+        precomputed: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>,
     ) -> Option<Vec<f32>> {
         let head_dim = self.config.head_dim;
         let (n_heads, n_kv_heads) = match self.config.layer_shape(layer_idx).attention {
@@ -151,37 +190,13 @@ impl Decoder {
             }
         };
 
-        let (mut q, mut k, mut v) = {
-            #[cfg(any(feature = "cuda", feature = "metal"))]
-            {
-                if let Some(mut outs) = ferrox_core::WeightMatrix::apply_gpu_multi(
-                    &[&layer.attn.q_proj, &layer.attn.k_proj, &layer.attn.v_proj],
-                    normed,
-                ) {
-                    let v = outs.pop().unwrap();
-                    let k = outs.pop().unwrap();
-                    let q = outs.pop().unwrap();
-                    (q, k, v)
-                } else {
-                    ferrox_core::weight_matrix::WeightMatrix::apply_three(
-                        &layer.attn.q_proj,
-                        &layer.attn.k_proj,
-                        &layer.attn.v_proj,
-                        normed,
-                    )
-                }
-            }
-            #[cfg(not(any(feature = "cuda", feature = "metal")))]
-            {
-                ferrox_core::weight_matrix::WeightMatrix::apply_three(
-                    &layer.attn.q_proj,
-                    &layer.attn.k_proj,
-                    &layer.attn.v_proj,
-                    normed,
-                )
-            }
+        let (mut q, mut k, mut v) = match precomputed {
+            // Already projected, at the end of the recurrent run that
+            // wrote the residual this layer norms
+            // (`GdnRun::attn_head`): one wait covered both.
+            Some(qkv) => qkv,
+            None => Self::project_qkv(layer, normed),
         };
-
         // qwen35.cpp:191-199: the gate rides in `wq`; split it off
         // before anything reads a Q width.
         let q_gate = layer.attn.q_gate_interleaved.then(|| {

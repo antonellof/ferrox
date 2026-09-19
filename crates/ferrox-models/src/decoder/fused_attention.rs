@@ -65,6 +65,69 @@ impl Decoder {
         LayerFfnParts::for_layer(layer, self.config.rms_norm_eps, true).map(|_| ())
     }
 
+    /// The Q/K/V launches for an attention layer, when all three have
+    /// Metal kernels and agree about their input basis.
+    ///
+    /// Used to encode the layer's projections at the END of the
+    /// preceding recurrent run, where they cost no wait of their own:
+    /// the layer reads `attn_norm(hidden)` and the run has just
+    /// finished writing `hidden`.
+    #[cfg(feature = "metal")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn attn_head_launch<'a>(
+        &self,
+        l: usize,
+        layer: &'a LayerWeights,
+    ) -> Option<(
+        &'a [f32],
+        ferrox_metal::gpu::MatvecLaunch<'a>,
+        ferrox_metal::gpu::MatvecLaunch<'a>,
+        ferrox_metal::gpu::MatvecLaunch<'a>,
+        Option<ferrox_metal::hadamard::FoldPlan<'a>>,
+    )> {
+        let shape = self.config.layer_shape(l);
+        if !matches!(shape.attention, AttnShape::Gqa { .. })
+            // The three projections' biases are applied by the host
+            // AFTER this, so they are fine; what is not is a layer
+            // whose pre-norm is anything but a plain weighted RMS,
+            // which is the only norm this encodes.
+            || layer.attn.q_bias.is_some() && false
+        {
+            return None;
+        }
+        let norm = layer.attn.norm_weight.rms_weights()?;
+        let hidden = norm.len();
+        let one = |m: &'a ferrox_core::WeightMatrix| {
+            let (base, fold) = m.launch_parts();
+            Some((crate::metal_launch::matvec(base)?, fold))
+        };
+        let (q, q_fold) = one(&layer.attn.q_proj)?;
+        let (k, k_fold) = one(&layer.attn.k_proj)?;
+        let (v, v_fold) = one(&layer.attn.v_proj)?;
+        // One rotation for all three, since they read the same vector
+        // and the kernel applies it once.
+        let same = |a: Option<
+            &std::sync::Arc<ferrox_core::weight_matrix::hadamard::HadamardFold>,
+        >,
+                    b: Option<
+            &std::sync::Arc<ferrox_core::weight_matrix::hadamard::HadamardFold>,
+        >| {
+            match (a, b) {
+                (None, None) => true,
+                (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
+                _ => false,
+            }
+        };
+        if !same(q_fold, k_fold) || !same(q_fold, v_fold) {
+            return None;
+        }
+        let fold_x = match q_fold {
+            None => None,
+            Some(f) => Some(f.metal_plan(hidden)?),
+        };
+        Some((norm, q, k, v, fold_x))
+    }
+
     /// The launch description for this layer's tail, or `None` when
     /// anything refuses.
     ///
