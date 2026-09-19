@@ -48,6 +48,8 @@ One item has a written **verdict** rather than a design:
 
 Parity inventory and deltas against llama.cpp:
 
+- **[`parity-audit-2026-09-19.md`](parity-audit-2026-09-19.md)** — the current re-measurement, llama.cpp AND vLLM
+- **[`server-speculative-decoding.md`](server-speculative-decoding.md)** — the engine has it, the server cannot reach it
 - **[`llama-cpp-gap-inventory.md`](llama-cpp-gap-inventory.md)** — evidence-backed differential (not a plan)
 - **[`llama-cpp-full-parity-audit-2026-09-02.md`](llama-cpp-full-parity-audit-2026-09-02.md)** — file map + sweep + priority plan
 - **[`llama-cpp-parity-update-2026-09-03.md`](llama-cpp-parity-update-2026-09-03.md)** — post-merge delta (Qwen MoE Metal, Phi-4 LongRoPE, sweep)
