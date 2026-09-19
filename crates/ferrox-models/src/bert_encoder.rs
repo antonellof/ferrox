@@ -96,6 +96,12 @@ pub struct BertHparams {
     pub rope_dim: usize,
     /// The FFN this architecture runs (`bert.cpp:179-201`).
     pub ffn: BertFfn,
+    /// Where this architecture's norms sit and what they are.
+    pub topology: BertTopology,
+    /// `true` for the NORM (interleaved-pair) rotation, `false` for
+    /// NEOX (split-half). `llama_model_rope_type` answers NORM for
+    /// `neo-bert` alone among the encoders here.
+    pub rope_interleaved: bool,
     /// ALiBi slopes, one per head, for the architecture whose graph
     /// carries a positional bias instead of a table or a rotation.
     ///
@@ -124,6 +130,23 @@ impl BertHparams {
 /// One transformer block's weights. Biases that llama.cpp marks
 /// `TENSOR_NOT_REQUIRED` are `Option`, so a checkpoint without them is
 /// run without them rather than with a silently fabricated zero vector.
+/// Where an encoder layer's norms sit, and which function they are.
+///
+/// `bert.cpp`'s graph is POST-norm with LayerNorm: attention, residual,
+/// norm, FFN, residual, norm. `neo-bert.cpp:59-118` and
+/// `eurobert.cpp:55-114` are the other shape -- RMSNorm BEFORE each
+/// block and a bare residual after it, with one final norm at the end
+/// -- and they are one topology with four table columns between them,
+/// not two graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BertTopology {
+    /// `bert.cpp`: LayerNorm with biases, after each residual.
+    PostNormLayerNorm,
+    /// `neo-bert` / `eurobert`: RMSNorm with a weight and no bias,
+    /// before each block, and one final norm.
+    PreNormRms,
+}
+
 /// The two FFN shapes `bert.cpp` builds on this graph for the
 /// architectures ferrox serves.
 ///
@@ -146,6 +169,11 @@ pub enum BertFfn {
     /// is `2 * n_ff` rows and `ggml_geglu` splits it, the FIRST half
     /// being the gate (`bert.cpp:189`, `up_contains_gate`).
     GegluFusedUp,
+    /// SwiGLU with the gate fused into `ffn_up` the same way:
+    /// `neo-bert.cpp:35,110-115` creates a `2 * n_ff`-wide matrix and
+    /// passes `LLM_FFN_SWIGLU` under `LLM_FFN_SEQ`, which is
+    /// `ggml_swiglu` over the doubled row.
+    SwigluFusedUp,
 }
 
 /// One layer's Q/K LayerNorm pair, weights and biases.
@@ -172,9 +200,14 @@ pub struct BertLayer {
     /// `:110` is `n_embd_head * n_head` wide, so one norm covers every
     /// head's channels together.
     pub qk_norm: Option<QkLayerNorm>,
+    /// `attn_norm` / `ffn_norm`: the PRE-norm weights, `Some` exactly
+    /// for [`BertTopology::PreNormRms`].
+    pub pre_attn_norm: Option<Vec<f32>>,
+    pub pre_ffn_norm: Option<Vec<f32>>,
     /// `attn_output_norm`, applied after the attention residual.
-    pub attn_out_norm_w: Vec<f32>,
-    pub attn_out_norm_b: Vec<f32>,
+    /// `Some` exactly for [`BertTopology::PostNormLayerNorm`].
+    pub attn_out_norm_w: Option<Vec<f32>>,
+    pub attn_out_norm_b: Option<Vec<f32>>,
     /// `attn_norm_2`, `jina-bert-v2`'s second attention norm
     /// (`bert.cpp:156-159`): the LAYER INPUT is re-added and normed a
     /// second time before the FFN reads it.
@@ -185,9 +218,10 @@ pub struct BertLayer {
     pub ffn_gate: Option<WeightMatrix>,
     pub ffn_down: WeightMatrix,
     pub ffn_down_b: Option<Vec<f32>>,
-    /// `layer_output_norm`, applied after the FFN residual.
-    pub layer_out_norm_w: Vec<f32>,
-    pub layer_out_norm_b: Vec<f32>,
+    /// `layer_output_norm`, applied after the FFN residual. `Some`
+    /// exactly for [`BertTopology::PostNormLayerNorm`].
+    pub layer_out_norm_w: Option<Vec<f32>>,
+    pub layer_out_norm_b: Option<Vec<f32>>,
 }
 
 pub struct BertEncoder {
@@ -203,8 +237,15 @@ pub struct BertEncoder {
     /// The learned position table, `None` for a rotating architecture
     /// (see [`BertHparams::rope_theta`]).
     pub pos_embd: Option<WeightMatrix>,
-    pub tok_norm_w: Vec<f32>,
-    pub tok_norm_b: Vec<f32>,
+    /// The embedding LayerNorm, `Some` exactly for
+    /// [`BertTopology::PostNormLayerNorm`]; a pre-norm encoder feeds
+    /// the raw embeddings into layer 0.
+    pub tok_norm_w: Option<Vec<f32>>,
+    pub tok_norm_b: Option<Vec<f32>>,
+    /// The final RMSNorm weight, `Some` exactly for
+    /// [`BertTopology::PreNormRms`] (`enc.output_norm` for
+    /// `neo-bert`, `output_norm` for `eurobert`).
+    pub final_norm: Option<Vec<f32>>,
     pub layers: Vec<BertLayer>,
 }
 
@@ -217,6 +258,16 @@ fn add_bias_rows(rows: &mut [f32], width: usize, bias: Option<&Vec<f32>>) {
             *x += bv;
         }
     }
+}
+
+/// RMSNorm applied independently to each `width`-wide row, returning a
+/// new buffer: the pre-norm shape needs the normed value AND the
+/// unnormed residual, so this one does not work in place.
+fn rms_norm_rows(rows: &[f32], width: usize, weight: &[f32], eps: f32) -> Vec<f32> {
+    debug_assert_eq!(weight.len(), width);
+    rows.chunks_exact(width)
+        .flat_map(|row| ferrox_core::matmul::rms_norm(row, weight, eps))
+        .collect()
 }
 
 /// LayerNorm applied independently to each `width`-wide row, in place.
@@ -423,19 +474,23 @@ impl TextEncoder for BertEncoder {
                 }
             }
         }
-        layer_norm_rows(
-            &mut h,
-            d,
-            &self.tok_norm_w,
-            &self.tok_norm_b,
-            self.hp.layer_norm_eps,
-        );
+        if let (Some(w), Some(b)) = (&self.tok_norm_w, &self.tok_norm_b) {
+            layer_norm_rows(&mut h, d, w, b, self.hp.layer_norm_eps);
+        }
 
         let head_dim = self.hp.head_dim();
         for layer in &self.layers {
-            let mut q = layer.wq.apply_batch(&h, n);
-            let mut k = layer.wk.apply_batch(&h, n);
-            let mut v = layer.wv.apply_batch(&h, n);
+            // A pre-norm layer normalises what the block reads and
+            // leaves the residual alone; a post-norm one reads the
+            // residual directly and norms after each add.
+            // `neo-bert.cpp:62-65` against `bert.cpp:103`.
+            let block_in = match &layer.pre_attn_norm {
+                None => h.clone(),
+                Some(w) => rms_norm_rows(&h, d, w, self.hp.layer_norm_eps),
+            };
+            let mut q = layer.wq.apply_batch(&block_in, n);
+            let mut k = layer.wk.apply_batch(&block_in, n);
+            let mut v = layer.wv.apply_batch(&block_in, n);
             add_bias_rows(&mut q, self.hp.n_head * head_dim, layer.bq.as_ref());
             add_bias_rows(&mut k, self.hp.n_head_kv * head_dim, layer.bk.as_ref());
             add_bias_rows(&mut v, self.hp.n_head_kv * head_dim, layer.bv.as_ref());
@@ -466,14 +521,23 @@ impl TextEncoder for BertEncoder {
                 // at the row's own position -- the same rotation the
                 // decoder path applies, on both Q and K.
                 let rot = self.hp.rope_dim.min(head_dim);
+                // NORM (interleaved pairs) for `neo-bert`, NEOX
+                // (split-half) for the others: `llama_model_rope_type`
+                // is the table and `BertHparams::rope_interleaved`
+                // carries its answer.
+                let rotate: fn(&mut [f32], usize, f32) = if self.hp.rope_interleaved {
+                    ferrox_core::attention::apply_rope_interleaved
+                } else {
+                    ferrox_core::attention::apply_rope
+                };
                 for (pos, row) in q.chunks_exact_mut(self.hp.n_head * head_dim).enumerate() {
                     for head in row.chunks_exact_mut(head_dim) {
-                        ferrox_core::attention::apply_rope(&mut head[..rot], pos, theta);
+                        rotate(&mut head[..rot], pos, theta);
                     }
                 }
                 for (pos, row) in k.chunks_exact_mut(self.hp.n_head_kv * head_dim).enumerate() {
                     for head in row.chunks_exact_mut(head_dim) {
-                        ferrox_core::attention::apply_rope(&mut head[..rot], pos, theta);
+                        rotate(&mut head[..rot], pos, theta);
                     }
                 }
             }
@@ -491,17 +555,14 @@ impl TextEncoder for BertEncoder {
 
             let mut x = layer.wo.apply_batch(&attn, n);
             add_bias_rows(&mut x, d, layer.bo.as_ref());
-            // Residual over the *layer input*, then attn_output_norm.
+            // Residual over the *layer input*; the post-norm shape
+            // then norms it, the pre-norm shape does not.
             for (xv, hv) in x.iter_mut().zip(h.iter()) {
                 *xv += hv;
             }
-            layer_norm_rows(
-                &mut x,
-                d,
-                &layer.attn_out_norm_w,
-                &layer.attn_out_norm_b,
-                self.hp.layer_norm_eps,
-            );
+            if let (Some(w), Some(b)) = (&layer.attn_out_norm_w, &layer.attn_out_norm_b) {
+                layer_norm_rows(&mut x, d, w, b, self.hp.layer_norm_eps);
+            }
 
             // `bert.cpp:156-159`: the layer INPUT is re-added and
             // normed a second time. Only `jina-bert-v2` carries the
@@ -516,7 +577,11 @@ impl TextEncoder for BertEncoder {
             // (5) the architecture's MLP; the FFN residual is over
             // `x`, i.e. over the post-norm value, not over the layer
             // input.
-            let mut up = layer.ffn_up.apply_batch(&x, n);
+            let ffn_in = match &layer.pre_ffn_norm {
+                None => x.clone(),
+                Some(w) => rms_norm_rows(&x, d, w, self.hp.layer_norm_eps),
+            };
+            let mut up = layer.ffn_up.apply_batch(&ffn_in, n);
             add_bias_rows(&mut up, self.hp.n_ff, layer.ffn_up_b.as_ref());
             match (self.hp.ffn, &layer.ffn_gate) {
                 (BertFfn::GeluSeq, _) => {
@@ -525,16 +590,33 @@ impl TextEncoder for BertEncoder {
                     }
                 }
                 (BertFfn::SwigluPar, Some(gate)) => {
-                    let g = gate.apply_batch(&x, n);
+                    let g = gate.apply_batch(&ffn_in, n);
                     for (a, gv) in up.iter_mut().zip(g.iter()) {
                         *a *= ferrox_core::matmul::silu(*gv);
                     }
                 }
                 (BertFfn::GegluPar, Some(gate)) => {
-                    let g = gate.apply_batch(&x, n);
+                    let g = gate.apply_batch(&ffn_in, n);
                     for (a, gv) in up.iter_mut().zip(g.iter()) {
                         *a *= gelu(*gv);
                     }
+                }
+                (BertFfn::SwigluFusedUp, _) => {
+                    // `ggml_swiglu` over a `2 * n_ff`-wide row: the
+                    // first half is the gate.
+                    let wide = self.hp.n_ff * 2;
+                    debug_assert_eq!(up.len(), n * wide);
+                    let mut folded = vec![0.0f32; n * self.hp.n_ff];
+                    for (row, out) in up
+                        .chunks_exact(wide)
+                        .zip(folded.chunks_exact_mut(self.hp.n_ff))
+                    {
+                        let (gate, rest) = row.split_at(self.hp.n_ff);
+                        for ((o, g), u) in out.iter_mut().zip(gate).zip(rest) {
+                            *o = ferrox_core::matmul::silu(*g) * u;
+                        }
+                    }
+                    up = folded;
                 }
                 (BertFfn::GegluFusedUp, _) => {
                     // `ggml_geglu` over a `2 * n_ff`-wide row: the
@@ -566,14 +648,16 @@ impl TextEncoder for BertEncoder {
             for (dv, xv) in down.iter_mut().zip(x.iter()) {
                 *dv += xv;
             }
-            layer_norm_rows(
-                &mut down,
-                d,
-                &layer.layer_out_norm_w,
-                &layer.layer_out_norm_b,
-                self.hp.layer_norm_eps,
-            );
+            if let (Some(w), Some(b)) = (&layer.layer_out_norm_w, &layer.layer_out_norm_b) {
+                layer_norm_rows(&mut down, d, w, b, self.hp.layer_norm_eps);
+            }
             h = down;
+        }
+        // One final norm for the pre-norm shape, which has normed
+        // nothing since the last block read its input
+        // (`neo-bert.cpp:122-125`, `eurobert.cpp:116-119`).
+        if let Some(w) = &self.final_norm {
+            h = rms_norm_rows(&h, d, w, self.hp.layer_norm_eps);
         }
         Ok(h)
     }
@@ -620,6 +704,8 @@ mod tests {
                 ffn_gate: None,
                 qk_norm: None,
                 attn_norm_2: None,
+                pre_attn_norm: None,
+                pre_ffn_norm: None,
                 wq: r.matrix(D, D),
                 bq: Some(r.vec(D)),
                 wk: r.matrix(D, D),
@@ -628,18 +714,20 @@ mod tests {
                 bv: Some(r.vec(D)),
                 wo: r.matrix(D, D),
                 bo: Some(r.vec(D)),
-                attn_out_norm_w: r.vec(D),
-                attn_out_norm_b: r.vec(D),
+                attn_out_norm_w: Some(r.vec(D)),
+                attn_out_norm_b: Some(r.vec(D)),
                 ffn_up: r.matrix(FF, D),
                 ffn_up_b: Some(r.vec(FF)),
                 ffn_down: r.matrix(D, FF),
                 ffn_down_b: Some(r.vec(D)),
-                layer_out_norm_w: r.vec(D),
-                layer_out_norm_b: r.vec(D),
+                layer_out_norm_w: Some(r.vec(D)),
+                layer_out_norm_b: Some(r.vec(D)),
             })
             .collect();
         BertEncoder {
             hp: BertHparams {
+                topology: BertTopology::PostNormLayerNorm,
+                rope_interleaved: false,
                 alibi_slopes: None,
                 rope_theta: None,
                 rope_dim: 0,
@@ -660,8 +748,9 @@ mod tests {
             tok_embd,
             type_embd,
             pos_embd: Some(pos_embd),
-            tok_norm_w,
-            tok_norm_b,
+            tok_norm_w: Some(tok_norm_w),
+            tok_norm_b: Some(tok_norm_b),
+            final_norm: None,
             layers,
         }
     }
@@ -716,7 +805,14 @@ mod tests {
                 let row: Vec<f64> = (0..d)
                     .map(|j| tok[j] as f64 + pos[j] as f64 + ty[j] as f64)
                     .collect();
-                ln(&row, &m.tok_norm_w, &m.tok_norm_b)
+                // The naive reference covers the POST-norm topology,
+                // which is the one it was written for; a pre-norm
+                // model has no embedding norm at all.
+                let (tw, tb) = (
+                    m.tok_norm_w.as_ref().expect("post-norm reference"),
+                    m.tok_norm_b.as_ref().expect("post-norm reference"),
+                );
+                ln(&row, tw, tb)
             })
             .collect();
 
@@ -777,7 +873,11 @@ mod tests {
                 for (x, hv) in o.iter_mut().zip(&h[i]) {
                     *x += hv;
                 }
-                let x = ln(&o, &layer.attn_out_norm_w, &layer.attn_out_norm_b);
+                let x = ln(
+                    &o,
+                    layer.attn_out_norm_w.as_ref().expect("post-norm reference"),
+                    layer.attn_out_norm_b.as_ref().expect("post-norm reference"),
+                );
                 let mut up = matvec(&wu, &x);
                 bias(&mut up, &layer.ffn_up_b);
                 let act: Vec<f64> = up
@@ -793,7 +893,17 @@ mod tests {
                 for (dv, xv) in down.iter_mut().zip(&x) {
                     *dv += xv;
                 }
-                next.push(ln(&down, &layer.layer_out_norm_w, &layer.layer_out_norm_b));
+                next.push(ln(
+                    &down,
+                    layer
+                        .layer_out_norm_w
+                        .as_ref()
+                        .expect("post-norm reference"),
+                    layer
+                        .layer_out_norm_b
+                        .as_ref()
+                        .expect("post-norm reference"),
+                ));
             }
             h = next;
         }
@@ -903,8 +1013,8 @@ mod tests {
     fn the_last_op_is_a_mean_subtracting_layer_norm() {
         let mut m = fixture(2);
         let last = m.layers.last_mut().unwrap();
-        last.layer_out_norm_w = vec![1.0; D];
-        last.layer_out_norm_b = vec![0.0; D];
+        last.layer_out_norm_w = Some(vec![1.0; D]);
+        last.layer_out_norm_b = Some(vec![0.0; D]);
         let out = m.encode_tokens(&[3u32, 4, 5]).unwrap();
         for row in out.as_chunks::<D>().0 {
             let mean: f32 = row.iter().sum::<f32>() / D as f32;

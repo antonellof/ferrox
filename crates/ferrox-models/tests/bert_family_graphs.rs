@@ -160,6 +160,80 @@ const JINA_V2_GOLDEN: [f32; 32] = [
     -1.3321261,
 ];
 
+/// llama.cpp's MEAN-pooled embedding for `"hello world"` on
+/// `neo_bert_tiny.gguf`, un-normalized.
+const NEO_BERT_GOLDEN: [f32; 32] = [
+    -0.13721451,
+    -0.30953044,
+    0.5746242,
+    0.48224318,
+    -0.5322671,
+    -0.33387074,
+    0.38777876,
+    -0.1777301,
+    -0.23012762,
+    -0.0012531132,
+    -0.9625808,
+    -0.6623553,
+    0.49542165,
+    0.30453932,
+    -0.41867602,
+    1.64823,
+    1.1925495,
+    0.4239208,
+    0.5657171,
+    0.08625776,
+    -0.18825471,
+    -2.3315008,
+    -0.22755218,
+    -0.60745573,
+    0.46385777,
+    0.08840336,
+    -0.78944945,
+    -0.40569812,
+    -0.61793786,
+    -1.0149992,
+    -0.93395233,
+    -0.33015501,
+];
+
+/// llama.cpp's MEAN-pooled embedding for `"hello world"` on
+/// `eurobert_tiny.gguf`, un-normalized.
+const EUROBERT_GOLDEN: [f32; 32] = [
+    0.13058862,
+    -0.18427274,
+    0.07286662,
+    0.900219,
+    -1.0927924,
+    0.98612857,
+    0.17524774,
+    -0.32638,
+    0.79318833,
+    0.37353244,
+    -1.8769612,
+    -1.0204492,
+    0.102979526,
+    0.3153057,
+    -0.14204782,
+    1.3116986,
+    0.24595036,
+    0.5444239,
+    -0.18833666,
+    0.17957813,
+    -0.521837,
+    -0.8548205,
+    1.7330112,
+    2.7190456,
+    0.06767517,
+    -0.5334006,
+    -0.743376,
+    0.21056612,
+    0.11974835,
+    0.53087395,
+    -0.82427704,
+    0.4152881,
+];
+
 fn fixture_named(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -270,6 +344,45 @@ fn jina_bert_v2_matches_llama_cpp_pooled_embedding() {
     }
     // GELU again, so the GELU-table line rather than the gated row's.
     assert!(worst < 1e-2, "max |ferrox - llama.cpp| = {worst}");
+}
+
+/// The PRE-NORM pair: `neo-bert` and `eurobert` are one topology with
+/// three columns between them.
+///
+/// `neo-bert.cpp:59-118` and `eurobert.cpp:55-114` are the same shape
+/// -- RMSNorm BEFORE each block, a bare residual after it, and one
+/// final norm where the post-norm rows have one after every add. What
+/// differs is the QKV spelling (fused for `neo-bert`, split for
+/// `eurobert`), the FFN's (a `2 * n_ff`-wide `ffn_up` against a
+/// separate `ffn_gate`), the rotation (NORM against NEOX) and the
+/// tensor the final norm is stored under (`enc.output_norm` against
+/// `output_norm`). `bert_gguf_loader::EncoderSpec` is those columns.
+#[test]
+fn the_pre_norm_encoders_match_llama_cpp() {
+    for (file, arch, golden) in [
+        ("neo_bert_tiny.gguf", "neo-bert", &NEO_BERT_GOLDEN),
+        ("eurobert_tiny.gguf", "eurobert", &EUROBERT_GOLDEN),
+    ] {
+        let model = EmbeddingModel::from_gguf_path(fixture_named(file))
+            .unwrap_or_else(|e| panic!("load {arch}: {e}"));
+        let hp = model.hparams().expect("a BERT-family encoder");
+        assert_eq!(hp.arch, arch);
+        assert_eq!(
+            hp.topology,
+            ferrox_models::bert_encoder::BertTopology::PreNormRms
+        );
+        assert_eq!(
+            hp.rope_interleaved,
+            arch == "neo-bert",
+            "llama_model_rope_type answers NORM for neo-bert and NEOX for eurobert"
+        );
+        let ours = model.embed("hello world", false).expect("embed");
+        let mut worst = 0.0f32;
+        for (a, b) in ours.iter().zip(golden.iter()) {
+            worst = worst.max((a - b).abs());
+        }
+        assert!(worst < 5e-3, "{arch}: max |ferrox - llama.cpp| = {worst}");
+    }
 }
 
 /// The two facts reached the encoder, and they came from the

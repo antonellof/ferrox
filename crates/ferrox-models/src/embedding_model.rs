@@ -25,6 +25,10 @@ use crate::tokenizer::{GgufWordPieceTokenizer, SpecialTokens, TokenizerLoadError
 /// that this crate does not have. Used to refuse *by name* instead of
 /// with a generic "unsupported".
 const NOT_YET: &[(&str, &str)] = &[
+    // `neo-bert` and `eurobert` were HERE until 2026-09-19: they are
+    // ONE topology (RMSNorm before each block, a bare residual after
+    // it, one final norm) with three table columns between them, and
+    // `bert_gguf_loader::EncoderSpec` is that table.
     // `jina-bert-v2` was HERE until 2026-09-19: GEGLU in both its
     // spellings (a separate gate, or one fused into a `2 * n_ff`-wide
     // `ffn_up`), the second attention norm, the whole-projection QK
@@ -48,12 +52,10 @@ const NOT_YET: &[(&str, &str)] = &[
         "nomic-bert-moe",
         "a second FFN shape on its MoE layers (moe_every_n_layers)",
     ),
-    ("neo-bert", "per-projection QK norm"),
     (
         "modern-bert",
         "its own graph (local/global alternating attention)",
     ),
-    ("eurobert", "its own graph"),
     ("t5encoder", "the T5 encoder stack"),
     ("llama-embed", "a decoder embedding path, not an encoder"),
     (

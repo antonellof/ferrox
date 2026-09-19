@@ -23,7 +23,7 @@
 
 use ferrox_gguf::{ShardedGguf, TensorSource};
 
-use crate::bert_encoder::{BertEncoder, BertFfn, BertHparams, BertLayer};
+use crate::bert_encoder::{BertEncoder, BertFfn, BertHparams, BertLayer, BertTopology};
 use crate::loader::{
     assert_every_tensor_consumed, load_f32_vec, load_f32_vec_optional, load_weight_matrix,
     LoadError,
@@ -74,27 +74,96 @@ pub fn check_arch(arch: &str) -> Result<(), LoadError> {
 /// graph is the same, which is why `nomic-bert-moe` is not in it (its
 /// `moe_every_n_layers` layers are a second FFN shape) and
 /// `jina-bert-v2` is not either (a second attention norm).
-pub const ENCODER_ARCHS: &[(&str, BertFfn)] = &[
-    ("bert", BertFfn::GeluSeq),
-    ("nomic-bert", BertFfn::SwigluPar),
+/// One architecture's row on this loader: the FFN, where the norms
+/// sit, and which rotation (if any) the attention uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderSpec {
+    pub ffn: BertFfn,
+    pub topology: BertTopology,
+    /// `true` for the NORM (interleaved) rotation: `llama_model_rope_type`
+    /// answers that for `neo-bert` and NEOX for the others.
+    pub rope_interleaved: bool,
+    /// The tensor the FINAL norm is stored under, for the pre-norm
+    /// shape. `neo-bert.cpp:23` uses `enc.output_norm` and
+    /// `eurobert.cpp:16` plain `output_norm` -- one fact, two
+    /// spellings, which is the `attn_output_norm` case again.
+    pub final_norm_name: &'static str,
+}
+
+const POST: EncoderSpec = EncoderSpec {
+    ffn: BertFfn::GeluSeq,
+    topology: BertTopology::PostNormLayerNorm,
+    rope_interleaved: false,
+    final_norm_name: "",
+};
+
+pub const ENCODER_ARCHS: &[(&str, EncoderSpec)] = &[
+    ("bert", POST),
+    (
+        "nomic-bert",
+        EncoderSpec {
+            ffn: BertFfn::SwigluPar,
+            ..POST
+        },
+    ),
     // `jina-bert-v3.cpp` reuses `llama_model_bert::graph` verbatim
-    // (`models.h:314-322`) and its own tensor loader creates NO
-    // position table and NO QK-norm tensors, so on this graph it is
-    // `nomic-bert`'s rotation with `bert`'s ungated GELU FFN -- one
-    // row, and the only row.
-    ("jina-bert-v3", BertFfn::GeluSeq),
-    // `jina-bert-v2` reuses the same graph and is the one row on it
-    // whose position is neither a table nor a rotation: ALiBi, at a
-    // literal `f_max_alibi_bias = 8.0` (`jina-bert-v2.cpp:5`). Its FFN
-    // is GEGLU in two spellings (a separate `ffn_gate`, or the gate
-    // fused into a `2 * n_ff`-wide `ffn_up`), decided per FILE at
-    // `bert.cpp:189`, so the table's entry is the fused one and the
-    // loader narrows it when the gate tensor is there.
-    ("jina-bert-v2", BertFfn::GegluFusedUp),
+    // (`models.h:314-322`) and creates no position table and no
+    // QK-norm tensors, so it is `nomic-bert`'s rotation with `bert`'s
+    // ungated GELU FFN.
+    ("jina-bert-v3", POST),
+    // The one row whose position is neither a table nor a rotation:
+    // ALiBi at a literal 8.0 (`jina-bert-v2.cpp:5`). Its GEGLU has two
+    // spellings and the loader narrows this one per file.
+    (
+        "jina-bert-v2",
+        EncoderSpec {
+            ffn: BertFfn::GegluFusedUp,
+            ..POST
+        },
+    ),
+    // The PRE-NORM pair. `neo-bert.cpp:59-118` and
+    // `eurobert.cpp:55-114` are the same topology -- RMSNorm before
+    // each block, a bare residual after it, one final norm -- and
+    // differ in three columns: the QKV spelling (fused vs split, which
+    // the loader reads off the file), the FFN's (fused vs a separate
+    // gate), and the rotation.
+    (
+        "neo-bert",
+        EncoderSpec {
+            ffn: BertFfn::SwigluFusedUp,
+            topology: BertTopology::PreNormRms,
+            rope_interleaved: true,
+            final_norm_name: "enc.output_norm.weight",
+        },
+    ),
+    (
+        "eurobert",
+        EncoderSpec {
+            ffn: BertFfn::SwigluPar,
+            topology: BertTopology::PreNormRms,
+            rope_interleaved: false,
+            final_norm_name: "output_norm.weight",
+        },
+    ),
 ];
 
 /// `jina-bert-v2.cpp:5` assigns this as a literal; no key carries it.
 const JINA_V2_ALIBI_MAX_BIAS: f32 = 8.0;
+
+/// A `WeightMatrix` copy for the three slices of a split fused QKV.
+///
+/// `WeightMatrix` is not `Clone` (a quantized one owns its bytes and a
+/// folded one an `Arc`), and the encoder needs three owned matrices out
+/// of one fused tensor, so this dequantizes into an owned F32 matrix.
+/// Only the fused path reaches it, and only at load.
+fn clone_matrix(m: &ferrox_core::WeightMatrix) -> ferrox_core::WeightMatrix {
+    let cols = m.cols();
+    let mut data = Vec::with_capacity(m.rows() * cols);
+    for r in 0..m.rows() {
+        data.extend_from_slice(&m.dequant_row(r));
+    }
+    ferrox_core::WeightMatrix::F32(ferrox_core::Tensor::new(data, vec![m.rows(), cols]))
+}
 
 /// Reads and checks `bert.*` hparams. Fails closed on anything the
 /// graph in [`crate::bert_encoder`] does not implement.
@@ -106,6 +175,12 @@ pub fn read_bert_hparams(file: &impl TensorSource) -> Result<BertHparams, LoadEr
     check_arch(&arch)?;
     let p = |suffix: &str| format!("{arch}.{suffix}");
 
+    let spec = ENCODER_ARCHS
+        .iter()
+        .find(|(a, _)| *a == arch)
+        .map(|(_, s)| *s)
+        .expect("check_arch admitted this architecture");
+    let ffn = spec.ffn;
     let n_layer = meta_u64(file, &p("block_count"))? as usize;
     let n_embd = meta_u64(file, &p("embedding_length"))? as usize;
     let n_ff = meta_u64(file, &p("feed_forward_length"))? as usize;
@@ -119,9 +194,19 @@ pub fn read_bert_hparams(file: &impl TensorSource) -> Result<BertHparams, LoadEr
     // upstream, i.e. required: there is no sane default for a norm this
     // small (this checkpoint's is 1e-12, a thousand times tighter than
     // any RMSNorm eps in the rest of this codebase).
-    let layer_norm_eps = file
-        .metadata_f32(&p("attention.layer_norm_epsilon"))
-        .ok_or_else(|| LoadError::MissingHparam(p("attention.layer_norm_epsilon")))?;
+    // The two topologies read DIFFERENT keys, because they are
+    // different norm functions: `bert.cpp:4` reads
+    // `attention.layer_norm_epsilon` and `neo-bert.cpp:4` /
+    // `eurobert.cpp:4` read `attention.layer_norm_rms_epsilon`. Both
+    // are required by upstream, so neither gets a default here.
+    let eps_key = match spec.topology {
+        BertTopology::PostNormLayerNorm => p("attention.layer_norm_epsilon"),
+        BertTopology::PreNormRms => p("attention.layer_norm_rms_epsilon"),
+    };
+    let layer_norm_eps = match file.metadata_f32(&eps_key) {
+        Some(eps) => eps,
+        None => return Err(LoadError::MissingHparam(eps_key)),
+    };
 
     // `n_token_types` is required by upstream's own loader, which
     // throws "model needs to define token type count".
@@ -174,11 +259,6 @@ pub fn read_bert_hparams(file: &impl TensorSource) -> Result<BertHparams, LoadEr
     // `bert.cpp:126-133` rotates for the architectures listed there and
     // adds no position table for them (`:90` is gated on `bert`); the
     // two facts are one field on `BertHparams`.
-    let ffn = ENCODER_ARCHS
-        .iter()
-        .find(|(a, _)| *a == arch)
-        .map(|(_, f)| *f)
-        .expect("check_arch admitted this architecture");
     // `bert.cpp:189` decides jina-bert-v2's FFN spelling from the
     // FILE, not from the architecture: `up_contains_gate` is true when
     // there is no `ffn_gate` and `ffn_up` is wider than `n_ff`. The
@@ -195,6 +275,9 @@ pub fn read_bert_hparams(file: &impl TensorSource) -> Result<BertHparams, LoadEr
     // learned table. Three architectures, three answers, one place.
     let rope_theta = (arch != BERT_ARCH && arch != "jina-bert-v2")
         .then(|| file.metadata_f32(&p("rope.freq_base")).unwrap_or(10_000.0));
+    // The pre-norm rows read the RMS epsilon key, not the LayerNorm
+    // one (`neo-bert.cpp:4`, `eurobert.cpp:4`).
+    let _ = &spec;
     let alibi_slopes = (arch == "jina-bert-v2")
         .then(|| ferrox_core::alibi::slopes(n_head, JINA_V2_ALIBI_MAX_BIAS))
         .flatten();
@@ -213,6 +296,8 @@ pub fn read_bert_hparams(file: &impl TensorSource) -> Result<BertHparams, LoadEr
 
     Ok(BertHparams {
         arch,
+        topology: spec.topology,
+        rope_interleaved: spec.rope_interleaved,
         alibi_slopes,
         rope_theta,
         rope_dim,
@@ -313,17 +398,63 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
         None => None,
     };
 
-    let tok_norm_w = load_f32_vec(file, "token_embd_norm.weight")?;
-    let tok_norm_b = load_f32_vec(file, "token_embd_norm.bias")?;
+    // The post-norm shape norms the embeddings before layer 0
+    // (`bert.cpp:96`); the pre-norm one feeds them in raw
+    // (`neo-bert.cpp:52`, `eurobert.cpp:48`) and norms once at the end
+    // instead.
+    let (tok_norm_w, tok_norm_b, final_norm) = match hp.topology {
+        BertTopology::PostNormLayerNorm => (
+            Some(load_f32_vec(file, "token_embd_norm.weight")?),
+            Some(load_f32_vec(file, "token_embd_norm.bias")?),
+            None,
+        ),
+        BertTopology::PreNormRms => {
+            let name = ENCODER_ARCHS
+                .iter()
+                .find(|(a, _)| *a == hp.arch)
+                .map(|(_, s)| s.final_norm_name)
+                .expect("a loaded architecture is in the table");
+            (None, None, Some(load_f32_vec(file, name)?))
+        }
+    };
 
     let mut layers = Vec::with_capacity(hp.n_layer);
     for l in 0..hp.n_layer {
         let b = format!("blk.{l}");
-        reject_tensor(
-            file,
-            &format!("{b}.attn_qkv.weight"),
-            "a fused QKV projection; this graph reads separate attn_q/attn_k/attn_v",
-        )?;
+        // `neo-bert.cpp:29` stores one `n_embd + 2 * n_embd_gqa`-wide
+        // matrix where the other rows store three; every other
+        // architecture on this loader is refused for carrying it,
+        // because their graphs read the three.
+        let fused_qkv = match hp.topology {
+            BertTopology::PreNormRms => file.find_tensor(&format!("{b}.attn_qkv.weight")).is_some(),
+            BertTopology::PostNormLayerNorm => {
+                reject_tensor(
+                    file,
+                    &format!("{b}.attn_qkv.weight"),
+                    "a fused QKV projection; this graph reads separate attn_q/attn_k/attn_v",
+                )?;
+                false
+            }
+        };
+        let split = if fused_qkv {
+            let fused = load_weight_matrix(file, &format!("{b}.attn_qkv.weight"))?;
+            let q_rows = hp.n_head * hp.head_dim();
+            let kv_rows = hp.n_head_kv * hp.head_dim();
+            if fused.rows() != q_rows + 2 * kv_rows {
+                return Err(refuse(&format!(
+                    "blk.{l}.attn_qkv.weight has {} rows, expected {} (q {q_rows} + 2 x kv \
+                     {kv_rows})",
+                    fused.rows(),
+                    q_rows + 2 * kv_rows
+                )));
+            }
+            Some(crate::qkv_fused::split_fused_weight(
+                &fused,
+                crate::qkv_fused::FusedQkvRows::from_widths(q_rows, kv_rows),
+            )?)
+        } else {
+            None
+        };
         if hp.arch != "jina-bert-v2" {
             reject_tensor(
                 file,
@@ -360,16 +491,51 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
         )?;
 
         layers.push(BertLayer {
-            wq: load_weight_matrix(file, &format!("{b}.attn_q.weight"))?,
+            wq: match split.as_ref() {
+                Some((q, _, _)) => clone_matrix(q),
+                None => load_weight_matrix(file, &format!("{b}.attn_q.weight"))?,
+            },
             bq: load_f32_vec_optional(file, &format!("{b}.attn_q.bias"))?,
-            wk: load_weight_matrix(file, &format!("{b}.attn_k.weight"))?,
+            wk: match split.as_ref() {
+                Some((_, k, _)) => clone_matrix(k),
+                None => load_weight_matrix(file, &format!("{b}.attn_k.weight"))?,
+            },
             bk: load_f32_vec_optional(file, &format!("{b}.attn_k.bias"))?,
-            wv: load_weight_matrix(file, &format!("{b}.attn_v.weight"))?,
+            wv: match split.as_ref() {
+                Some((_, _, v)) => clone_matrix(v),
+                None => load_weight_matrix(file, &format!("{b}.attn_v.weight"))?,
+            },
             bv: load_f32_vec_optional(file, &format!("{b}.attn_v.bias"))?,
             wo: load_weight_matrix(file, &format!("{b}.attn_output.weight"))?,
             bo: load_f32_vec_optional(file, &format!("{b}.attn_output.bias"))?,
-            attn_out_norm_w: load_f32_vec(file, &format!("{b}.attn_output_norm.weight"))?,
-            attn_out_norm_b: load_f32_vec(file, &format!("{b}.attn_output_norm.bias"))?,
+            // The two topologies read different norm slots, and the
+            // pair is exclusive by construction: a post-norm layer has
+            // `attn_output_norm` / `layer_output_norm` and no
+            // `attn_norm`, a pre-norm layer the other way round.
+            pre_attn_norm: match hp.topology {
+                BertTopology::PostNormLayerNorm => None,
+                BertTopology::PreNormRms => {
+                    Some(load_f32_vec(file, &format!("{b}.attn_norm.weight"))?)
+                }
+            },
+            pre_ffn_norm: match hp.topology {
+                BertTopology::PostNormLayerNorm => None,
+                BertTopology::PreNormRms => {
+                    Some(load_f32_vec(file, &format!("{b}.ffn_norm.weight"))?)
+                }
+            },
+            attn_out_norm_w: match hp.topology {
+                BertTopology::PostNormLayerNorm => {
+                    Some(load_f32_vec(file, &format!("{b}.attn_output_norm.weight"))?)
+                }
+                BertTopology::PreNormRms => None,
+            },
+            attn_out_norm_b: match hp.topology {
+                BertTopology::PostNormLayerNorm => {
+                    Some(load_f32_vec(file, &format!("{b}.attn_output_norm.bias"))?)
+                }
+                BertTopology::PreNormRms => None,
+            },
             qk_norm: match load_f32_vec_optional(file, &format!("{b}.attn_q_norm.weight"))? {
                 None => None,
                 Some(q_w) => Some(crate::bert_encoder::QkLayerNorm {
@@ -386,15 +552,26 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
             ffn_up: load_weight_matrix(file, &format!("{b}.ffn_up.weight"))?,
             ffn_up_b: load_f32_vec_optional(file, &format!("{b}.ffn_up.bias"))?,
             ffn_gate: match hp.ffn {
-                BertFfn::GeluSeq | BertFfn::GegluFusedUp => None,
+                BertFfn::GeluSeq | BertFfn::GegluFusedUp | BertFfn::SwigluFusedUp => None,
                 BertFfn::SwigluPar | BertFfn::GegluPar => {
                     Some(load_weight_matrix(file, &format!("{b}.ffn_gate.weight"))?)
                 }
             },
             ffn_down: load_weight_matrix(file, &format!("{b}.ffn_down.weight"))?,
             ffn_down_b: load_f32_vec_optional(file, &format!("{b}.ffn_down.bias"))?,
-            layer_out_norm_w: load_f32_vec(file, &format!("{b}.layer_output_norm.weight"))?,
-            layer_out_norm_b: load_f32_vec(file, &format!("{b}.layer_output_norm.bias"))?,
+            layer_out_norm_w: match hp.topology {
+                BertTopology::PostNormLayerNorm => Some(load_f32_vec(
+                    file,
+                    &format!("{b}.layer_output_norm.weight"),
+                )?),
+                BertTopology::PreNormRms => None,
+            },
+            layer_out_norm_b: match hp.topology {
+                BertTopology::PostNormLayerNorm => {
+                    Some(load_f32_vec(file, &format!("{b}.layer_output_norm.bias"))?)
+                }
+                BertTopology::PreNormRms => None,
+            },
         });
     }
 
@@ -411,7 +588,7 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
                 "ffn_up",
                 &layer.ffn_up,
                 match hp.ffn {
-                    BertFfn::GegluFusedUp => 2 * hp.n_ff,
+                    BertFfn::GegluFusedUp | BertFfn::SwigluFusedUp => 2 * hp.n_ff,
                     _ => hp.n_ff,
                 },
             ),
@@ -435,6 +612,7 @@ pub fn load_bert_encoder(file: &ShardedGguf) -> Result<BertEncoder, LoadError> {
         pos_embd,
         tok_norm_w,
         tok_norm_b,
+        final_norm,
         layers,
     })
 }
@@ -448,7 +626,7 @@ mod tests {
     /// a way that would load clean and embed wrong.
     #[test]
     fn an_architecture_outside_the_table_is_refused_by_name() {
-        for arch in ["nomic-bert-moe", "neo-bert", "modern-bert", "llama"] {
+        for arch in ["nomic-bert-moe", "modern-bert", "t5encoder", "llama"] {
             assert!(
                 !ENCODER_ARCHS.iter().any(|(a, _)| *a == arch),
                 "`{arch}` is in the table; the refusal below would be wrong"
