@@ -165,8 +165,16 @@ any of these settings.
    the algorithm behind it.
 2. Server-side speculative decoding. llama.cpp parity, plan written.
 3. Multimodal. llama.cpp parity, and the largest thing on either list.
-4. Quantized safetensors and ISQ. xinfer parity only; worth doing after
-   the two llama.cpp rows.
+4. Quantized safetensors and ISQ. xInfer parity only, and both sit
+   behind something neither of them is: a GENERIC safetensors loader.
+   `grep -rln safetensors crates/frink-models/src` is Kimi K3's
+   dedicated stack and one BERT pooler, and `safetensors_f32` widens
+   exactly three float dtypes; there is no `config.json` to
+   `ModelConfig` path for an arbitrary Hugging Face checkpoint. That
+   prerequisite is most of the work and it duplicates the GGUF
+   loader's architecture mapping against HF naming, which is why it
+   ranks below the two llama.cpp rows rather than beside them.
+   llama.cpp does not read HF checkpoints either.
 
 ## Defect found on the way
 
