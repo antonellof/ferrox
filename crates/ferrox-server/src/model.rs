@@ -33,8 +33,8 @@ use ferrox_models::tokenizer::{SpecialTokens, StopTokens};
 use ferrox_models::{
     deepseek_v4_pro, glm_5_2, kimi_k3, load_gemma4_engine_from_path, load_glm52_engine_from_path,
     load_mla_engine_from_path, select_engine_kind, ByteTokenizer, Decoder, Gemma4Engine,
-    GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, Glm52Engine, KimiEngine, MlaEngine,
-    ModelConfig, SelectedEngineKind, ServedEngine, TextTokenizer,
+    GgufBpeTokenizer, GgufPlamo2Tokenizer, GgufSpmTokenizer, GgufUnigramTokenizer, Glm52Engine,
+    KimiEngine, MlaEngine, ModelConfig, SelectedEngineKind, ServedEngine, TextTokenizer,
 };
 
 /// Default expert-cache budget when `FERROX_SSD_STREAMING` is set without
@@ -153,6 +153,7 @@ pub enum ServerTokenizer {
     Bpe(Box<GgufBpeTokenizer>),
     Spm(GgufSpmTokenizer),
     Unigram(GgufUnigramTokenizer),
+    Plamo2(Box<GgufPlamo2Tokenizer>),
     Byte,
 }
 
@@ -177,6 +178,11 @@ impl ServerTokenizer {
                 .into_iter()
                 .map(|id| id as usize)
                 .collect(),
+            ServerTokenizer::Plamo2(t) => t
+                .encode(text, specials)
+                .into_iter()
+                .map(|id| id as usize)
+                .collect(),
             // A byte vocabulary has no special entries, so the setting
             // has nothing to select.
             ServerTokenizer::Byte => ByteTokenizer::encode(text)
@@ -192,6 +198,7 @@ impl ServerTokenizer {
             ServerTokenizer::Bpe(t) => t.decode(&ids32),
             ServerTokenizer::Spm(t) => t.decode(&ids32),
             ServerTokenizer::Unigram(t) => t.decode(&ids32),
+            ServerTokenizer::Plamo2(t) => t.decode(&ids32),
             ServerTokenizer::Byte => ByteTokenizer::decode(&ids32),
         }
     }
@@ -204,6 +211,7 @@ impl ServerTokenizer {
             ServerTokenizer::Bpe(t) => t.decode_bytes(&ids32),
             ServerTokenizer::Spm(t) => t.decode_bytes(&ids32),
             ServerTokenizer::Unigram(t) => t.decode_bytes(&ids32),
+            ServerTokenizer::Plamo2(t) => t.decode_bytes(&ids32),
             ServerTokenizer::Byte => ferrox_models::tokenizer::ByteTokenizer::decode_bytes(&ids32),
         }
     }
@@ -213,6 +221,7 @@ impl ServerTokenizer {
             ServerTokenizer::Bpe(_) => "gguf-bpe",
             ServerTokenizer::Spm(_) => "gguf-spm",
             ServerTokenizer::Unigram(_) => "gguf-unigram",
+            ServerTokenizer::Plamo2(_) => "gguf-plamo2",
             ServerTokenizer::Byte => "byte (no real vocabulary loaded)",
         }
     }
@@ -245,6 +254,9 @@ fn tokenizer_from_gguf(file: &ShardedGguf) -> anyhow::Result<ServerTokenizer> {
         Some("t5") => Ok(ServerTokenizer::Unigram(GgufUnigramTokenizer::from_gguf(
             file,
         )?)),
+        Some("plamo2") => Ok(ServerTokenizer::Plamo2(Box::new(
+            GgufPlamo2Tokenizer::from_gguf(file)?,
+        ))),
         // A vocabulary this engine cannot read is not a warning, it is a
         // refusal.
         //

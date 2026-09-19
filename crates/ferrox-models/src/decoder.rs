@@ -4598,6 +4598,7 @@ impl Decoder {
                     crate::layer_shapes::AttnShape::ShortConv
                     | crate::layer_shapes::AttnShape::Mamba2
                     | crate::layer_shapes::AttnShape::Mamba1
+                    | crate::layer_shapes::AttnShape::Plamo2Ssm
                     | crate::layer_shapes::AttnShape::Gdn => {
                         let out = self.recurrent_block(
                             l,
@@ -5056,6 +5057,7 @@ impl Decoder {
                     crate::layer_shapes::AttnShape::ShortConv
                     | crate::layer_shapes::AttnShape::Mamba2
                     | crate::layer_shapes::AttnShape::Mamba1
+                    | crate::layer_shapes::AttnShape::Plamo2Ssm
                     | crate::layer_shapes::AttnShape::Gdn => {
                         let mut out = Vec::with_capacity(batch_size * hidden_dim);
                         for b in 0..batch_size {

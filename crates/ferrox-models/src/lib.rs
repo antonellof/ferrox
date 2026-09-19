@@ -89,6 +89,7 @@ pub mod output_projection;
 pub mod parallel_dense_ffn;
 pub mod parallel_residual;
 pub mod penalty_window;
+pub mod plamo2_ssm;
 pub mod pooling;
 pub mod position_embd;
 pub mod prefix_cache;
@@ -171,7 +172,7 @@ pub use speculative::{
 };
 pub use tensor_role::TensorRole;
 pub use tokenizer::{
-    ByteTokenizer, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer,
+    ByteTokenizer, GgufBpeTokenizer, GgufPlamo2Tokenizer, GgufSpmTokenizer, GgufUnigramTokenizer,
     GgufWordPieceTokenizer, NormalizerOptions, TokenizerLoadError,
 };
 

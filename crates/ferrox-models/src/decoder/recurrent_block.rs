@@ -36,13 +36,26 @@ impl Decoder {
         rows: usize,
         kv: KvStep<'_>,
     ) -> Vec<f32> {
-        match self.config.layer_shape(layer_idx).attention {
+        let mut out = match self.config.layer_shape(layer_idx).attention {
             AttnShape::ShortConv => self.shortconv_block(layer_idx, layer, normed, rows, kv),
-            AttnShape::Mamba1 | AttnShape::Mamba2 | AttnShape::Gdn => {
+            AttnShape::Mamba1 | AttnShape::Mamba2 | AttnShape::Plamo2Ssm | AttnShape::Gdn => {
                 self.ssm_block(layer_idx, layer, normed, rows, kv)
             }
             other => unreachable!("layer {layer_idx} is {other:?}, not a recurrent block"),
+        };
+        // `plamo2.cpp:150`: the block's output under `attn_post_norm`
+        // before the residual add, the same site the attention tail
+        // applies it at (`attn_out_to_residual_rows`). Loaded only for
+        // the shape whose graph creates it (`layer_shapes::
+        // load_non_gqa_attention`), so this is a no-op elsewhere.
+        if let Some(post) = &layer.attn.post_attn_norm {
+            let hidden = post.len();
+            out = out
+                .chunks(hidden)
+                .flat_map(|row| ferrox_core::matmul::rms_norm(row, post, self.config.rms_norm_eps))
+                .collect();
         }
+        out
     }
 
     /// LFM2's short convolution. Each row's `bx` is pushed to the

@@ -46,8 +46,8 @@ use anyhow::Context;
 use corpus::{Case, CORPUS};
 use ferrox_gguf::ShardedGguf;
 use ferrox_models::tokenizer::{
-    should_add_bos_token, GgufBpeTokenizer, GgufSpmTokenizer, GgufUnigramTokenizer,
-    GgufWordPieceTokenizer, SpecialTokens,
+    should_add_bos_token, GgufBpeTokenizer, GgufPlamo2Tokenizer, GgufSpmTokenizer,
+    GgufUnigramTokenizer, GgufWordPieceTokenizer, SpecialTokens,
 };
 use std::path::Path;
 use std::process::Command;
@@ -155,6 +155,8 @@ enum Encoder {
     /// `tokenizer.ggml.model == "bert"`, i.e. WordPiece — every BGE,
     /// E5, nomic-embed, jina-embed and GTE checkpoint.
     WordPiece(GgufWordPieceTokenizer),
+    /// `tokenizer.ggml.model == "plamo2"`, PLaMo-2's suffix-table segmenter.
+    Plamo2(Box<GgufPlamo2Tokenizer>),
 }
 
 impl Encoder {
@@ -164,9 +166,10 @@ impl Encoder {
             Some("llama") => Encoder::Spm(GgufSpmTokenizer::from_gguf(file)?),
             Some("t5") => Encoder::Unigram(GgufUnigramTokenizer::from_gguf(file)?),
             Some("bert") => Encoder::WordPiece(GgufWordPieceTokenizer::from_gguf(file)?),
+            Some("plamo2") => Encoder::Plamo2(Box::new(GgufPlamo2Tokenizer::from_gguf(file)?)),
             other => anyhow::bail!(
                 "parity does not cover tokenizer {other:?} — it builds gpt2/gemma4 (BPE), \
-                 llama (SPM), t5 (unigram) and bert (WordPiece) vocabularies only"
+                 llama (SPM), t5 (unigram), bert (WordPiece) and plamo2 vocabularies only"
             ),
         })
     }
@@ -177,6 +180,7 @@ impl Encoder {
             Encoder::Spm(t) => t.encode(text, mode),
             Encoder::Unigram(t) => t.encode(text, mode),
             Encoder::WordPiece(t) => t.encode(text, mode),
+            Encoder::Plamo2(t) => t.encode(text, mode),
         }
     }
 
@@ -191,6 +195,7 @@ impl Encoder {
             Encoder::Spm(t) => t.decode(&[id]),
             Encoder::Unigram(t) => t.decode(&[id]),
             Encoder::WordPiece(t) => t.decode(&[id]),
+            Encoder::Plamo2(t) => t.decode(&[id]),
         }
     }
 
@@ -200,6 +205,7 @@ impl Encoder {
             Encoder::Spm(t) => t.vocab_size(),
             Encoder::Unigram(t) => t.vocab_size(),
             Encoder::WordPiece(t) => t.vocab_size(),
+            Encoder::Plamo2(t) => t.vocab_size(),
         }
     }
 }

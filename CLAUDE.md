@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-14. **92** architectures run with
+Honest position, re-audited 2026-09-18. **93** architectures run with
 evidence (`capability::AUDITED_GENERIC_GQA`), 4 more have dedicated
 engines, and everything else REFUSES. The "loads and is WRONG" class is
 closed: the generic path is opt-in, so an unaudited architecture stops
@@ -1001,8 +1001,8 @@ Granite-4.0 hybrid export and no row could match without it. KL
 with the shared expert), `tests/granite_hybrid_graphs.rs`; resetting
 the state every token or dropping the `exp` from the decay turns five
 tests red. `nemotron-h` (one block per layer), `falcon-h1` (attention
-and Mamba-2 in PARALLEL), `jamba` and `plamo2` (Mamba-1) each name
-what they still need in `layer_shapes::ZeroKvLayer`.
+and Mamba-2 in PARALLEL), `jamba` and `plamo2` (Mamba-1) each named
+what they still needed in `layer_shapes::ZeroKvLayer`; all three have closed since.
 
 `nemotron_h` (Nemotron-H 8B / 47B / 56B, Nemotron-3 Nano dense) closed
 the same day on that seam, and what it added is two table rows and no
@@ -1056,6 +1056,44 @@ every token turns six tests red. Every `build_mamba2_layer` caller
 of the 140 graphs is served; `jamba`, `plamo2` and `mamba` are
 `build_mamba_layer` (Mamba-1) and said so.
 
+`plamo2` (PLaMo-2 1B / 2B / 8B) closed on 2026-09-18 on its own SSM
+spelling, `ferrox-models/src/plamo2_ssm.rs`: Mamba-1's dt / B / C path
+(one projection of the conv output, REQUIRED weighted norms) in the
+order B, C, dt, feeding Mamba-2's per-head scan (dt, A, D per head,
+`head_dim = d_inner / n_heads`, `Decay::PerHead`), z and x interleaved
+PER HEAD in `ssm_in`'s output, no conv bias, `dt_dim = max(64,
+n_embd / 16)` a literal of the graph (`plamo2.cpp:38,285`), and the
+three norm tensors spelled with NO `.weight` (the two-argument `tn`,
+`:77-79`, and the converter's exact-match entries). Its attention is
+the generic path plus one QK-norm style: `QkNormStyle::
+PerHeadDistinct`, RMS per head with a DISTINCT weight row per head
+(`{qk_dim, n_head}`, `:92-93,163,166`), the same length as a
+whole-vector weight and so decided by architecture (`capability::
+PER_HEAD_DISTINCT_QK_NORM`, one RMS row of the five graphs that
+create that shape); the fused Metal / CUDA launches refuse the style.
+And `plamo2.cpp:19` reads only `n_head_kv(il)`, while the converter
+writes BOTH head arrays as 0 on an SSM layer, so `(0, 0)` means the
+block on this architecture (`AttnShape::Plamo2Ssm`) and deci's
+attention-free layer everywhere else. KL 3.0e-12 on both head-count
+spellings (`tests/plamo2_graphs.rs`); swapping B and C turns it red.
+The finding is llama.cpp's: `llama-model.cpp:1189-1201` seed `n_rot`
+from layer 0's head count and set it to 0 when that is 0, so libllama
+runs every current PLaMo-2 export UNROTATED (`print_info: n_rot = 0`,
+measured; 1.3 in the logits), and `rope.dimension_count` cannot
+restore it because that read sits inside the same branch. ferrox
+rotates, as `modeling_plamo.py` does and as `:239,245` were written
+to; the golden is the same weights with `head_count` scalar, an
+equally valid file libllama rotates, and the unrotated logits are
+kept beside it as a number. The real checkpoint also needed the
+`plamo2` TOKENIZER (`tokenizer/plamo2.rs`, a port of
+`llm_tokenizer_plamo2`, `llama-vocab.cpp:1351-1616`: a suffix-table
+segmenter searched backwards, `<0xXX>` byte fallback), which
+`ferrox parity` holds byte-identical to libllama on 1,264 tokens of
+the corpus, CJK and emoji included. On the one public GGUF
+(`mmnga/plamo-2-1b-gguf`, an older conversion with a scalar
+`head_count`) libllama itself returns all-NaN logits; ferrox answers
+"Paris. Paris is the capital of France."
+
 `jamba`, `mamba` and `mamba2` closed next on that block and on one
 rule. `ferrox-models/src/mamba1.rs` is `build_mamba_layer`
 (`mamba-base.cpp:4-148`) once: the same conv step and the same scan
@@ -1081,7 +1119,7 @@ false`. KL 7.3e-12 / 2.3e-12 / 1.8e-12 / 3.6e-13
 (`tests/mamba_graphs.rs`), the Mamba-1 rows at the `orion` tolerance
 class because `d_inner` one-element heads each take their own `exp`;
 swapping B and C turns five tests red. Every Mamba graph in llama.cpp
-is served but `plamo2`'s own spelling.
+is served but `plamo2`'s own spelling, which closed on 2026-09-18 (below).
 
 `qwen35` (Qwen3.5 dense, 0.8B to 27B) closed next, and it is the row
 the "hybrid engine" had been a scaffold FOR since 2026-09-01: 852

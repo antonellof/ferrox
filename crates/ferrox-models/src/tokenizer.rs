@@ -25,9 +25,12 @@
 //! [`GgufSpmTokenizer`], `t5` by [`GgufUnigramTokenizer`], and `bert` by
 //! [`GgufWordPieceTokenizer`] in `wordpiece`, which brings its own
 //! normalizer and its own Unicode tables (`unicode`, `unicode_data`)
-//! because WordPiece does not use the pre-tokenizer regexes at all.
-//! Still missing: `rwkv`, which needs a trie tokenizer, and `none`.
+//! because WordPiece does not use the pre-tokenizer regexes at all,
+//! and `plamo2` by [`GgufPlamo2Tokenizer`] in `plamo2`, a suffix-table
+//! segmenter. Still missing: `rwkv`, which needs a trie tokenizer, and
+//! `none`.
 
+mod plamo2;
 mod pretokenize;
 mod scored_vocab;
 mod special;
@@ -35,6 +38,7 @@ mod unicode;
 mod unicode_data;
 mod wordpiece;
 
+pub use plamo2::GgufPlamo2Tokenizer;
 use scored_vocab::ScoredVocab;
 pub use special::SpecialTokens;
 pub(crate) use special::{SpecialKind, SpecialTokenTable, TextOrSpecial};
@@ -401,6 +405,11 @@ pub enum TokenizerLoadError {
          needs one score per token; this checkpoint cannot be tokenized"
     )]
     ScoresVocabLengthMismatch { tokens: usize, scores: usize },
+    #[error(
+        "PLaMo-2 vocabulary has no byte token <0x{byte:02X}>: llama-vocab.cpp:1400-1404 refuses \
+         the file for the same reason, because a character no piece covers is spelled in these"
+    )]
+    Plamo2ByteTokenMissing { byte: u8 },
 }
 
 impl GgufBpeTokenizer {
