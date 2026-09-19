@@ -331,7 +331,46 @@ and 5 ms a token; the rest is the PTQ1_0 matvecs, which
 `gemm_throughput_probe` and the six measured non-results below say are
 close to what this kernel shape gives.
 
-## What is left, and what it is worth
+## The limit, which is not where this plan assumed
+
+Our GPU time for a decode token is **88.8 ms**. The reference's WHOLE
+token is 86.7 to 87.3 ms. So:
+
+    every submission removed, every host microsecond removed  ->  88.8 ms = 11.26 tok/s
+    the reference                                                 86.7-87.3 ms = 11.45-11.54
+
+**Scheduling cannot reach parity.** Not the fused branch, not the fused
+layer, not the runs, not the attention layers, not one command buffer
+for the whole token: the limit of all of it together is about 2% SHORT,
+because the kernels themselves are about 2% slower than the reference's
+and everything else is already overhead that can only go to zero.
+
+That is worth stating plainly because this plan spent four rounds on
+the premise that the gap was the submission count. It WAS, for 7.10 to
+10.12 tok/s. It is not any more, and the table below prices what is
+left of it precisely so nobody spends a fifth round finding that out.
+
+| | waits | latency | token | tok/s |
+|---|---|---|---|---|
+| today | 69 | 11.7 ms | 100.5 ms | 9.95 - 10.17 |
+| the attention TAIL fused (`wo` + residual + norm + FFN) | 53 | 9.0 ms | 97.8 ms | 10.22 |
+| the attention LAYER fused | 37 | 6.3 ms | 95.1 ms | 10.52 |
+| the whole token as ONE run | 2 | 0.3 ms | 89.1 ms | 11.22 |
+| **the floor, at today's kernels** | 0 | 0 | **88.8 ms** | **11.26** |
+
+So the work that closes this is in the PTQ1_0 matvec's inner loop and
+nowhere else, and it needs about 3% -- which is small, but three
+hypotheses against it (a four-row prefetch, wider loads, eight rows a
+threadgroup) measured NEUTRAL, and both concurrency schemes measured
+flat or worse because one matvec already saturates the part. The next
+idea has to be a different kernel, not a different schedule: the decode
+is 42% of it, and the only untried shape is a lookup of the five trits
+of a byte out of threadgroup memory rather than five `floor`s on the
+float pipe. That has a recorded failure behind it (the FIRST version of
+this kernel decoded with integer ops and reached 2.4 tok/s), so it would
+have to be the table WITHOUT the rest of that version's shape.
+
+## What the scheduling steps are worth
 
 Waits per token are 69: sixteen `gdn-run` (three recurrent layers each),
 thirty-five `matvec-fused` and eighteen `dense-ffn`, and forty-eight of
