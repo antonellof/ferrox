@@ -60,6 +60,22 @@ are the ones worth reading twice.
   reference's own approximation, measured rather than assumed
   (`tests/gated_attention_graphs.rs`).
 
+- **`granite_swa` runs (Granite 4.1)**, the third row closed against
+  the moved pin and the first architecture anywhere that lets the FILE
+  say which layers rotate. `src/models/granite-swa.cpp:43` reads
+  `{arch}.attention.rope_pattern`, one entry per layer, and
+  `llama_hparams::has_rope` (`llama-hparams.cpp:333-343`) is what the
+  graph asks at `:212`; `ferrox_models::rope_layers::RopeLayers::
+  FileMask` is that mask and `ROPE_PATTERN_READERS` is the census (one
+  line of 155, so the key stays dead metadata everywhere else, exactly
+  as `llama-model.cpp:1314` leaves it). Everything else it needed was
+  served and each table gained one name: Granite's four multipliers,
+  the window ARRAY, the REQUIRED per-layer attention sinks, all four
+  optional projection biases, and the `attention.scale` override. The
+  fixture's window array and rope pattern DISAGREE about which layer is
+  special, so a loader that read one into the other is caught
+  (`tests/granite_swa_graphs.rs`).
+
 - **`maple` runs (Maple-20B)**, the second row closed against the moved
   pin, and the one that says what a verdict read from a single graph
   file can miss. The row itself was one `crate::rope_layers` entry --

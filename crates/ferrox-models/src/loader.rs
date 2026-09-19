@@ -754,6 +754,25 @@ impl ModelConfig {
                 );
                 (hidden_dim * 4) as u64
             }) as usize;
+        // `{arch}.attention.rope_pattern`: one entry per layer, nonzero
+        // meaning "this layer rotates" (`llama-hparams.cpp:333-343`).
+        // Read only where llama.cpp reads it, because
+        // `llama-model.cpp:1314` seeds the array with 1 for every
+        // architecture and only `granite-swa.cpp:43` reads it back --
+        // so honouring it elsewhere would answer differently from
+        // upstream on a file that carries it as dead metadata.
+        let rope_pattern: Option<std::sync::Arc<[bool]>> =
+            if crate::rope_layers::reads_rope_pattern(&arch) {
+                crate::layer_shapes::read_u64_per_layer(
+                    file,
+                    &key("attention.rope_pattern"),
+                    block_count,
+                )?
+                .map(|v| v.into_iter().map(|x| x != 0).collect())
+            } else {
+                None
+            };
+
         // Qwen3.5's recurrent layers come from two keys, not from the
         // head counts (`crate::gdn::recurrent_layers`).
         let recurrent_layers =
@@ -1541,6 +1560,10 @@ impl ModelConfig {
             // two must not be able to disagree.
             rope_layers: if rope_switched_off {
                 crate::rope_layers::RopeLayers::Never
+            } else if let Some(mask) = rope_pattern.clone() {
+                // The FILE's answer, for the one architecture that
+                // reads the key (`rope_layers::ROPE_PATTERN_READERS`).
+                crate::rope_layers::RopeLayers::FileMask(mask)
             } else {
                 crate::rope_layers::rope_layers(
                     &arch,

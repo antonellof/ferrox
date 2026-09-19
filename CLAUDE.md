@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-19 against a MOVED PIN. **95**
+Honest position, re-audited 2026-09-19 against a MOVED PIN. **96**
 architectures run with evidence (`capability::AUDITED_GENERIC_GQA`), 4
 more have dedicated engines, and everything else REFUSES. The "loads
 and is WRONG" class is closed: the generic path is opt-in, so an
@@ -60,11 +60,27 @@ cannot tell them apart. Reading the graph file is not enough when the
 graph calls a GENERIC builder: the builder branches on the
 architecture too.
 
-So **eight** triaged refusals are left, and they say which of three
+`granite_swa` (Granite 4.1) closed the same day as the third row, on
+`RopeLayers::FileMask`: `granite-swa.cpp:43` reads
+`attention.rope_pattern`, one entry per layer, and it is the FIRST
+upstream graph that lets the FILE say which layers rotate where every
+other per-layer RoPE gate here is a rule read out of a literal
+(`grep -rn LLM_KV_ATTENTION_ROPE_PATTERN src/models/*.cpp` is that one
+line; `llama-model.cpp:1314` seeds the array with 1 for everyone, so
+honouring it elsewhere would diverge on a file carrying it as dead
+metadata). Its other blocker, the `expert_used_count` ARRAY, had
+already been fixed as a silent default. The fixture's window array and
+rope pattern DISAGREE about which layer is special -- layer 1 is the
+full-attention one, layer 2 the unrotated one -- so a loader that read
+either into the other's field is caught by the golden rather than by
+luck.
+
+So **seven** triaged refusals are left, and they say which of three
 things is missing: **0 are a fixture away, 0 are one match arm away**,
-7 need new code, 1 is unknown with the question stated. Both cheap
+6 need new code, 1 is unknown with the question stated. Both cheap
 classes are EMPTY again, which is where they were before the pin
-moved.
+moved, and the three rows that closed were the three cheapest of the
+eight it brought in.
 
 Three things the pin move found that are not new architectures at all:
 `kimi_k3` had been spelled with an UNDERSCORE in the catalog since it
