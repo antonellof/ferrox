@@ -797,6 +797,103 @@ impl GdnRun {
         Ok(())
     }
 
+    /// An ATTENTION layer's tail at the head of this run: `wo`, the
+    /// residual add, the FFN norm, the FFN and the second residual add,
+    /// committed but NOT waited for.
+    ///
+    /// A hybrid alternates three recurrent layers and one attention
+    /// layer, and the attention layer's tail feeds the next three. Its
+    /// output is the residual stream they read, which the host never
+    /// looks at, so it belongs in their command buffer rather than one
+    /// of its own: sixteen waits a token.
+    ///
+    /// `residual` is ignored when the run already holds the stream --
+    /// which it does from [`Self::start`] -- and the tail writes back
+    /// into that same buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_tail(
+        &mut self,
+        out_proj: &MatvecLaunch<'_>,
+        fold_branch: Option<&FoldPlan<'_>>,
+        ffn: &LayerFfn<'_>,
+        branch: &[f32],
+    ) -> Result<(), MetalError> {
+        let hidden = self.rows;
+        let branch_cols = out_proj.row_bytes / out_proj.block_bytes * out_proj.block_elems;
+        if out_proj.rows != hidden
+            || branch.len() != branch_cols
+            || ffn.norm.len() != hidden
+            || ffn.gate.rows != ffn.up.rows
+            || ffn.down.rows != hidden
+        {
+            return Err(MetalError::CommandFailed);
+        }
+        let shared = shared_metal()?;
+        let device = &shared.device;
+        let scratch = crate::scratch_pool::Scratch::take(device, &[branch_cols, hidden])
+            .ok_or(MetalError::BufferAllocFailed)?;
+        let branch_buf = scratch.write(0, branch).ok_or(MetalError::CommandFailed)?;
+        let proj_buf = scratch.buf(1);
+        let tail = crate::scratch_pool::Scratch::take(
+            device,
+            &[
+                hidden,
+                hidden,
+                ffn.gate.rows,
+                ffn.up.rows,
+                ffn.gate.rows,
+                hidden,
+            ],
+        )
+        .ok_or(MetalError::BufferAllocFailed)?;
+        let out_w = resident_weight_buffer(device, out_proj.weights)?;
+        let signs = match fold_branch.and_then(|p| p.signs) {
+            None => None,
+            Some(sg) => {
+                // SAFETY: a `&[f32]` viewed as its own bytes, read only.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(sg.as_ptr() as *const u8, std::mem::size_of_val(sg))
+                };
+                Some(resident_weight_buffer(device, bytes)?)
+            }
+        };
+        let cmd_buf = shared
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandFailed)?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?;
+        encode_attn_tail(
+            &encoder,
+            device,
+            out_proj,
+            &out_w,
+            fold_branch,
+            signs.as_ref().map(|b| &*b.buffer),
+            ffn,
+            branch_buf,
+            branch_cols,
+            proj_buf,
+            &tail,
+            &[],
+            // The run's own stream: the tail reads it as the residual
+            // and writes the layer's output back into it.
+            Some(self.hidden.buf(0)),
+            hidden,
+        )?;
+        encoder.endEncoding();
+        cmd_buf.commit();
+        self.keep.push(ScratchSet {
+            main: scratch,
+            head: None,
+            ffn: Some(tail),
+        });
+        self.last = Some(cmd_buf);
+        self.submissions += 1;
+        Ok(())
+    }
+
     /// Waits for every layer committed so far and returns the residual
     /// stream.
     pub fn finish(self) -> Result<Vec<f32>, MetalError> {
@@ -825,6 +922,40 @@ impl GdnRun {
             .to_vec()
         })
     }
+}
+
+/// `wo` on the attention branch, then the FFN tail, encoded into the
+/// caller's command buffer.
+///
+/// The ONE attention tail: [`launch_attn_tail`] wraps it in a command
+/// buffer of its own and waits, and [`GdnRun::attn_tail`] puts it at
+/// the head of a RUN, where it shares the single wait with the
+/// recurrent layers that follow it.
+#[allow(clippy::too_many_arguments)]
+fn encode_attn_tail<'b>(
+    encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    device: &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    out_proj: &MatvecLaunch<'_>,
+    out_w: &crate::gpu::ResidentWeightBuffer,
+    fold_branch: Option<&FoldPlan<'_>>,
+    signs: Option<&ProtocolObject<dyn MTLBuffer>>,
+    ffn: &LayerFfn<'_>,
+    branch_buf: &ProtocolObject<dyn MTLBuffer>,
+    branch_cols: usize,
+    proj_buf: &ProtocolObject<dyn MTLBuffer>,
+    tail: &'b crate::scratch_pool::Scratch,
+    residual: &[f32],
+    h_ext: Option<&'b ProtocolObject<dyn MTLBuffer>>,
+    hidden: usize,
+) -> Result<&'b ProtocolObject<dyn MTLBuffer>, MetalError> {
+    if let Some(plan) = fold_branch {
+        plan.check(branch_cols)?;
+        crate::hadamard::encode_fold(encoder, device, branch_buf, branch_cols, plan, signs)?;
+    }
+    encode_matvec(encoder, device, out_proj, out_w, branch_buf, proj_buf)?;
+    encode_ffn_tail(
+        encoder, device, ffn, tail, proj_buf, residual, h_ext, hidden,
+    )
 }
 
 /// An ATTENTION layer's tail in one command buffer: `wo`, the residual
@@ -912,20 +1043,21 @@ pub fn launch_attn_tail(
         .computeCommandEncoder()
         .ok_or(MetalError::CommandFailed)?;
     let encoder = &*encoder;
-    if let Some(plan) = fold_branch {
-        plan.check(branch_cols)?;
-        crate::hadamard::encode_fold(
-            encoder,
-            device,
-            branch_buf,
-            branch_cols,
-            plan,
-            signs.as_ref().map(|b| &*b.buffer),
-        )?;
-    }
-    encode_matvec(encoder, device, out_proj, &out_w, branch_buf, proj_buf)?;
-    let result = encode_ffn_tail(
-        encoder, device, ffn, &tail, proj_buf, residual, None, hidden,
+    let result = encode_attn_tail(
+        encoder,
+        device,
+        out_proj,
+        &out_w,
+        fold_branch,
+        signs.as_ref().map(|b| &*b.buffer),
+        ffn,
+        branch_buf,
+        branch_cols,
+        proj_buf,
+        &tail,
+        residual,
+        None,
+        hidden,
     )?;
     encoder.endEncoding();
     let clock = crate::timing::SubmitClock::start();

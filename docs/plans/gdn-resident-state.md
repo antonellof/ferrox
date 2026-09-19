@@ -380,6 +380,25 @@ head, the smallest context anyone measures -- it reads 10.33 against
 for: a tg32 token spends more time forking than attending, and a real
 one does not.
 
+## The attention tail rides in the next run
+
+A hybrid alternates three recurrent layers and one attention layer, and
+the attention layer's tail FEEDS the next three: its output is the
+residual stream they read, which the host never looks at. So it belongs
+in their command buffer, not one of its own
+(`GdnRun::attn_tail`). Fifteen of sixteen tails a token move that way;
+the last has no recurrent layer behind it and keeps the standalone
+launch.
+
+Waits a token: 51 to 36. Interleaved at a 300-token context:
+
+    10.61 / 10.50 tok/s   with
+    10.29                 without
+
+`encode_attn_tail` is the one encoder both paths share, and
+`Decoder::attn_tail_launch` the one builder, so the standalone launch
+and the run cannot disagree about the fold width or the refusals.
+
 ## The limit, which is not where this plan assumed
 
 Our GPU time for a decode token is **88.8 ms**. The reference's WHOLE
@@ -402,7 +421,8 @@ left of it precisely so nobody spends a fifth round finding that out.
 | | waits | latency | token | tok/s |
 |---|---|---|---|---|
 | before the tail was fused | 69 | 11.7 ms | 100.5 ms | 10.29 |
-| **the attention TAIL fused (`wo` + residual + norm + FFN), today** | **51** | **8.7 ms** | **97.5 ms** | **10.59** |
+| the attention TAIL fused (`wo` + residual + norm + FFN) | 51 | 8.7 ms | 97.5 ms | 10.59 |
+| **the tail riding in the next run, today** | **36** | **6.1 ms** | **94.9 ms** | **10.6 - 10.8** |
 | the attention LAYER fused | 37 | 6.3 ms | 95.1 ms | 10.52 |
 | the whole token as ONE run | 2 | 0.3 ms | 89.1 ms | 11.22 |
 | **the floor, at today's kernels** | 0 | 0 | **88.8 ms** | **11.26** |
