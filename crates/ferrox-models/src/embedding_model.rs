@@ -25,6 +25,11 @@ use crate::tokenizer::{GgufWordPieceTokenizer, SpecialTokens, TokenizerLoadError
 /// that this crate does not have. Used to refuse *by name* instead of
 /// with a generic "unsupported".
 const NOT_YET: &[(&str, &str)] = &[
+    // `jina-bert-v2` was HERE until 2026-09-19: GEGLU in both its
+    // spellings (a separate gate, or one fused into a `2 * n_ff`-wide
+    // `ffn_up`), the second attention norm, the whole-projection QK
+    // LayerNorm and ALiBi at a literal 8.0 are all served now
+    // (`tests/bert_family_graphs.rs`).
     // `jina-bert-v3` was HERE until 2026-09-19, refused for "RoPE and
     // per-projection QK norm". The first half is served
     // (`nomic-bert`'s rotation) and the second half was WRONG:
@@ -43,7 +48,6 @@ const NOT_YET: &[(&str, &str)] = &[
         "nomic-bert-moe",
         "a second FFN shape on its MoE layers (moe_every_n_layers)",
     ),
-    ("jina-bert-v2", "GEGLU and a second attention norm"),
     ("neo-bert", "per-projection QK norm"),
     (
         "modern-bert",

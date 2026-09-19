@@ -3014,15 +3014,25 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
                 DeferredEncoderEmbedding,
                 "encoder/embedding; deferred",
             ),
+            // Served since 2026-09-19 on the same encoder as `bert`
+            // (ALiBi, GEGLU and two optional norms);
+            // deferred from the DECODER path, which is where the
+            // scope column speaks from -- it has no output head.
             (
                 "jina-bert-v2",
                 DeferredEncoderEmbedding,
-                "encoder/embedding; deferred",
+                "encoder; no output head, so never a decoder -- served by \
+                 ferrox_models::EmbeddingModel on /v1/embeddings",
             ),
+            // Served since 2026-09-19 on the same encoder as `bert`
+            // (its rotation with `bert`'s FFN);
+            // deferred from the DECODER path, which is where the
+            // scope column speaks from -- it has no output head.
             (
                 "jina-bert-v3",
                 DeferredEncoderEmbedding,
-                "encoder/embedding; deferred",
+                "encoder; no output head, so never a decoder -- served by \
+                 ferrox_models::EmbeddingModel on /v1/embeddings",
             ),
             (
                 "eurobert",

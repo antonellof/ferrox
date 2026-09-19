@@ -96,6 +96,17 @@ pub struct BertHparams {
     pub rope_dim: usize,
     /// The FFN this architecture runs (`bert.cpp:179-201`).
     pub ffn: BertFfn,
+    /// ALiBi slopes, one per head, for the architecture whose graph
+    /// carries a positional bias instead of a table or a rotation.
+    ///
+    /// `jina-bert-v2.cpp:5` sets `f_max_alibi_bias = 8.0f` as a
+    /// LITERAL and `bert.cpp:78-80` builds no `inp_pos` for it at all,
+    /// so this is the only place position enters that model. The bias
+    /// is SYMMETRIC here -- `llama-graph.cpp:442` fills the mask with
+    /// `-|p0 - p1|` for a non-causal model, where the decoder's is
+    /// `p_key - p_query` -- which is why the encoder computes its own
+    /// rather than calling the decoder's row helper.
+    pub alibi_slopes: Option<Vec<f32>>,
     pub pooling: PoolingType,
     /// `[CLS]` / `[SEP]`, from `tokenizer.ggml.bos_token_id` and
     /// `tokenizer.ggml.seperator_token_id` (upstream's spelling of the
@@ -127,6 +138,23 @@ pub enum BertFfn {
     GeluSeq,
     /// `down(silu(gate(x)) * up(x))`, no biases.
     SwigluPar,
+    /// `down(gelu(gate(x)) * up(x))`: `jina-bert-v2` with a separate
+    /// `ffn_gate` (`bert.cpp:188-194` picks `LLM_FFN_GELU` under
+    /// `LLM_FFN_PAR`, which `build_ffn` turns into `ggml_geglu_split`).
+    GegluPar,
+    /// The same function with the gate FUSED into `ffn_up`: the matrix
+    /// is `2 * n_ff` rows and `ggml_geglu` splits it, the FIRST half
+    /// being the gate (`bert.cpp:189`, `up_contains_gate`).
+    GegluFusedUp,
+}
+
+/// One layer's Q/K LayerNorm pair, weights and biases.
+#[derive(Debug, Clone)]
+pub struct QkLayerNorm {
+    pub q_w: Vec<f32>,
+    pub q_b: Vec<f32>,
+    pub k_w: Vec<f32>,
+    pub k_b: Vec<f32>,
 }
 
 pub struct BertLayer {
@@ -138,9 +166,19 @@ pub struct BertLayer {
     pub bv: Option<Vec<f32>>,
     pub wo: WeightMatrix,
     pub bo: Option<Vec<f32>>,
+    /// A LayerNorm over the WHOLE Q / K projection, with biases, when
+    /// the file carries one (`bert.cpp:109-123`; `jina-bert-v2.cpp:
+    /// 30-35` creates the pair optional). Not per head: the reshape at
+    /// `:110` is `n_embd_head * n_head` wide, so one norm covers every
+    /// head's channels together.
+    pub qk_norm: Option<QkLayerNorm>,
     /// `attn_output_norm`, applied after the attention residual.
     pub attn_out_norm_w: Vec<f32>,
     pub attn_out_norm_b: Vec<f32>,
+    /// `attn_norm_2`, `jina-bert-v2`'s second attention norm
+    /// (`bert.cpp:156-159`): the LAYER INPUT is re-added and normed a
+    /// second time before the FFN reads it.
+    pub attn_norm_2: Option<(Vec<f32>, Vec<f32>)>,
     pub ffn_up: WeightMatrix,
     pub ffn_up_b: Option<Vec<f32>>,
     /// `ffn_gate`, present exactly for [`BertFfn::SwigluPar`].
@@ -209,6 +247,7 @@ fn softmax_row(scores: &mut [f32]) {
 /// `[n][n_head_kv * head_dim]`. **Every query row attends to every key
 /// row** — there is no mask argument here on purpose, so a causal mask
 /// cannot be added by accident.
+#[allow(clippy::too_many_arguments)]
 fn bidirectional_attention(
     q: &[f32],
     k: &[f32],
@@ -217,6 +256,11 @@ fn bidirectional_attention(
     n_head: usize,
     n_head_kv: usize,
     head_dim: usize,
+    // One slope per head, or `None`. The bias is `-slope * |i - j|`:
+    // SYMMETRIC, because `llama-graph.cpp:442` fills a non-causal
+    // model's mask with `-|p0 - p1|` and `ggml_soft_max_ext`
+    // multiplies it by the head's slope.
+    alibi_slopes: Option<&[f32]>,
 ) -> Vec<f32> {
     let q_width = n_head * head_dim;
     let kv_width = n_head_kv * head_dim;
@@ -228,11 +272,15 @@ fn bidirectional_attention(
         let kv_h = h / heads_per_kv;
         let q_off = h * head_dim;
         let kv_off = kv_h * head_dim;
+        let slope = alibi_slopes.map(|s| s[h]);
         for i in 0..n {
             let qi = &q[i * q_width + q_off..i * q_width + q_off + head_dim];
             for (j, s) in scores.iter_mut().enumerate() {
                 let kj = &k[j * kv_width + kv_off..j * kv_width + kv_off + head_dim];
                 *s = qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
+                if let Some(slope) = slope {
+                    *s += slope * -((i as f32 - j as f32).abs());
+                }
             }
             softmax_row(&mut scores);
             let dst = &mut out[i * q_width + q_off..i * q_width + q_off + head_dim];
@@ -392,6 +440,26 @@ impl TextEncoder for BertEncoder {
             add_bias_rows(&mut k, self.hp.n_head_kv * head_dim, layer.bk.as_ref());
             add_bias_rows(&mut v, self.hp.n_head_kv * head_dim, layer.bv.as_ref());
 
+            if let Some(qk) = &layer.qk_norm {
+                // `bert.cpp:109-123`: a LayerNorm over the whole
+                // projection, BEFORE the rotation below, which is the
+                // order the graph builds them in.
+                layer_norm_rows(
+                    &mut q,
+                    self.hp.n_head * head_dim,
+                    &qk.q_w,
+                    &qk.q_b,
+                    self.hp.layer_norm_eps,
+                );
+                layer_norm_rows(
+                    &mut k,
+                    self.hp.n_head_kv * head_dim,
+                    &qk.k_w,
+                    &qk.k_b,
+                    self.hp.layer_norm_eps,
+                );
+            }
+
             if let Some(theta) = self.hp.rope_theta {
                 // `bert.cpp:126-133`, NEOX (`llama_model_rope_type`),
                 // over the first `rope_dim` channels of every head and
@@ -410,8 +478,16 @@ impl TextEncoder for BertEncoder {
                 }
             }
 
-            let attn =
-                bidirectional_attention(&q, &k, &v, n, self.hp.n_head, self.hp.n_head_kv, head_dim);
+            let attn = bidirectional_attention(
+                &q,
+                &k,
+                &v,
+                n,
+                self.hp.n_head,
+                self.hp.n_head_kv,
+                head_dim,
+                self.hp.alibi_slopes.as_deref(),
+            );
 
             let mut x = layer.wo.apply_batch(&attn, n);
             add_bias_rows(&mut x, d, layer.bo.as_ref());
@@ -426,6 +502,16 @@ impl TextEncoder for BertEncoder {
                 &layer.attn_out_norm_b,
                 self.hp.layer_norm_eps,
             );
+
+            // `bert.cpp:156-159`: the layer INPUT is re-added and
+            // normed a second time. Only `jina-bert-v2` carries the
+            // tensor, and only on the layers that have it.
+            if let Some((w, b)) = &layer.attn_norm_2 {
+                for (xv, hv) in x.iter_mut().zip(h.iter()) {
+                    *xv += hv;
+                }
+                layer_norm_rows(&mut x, d, w, b, self.hp.layer_norm_eps);
+            }
 
             // (5) the architecture's MLP; the FFN residual is over
             // `x`, i.e. over the post-norm value, not over the layer
@@ -444,10 +530,34 @@ impl TextEncoder for BertEncoder {
                         *a *= ferrox_core::matmul::silu(*gv);
                     }
                 }
+                (BertFfn::GegluPar, Some(gate)) => {
+                    let g = gate.apply_batch(&x, n);
+                    for (a, gv) in up.iter_mut().zip(g.iter()) {
+                        *a *= gelu(*gv);
+                    }
+                }
+                (BertFfn::GegluFusedUp, _) => {
+                    // `ggml_geglu` over a `2 * n_ff`-wide row: the
+                    // first half is the gate and the second the up, per
+                    // row, and the result is `n_ff` wide.
+                    let wide = self.hp.n_ff * 2;
+                    debug_assert_eq!(up.len(), n * wide);
+                    let mut folded = vec![0.0f32; n * self.hp.n_ff];
+                    for (row, out) in up
+                        .chunks_exact(wide)
+                        .zip(folded.chunks_exact_mut(self.hp.n_ff))
+                    {
+                        let (gate, rest) = row.split_at(self.hp.n_ff);
+                        for ((o, g), u) in out.iter_mut().zip(gate).zip(rest) {
+                            *o = gelu(*g) * u;
+                        }
+                    }
+                    up = folded;
+                }
                 // Unreachable through the loader, which builds the
                 // pair together; spelled so a third FFN has to answer
                 // here rather than silently running GELU.
-                (BertFfn::SwigluPar, None) => {
+                (BertFfn::SwigluPar | BertFfn::GegluPar, None) => {
                     return Err(EncodeError::MissingGate { layer: 0 });
                 }
             }
@@ -508,6 +618,8 @@ mod tests {
         let layers = (0..n_layer)
             .map(|_| BertLayer {
                 ffn_gate: None,
+                qk_norm: None,
+                attn_norm_2: None,
                 wq: r.matrix(D, D),
                 bq: Some(r.vec(D)),
                 wk: r.matrix(D, D),
@@ -528,6 +640,7 @@ mod tests {
             .collect();
         BertEncoder {
             hp: BertHparams {
+                alibi_slopes: None,
                 rope_theta: None,
                 rope_dim: 0,
                 ffn: BertFfn::GeluSeq,
