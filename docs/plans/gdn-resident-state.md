@@ -444,8 +444,56 @@ against the fork's libllama on a 256-token prompt, which is the same
 path). A decode token still steps one row on the host, where there is
 no traffic to amortise and the three losses below still hold.
 
+## Where the PTQ1_0 matvec actually stands
+
+With the submissions down to 69 a token the gap is kernel time, so the
+kernel was taken apart. Removing the trit decode from it entirely and
+timing the loads alone splits it: on Bonsai's `17408x5120` the full
+matvec is 0.94 ms and the loads alone 0.57 ms, so the decode is 42% and
+the memory side 58%.
+
+Three hypotheses about that memory side were tested and all three came
+back NEUTRAL:
+
+- **Four rows' bytes requested before any is decoded**, so a lane has
+  four outstanding requests instead of one. 1.004 to 0.980 ms.
+- **One aligned 16-bit load for the two adjacent bytes a lane owns**,
+  five loads to four. 0.980 to 0.943 ms.
+- **Eight rows per threadgroup instead of four**, halving the activation
+  re-reads, which the arithmetic said were 4.6x the weight traffic
+  (every threadgroup reads the whole 20 KB activation, 4352 times for
+  `ffn_gate`). 0.943 to 0.941 ms.
+
+Together they are +2% end to end (9.99 to 10.20 tok/s, measured
+interleaved), which is worth keeping and is not what the probe implied.
+
+**The probe is why they looked bigger than they are.** It reports 20
+GB/s where the production path reaches 77 on the same matrices, and the
+difference is not the kernel: the probe times ONE matvec in isolation,
+while a real layer has several in flight in one command buffer. A
+kernel that is latency-bound per launch and fine under concurrency
+reads as catastrophic there. Its numbers are only good for comparing
+one variant of the kernel against another, which is how they are used
+above.
+
+The obvious follow-on, letting those matvecs overlap EXPLICITLY, is a
+measured non-result below.
+
 ## Measured non-results, so they are not tried again
 
+- The fused recurrent layer on a CONCURRENT encoder
+  (`computeCommandEncoderWithDispatchType`), with scope-Buffers
+  barriers only between stages that depend on each other, so `qkv` runs
+  beside `z` and `gate` beside `up` -- the two biggest matvecs in the
+  layer: 10.10 against 10.20 tok/s. Eighteen barriers a layer cost more
+  than the overlap buys, which is what `memory_barrier_buffers`' own
+  comment already said about scope-Buffers. A resource-scoped version
+  (`MemRanges::begin_op`, as the dense decode stack uses) is the form
+  that might pay, and it needs the read and write set of every dispatch
+  named.
+  Building it found three real missing barriers by turning the oracle
+  tests red, and a fourth that a patch had SILENTLY not applied -- the
+  race it left was 1%, the shape a loose tolerance would have passed.
 - The Hadamard rotation on the device for a prefill BATCH: `pp128` 33.96
   to 32.04 tok/s. `transform_rows` is already parallel across cores;
   the kernel serialises into the GEMM's own command buffer.

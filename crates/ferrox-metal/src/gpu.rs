@@ -5135,7 +5135,7 @@ pub fn matvec_launch_meta(kind: &str) -> Option<(&'static str, &'static str, usi
             "ptq1_0_matvec",
             28,
             128,
-            4,
+            8,
         )),
         _ => None,
     }
