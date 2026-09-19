@@ -17,6 +17,8 @@ mod attn_block;
 mod cuda_prefill;
 mod entry;
 mod ffn_block;
+#[cfg(feature = "metal")]
+mod fused_recurrent;
 #[cfg(any(feature = "metal", feature = "cuda"))]
 mod fused_view;
 pub mod kv_window;
@@ -430,6 +432,14 @@ impl MoeWeights {
                 f(&tmp)
             }
         }
+    }
+
+    /// The one expert a DENSE layer runs, recorded as the host body
+    /// records it, so a fused layer's hotness counters do not depend on
+    /// which backend ran it (`crate::fused_layer`).
+    #[cfg(feature = "metal")]
+    pub(crate) fn record_activations_dense(&self) {
+        self.record_activations(&[0]);
     }
 
     fn record_activations(&self, expert_ids: &[usize]) {
@@ -916,73 +926,12 @@ impl Decoder {
         }
     }
 
-    /// Builds a Metal [`MatvecLaunch`] for a quantized matrix, or `None`
-    /// if the storage/kind cannot run on Metal.
+    /// Metal's launch description for `m`, or `None` when no kernel
+    /// serves its storage. Delegates to `crate::metal_launch`, which is
+    /// where both this file and `crate::gdn` read it from.
     #[cfg(feature = "metal")]
     fn metal_matvec_launch<'a>(m: &'a WeightMatrix) -> Option<ferrox_metal::gpu::MatvecLaunch<'a>> {
-        match m {
-            WeightMatrix::F32(t) => {
-                let rows = t.shape[0];
-                let cols = t.shape[1];
-                let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
-                    ferrox_metal::gpu::matvec_launch_meta("F32")?;
-                // SAFETY: f32 ↔ little-endian byte view for Metal upload/alias.
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(t.data.as_ptr() as *const u8, t.data.len() * 4)
-                };
-                Some(ferrox_metal::gpu::MatvecLaunch {
-                    kernel_src: src,
-                    fn_name,
-                    block_bytes,
-                    block_elems,
-                    weights: bytes,
-                    rows,
-                    row_bytes: cols * 4,
-                    rows_per_tg,
-                })
-            }
-            WeightMatrix::Quantized {
-                data,
-                rows,
-                cols: _,
-                kind,
-            } => {
-                let kind_name = match kind {
-                    ferrox_core::QuantKind::Q8_0 => "Q8_0",
-                    ferrox_core::QuantKind::Q4_0 => "Q4_0",
-                    ferrox_core::QuantKind::Q4K => "Q4_K",
-                    ferrox_core::QuantKind::Q5K => "Q5_K",
-                    ferrox_core::QuantKind::Q6K => "Q6_K",
-                    ferrox_core::QuantKind::IQ4XS => "IQ4_XS",
-                    _ => return None,
-                };
-                let (src, fn_name, block_bytes, block_elems, rows_per_tg) =
-                    ferrox_metal::gpu::matvec_launch_meta(kind_name)?;
-                // A zero-row matrix has no rows to stride over, so
-                // there is no meaningful row size; `checked_div`
-                // says that once instead of splitting it across a
-                // guard and a bare division.
-                let row_bytes = data.as_slice().len().checked_div(*rows).unwrap_or(0);
-                Some(ferrox_metal::gpu::MatvecLaunch {
-                    kernel_src: src,
-                    fn_name,
-                    block_bytes,
-                    block_elems,
-                    weights: data.as_slice(),
-                    rows: *rows,
-                    row_bytes,
-                    rows_per_tg,
-                })
-            }
-            // No fused kernel adds a LoRA delta, and the safetensors
-            // MXFP4 pair has no Metal matvec. Spelled out rather than
-            // `_` so a fifth storage has to answer here.
-            // A folded matrix's launch would read the untransformed
-            // activation; `apply` transforms and then runs the base.
-            WeightMatrix::Mxfp4 { .. }
-            | WeightMatrix::Adapted { .. }
-            | WeightMatrix::Folded { .. } => None,
-        }
+        crate::metal_launch::matvec(m)
     }
 
     /// The per-model facts no fused Metal kernel implements, as ONE
@@ -1093,6 +1042,75 @@ impl Decoder {
             // Step-3.5 and Laguna-XS.2) stays on the host bodies, which
             // read each layer's own through `layer_rope`.
             && !config.rope_dim_varies_by_layer()
+    }
+
+    /// The blocked prefill attention, on the GPU when this shape is one
+    /// the Metal flash kernel serves and on the Rayon host kernel
+    /// otherwise, which is the ONE place that choice is made.
+    ///
+    /// It is reached only by layers the FUSED Metal attention block
+    /// cannot take -- a gated softmax attention, a V width that differs
+    /// from K's, a projection with no Metal launch -- so the layer's
+    /// Q, K and V are on the host either way and there is nothing to
+    /// fuse; what is left is whether the `n_q x n_kv` score matrix is
+    /// built by six cores or by the GPU. On Bonsai's 16 attention
+    /// layers that matrix is the largest single host cost of a prefill
+    /// (`dot_f32`, `pv_tile` and `qk_tile` are 11178 of a sampled
+    /// prefill's top-of-stack against 1504 for the next thing).
+    ///
+    /// The refusals are the kernel's, not a guess: it takes no sliding
+    /// window, no ALiBi slopes, no attention sink and one head width
+    /// for K and V, and a shape it does not serve falls through to the
+    /// host body below rather than being approximated.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_attention_blocked(
+        &self,
+        q_batch: &[f32],
+        cache_k: &[f32],
+        cache_v: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        batch_size: usize,
+        base_seq_len: usize,
+        softcap: Option<f32>,
+        window: Option<usize>,
+    ) -> Vec<f32> {
+        #[cfg(feature = "metal")]
+        if window.is_none()
+            && self.alibi_slopes.is_none()
+            && v_head_dim == head_dim
+            && ferrox_core::weight_matrix::metal_dense_enabled()
+        {
+            if let Ok(out) = ferrox_metal::attn::launch_gqa_prefill_host_ex(
+                q_batch,
+                cache_k,
+                cache_v,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                base_seq_len,
+                softcap,
+            ) {
+                return out;
+            }
+        }
+        causal_gqa_attention_prefill_shared_kv_split(
+            q_batch,
+            cache_k,
+            cache_v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            v_head_dim,
+            batch_size,
+            base_seq_len,
+            softcap,
+            window,
+            self.alibi_slopes.as_deref(),
+        )
     }
 
     /// True when this layer can use the fused Metal attention block
@@ -2630,7 +2648,32 @@ impl Decoder {
         // reaches them (`metal_can_serve_model`).
         let skip_rows = self.config.skip_stream.then(|| hidden.clone());
         if run_cpu_layers {
-            for (l, cache) in kv_caches.iter_mut().enumerate() {
+            // Indexed rather than iterated, because a RUN of consecutive
+            // recurrent layers is submitted together
+            // (`ferrox_metal::gdn_branch::GdnRun`) and needs several
+            // caches at once. `fused_through` is how many layers that
+            // consumed; every `continue` below is a `for`, so it cannot
+            // spin.
+            // `fused_through` is only ever written under `metal`; the
+            // binding is unconditional so the loop reads the same either
+            // way.
+            #[allow(unused_mut, unused_assignments)]
+            let mut fused_through = 0usize;
+            #[allow(clippy::needless_range_loop)]
+            for l in 0..kv_caches.len() {
+                if l < fused_through {
+                    continue;
+                }
+                // Consecutive layers the fused launch serves whole pass
+                // their residual stream to each other on the device and
+                // wait ONCE, which is the submission count the decode
+                // gap is made of (`docs/plans/gdn-resident-state.md`).
+                #[cfg(feature = "metal")]
+                if let Some(end) = self.fused_recurrent_run(l, &mut hidden, kv_caches) {
+                    fused_through = end;
+                    continue;
+                }
+                let cache = &mut kv_caches[l];
                 let layer = self.layer_for(l);
                 // --- attention block ---
                 #[cfg(feature = "metal")]
@@ -3020,6 +3063,23 @@ impl Decoder {
                     .gpt_oss
                     .as_ref()
                     .map(|g| &g.layers[self.physical_index(l)]);
+                // A recurrent layer whose whole shape the fused Metal
+                // launch serves runs END TO END in one submission --
+                // branch, residual, norm, FFN, residual -- and this
+                // loop moves to the next layer. Everything it does not
+                // serve it refuses (`crate::fused_layer`,
+                // `decoder::fused_recurrent`), and the two bodies below
+                // run exactly as before.
+                #[cfg(feature = "metal")]
+                if let Some(out) =
+                    self.fused_recurrent_layer(l, layer, &normed, &hidden, &mut cache.recurrent)
+                {
+                    hidden = out;
+                    cache
+                        .advance_len(1)
+                        .expect("unbounded/planned KvCache growth is infallible");
+                    continue;
+                }
                 if let Some(projected) =
                     self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache))
                 {
@@ -4665,7 +4725,7 @@ impl Decoder {
                     | (crate::config::BatchWindow::PerQuery, _) => None,
                 };
                 let mut attn_out_batch = match blocked {
-                    Some(window) => causal_gqa_attention_prefill_shared_kv_split(
+                    Some(window) => self.prefill_attention_blocked(
                         &q_batch,
                         cache_k,
                         cache_v,
@@ -4677,7 +4737,6 @@ impl Decoder {
                         base_seq_len,
                         softcap,
                         window,
-                        self.alibi_slopes.as_deref(),
                     ),
                     None => {
                         let mut out = vec![0f32; batch_size * out_width];

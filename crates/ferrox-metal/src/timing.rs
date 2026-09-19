@@ -286,6 +286,43 @@ impl SubmitClock {
 /// `tag`, logging a running mean every `every` submissions. Returns how
 /// long the host waited (commit to completion), for callers that keep a
 /// wall-clock total of their own.
+/// Waits for a command buffer that was committed EARLIER, and notes it.
+///
+/// [`commit_wait_note`] commits and waits together, which is right when
+/// one buffer is one unit of work. A RUN of buffers committed back to
+/// back is one unit of work spread over several, and waiting for the
+/// last one waits for all of them: the GPU time noted is that last
+/// buffer's, and `count` says how many submissions shared the single
+/// wake-up, which is the number the run exists to reduce.
+pub(crate) fn note_wait(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    tag: &'static str,
+    count: usize,
+    every: u64,
+    clock: SubmitClock,
+) -> Duration {
+    let committed = Instant::now();
+    cmd_buf.waitUntilCompleted();
+    let waited = committed.elapsed();
+    if !gpu_timing_enabled() || count == 0 {
+        return waited;
+    }
+    let sample = Sample {
+        gpu_ns: ((cmd_buf.GPUEndTime() - cmd_buf.GPUStartTime()) * 1e9).max(0.0) as u64,
+        encode_ns: committed.duration_since(clock.encode_start).as_nanos() as u64,
+        wait_ns: waited.as_nanos() as u64,
+        encode_stats: crate::dispatch::metal_encode_stats(),
+    };
+    let report = match GPU_TIMING.lock() {
+        Ok(mut ledger) => ledger.note(tag, sample, every),
+        Err(_) => None,
+    };
+    if let Some(r) = report {
+        r.print();
+    }
+    waited
+}
+
 pub(crate) fn commit_wait_note(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     tag: &'static str,

@@ -109,6 +109,66 @@ pub fn ptq1_0_matvec_src() -> &'static str {
 /// decoded with integer ops; it reached 2.4 tok/s on Bonsai-2-27B
 /// where the fork reaches 11 on the same GPU.
 const PTQ1_0_MATVEC_BODY_MSL: &str = r#"
+// One row's five bytes, read BEFORE any of them is used.
+//
+// The bytes a lane needs from a block are five separate non-contiguous
+// loads, and the kernel's four rows used to be loaded and consumed one
+// at a time: one memory request in flight per lane, with the whole
+// float-pipe decode waiting on it. The probe said what that costs --
+// PTQ1_0 at Bonsai's `17408x5120` took 1.004 ms against Q4_0's 0.897 on
+// the same shape while reading 2.6x FEWER bytes -- so the kernel is
+// latency-bound and not bandwidth-bound, and the fix is to have four
+// rows' requests outstanding at once.
+struct ptq1_0_row {
+    ushort b01; // qs[2 it] and qs[2 it + 1], one aligned load
+    uchar b2;   // qs[16 + it]
+    uchar bh;   // qh[it & 1]
+    half  d;    // the block scale
+};
+
+static inline ptq1_0_row ptq1_0_load_row(device const uchar* qb, short it) {
+    ptq1_0_row r;
+    // `2 * it` is even, so the pair of bytes this lane owns is one
+    // aligned 16-bit load rather than two 8-bit ones. The memory side
+    // of this kernel measures 34 GB/s against Q4_0's 55 on the same
+    // rows, with the decode removed, so the load COUNT is what it is
+    // bound by and not the byte count.
+    r.b01 = *(device const ushort*)(qb + 2 * it);
+    r.b2 = qb[16 + it];
+    r.bh = qb[24 + (it & 1)];
+    r.d  = *(device const half*)(qb + 26);
+    return r;
+}
+
+static inline float ptq1_0_dot_loaded(ptq1_0_row r, thread const float* yl, float sumy) {
+    float acc = 0.0f;
+    const uchar bs[2] = { uchar(r.b01 & 0xFFu), uchar(r.b01 >> 8) };
+    for (short k = 0; k < 2; ++k) {
+        const float u = float(bs[k]) * (1.0f / 256.0f);
+        thread const float* c = yl + 5 * k;
+        acc += floor(  3.0f * u) * c[0];
+        acc += floor(  9.0f * u) * c[1];
+        acc += floor( 27.0f * u) * c[2];
+        acc += floor( 81.0f * u) * c[3];
+        acc += floor(243.0f * u) * c[4];
+    }
+    {
+        const float u = float(r.b2) * (1.0f / 256.0f);
+        thread const float* c = yl + 10;
+        acc += floor(  3.0f * u) * c[0];
+        acc += floor(  9.0f * u) * c[1];
+        acc += floor( 27.0f * u) * c[2];
+        acc += floor( 81.0f * u) * c[3];
+        acc += floor(243.0f * u) * c[4];
+    }
+    {
+        const float u  = float(r.bh) * (1.0f / 256.0f);
+        const float p0 = yl[16];
+        acc += (floor(3.0f * p0 * u) - 3.0f * floor(p0 * u)) * yl[15];
+    }
+    return (acc - sumy) * float(r.d);
+}
+
 static inline float ptq1_0_dot_coeffs(device const uchar* qb, thread const float* yl, float sumy, short it) {
     float acc = 0.0f;
     for (short k = 0; k < 2; ++k) {
@@ -160,7 +220,7 @@ kernel void ptq1_0_matvec(
 
     // 15 collapse coefficients, the qh activation, and this lane's 3^n.
     float yl[17];
-    float sumf[NR] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float sumf[NR] = { 0.0f };
     {
         const float pow3f[4] = { 1.0f, 3.0f, 9.0f, 27.0f };
         yl[16] = pow3f[it >> 1];
@@ -197,11 +257,19 @@ kernel void ptq1_0_matvec(
             yl[15] = v;
             sumy += v;
         }
+        // All four rows' bytes requested first, then decoded: four
+        // outstanding requests per lane instead of one.
+        ptq1_0_row rows[NR];
+        #pragma unroll
         for (uint rr = 0u; rr < NR; ++rr) {
-            const uint row = first_row + rr;
-            if (row >= n_rows) continue;
+            const uint row = min(first_row + rr, n_rows - 1u);
             device const uchar* block = weights + (size_t)row * row_bytes + (size_t)ib * 28u;
-            sumf[rr] += ptq1_0_dot_coeffs(block, yl, sumy, it);
+            rows[rr] = ptq1_0_load_row(block, it);
+        }
+        #pragma unroll
+        for (uint rr = 0u; rr < NR; ++rr) {
+            if (first_row + rr >= n_rows) continue;
+            sumf[rr] += ptq1_0_dot_loaded(rows[rr], yl, sumy);
         }
         yb += 128 * 4;
     }

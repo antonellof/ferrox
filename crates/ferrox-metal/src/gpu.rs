@@ -4455,6 +4455,7 @@ fn launch_k_quant_mul_mm_sg(
     let pipeline = ensure_pipeline(device, *K_QUANT_MUL_MM_SG_KERNEL_SRC, fn_pick)?;
     let setup_us = t_setup.elapsed().as_micros();
 
+    let clock = crate::timing::SubmitClock::start();
     let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
     let enc = cmd_buf
         .computeCommandEncoder()
@@ -4524,8 +4525,10 @@ fn launch_k_quant_mul_mm_sg(
     }
     enc.endEncoding();
     let t_gpu = std::time::Instant::now();
-    cmd_buf.commit();
-    cmd_buf.waitUntilCompleted();
+    // Timed like every other submission: the prefill GEMM is where a
+    // batch spends its GPU, and an untimed command buffer reads as
+    // host time in the ledger (the confusion issue #149 was about).
+    crate::timing::commit_wait_note(&cmd_buf, "gemm-prefill", 32, clock);
     let gpu_us = t_gpu.elapsed().as_micros();
 
     let t_read = std::time::Instant::now();
@@ -9200,11 +9203,78 @@ mod tests {
         }
     }
 
+    /// GEMM throughput at Bonsai's FFN shapes and a prefill batch, in
+    /// TFLOP/s, printed rather than asserted: run with `--nocapture`.
+    ///
+    /// The question it answers is whether the PTQ1_0 GEMM is slow or
+    /// the shared simdgroup body is: Q4_K runs the SAME body with a
+    /// different dequant functor, so the two numbers side by side say
+    /// which. An M2 Pro peaks near 6.8 TFLOP/s in f32.
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn gemm_throughput_probe() {
+        let batch = 128usize;
+        for &(rows, cols) in &[(17408usize, 5120usize), (5120usize, 17408usize)] {
+            let x: Vec<f32> = (0..batch * cols)
+                .map(|i| (i as f32 * 0.001).sin())
+                .collect();
+            let flops = 2.0 * rows as f64 * cols as f64 * batch as f64;
+
+            let ptq_row_bytes = cols / 128 * 28;
+            let ptq = pseudo_bytes(3, rows * ptq_row_bytes);
+            launch_ptq1_0_mul_mm_sg(&ptq, &x, rows, ptq_row_bytes, batch).expect("warm");
+            let n = 10;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                launch_ptq1_0_mul_mm_sg(&ptq, &x, rows, ptq_row_bytes, batch).expect("ptq");
+            }
+            let ptq_s = t.elapsed().as_secs_f64() / n as f64;
+
+            let q4k_row_bytes = cols / 256 * 144;
+            let q4k = realistic_blocks(rows, cols / 256, 144, 5, 0.01, Some(0.003));
+            launch_q4_k_mul_mm_sg(&q4k, &x, rows, q4k_row_bytes, batch).expect("warm");
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                launch_q4_k_mul_mm_sg(&q4k, &x, rows, q4k_row_bytes, batch).expect("q4k");
+            }
+            let q4k_s = t.elapsed().as_secs_f64() / n as f64;
+
+            eprintln!(
+                "{rows}x{cols} b{batch}: PTQ1_0 {:.2} ms ({:.2} TFLOP/s) | Q4_K {:.2} ms ({:.2} TFLOP/s)",
+                ptq_s * 1e3,
+                flops / ptq_s / 1e12,
+                q4k_s * 1e3,
+                flops / q4k_s / 1e12,
+            );
+        }
+    }
+
     /// Achieved weight bandwidth of the PTQ1_0 matvec on Bonsai's two
     /// FFN shapes, printed, not asserted: run with `--nocapture`.
+    ///
+    /// # What this measures, and what it does not
+    ///
+    /// Wall time around `launch_*`, which is a command buffer's worth
+    /// of HOST cost -- an output allocation, an activation upload, a
+    /// commit and a wait -- plus the kernel. On the small shapes that
+    /// host cost is most of the number: the `64x512` row is almost
+    /// entirely it, which is why it is measured FIRST and subtracted
+    /// from the rest as `net`.
+    ///
+    /// Even net, this is one matvec in isolation and the production
+    /// path reads 65 GB/s on the same matrices where this reads 21. So
+    /// the ONLY sound use of these numbers is comparing one variant of
+    /// the kernel against another in the same run. Three kernel
+    /// hypotheses were aimed at the raw figure before that was
+    /// understood (`docs/plans/gdn-resident-state.md`), which is the
+    /// reason for this comment.
     #[test]
     #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
     fn ptq1_0_matvec_bandwidth_probe() {
+        // The fixed per-launch cost, measured in THIS run on a shape
+        // whose kernel is negligible, so the rows below can be reported
+        // net of it.
+        let mut fixed = 0.0f64;
         for &(rows, cols) in &[
             (64usize, 512usize),
             (17408usize, 5120usize),
@@ -9229,12 +9299,26 @@ mod tests {
                 launch_q4_0_matvec(&q4, &x, rows, q4_row_bytes).expect("kernel");
             }
             let per_q4 = t.elapsed().as_secs_f64() / n as f64;
+            if rows == 64 {
+                // The smallest shape IS the per-launch cost.
+                fixed = per.min(per_q4);
+                eprintln!(
+                    "ptq1_0 per-launch host cost: {:.3} ms (subtracted below)",
+                    fixed * 1e3
+                );
+                continue;
+            }
+            let net = (per - fixed).max(1e-9);
+            let net_q4 = (per_q4 - fixed).max(1e-9);
             eprintln!(
-                "ptq1_0 {rows}x{cols}: {:.3} ms, {:.1} GB/s | q4_0 same shape: {:.3} ms, {:.1} GB/s",
+                "ptq1_0 {rows}x{cols}: {:.3} ms raw, {:.3} net, {:.1} GB/s | q4_0: {:.3} raw, \
+                 {:.3} net, {:.1} GB/s",
                 per * 1e3,
-                (rows * row_bytes) as f64 / per / 1e9,
+                net * 1e3,
+                (rows * row_bytes) as f64 / net / 1e9,
                 per_q4 * 1e3,
-                (rows * q4_row_bytes) as f64 / per_q4 / 1e9
+                net_q4 * 1e3,
+                (rows * q4_row_bytes) as f64 / net_q4 / 1e9
             );
         }
     }

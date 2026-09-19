@@ -56,6 +56,65 @@ use crate::gdn::DeltaDims;
 /// 32x, so 32 is the measured optimum here rather than llama.cpp's 64.
 pub const CHUNK: usize = 32;
 
+/// Rows below which the device kernel is not worth its submission.
+///
+/// Measured on an M2 Pro at Bonsai's shape, device against host, both
+/// warmed (`device_chunk_against_host_throughput`): 8 rows 1.10x, 32
+/// rows 1.37x, 64 rows 2.21x, 128 rows 1.93x, 512 rows 3.13x, 1201
+/// rows 2.99x. It is ahead everywhere it was measured, and the bar sits
+/// where the margin stops being inside the noise of one submission.
+pub const DEVICE_ROWS: usize = 32;
+
+/// The chunked rule on whichever of the two runs it faster, which is
+/// the ONE place that decision is made.
+///
+/// The host body below is the definition and the device kernel is
+/// checked against it (`tests::the_device_chunk_matches_this_one`, via
+/// the sequential rule both are measured against). `state` is taken as
+/// the page-aligned allocation rather than a slice because the kernel
+/// wraps those very bytes instead of copying them, and a caller that
+/// had only a slice could not say whether that is sound.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_chunk_rows(
+    dims: DeltaDims,
+    rows: usize,
+    state: &mut crate::recurrent_state::AlignedF32,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    out: &mut [f32],
+) {
+    #[cfg(feature = "metal")]
+    if rows >= DEVICE_ROWS && dims.head_dim <= ferrox_metal::gdn_chunk::MAX_HEAD_DIM {
+        let shape = ferrox_metal::gdn::DeltaShape {
+            n_k_heads: dims.n_k_heads,
+            n_v_heads: dims.n_v_heads,
+            head_dim: dims.head_dim,
+            map: match dims.map {
+                crate::gdn::HeadMap::Tiled => ferrox_metal::gdn::HeadMapKind::Tiled,
+                crate::gdn::HeadMap::Grouped => ferrox_metal::gdn::HeadMapKind::Grouped,
+            },
+        };
+        let (bytes, ptr) = (state.alloc_bytes(), state.as_ptr());
+        // SAFETY: `AlignedF32` is page-aligned and page-rounded, it is
+        // borrowed mutably for this call so nothing else touches those
+        // bytes, and the launch waits before returning.
+        let done = unsafe {
+            ferrox_metal::gdn_chunk::launch_delta_chunk(shape, rows, ptr, bytes, q, k, v, g, beta)
+        };
+        // A launch that fails leaves the state untouched -- it is
+        // wrapped, not copied, and nothing has run -- so the host body
+        // below is a real fallback and not a half-applied recurrence.
+        if let Ok(o) = done {
+            out.copy_from_slice(&o);
+            return;
+        }
+    }
+    delta_chunk(dims, rows, state, q, k, v, g, beta, out);
+}
+
 /// `rows` consecutive tokens of one sequence through the delta rule,
 /// advancing `state` in place, writing `[rows][n_v_heads * head_dim]`
 /// into `out`.
@@ -149,11 +208,35 @@ pub fn delta_chunk(
             // The state against this chunk's keys and queries: the two
             // `S x S x C` products that replace one pass over the state
             // per row.
+            //
+            // Four `t` at a time against one read of the row, because
+            // this is the loop the step is now bound BY: chunking
+            // traded 1.5x the multiply-adds for a 32nd of the traffic,
+            // so the arithmetic is what is left, and a row dotted
+            // against one vector at a time leaves the pipeline waiting
+            // on the load rather than on the multiply.
             for j in 0..s {
                 let row = &st[j * s..(j + 1) * s];
-                for t in 0..c {
+                let mut t = 0;
+                while t + 4 <= c {
+                    let (m0, m1, m2, m3) =
+                        dot4(row, krow(t), krow(t + 1), krow(t + 2), krow(t + 3));
+                    m[j * CHUNK + t] = m0;
+                    m[j * CHUNK + t + 1] = m1;
+                    m[j * CHUNK + t + 2] = m2;
+                    m[j * CHUNK + t + 3] = m3;
+                    let (n0, n1, n2, n3) =
+                        dot4(row, qrow(t), qrow(t + 1), qrow(t + 2), qrow(t + 3));
+                    n[j * CHUNK + t] = n0;
+                    n[j * CHUNK + t + 1] = n1;
+                    n[j * CHUNK + t + 2] = n2;
+                    n[j * CHUNK + t + 3] = n3;
+                    t += 4;
+                }
+                while t < c {
                     m[j * CHUNK + t] = dot(row, krow(t));
                     n[j * CHUNK + t] = dot(row, qrow(t));
+                    t += 1;
                 }
             }
             // The two triangles over the chunk's own vectors.
@@ -219,6 +302,41 @@ pub fn delta_chunk(
     });
 }
 
+/// Four dots against one vector, from one pass over it: the four
+/// accumulator sets keep the multiply pipeline busy where a single dot
+/// waits on `row`'s loads.
+#[inline]
+fn dot4(row: &[f32], a: &[f32], b: &[f32], c: &[f32], d: &[f32]) -> (f32, f32, f32, f32) {
+    let mut acc = [[0.0f32; 4]; 4];
+    let (rb, rt) = row.as_chunks::<4>();
+    let (ab, at) = a.as_chunks::<4>();
+    let (bb, bt) = b.as_chunks::<4>();
+    let (cb, ct) = c.as_chunks::<4>();
+    let (db, dt) = d.as_chunks::<4>();
+    for ((((r, x), y), z), w) in rb.iter().zip(ab).zip(bb).zip(cb).zip(db) {
+        for l in 0..4 {
+            acc[0][l] += r[l] * x[l];
+            acc[1][l] += r[l] * y[l];
+            acc[2][l] += r[l] * z[l];
+            acc[3][l] += r[l] * w[l];
+        }
+    }
+    let mut tail = [0.0f32; 4];
+    for ((((r, x), y), z), w) in rt.iter().zip(at).zip(bt).zip(ct).zip(dt) {
+        tail[0] += *r * *x;
+        tail[1] += *r * *y;
+        tail[2] += *r * *z;
+        tail[3] += *r * *w;
+    }
+    let sum = |v: [f32; 4], t: f32| v[0] + v[1] + v[2] + v[3] + t;
+    (
+        sum(acc[0], tail[0]),
+        sum(acc[1], tail[1]),
+        sum(acc[2], tail[2]),
+        sum(acc[3], tail[3]),
+    )
+}
+
 /// A dot with four accumulators, as the sequential step's reductions
 /// use: a single-accumulator float sum cannot be reordered without
 /// fast-math, so the compiler will not vectorise it.
@@ -242,6 +360,258 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Host chunk against device chunk on Bonsai's shape and a
+    /// prefill-sized batch, printed rather than asserted: run with
+    /// `--nocapture`.
+    ///
+    /// This is the number that decides whether the kernel gets a
+    /// caller. The three earlier device attempts lost because the
+    /// state moved once per ROW (`docs/plans/gdn-resident-state.md`);
+    /// chunking cuts that traffic by the chunk width, which is the
+    /// only thing that changed.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn device_chunk_against_host_chunk_throughput() {
+        use crate::gdn::HeadMap;
+        use crate::recurrent_state::AlignedF32;
+        use ferrox_metal::gdn::{DeltaShape, HeadMapKind};
+
+        let (n_k, n_v, s) = (4usize, 48usize, 128usize);
+        let dims = DeltaDims {
+            n_k_heads: n_k,
+            n_v_heads: n_v,
+            head_dim: s,
+            map: HeadMap::Tiled,
+        };
+        let shape = DeltaShape {
+            n_k_heads: n_k,
+            n_v_heads: n_v,
+            head_dim: s,
+            map: HeadMapKind::Tiled,
+        };
+        for rows in [1usize, 2, 8, 32, 64, 128, 512, 1201] {
+            let mut seed = 5u32;
+            let mut draw = |n: usize, scale: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        ((seed >> 8) as f32 / 8388608.0 - 1.0) * scale
+                    })
+                    .collect()
+            };
+            let state0 = draw(dims.state_len(), 0.5);
+            let q = draw(rows * n_k * s, 1.0);
+            let k = draw(rows * n_k * s, 1.0);
+            let v = draw(rows * n_v * s, 1.0);
+            let g: Vec<f32> = draw(rows * n_v, 3.0).iter().map(|x| -x.abs()).collect();
+            let beta: Vec<f32> = draw(rows * n_v, 1.0)
+                .iter()
+                .map(|x| 0.5 + 0.25 * x)
+                .collect();
+            let mut out = vec![0.0f32; rows * n_v * s];
+
+            // Both sides warmed: the host's thread pool starts on its
+            // first call and the device's pipeline compiles on its
+            // first launch, and either one unwarmed is worth more than
+            // the difference being measured.
+            let mut host_state = state0.clone();
+            let mut host = || {
+                host_state.copy_from_slice(&state0);
+                let t = std::time::Instant::now();
+                delta_chunk(dims, rows, &mut host_state, &q, &k, &v, &g, &beta, &mut out);
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            host();
+            let host_ms = host();
+
+            let mut device_state = AlignedF32::zeros(state0.len());
+            device_state.copy_from_slice(&state0);
+            let (bytes, ptr) = (device_state.alloc_bytes(), device_state.as_ptr());
+            // SAFETY: page-aligned, exclusively borrowed, outlives the
+            // call, which waits.
+            let warm = unsafe {
+                ferrox_metal::gdn_chunk::launch_delta_chunk(
+                    shape, rows, ptr, bytes, &q, &k, &v, &g, &beta,
+                )
+            };
+            warm.expect("the kernel launches");
+            device_state.copy_from_slice(&state0);
+            let t = std::time::Instant::now();
+            // SAFETY: as above.
+            let _ = unsafe {
+                ferrox_metal::gdn_chunk::launch_delta_chunk(
+                    shape, rows, ptr, bytes, &q, &k, &v, &g, &beta,
+                )
+            }
+            .expect("the kernel launches");
+            let device_ms = t.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "{rows} rows: host chunk {host_ms:.2} ms, device chunk {device_ms:.2} ms, \
+                 {:.2}x",
+                host_ms / device_ms
+            );
+        }
+    }
+
+    /// The device kernel IS this chunk: same decay products, same two
+    /// triangles, same forward substitution, same state left behind.
+    /// Run on the M2 Pro.
+    ///
+    /// The host side chunks by 32 and the device by 16, because what
+    /// bounds the device is threadgroup memory rather than cache, so
+    /// the two disagree about chunk width on purpose and must still
+    /// agree about the answer: a recurrence that is right only at one
+    /// chunk width is not the recurrence.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a real Metal-capable GPU; run manually with --ignored on Apple Silicon"]
+    fn the_device_chunk_matches_this_one() {
+        use crate::gdn::HeadMap;
+        use crate::recurrent_state::AlignedF32;
+        use ferrox_metal::gdn::{DeltaShape, HeadMapKind};
+
+        for (n_k, n_v, s, rows, map, kind) in [
+            // Bonsai's shape, and a row count that is neither a
+            // multiple of the device chunk nor of the host one.
+            (
+                4usize,
+                48usize,
+                128usize,
+                37usize,
+                HeadMap::Tiled,
+                HeadMapKind::Tiled,
+            ),
+            (4, 48, 128, 37, HeadMap::Grouped, HeadMapKind::Grouped),
+            // Shorter than one chunk either way.
+            (2, 2, 4, 3, HeadMap::Tiled, HeadMapKind::Tiled),
+            // Long enough that the host re-reads its state and the
+            // device does so four times more often.
+            (2, 4, 16, 70, HeadMap::Grouped, HeadMapKind::Grouped),
+        ] {
+            let dims = DeltaDims {
+                n_k_heads: n_k,
+                n_v_heads: n_v,
+                head_dim: s,
+                map,
+            };
+            let mut seed = 987_654_321u32;
+            let mut draw = |n: usize, scale: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        ((seed >> 8) as f32 / 8388608.0 - 1.0) * scale
+                    })
+                    .collect()
+            };
+            let state0 = draw(dims.state_len(), 0.5);
+            let q = draw(rows * n_k * s, 1.0);
+            let k = draw(rows * n_k * s, 1.0);
+            let v = draw(rows * n_v * s, 1.0);
+            let g: Vec<f32> = draw(rows * n_v, 1.0).iter().map(|x| -x.abs()).collect();
+            let beta: Vec<f32> = draw(rows * n_v, 1.0)
+                .iter()
+                .map(|x| 0.5 + 0.25 * x)
+                .collect();
+
+            let mut host_state = state0.clone();
+            let mut host_out = vec![0.0f32; rows * n_v * s];
+            delta_chunk(
+                dims,
+                rows,
+                &mut host_state,
+                &q,
+                &k,
+                &v,
+                &g,
+                &beta,
+                &mut host_out,
+            );
+
+            // Page-aligned, because the kernel wraps these very bytes
+            // rather than copying them.
+            let mut device_state = AlignedF32::zeros(state0.len());
+            device_state.copy_from_slice(&state0);
+            let shape = DeltaShape {
+                n_k_heads: n_k,
+                n_v_heads: n_v,
+                head_dim: s,
+                map: kind,
+            };
+            // The whole page-rounded allocation, which is what
+            // `newBufferWithBytesNoCopy` has to be given.
+            let bytes = device_state.alloc_bytes();
+            let ptr = device_state.as_ptr();
+            // SAFETY: `device_state` is page-aligned, exclusively
+            // borrowed here, and outlives the call, which waits.
+            let device_out = unsafe {
+                ferrox_metal::gdn_chunk::launch_delta_chunk(
+                    shape, rows, ptr, bytes, &q, &k, &v, &g, &beta,
+                )
+            }
+            .expect("the kernel launches");
+
+            // The sequential step is the DEFINITION, so both chunked
+            // implementations are measured against it rather than
+            // against each other: they chunk by different widths (32
+            // and 16) and so associate the same sums differently, and
+            // a device that merely tracked the host's associations
+            // would be a weaker claim than either matching the rule.
+            let mut seq_state = state0.clone();
+            let mut seq_out = vec![0.0f32; rows * n_v * s];
+            for t in 0..rows {
+                crate::gdn::delta_step(
+                    dims,
+                    &mut seq_state,
+                    &q[t * n_k * s..][..n_k * s],
+                    &k[t * n_k * s..][..n_k * s],
+                    &v[t * n_v * s..][..n_v * s],
+                    &g[t * n_v..][..n_v],
+                    &beta[t * n_v..][..n_v],
+                    &mut seq_out[t * n_v * s..][..n_v * s],
+                );
+            }
+
+            let worst = |xs: &[f32], ys: &[f32]| -> f32 {
+                xs.iter()
+                    .zip(ys)
+                    .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+                    .fold(0.0f32, f32::max)
+            };
+            let (dev_out, dev_state) = (
+                worst(&device_out, &seq_out),
+                worst(&device_state, &seq_state),
+            );
+            let (hst_out, hst_state) = (worst(&host_out, &seq_out), worst(&host_state, &seq_state));
+            eprintln!(
+                "{n_v}x{s} rows {rows} {map:?}: device {dev_out:.2e}/{dev_state:.2e} \
+                 host {hst_out:.2e}/{hst_state:.2e} against the sequential rule"
+            );
+            // Sized from the HOST's own distance to the sequential
+            // rule, printed above: on the 37-row draw, whose decays
+            // are slow enough that the chunk boundaries really do
+            // accumulate, the host reads 7.3e-4 on the outputs and
+            // 2.1e-3 on the state and the device 8.7e-4 and 2.6e-3 --
+            // one error class, which is what says the two are the same
+            // recurrence associated differently. Narrow enough to
+            // catch a real disagreement by orders: the head map, the
+            // decay products and the forward substitution each read
+            // above 1 when sabotaged in the kernel.
+            let tol = 5e-3;
+            for (what, got) in [
+                ("device out", dev_out),
+                ("device state", dev_state),
+                ("host out", hst_out),
+                ("host state", hst_state),
+            ] {
+                assert!(
+                    got <= tol,
+                    "{n_v}x{s} rows {rows} {map:?} {what}: {got:.3e} over {tol:.0e}"
+                );
+            }
+        }
+    }
     use crate::gdn::{delta_step, HeadMap};
 
     /// The chunked rule IS the sequential one. Shapes chosen so the

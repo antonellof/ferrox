@@ -136,6 +136,95 @@ kernel void gdn_delta_step(
 }
 "#;
 
+/// The same step with the state read COALESCED: one threadgroup per
+/// `(head, state row)` and one thread per state COLUMN, where
+/// `gdn_delta_step` above gives a thread a whole row and walks it.
+///
+/// That difference is the whole reason the device recurrence lost to
+/// six CPU cores (`docs/plans/gdn-resident-state.md`: 6.9 against 7.3
+/// tok/s with the state wrapped in place and the wrapper cached, so the
+/// plumbing was already free). The step is bandwidth-bound -- 3.1 MB of
+/// state per Bonsai layer, read and written once -- and in the kernel
+/// above adjacent threads touch addresses `head_dim` floats apart, so
+/// every 128-byte transaction the hardware issues carries 4 useful
+/// bytes. A 200 GB/s part reading at a 32nd of its width is not faster
+/// than six cores reading out of L2, which is what the measurement
+/// said and nobody had read as an access pattern.
+///
+/// Here thread `i` owns element `i` of one row, so a threadgroup's
+/// reads are one contiguous 512-byte span, and the two dot products
+/// become threadgroup reductions. The grid is `n_v_heads * head_dim`
+/// threadgroups instead of `n_v_heads`, which is also what gives the
+/// part enough parallelism to have any bandwidth to lose.
+pub const GDN_DELTA_STEP_COALESCED_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void gdn_delta_step_coalesced(
+    device float* state [[buffer(0)]],
+    device const float* q [[buffer(1)]],
+    device const float* k [[buffer(2)]],
+    device const float* v [[buffer(3)]],
+    device const float* g [[buffer(4)]],
+    device const float* beta [[buffer(5)]],
+    device float* out [[buffer(6)]],
+    constant uint4& dims [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tcount [[threads_per_threadgroup]]
+) {
+    // dims: x = n_k_heads, y = n_v_heads, z = head_dim, w = map flag.
+    const uint n_k = dims.x;
+    const uint n_v = dims.y;
+    const uint S = dims.z;
+    const uint h = tgid / S;   // value head
+    const uint j = tgid % S;   // this row of its state
+    if (h >= n_v || tid >= S) {
+        return;
+    }
+    const uint kh = (dims.w == 0u) ? (h % n_k) : (h / (n_v / n_k));
+
+    const float decay = exp(g[h]);
+    const float scale = 1.0f / sqrt(float(S));
+    device float* row = state + ((size_t)h * S + (size_t)j) * S;
+
+    // One contiguous span per threadgroup, one element per thread.
+    const float ki = k[kh * S + tid];
+    const float qi = q[kh * S + tid];
+    const float r0 = row[tid] * decay;
+
+    threadgroup float partial[1024];
+    partial[tid] = r0 * ki;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = S >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float pred = partial[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The rank-one update, written back once, and the read-out off the
+    // value each thread already holds.
+    const float d = (v[h * S + j] - pred) * beta[h];
+    const float r1 = r0 + ki * d;
+    row[tid] = r1;
+
+    partial[tid] = r1 * qi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = S >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out[h * S + j] = partial[0] * scale;
+    }
+}
+"#;
+
 /// The gated output norm that follows the recurrence: per head,
 /// `rms_norm(o, weight) * silu(z)` (`qwen35.cpp:311-313`, llama.cpp's
 /// `build_norm_gated`). One threadgroup per head, the sum of squares
@@ -278,13 +367,22 @@ pub fn encode_delta_step_at(
 ) -> Result<(), MetalError> {
     if shape.head_dim == 0
         || shape.head_dim > MAX_HEAD_DIM
+        // The two reductions halve their stride from `head_dim`, so a
+        // width that is not a power of two would drop the odd tail
+        // silently. Every real gated-delta-net head is 64, 128 or 256;
+        // one that is not is refused here rather than reduced wrongly.
+        || !shape.head_dim.is_power_of_two()
         || shape.n_k_heads == 0
         || shape.n_v_heads == 0
         || !shape.n_v_heads.is_multiple_of(shape.n_k_heads)
     {
         return Err(MetalError::CommandFailed);
     }
-    let pipe = ensure_pipeline(device, GDN_KERNEL_SRC, "gdn_delta_step")?;
+    let pipe = ensure_pipeline(
+        device,
+        GDN_DELTA_STEP_COALESCED_SRC,
+        "gdn_delta_step_coalesced",
+    )?;
     encoder.setComputePipelineState(&pipe.0);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(state), 0, 0);
@@ -299,12 +397,17 @@ pub fn encode_delta_step_at(
         ];
         encoder.setBytes_length_atIndex(NonNull::new(dims.as_mut_ptr() as *mut _).unwrap(), 16, 7);
     }
-    // One thread per state row, capped at the pipeline's own maximum so
-    // a 1024-wide head still dispatches (the row loop strides).
-    let threads = shape.head_dim.min(pipe.0.maxTotalThreadsPerThreadgroup());
+    // One threadgroup per `(head, state row)` and one thread per state
+    // COLUMN, which is what makes a threadgroup's read of the state one
+    // contiguous span. The reduction below the kernel's first barrier
+    // halves from `S`, so the width must be the head width exactly.
+    let threads = shape.head_dim;
+    if threads > pipe.0.maxTotalThreadsPerThreadgroup() {
+        return Err(MetalError::CommandFailed);
+    }
     encoder.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
-            width: shape.n_v_heads,
+            width: shape.n_v_heads * shape.head_dim,
             height: 1,
             depth: 1,
         },
