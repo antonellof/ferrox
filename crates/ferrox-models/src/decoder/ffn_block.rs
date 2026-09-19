@@ -385,22 +385,32 @@ impl Decoder {
         }
     }
 
-    /// Nanbeige's loop norm (`nanbeige.cpp:167-175`): after the last
-    /// logical layer of every pass but the final one, the residual is
-    /// normed with `output_norm` (`crate::layer_loops`). Here, at the
-    /// end of BOTH FFN bodies, so every caller of either gets it; a
-    /// model that does not loop never enters the branch.
+    /// The norm a pass boundary applies (`crate::layer_loops`). Here,
+    /// at the end of BOTH FFN bodies, so every caller of either gets
+    /// it; a model that does not loop never enters the branch.
+    ///
+    /// Two shapes: `nanbeige.cpp:167-175` norms with the model's own
+    /// `output_norm` after every pass but the last, and
+    /// `hrm-text.cpp:162` closes every stack with a WEIGHTLESS RMS --
+    /// which for that architecture is the only final norm there is.
     fn apply_loop_norm(&self, layer_idx: usize, hidden: &mut [f32], rows: usize) {
         let Some(loops) = self.config.layer_loops else {
             return;
         };
-        if !loops.loop_norm_after(layer_idx) {
+        let Some(kind) = loops.loop_norm_after(layer_idx) else {
             return;
-        }
+        };
         let width = self.config.hidden_dim;
         debug_assert_eq!(hidden.len(), rows * width);
         for row in hidden.chunks_mut(width) {
-            let normed = self.final_norm.apply(row, self.config.rms_norm_eps);
+            let normed = match kind {
+                crate::layer_loops::LoopNorm::Output => {
+                    self.final_norm.apply(row, self.config.rms_norm_eps)
+                }
+                crate::layer_loops::LoopNorm::Weightless => {
+                    crate::norm::NormOp::RmsNoParams.apply(row, self.config.rms_norm_eps)
+                }
+            };
             row.copy_from_slice(&normed);
         }
     }

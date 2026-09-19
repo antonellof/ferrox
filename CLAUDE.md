@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-19 against a MOVED PIN. **97**
+Honest position, re-audited 2026-09-19 against a MOVED PIN. **98**
 architectures run with evidence (`capability::AUDITED_GENERIC_GQA`), 4
 more have dedicated engines, and everything else REFUSES. The "loads
 and is WRONG" class is closed: the generic path is opt-in, so an
@@ -90,12 +90,33 @@ ONE epsilon into its kernel. Its fixture declares the model epsilon
 four orders larger than the literal, so the two cannot be swapped
 without moving the logits.
 
-So **six** triaged refusals are left, and they say which of three
+`hrm_text` (DFM Mimir 1B) closed the same day as the fifth, and it is
+the first decoder here that is not a walk down ONE residual stream.
+`hrm-text.cpp:183-196` runs `h_cycles` cycles of `l_cycles` LOW stacks
+and one HIGH stack; every stack reads `zH + zL` and replaces one of
+the two, `zH` starting as the embeddings and `zL` as a learned
+`hrm.z_l_init` row, and the lm_head reads `zH` with no final norm
+because every stack ends with its own weightless RMS. Its stacks are
+ALIASES: the file holds `2 * layers_per_stack` blocks while
+`block_count` is the expanded slot count, and each slot keeps its own
+KV. `crate::layer_loops::LayerLoops` is an enum now -- `Repeat`
+(nanbeige) and `Hrm` -- so the mapping, the pass norm and the stream
+schedule are one value the four host bodies ask, and `crate::hrm` is
+the two-stream state, one type with two methods rather than four
+copies of "hold two vectors". Two fixtures: the alternating schedule
+matches EXACTLY and the deep one (two LOW passes in a row, the case
+the alternating order never reaches) lands at 1.6e-4, which is six
+weightless renormalisations amplifying the 1e-7 ferrox and ggml differ
+by per reduction -- measured by running three depths, not assumed.
+
+So **five** triaged refusals are left, and they say which of three
 things is missing: **0 are a fixture away, 0 are one match arm away**,
-5 need new code, 1 is unknown with the question stated. Both cheap
+4 need new code, 1 is unknown with the question stated. Both cheap
 classes are EMPTY again, which is where they were before the pin
-moved, and FOUR of the eight rows the pin brought in closed the day it
-moved.
+moved; FIVE of the eight rows the pin brought in closed the day it
+moved, and the three that are left each need a block this engine does
+not have (a per-token adapter selection, lightning attention, a
+delta-net over a hybrid memory index).
 
 Three things the pin move found that are not new architectures at all:
 `kimi_k3` had been spelled with an UNDERSCORE in the catalog since it

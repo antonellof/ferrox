@@ -150,6 +150,16 @@ pub const EMBEDDING_NORM_ARCHITECTURES: &[&str] = &["bloom"];
 /// a norm" -- and `bloom`'s site has a weight where this one has none.
 pub const WEIGHTLESS_EMBEDDING_NORM: &[&str] = &["muse-glimmer"];
 
+/// Architectures with NO final norm tensor at all.
+///
+/// `hrm-text.cpp:37-45` creates `token_embd`, `output` and
+/// `hrm_z_l_init` and no `output_norm`: every stack ends with its own
+/// weightless RMS (`:162`, `crate::layer_loops::LoopNorm::Weightless`)
+/// and the last stack's IS the final norm, so the lm_head reads what
+/// that norm produced. Asking for the tensor would refuse every real
+/// HRM-Text file.
+pub const NO_OUTPUT_NORM: &[&str] = &["hrm_text"];
+
 /// Does this architecture norm its embeddings without a weight? See
 /// [`WEIGHTLESS_EMBEDDING_NORM`].
 pub fn weightless_embedding_norm(arch: &str) -> bool {
@@ -310,7 +320,10 @@ pub struct NormSites {
     pub ffn: Option<StoredNorm>,
     pub post_attn: Option<StoredNorm>,
     pub post_ffn: Option<StoredNorm>,
-    pub output: StoredNorm,
+    /// The final norm before the LM head, or `None` for
+    /// [`NO_OUTPUT_NORM`] -- the one architecture whose last stack
+    /// norm IS the final one.
+    pub output: Option<StoredNorm>,
     /// The norm on the token embeddings before layer 0, or `None` for
     /// every architecture but [`EMBEDDING_NORM_ARCHITECTURES`].
     pub embedding: Option<StoredNorm>,
@@ -332,10 +345,12 @@ impl NormSites {
             ffn: Some(StoredNorm::required(&["ffn_norm"])),
             post_attn: Some(StoredNorm::optional(&["post_attention_norm"])),
             post_ffn: Some(StoredNorm::optional(&["post_ffw_norm"])),
-            output: if OUTPUT_NORM_UNDER_EMBEDDING_NAME.contains(&arch) {
-                StoredNorm::required(&["token_embd_norm"])
+            output: if NO_OUTPUT_NORM.contains(&arch) {
+                None
+            } else if OUTPUT_NORM_UNDER_EMBEDDING_NAME.contains(&arch) {
+                Some(StoredNorm::required(&["token_embd_norm"]))
             } else {
-                StoredNorm::required(&["output_norm"])
+                Some(StoredNorm::required(&["output_norm"]))
             },
             embedding: EMBEDDING_NORM_ARCHITECTURES
                 .contains(&arch)
@@ -457,7 +472,7 @@ mod tests {
             Some(StoredNorm::optional(&["post_attention_norm"]))
         );
         assert_eq!(s.post_ffn, Some(StoredNorm::optional(&["post_ffw_norm"])));
-        assert_eq!(s.output, StoredNorm::required(&["output_norm"]));
+        assert_eq!(s.output, Some(StoredNorm::required(&["output_norm"])));
         assert_eq!(s.embedding, None);
         assert_eq!(
             NormSites::for_arch("bloom").embedding,
@@ -480,10 +495,10 @@ mod tests {
     #[test]
     fn token_embd_norm_is_the_output_norm_on_lfm2_alone() {
         let s = NormSites::for_arch("lfm2");
-        assert_eq!(s.output, StoredNorm::required(&["token_embd_norm"]));
+        assert_eq!(s.output, Some(StoredNorm::required(&["token_embd_norm"])));
         assert_eq!(s.embedding, None);
         let b = NormSites::for_arch("bloom");
-        assert_eq!(b.output, StoredNorm::required(&["output_norm"]));
+        assert_eq!(b.output, Some(StoredNorm::required(&["output_norm"])));
         for arch in OUTPUT_NORM_UNDER_EMBEDDING_NAME {
             assert!(
                 !EMBEDDING_NORM_ARCHITECTURES.contains(arch),

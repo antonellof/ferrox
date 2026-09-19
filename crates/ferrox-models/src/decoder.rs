@@ -546,6 +546,10 @@ pub struct Decoder {
     /// one embedding site; the GPU embedding gather has no norm and is
     /// not taken for a model that has one.
     pub embedding_norm: NormOp,
+    /// HRM-Text's learned LOW stream (`hrm.z_l_init`,
+    /// `hrm-text.cpp:46`, one `[n_embd]` row), `None` for every other
+    /// architecture. `crate::hrm` is the state the bodies carry.
+    pub hrm_z_l_init: Option<Vec<f32>>,
     pub layers: Vec<LayerWeights>,
     /// The norm before the LM head.
     ///
@@ -910,6 +914,7 @@ impl Decoder {
             embedding,
             position_embd: None,
             embedding_norm: NormOp::None,
+            hrm_z_l_init: None,
             layers,
             final_norm,
             output_head,
@@ -936,6 +941,54 @@ impl Decoder {
     #[cfg(feature = "metal")]
     fn metal_matvec_launch<'a>(m: &'a WeightMatrix) -> Option<ferrox_metal::gpu::MatvecLaunch<'a>> {
         crate::metal_launch::matvec(m)
+    }
+    /// HRM-Text's two streams for a decode of `rows` rows, or `None`
+    /// for every other architecture (`crate::hrm`).
+    ///
+    /// Called by every body that walks layers, so the state is built
+    /// in one place from one rule; a body that forgot it would run the
+    /// stacks on a single stream and answer fluently.
+    pub(crate) fn hrm_streams(&self, embedded: &[f32]) -> Option<crate::hrm::HrmStreams> {
+        let init = self.hrm_z_l_init.as_ref()?;
+        crate::hrm::hrm_schedule(self.config.layer_loops)?;
+        Some(crate::hrm::HrmStreams::new(embedded, init))
+    }
+
+    /// The residual layer `l` reads: `zH + zL` at a stack boundary,
+    /// and whatever the previous layer produced everywhere else.
+    pub(crate) fn hrm_stack_input(
+        &self,
+        streams: Option<&crate::hrm::HrmStreams>,
+        l: usize,
+        hidden: &mut Vec<f32>,
+    ) {
+        let Some(streams) = streams else { return };
+        let Some(loops) = self.config.layer_loops else {
+            return;
+        };
+        if loops.stack_starts_at(l) {
+            *hidden = streams.stack_input();
+        }
+    }
+
+    /// Store a finished stack's output in the stream it writes.
+    ///
+    /// Runs AFTER the FFN body's weightless pass norm
+    /// (`Decoder::apply_loop_norm`), because `hrm-text.cpp:162` norms
+    /// inside `build_stack` and `:186,193` store what it returned.
+    pub(crate) fn hrm_store(
+        &self,
+        streams: Option<&mut crate::hrm::HrmStreams>,
+        l: usize,
+        hidden: &[f32],
+    ) {
+        let Some(streams) = streams else { return };
+        let Some(loops) = self.config.layer_loops else {
+            return;
+        };
+        if let Some(stream) = loops.stream_after(l) {
+            streams.store(stream, hidden);
+        }
     }
 
     /// The per-model facts no fused Metal kernel implements, as ONE
@@ -2658,6 +2711,7 @@ impl Decoder {
         // `hidden` empty on purpose -- and a skip-stream model never
         // reaches them (`metal_can_serve_model`).
         let skip_rows = self.config.skip_stream.then(|| hidden.clone());
+        let mut hrm = self.hrm_streams(&hidden);
         if run_cpu_layers {
             // Indexed rather than iterated, because a RUN of consecutive
             // recurrent layers is submitted together
@@ -2677,6 +2731,7 @@ impl Decoder {
             let mut pending_qkv: crate::decoder::fused_recurrent::PendingQkv = None;
             #[allow(clippy::needless_range_loop)]
             for l in 0..kv_caches.len() {
+                self.hrm_stack_input(hrm.as_ref(), l, &mut hidden);
                 if l < fused_through {
                     continue;
                 }
@@ -3253,6 +3308,7 @@ impl Decoder {
                     inputs,
                     skip_rows.as_deref().map(|rows| SkipStream { rows }),
                 );
+                self.hrm_store(hrm.as_mut(), l, &hidden);
             }
         } // run_cpu_layers
 
@@ -3324,9 +3380,11 @@ impl Decoder {
 
         let mut hidden = self.embed_token(token_id, pos);
         let skip_rows = self.config.skip_stream.then(|| hidden.clone());
+        let mut hrm = self.hrm_streams(&hidden);
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
         for (l, cache) in kv_caches.iter_mut().enumerate() {
+            self.hrm_stack_input(hrm.as_ref(), l, &mut hidden);
             let layer = self.layer_for(l);
             // --- attention block ---
             let inputs = self.branch_inputs(layer, &hidden, 1);
@@ -3368,6 +3426,7 @@ impl Decoder {
                 inputs,
                 skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
+            self.hrm_store(hrm.as_mut(), l, &hidden);
         }
 
         let final_normed = self.final_norm.apply(&hidden, self.config.rms_norm_eps);
@@ -4420,11 +4479,13 @@ impl Decoder {
         }
 
         let n_layers = self.config.n_layers;
+        let mut hrm = self.hrm_streams(&hidden_batch);
         let mut l = 0usize;
         // Labelled for the Metal arm inside the `'attention` block below,
         // whose `continue` must name the loop it leaves.
         #[allow(unused_labels)]
         'layers: while l < n_layers {
+            self.hrm_stack_input(hrm.as_ref(), l, &mut hidden_batch);
             let layer = self.layer_for(l);
             // THIS layer's head counts. Zero for the two attention-less
             // shapes, which leave the loop below before a width is used;
@@ -4970,6 +5031,7 @@ impl Decoder {
                 ffn_block::BatchedFfnKernels::Prefill,
                 skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
+            self.hrm_store(hrm.as_mut(), l, &hidden_batch);
             l += 1;
         }
 
@@ -5030,10 +5092,12 @@ impl Decoder {
         // [batch, hidden], flattened row-major.
         let mut hidden_batch: Vec<f32> = self.embed_tokens(tokens, |b| positions[b]);
         let skip_rows = self.config.skip_stream.then(|| hidden_batch.clone());
+        let mut hrm = self.hrm_streams(&hidden_batch);
 
         let residency = self.gpu_vram_budget_bytes.map(|b| self.residency_plan(b));
 
         for l in 0..self.config.n_layers {
+            self.hrm_stack_input(hrm.as_ref(), l, &mut hidden_batch);
             let layer = self.layer_for(l);
             // THIS layer's head counts; see the prefill body.
             let shape = self.config.layer_shape(l);
@@ -5234,6 +5298,7 @@ impl Decoder {
                 ffn_block::BatchedFfnKernels::PerRow,
                 skip_rows.as_deref().map(|rows| SkipStream { rows }),
             );
+            self.hrm_store(hrm.as_mut(), l, &hidden_batch);
         }
 
         let final_normed_batch: Vec<f32> = hidden_batch
@@ -7561,7 +7626,7 @@ mod metal_rope_tests {
         let d = Decoder::new_random_small(plain.clone(), 1, 32);
         assert!(d.layer_supports_metal_attn(&d.layers[0]), "the premise");
         let mut looped = plain;
-        looped.layer_loops = Some(crate::layer_loops::LayerLoops {
+        looped.layer_loops = Some(crate::layer_loops::LayerLoops::Repeat {
             n_phys: 1,
             n_loops: 2,
             skip_loop_final_norm: false,
@@ -7673,6 +7738,7 @@ mod metal_rope_tests {
             crate::config::FfnActivation::SwigluClamped(crate::act_layers::SwigluClamps::new(
                 vec![0.0; clamped.n_layers],
                 vec![7.0; clamped.n_layers],
+                ferrox_moe::ClampForm::AfterSilu,
             ));
         assert_eq!(clamped.model_ffn_act(), None);
         assert!(!Decoder::metal_can_serve_model(&clamped, false));

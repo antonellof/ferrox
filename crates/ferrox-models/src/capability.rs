@@ -766,6 +766,12 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // post-norm epsilon that is a literal in the graph rather than the
     // model's key -- on top of four tables that each gained one name.
     "muse-glimmer",
+    // tests/hrm_text_graphs.rs: `hrm_text` (DFM Mimir 1B), the fifth
+    // row closed against the moved pin and the first decoder here with
+    // TWO residual streams. `crate::hrm` holds them and
+    // `crate::layer_loops::LayerLoops::Hrm` is the schedule that says
+    // which stack a logical layer runs and which stream it writes.
+    "hrm_text",
     // tests/attn_temperature_graphs.rs: `mistral3` (mistral3.cpp:5,
     // 14-17, 153-156), every Ministral-3 export. Its one blocker was
     // the PER-POSITION ATTENTION TEMPERATURE, `attention.temperature_scale`,
@@ -1342,7 +1348,7 @@ pub fn uses_non_parametric_layer_norm(arch: &str) -> bool {
 /// checked for either. `muse-glimmer`'s is also the first WEIGHTLESS
 /// norm at the EMBEDDING site, where `crate::norm_sites`' row is
 /// `bloom`'s weighted one.
-pub const NON_PARAMETRIC_RMS_NORM: &[&str] = &["talkie"];
+pub const NON_PARAMETRIC_RMS_NORM: &[&str] = &["talkie", "hrm_text"];
 
 /// See [`NON_PARAMETRIC_RMS_NORM`].
 pub fn uses_non_parametric_rms_norm(arch: &str) -> bool {
@@ -1799,19 +1805,18 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // `tests/gated_attention_graphs.rs`; it is the first row closed
     // against the MOVED pin, and it took a fixture and an hour, which
     // is what a ONE MATCH ARM verdict is supposed to mean.
-    (
-        "hrm_text",
-        TriageClass::NewCode,
-        "two transformer stacks replayed over one token stream. `src/models/hrm-text.cpp:8-10` read \
-         `hrm.layers_per_stack`, `hrm.h_cycles` and `hrm.l_cycles`; the graph runs the LOW \
-         stack `l_cycles` times and the HIGH stack once per H cycle, each stack being \
-         `layers_per_stack` layers with WEIGHTLESS RMS norms (`:107,144,162`) and a \
-         sigmoid attention gate (`:113-134`). `crate::layer_loops` is the same IDEA -- \
-         weights replayed, KV logical, `Decoder::layer_for` the one mapping -- with ONE \
-         loop count over ALL layers, where this is two counts over two disjoint stacks \
-         that alternate, so the mapping is different and the seam does not stretch to it \
-         without being re-read. `:478` also takes a prefix-LM flag it does not implement",
-    ),
+    // `hrm_text` (DFM Mimir 1B) was HERE for one PR, NEW CODE on its
+    // two-stack cycle schedule, and is audited now. The schedule is a
+    // second variant of `crate::layer_loops` -- two stacks of `lps`
+    // blocks replayed over `h * (l + 1)` passes, each pass aliasing
+    // one of the two -- and the TWO residual streams it recombines at
+    // every stack boundary are `crate::hrm`, one type the four host
+    // bodies call rather than four copies of "hold two vectors". Its
+    // other facts were served or one table row each: weightless RMS
+    // norms (`NON_PARAMETRIC_RMS_NORM`), a per-element sigmoid gate,
+    // an `embedding_scale`, and NO `output_norm` tensor at all
+    // (`norm_sites::NO_OUTPUT_NORM`, because the last stack's own norm
+    // is the final one). `tests/hrm_text_graphs.rs`.
     (
         "minimax-01",
         TriageClass::NewCode,
@@ -2414,6 +2419,20 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `rope_layers::RopeLayers::Never` as the other half of each.
         // `tests/rope_layout.rs`'s `LLAMA_NO_ROPE` pins that a row of
         // that group reaches the generic path ONLY under `Never`.
+        // `hrm_text` was NEW CODE in `NEOX_ROPE_TRIAGED` for one PR on
+        // its two-stack schedule and is audited now
+        // (`tests/hrm_text_graphs.rs`). NEOX RoPE:
+        // `llama_model_rope_type` puts LLM_ARCH_HRM_TEXT in the NEOX
+        // group, which `tests/rope_layout.rs` pins.
+        v.push(prof(
+            "hrm_text",
+            TextGeneration,
+            StandardGqa,
+            KvGqa,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            WholeVector,
+        ));
         // `muse-glimmer` was NEW CODE in `NORM_ROPE_TRIAGED` for one
         // PR on its two norm facts and is audited now
         // (`tests/muse_glimmer_graphs.rs`). NORM RoPE:
@@ -3988,7 +4007,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 6,
+            seen == 5,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
