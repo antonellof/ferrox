@@ -962,7 +962,7 @@ pub fn run_expert_oai(
 }
 
 pub use dense_bias::{run_expert_biased, DenseBias};
-pub use glu_act::{relu_sqr, GluAct, Ungated, XieluParams};
+pub use glu_act::{relu_sqr, ClampForm, GluAct, Ungated, XieluParams};
 
 /// Runs one token's hidden state through a single expert's gated FFN.
 ///

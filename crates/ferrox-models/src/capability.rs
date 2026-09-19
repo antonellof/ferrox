@@ -742,6 +742,14 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // per-layer head counts that size the gate, and a full-attention
     // layer in the middle of sliding ones.
     "spark2_5",
+    // tests/no_rope_layer_graphs.rs: `maple` (Maple-20B), the second
+    // row closed against the pin moved on 2026-09-19. Its one blocker
+    // was the per-layer RoPE gate -- `maple.cpp:88` rotates the
+    // sliding layers and not the full ones, `RopeLayers::SlidingOnly`
+    // -- and the fixture carries the window array, the per-layer
+    // expert widths, the per-head QK norm and the clamp arrays beside
+    // it, with layer 2 the unrotated one.
+    "maple",
     // tests/attn_temperature_graphs.rs: `mistral3` (mistral3.cpp:5,
     // 14-17, 153-156), every Ministral-3 export. Its one blocker was
     // the PER-POSITION ATTENTION TEMPERATURE, `attention.temperature_scale`,
@@ -1763,19 +1771,15 @@ const NO_UPSTREAM_ARCH: &str =
 /// [`NORM_ROPE_TRIAGED`].
 const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
     // --- Landed upstream AFTER the 2026-08-04 pin (see the NORM group).
-    (
-        "maple",
-        TriageClass::OneMatchArm,
-        "ONE `crate::rope_layers` table row. `src/models/maple.cpp:88` rotates inside `if \
-         (hparams.is_swa(il))` and nowhere else, which is `RopeLayers::SlidingOnly`, the \
-         rule `exaone-moe` and `cohere2` already use. Everything else in the graph is \
-         served and was checked line by line: the window array and `rope.freq_base_swa` \
-         (`:4-11`, `crate::swa_layers`), the per-head QK RMSNorm at `{head_dim}` (`:84-88`, \
-         `QkNormStyle::PerHead`), softmax routing with `norm_w = true` (`:128`), the \
-         per-layer `expert_feed_forward_length` ARRAY (`:6`, `LayerShapes`), and the SwiGLU \
-         clamp arrays llama.cpp's generic `build_moe_ffn` applies, which \
-         `crate::act_layers` already serves (`:11`)",
-    ),
+    // `maple` was HERE for one PR, ONE MATCH ARM on the per-layer RoPE
+    // gate, and is audited now: `src/models/maple.cpp:88` rotates only
+    // the sliding layers, which is `RopeLayers::SlidingOnly` --
+    // `cohere2`'s rule, one row of `crate::rope_layers`. The other
+    // things its verdict listed were already served and each table
+    // gained one name: the window ARRAY (`crate::swa_layers`), the
+    // per-layer `expert_feed_forward_length` array
+    // (`crate::layer_shapes`) and the SwiGLU clamp arrays
+    // (`crate::act_layers`). `tests/no_rope_layer_graphs.rs`.
     // `spark2_5` was HERE for one PR, ONE MATCH ARM on the attention
     // gate, and is audited now: `src/models/spark2-5.cpp:41,97-105`
     // is `step35`'s corner of `crate::attn_gate` with the tensor
@@ -2401,6 +2405,24 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
         // `rope_layers::RopeLayers::Never` as the other half of each.
         // `tests/rope_layout.rs`'s `LLAMA_NO_ROPE` pins that a row of
         // that group reaches the generic path ONLY under `Never`.
+        // `maple` was ONE MATCH ARM in `NEOX_ROPE_TRIAGED` for one PR
+        // on the per-layer RoPE gate and is audited now on
+        // `crate::rope_layers` (`tests/no_rope_layer_graphs.rs`). It is
+        // pushed here rather than in the `gqa_neox` list above because
+        // its QK norm is PER HEAD (`maple.cpp:49-50,84-88`, a
+        // `{head_dim}` weight applied to each head), and `gqa_neox`
+        // hands out `WholeVector` -- which loads, runs and normalises
+        // over the whole projection, the silent-wrong shape this
+        // column exists to prevent.
+        v.push(prof(
+            "maple",
+            TextGeneration,
+            StandardGqa,
+            KvIswa,
+            Neox,
+            ArchPath::GenericGqa { rope: Neox },
+            PerHead,
+        ));
         v.push(prof(
             "qwen3",
             TextGeneration,
@@ -3923,7 +3945,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 9,
+            seen == 8,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -4045,9 +4067,13 @@ mod audit_tests {
              `hy_v4`, `kimi-k3`); two are text-to-speech and are deferred with the audio \
              scope. TWO of the eight were ONE MATCH ARM -- `maple` needs one \
              `crate::rope_layers` row and `spark2_5` needed one `crate::attn_gate` row -- \
-             and `spark2_5` closed the same day on exactly that row plus a fixture, which \
-             is what that class is supposed to mean and why 10 is 9. `maple` is the one \
-             left in it"
+             and BOTH closed the same day, `spark2_5` on exactly the row its \
+             verdict named and `maple` on that row PLUS one thing no reading of \
+             `maple.cpp` alone could have found: `llama-graph.cpp:2228` sends four \
+             architectures, `maple` among them, to `ggml_swiglu_clamp`, which clamps the \
+             gate BEFORE the SiLU where every other graph clamps the SiLU's output \
+             (`ferrox_moe::ClampForm`). That is why 10 is 8, and why a fixture whose \
+             clamp never binds would have passed while the model was wrong"
         );
     }
 

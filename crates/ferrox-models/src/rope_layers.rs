@@ -219,6 +219,13 @@ pub fn rope_layers(
         // `exaone-moe`'s rule spelled `if (is_swa)` at `:91`: Command-R7B
         // rotates its three sliding layers in four and not the fourth.
         "cohere2" => RopeLayers::SlidingOnly,
+        // `maple.cpp:88` is the same `if (hparams.is_swa(il))` around
+        // both `ggml_rope_ext` calls, and `:5` reads the window as a
+        // REQUIRED key, so a Maple file always has one and the rule is
+        // unconditional here as it is for `cohere2`. Landed upstream
+        // after the 2026-08-04 pin; `tests/no_rope_layer_graphs.rs`
+        // carries the fixture, whose layer 2 is the unrotated one.
+        "maple" => RopeLayers::SlidingOnly,
         // `cohere2moe.cpp:192` adds `|| il < n_layer_dense_lead`
         // (`:177-179`: "dense-prefix full-attention layers use RoPE");
         // `:13` reads the window REQUIRED as `cohere2` does, so
