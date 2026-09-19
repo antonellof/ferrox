@@ -1357,35 +1357,45 @@ PTQ1_0 matvec returned zeros on its first run because
 had been quietly running Q5_0 through their fallbacks for two weeks
 while the capability table and the kernel registry said otherwise.
 Each is derived from the one table now, with a test that holds it.
-The speed gap that remains (7.7 vs 11.5 tok/s decode, 32.7 vs 66.8
-prefill on the M2 Pro, measured back to back on a quiet box) is structural: ~120 command buffers a token at
-0.166 ms of submission latency each, where the fork encodes one graph,
-and the delta-net recurrence on the CPU. Two of the levers pulled at
-it are worth as much as the one that worked: the device-side Hadamard
-bought 9% of decode (it let the folded FFN take the fused launch) and
-COST 6% of prefill, where the host transform is already parallel; and
-a spin-then-block wait on the command buffer, aimed at that 0.166 ms,
-measured 3.7 tok/s against 7.1 -- polling the status through objc
-takes the core the host work needs. Both are recorded where the code
-is, so the next attempt starts after them.
-`docs/plans/gdn-resident-state.md` IS that next attempt, with the
-ledger it has to beat: 159 submissions, 66 ms of GPU, 34 ms of
-submission overhead and 41 ms of host compute in a 141 ms token, and a
-`sample` that says 83% of the decode thread sits in
-`waitUntilCompleted`. Its delta-rule and gated-norm kernels LANDED
-(`ferrox-metal/src/gdn.rs`, pinned against
-`ferrox_core::gdn::delta_step`, sabotage red) and wiring them is a LOSS
-three different ways: 6.0 tok/s against 7.3 with the state copied both
-ways (3.1 MB a layer, 300 MB a token, more traffic than the whole
-weight read), 6.6 with it wrapped in place -- `RecurrentState::ssm` is
-page-aligned for exactly that -- and 6.9 with the wrapper cached so the
-host pages are mapped once. With every copy removed it is STILL behind,
-so the difference is the KERNEL: one threadgroup per head streaming a
-128x128 state does not beat six cores doing the same reduction out of
-cache when the layer's own work is 3 MFLOP. What beats it is the
-CHUNKED delta rule llama.cpp uses, which reads the state once per chunk
-of rows rather than once per row. That is a different algorithm, and it
-is the honest next step.
+The speed gap that remains is **10.1 vs 11.5 tok/s decode** and
+**43.1 vs 66.8 prefill** on the M2 Pro, measured back to back on a
+quiet box at the reference's own `tg32` shape, and by 0.24.0 it is no
+longer the shape it looked. Prefill's HOST side is finished: the
+gated delta-net recurrence runs chunked (the state read once per
+CHUNK of rows, not once per row) and then on the device, and the
+blocked attention the fused block refuses now runs on the GPU too;
+a `sample` of a prefill has nothing host-side above the noise.
+Decode went 7.1 to 10.1 by collapsing command buffers: a recurrent
+layer is ONE submission end to end -- `attn_norm`, the four
+projections, the gates, the convolution, the l2 norms, the delta
+rule, the gated norm, the rotation, `ssm_out`, the residual, the FFN
+norm, the FFN, the residual -- and consecutive recurrent layers
+commit back to back against one device buffer and wait ONCE, 192
+waits a token down to 69.
+
+**And that lever is now spent, with a number.** A decode token's GPU
+time is 88.8 ms; the reference's WHOLE token is 86.7 to 87.3. So
+removing every remaining submission and every host microsecond
+converges to 11.26 tok/s, below the reference: scheduling cannot
+reach parity from here, and neither can the device-resident attention
+layer that is the obvious next fusion (priced at 11.22). What is left
+is ~3% in the PTQ1_0 matvec's inner loop, and
+`docs/plans/gdn-resident-state.md` records what has already been
+eliminated against it -- three measured-neutral memory hypotheses, two
+concurrency schemes (one slower, one correct and flat, because a
+single matvec already dispatches 4352 threadgroups and fills the
+part), and the per-stage breakdown (head 0.286 ms, branch 0.251, FFN
+0.762 per recurrent layer). It also records that the bandwidth probe
+those hypotheses were aimed at reports a third of the truth and has
+never once predicted production; it subtracts its own launch cost
+now, and is still only good for comparing kernel variants.
+
+Two earlier levers are worth as much as the ones that worked: the
+device-side Hadamard bought 9% of decode and COST 6% of prefill,
+where the host transform is already parallel; and a spin-then-block
+wait on the command buffer, aimed at 0.166 ms of wake-up, measured
+3.7 tok/s against 7.1 -- polling the status through objc takes the
+core the host work needs. Both are recorded where the code is.
 
 Do not read the architecture catalog as a support matrix. `ferrox
 parity` is the oracle: its tokenizer half matches llama.cpp on every
