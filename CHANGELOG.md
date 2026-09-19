@@ -41,6 +41,25 @@ are the ones worth reading twice.
   row -- so that class is not empty for the first time since
   2026-09-12.
 
+### Added
+
+- **`spark2_5` runs (Spark-2.5 1.7B)**, the first architecture closed
+  against the moved pin and the whole point of triaging the new rows
+  the same day they arrive: its verdict said ONE `attn_gate` table row,
+  and that is exactly what it cost. `src/models/spark2-5.cpp:41,97-105`
+  projects a per-head gate from the normed attention input, sigmoids it
+  and multiplies it into the attention output before `wo` --
+  `step35`'s corner of the seam's two axes with the tensor REQUIRED
+  rather than optional. Everything else in the graph was served and
+  each existing table gained one name: the window ARRAY read with no
+  scalar attempt (`crate::swa_layers`), per-layer head counts that SIZE
+  the gate (`crate::layer_shapes`), and a gated GELU FFN
+  (`capability::uses_geglu`, which the family rule would have given
+  SwiGLU). KL 7.70e-7 against libllama, and 3.34e-12 with ferrox's GELU
+  made to emulate ggml's f16 table -- so the residual is the
+  reference's own approximation, measured rather than assumed
+  (`tests/gated_attention_graphs.rs`).
+
 ### Fixed
 
 - **`expert_used_count` is scalar OR an array, and the array spelling

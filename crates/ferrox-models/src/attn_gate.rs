@@ -155,6 +155,21 @@ pub const ATTN_GATE_ARCHS: &[(&str, AttnGateSpec)] = &[
             lines: "src/models/step35.cpp:96,268-284",
         },
     ),
+    // Landed upstream after the 2026-08-04 pin and closed on
+    // 2026-09-19 as ONE row: `spark2-5.cpp:41` creates the tensor
+    // REQUIRED at `{n_embd, n_head}` and `:97-105` sigmoids it and
+    // multiplies it in per head, which is `step35`'s corner of the two
+    // axes with the presence flipped. Nothing else in that graph was
+    // new (`tests/gated_attention_graphs.rs`).
+    (
+        "spark2_5",
+        AttnGateSpec {
+            act: GateAct::Sigmoid,
+            widths: &[GateWidth::PerHead],
+            presence: GatePresence::Required,
+            lines: "src/models/spark2-5.cpp:41,97-105",
+        },
+    ),
 ];
 
 /// The three graphs whose FULL-attention layers gate the softmax output
@@ -451,10 +466,13 @@ mod tests {
 
     /// The table is keyed by architecture, every row cites its lines,
     /// and the three GDN rows that share the tensor NAME are not in it.
+    ///
+    /// Four rows since 2026-09-19: `spark2_5` landed upstream after the
+    /// 2026-08-04 pin and is `step35`'s pair with the tensor required.
     #[test]
-    fn the_table_covers_the_three_softmax_gates_and_excludes_the_gdn_z_gates() {
+    fn the_table_covers_the_softmax_gates_and_excludes_the_gdn_z_gates() {
         let names: Vec<&str> = ATTN_GATE_ARCHS.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, ["afmoe", "laguna", "step35"]);
+        assert_eq!(names, ["afmoe", "laguna", "step35", "spark2_5"]);
         for (arch, spec) in ATTN_GATE_ARCHS {
             assert!(spec.lines.contains(".cpp:"), "`{arch}` cites no line");
             assert!(!spec.widths.is_empty(), "`{arch}` admits no width");

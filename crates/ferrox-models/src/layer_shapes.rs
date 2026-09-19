@@ -112,6 +112,13 @@ pub const PER_LAYER_SHAPE_ARCHS: &[(&str, &str)] = &[
          the NEXTN blocks at :32 `crate::mtp_blocks`",
     ),
     (
+        "spark2_5",
+        "generic. spark2-5.cpp:33-37 (loader) and :76-77 (graph) read n_head(i) and \
+         n_head_kv(i) per layer, sizing the per-head attention gate (:41) by each layer's \
+         own count. Landed upstream after the 2026-08-04 pin and closed on 2026-09-19 with \
+         one `crate::attn_gate` row",
+    ),
+    (
         "nanbeige",
         "nanbeige.cpp:24-26 copies each physical layer's arrays to every logical slot; \
          `LayerShapes::replicated` does the same and `crate::layer_loops` is the seam the row \
@@ -1302,6 +1309,7 @@ mod tests {
                 "plamo3",
                 "laguna",
                 "step35",
+                "spark2_5",
                 "jamba",
                 "nemotron_h",
                 "granitehybrid",

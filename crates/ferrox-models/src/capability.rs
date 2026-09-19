@@ -733,6 +733,15 @@ pub const AUDITED_GENERIC_GQA: &[&str] = &[
     // it through `ModelConfig::model_ffn_act`.
     "apertus",
     "step35",
+    // tests/gated_attention_graphs.rs: `spark2_5` (Spark-2.5 1.7B),
+    // the first architecture closed against the pin moved on
+    // 2026-09-19. Its one blocker was the per-head sigmoid attention
+    // gate, which is `crate::attn_gate`'s existing pair with the
+    // tensor REQUIRED (`src/models/spark2-5.cpp:41,97-105`); the
+    // fixture carries the window ARRAY with its own RoPE base, the
+    // per-layer head counts that size the gate, and a full-attention
+    // layer in the middle of sliding ones.
+    "spark2_5",
     // tests/attn_temperature_graphs.rs: `mistral3` (mistral3.cpp:5,
     // 14-17, 153-156), every Ministral-3 export. Its one blocker was
     // the PER-POSITION ATTENTION TEMPERATURE, `attention.temperature_scale`,
@@ -1767,17 +1776,16 @@ const NEOX_ROPE_TRIAGED: &[(&str, TriageClass, &str)] = &[
          clamp arrays llama.cpp's generic `build_moe_ffn` applies, which \
          `crate::act_layers` already serves (`:11`)",
     ),
-    (
-        "spark2_5",
-        TriageClass::OneMatchArm,
-        "ONE `crate::attn_gate` table row. `src/models/spark2-5.cpp:41` creates `attn_gate` at \
-         `{n_embd, n_head}` and `:97-105` sigmoid it and multiply it into the attention \
-         output per HEAD before `wo` -- `GateAct::Sigmoid` with `GateWidth::PerHead`, the \
-         pair `step35` already admits, so the seam needs the name and nothing else. The \
-         rest is a llama with a window array and `rope.freq_base_swa` (`:5-12`), per-layer \
-         head counts (`:33-37`, `LayerShapes`) and a gated GELU FFN (`:124`, \
-         `GluAct::Geglu`)",
-    ),
+    // `spark2_5` was HERE for one PR, ONE MATCH ARM on the attention
+    // gate, and is audited now: `src/models/spark2-5.cpp:41,97-105`
+    // is `step35`'s corner of `crate::attn_gate` with the tensor
+    // REQUIRED instead of optional, which is one row of
+    // `ATTN_GATE_ARCHS`, and the rest of its graph (the window ARRAY
+    // with `rope.freq_base_swa`, per-layer head counts, a gated GELU
+    // FFN, NEOX RoPE) was already served. The libllama golden is
+    // `tests/gated_attention_graphs.rs`; it is the first row closed
+    // against the MOVED pin, and it took a fixture and an hour, which
+    // is what a ONE MATCH ARM verdict is supposed to mean.
     (
         "hrm_text",
         TriageClass::NewCode,
@@ -2336,6 +2344,13 @@ pub fn architecture_catalog() -> &'static [ArchProfile] {
             // llama-model.cpp:2671.
             "apertus",
             "step35",
+            // Was ONE MATCH ARM in `NEOX_ROPE_TRIAGED` for one PR on
+            // the per-head attention gate, audited now on
+            // `crate::attn_gate` (`tests/gated_attention_graphs.rs`).
+            // NEOX RoPE: `llama_model_rope_type` puts
+            // LLM_ARCH_SPARK2_5 in the NEOX group, which
+            // `tests/rope_layout.rs` pins.
+            "spark2_5",
             // Was NEW CODE in `NEOX_ROPE_TRIAGED` on the router
             // operand (`smallthinker.cpp:111`), audited now on
             // `crate::router_input` (`tests/router_input_graphs.rs`).
@@ -3189,7 +3204,14 @@ pub fn swa_window_override(arch: &str, n_layers: usize) -> SwaWindowOverride {
 /// listed. The Gemma lineage is GELU too and stays on the family rule,
 /// because every Gemma row IS `GemmaFamily`.
 pub fn uses_geglu(arch: &str) -> bool {
-    matches!(arch, "grok")
+    // `spark2_5` joined on 2026-09-19 with the pin move:
+    // `src/models/spark2-5.cpp:124` passes `LLM_FFN_GELU` under
+    // `LLM_FFN_PAR` to `build_ffn`, i.e. a GATED GELU, and the row is
+    // `StandardGqa` like `grok` -- so the family rule would have given
+    // it SwiGLU and a different FFN on every layer. Its golden
+    // (`tests/gated_attention_graphs.rs`) holds at the same GeGLU
+    // tolerance llama.cpp's f16 GELU table forces.
+    matches!(arch, "grok" | "spark2_5")
 }
 
 /// Architectures whose FFN is the UNGATED ReLU-squared MLP:
@@ -3901,7 +3923,7 @@ mod audit_tests {
             }
         }
         assert!(
-            seen == 10,
+            seen == 9,
             "every unaudited generic architecture is triaged; found {seen}. \
              It was 47 until the triage found `minicpm3` was an MLA model on the \
              generic-GQA row and it moved to DedicatedOnly, 46 until five ONE MATCH ARM \
@@ -4021,9 +4043,11 @@ mod audit_tests {
              `hrm_text`, `minimax-01`, `qwen4exp`); four need an attention this engine \
              does not have and are `dedicated` refusals (`bailingmoe3`, `dots3note`, \
              `hy_v4`, `kimi-k3`); two are text-to-speech and are deferred with the audio \
-             scope. TWO of the eight are ONE MATCH ARM -- `maple` needs one \
-             `crate::rope_layers` row and `spark2_5` one `crate::attn_gate` row -- so \
-             that class is not empty any more, and it is the cheapest work in the tree"
+             scope. TWO of the eight were ONE MATCH ARM -- `maple` needs one \
+             `crate::rope_layers` row and `spark2_5` needed one `crate::attn_gate` row -- \
+             and `spark2_5` closed the same day on exactly that row plus a fixture, which \
+             is what that class is supposed to mean and why 10 is 9. `maple` is the one \
+             left in it"
         );
     }
 

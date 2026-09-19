@@ -67,7 +67,7 @@ fn every_unaudited_architecture_renders_a_detail_line() {
         assert!(detail.len() > 100, "`{}` renders {detail:?}", p.gguf_name);
     }
     assert_eq!(
-        n, 10,
+        n, 9,
         "the unaudited count moved. It was 47 until the triage itself found `minicpm3` was \
          an MLA model sitting on the generic-GQA row and it was reclassified to \
          DedicatedOnly, 46 until `deepseek`, `bailingmoe`, `seed_oss`, `maincoder` and \
@@ -428,7 +428,7 @@ fn the_remaining_work_is_counted() {
         .count();
     // 2 before the 2026-09-19 pin move (`grovemoe`, `phi4`), plus the
     // eight upstream architectures it brought in.
-    assert_eq!(triaged + TRIAGE_PENDING.len(), 10);
+    assert_eq!(triaged + TRIAGE_PENDING.len(), 9);
 }
 
 /// `minicpm3` is refused as an MLA model, not as an unaudited one.
@@ -1201,15 +1201,16 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
     }
     assert_eq!(
         (fixture, arm, new_code, unknown),
-        (0, 2, 7, 1),
+        (0, 1, 7, 1),
         "the triage distribution moved; if a verdict changed on evidence that is correct, \
          update this and docs/MODELS.md together. BOTH cheap classes were ZERO between \
          2026-09-12 and 2026-09-19 -- `gemma` was the last FIXTURE-AWAY row and `chatglm` \
          the last ONE MATCH ARM one -- and the 2026-09-19 pin move refilled the ONE MATCH \
          ARM column with two: `maple` needs one `ferrox_models::rope_layers` row \
-         (`RopeLayers::SlidingOnly`, `src/models/maple.cpp:88`) and `spark2_5` one \
-         `ferrox_models::attn_gate` row (sigmoid, per head, `src/models/spark2-5.cpp:41`). \
-         Those two are the cheapest work in the tree and should not sit here: the lesson \
+         (`RopeLayers::SlidingOnly`, `src/models/maple.cpp:88`) and `spark2_5` needed one \
+         `ferrox_models::attn_gate` row (sigmoid, per head, `src/models/spark2-5.cpp:41`), \
+         which it got the same day -- so the column reads 1, not 2, and the row that \
+         closed took a fixture and an hour. `maple` should not sit here either: the lesson \
          of `minimax-m2` is that a row whose verdict names its own closing evidence and \
          does not go and get it is a refusal that could have been a row. The NEW CODE \
          column went 1 to 7 the same day (`granite_swa`, `graniteswitch`, `muse-glimmer`, \
@@ -1295,7 +1296,7 @@ fn every_unaudited_row_is_triaged_and_the_distribution_is_pinned() {
          single UNKNOWN left is `phi4`; `mistral`, `mixtral` and `yi` were the other \
          three and turned out not to be architectures at all"
     );
-    assert_eq!(fixture + arm + new_code + unknown, 10);
+    assert_eq!(fixture + arm + new_code + unknown, 9);
 }
 
 /// The per-layer activation-parameter seam closed two rows whose

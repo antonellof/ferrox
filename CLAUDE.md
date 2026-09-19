@@ -12,7 +12,7 @@ same command shapes, same or better performance, on the hardware people
 actually own. `docs/plans/north-star.md` is the ranking every other plan
 is read through, and `docs/plans/README.md` is the index.
 
-Honest position, re-audited 2026-09-19 against a MOVED PIN. **93**
+Honest position, re-audited 2026-09-19 against a MOVED PIN. **94**
 architectures run with evidence (`capability::AUDITED_GENERIC_GQA`), 4
 more have dedicated engines, and everything else REFUSES. The "loads
 and is WRONG" class is closed: the generic path is opt-in, so an
@@ -30,12 +30,24 @@ two are text-to-speech. A count that only ever fell would mean nobody
 was reading upstream. `docs/plans/parity-audit-2026-09-19.md` is the
 re-measurement, llama.cpp AND vLLM.
 
-So the ten triaged refusals say which of three things is missing: **0
-are a fixture away, 2 are one match arm away** (`maple` needs one
-`rope_layers` row, `spark2_5` one `attn_gate` row -- the cheapest work
-in the tree), 7 need new code, 1 is unknown with the question stated.
-Before the pin moved both cheap classes were EMPTY, which is the state
-to get back to.
+`spark2_5` (Spark-2.5 1.7B) closed the same day, which is what a ONE
+MATCH ARM verdict is supposed to cost: `spark2-5.cpp:41,97-105` is a
+per-head sigmoid attention gate, one row of `crate::attn_gate` beside
+`step35`'s, and the rest of its graph -- the window ARRAY with
+`rope.freq_base_swa`, per-layer head counts that SIZE the gate, a gated
+GELU FFN -- was already served, each by an existing table that had to
+gain one name. KL 7.70e-7 at the GELU-table line, and with ferrox's
+GELU made to emulate ggml's f16 table the same file agrees to 6.08e-6
+(KL 3.34e-12), so the residual is llama.cpp's own approximation and the
+row is pinned at 5e-3 with that measurement beside it. Three sabotages
+(the activation, the window-array reader, the GeGLU row) each move the
+logits by more than 0.8.
+
+So **nine** triaged refusals are left, and they say which of three
+things is missing: **0 are a fixture away, 1 is one match arm away**
+(`maple`, one `rope_layers` row), 7 need new code, 1 is unknown with
+the question stated. Before the pin moved both cheap classes were
+EMPTY, which is the state to get back to.
 
 Three things the pin move found that are not new architectures at all:
 `kimi_k3` had been spelled with an UNDERSCORE in the catalog since it
