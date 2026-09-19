@@ -15,6 +15,8 @@ are the ones worth reading twice.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-19
+
 ### Added
 
 - **`plamo2` runs (PLaMo-2 1B / 2B / 8B).** PLaMo-2's own state-space
@@ -30,6 +32,74 @@ are the ones worth reading twice.
   PLaMo-2 export unrotated (`print_info: n_rot = 0`); ferrox rotates,
   as the model does, and the deviation is pinned as a number in
   `tests/plamo2_graphs.rs`.
+
+- **A decode token that does not come back to the host.** On a hybrid,
+  a four-layer group -- one attention layer and three recurrent -- is
+  now ONE Metal submission, and nothing inside it returns to the CPU.
+  It arrived in five steps, each measured against the one before:
+
+  | | waits/token | tg32 |
+  |---|---|---|
+  | 0.24.0 | 69 | 10.12 |
+  | the attention layer's TAIL fused (`wo` + residual + norm + FFN) | 51 | 10.59 |
+  | the decode attention parallel over heads | 51 | 10.59 (and 9.44 to 10.19 at 300 tokens) |
+  | the tail riding in the NEXT recurrent run | 36 | 10.6 - 10.8 |
+  | the layer's projections riding in the PREVIOUS one | 20 | 11.06 - 11.17 |
+  | the attention itself on the device | 20 | **11.17** |
+
+- **`KvCache::metal_attn`**, a sequence's own device KV mirror. It lives
+  on the CACHE and not on the model because it is per-sequence state:
+  two requests in flight have two histories, and a mirror hung off a
+  shared `Decoder` would hand one sequence the other's keys. It is a
+  mirror and not the authority -- the host `k`/`v` stay complete, so
+  truncation, the prefix cache, slot files and every host reader are
+  untouched -- and it is trusted only while its own `seq_len` equals
+  the cache's `rows()`, re-uploading from the authority whenever
+  anything has moved the cache backwards.
+
+### Changed
+
+- **Decode is FLAT with context, which it was not.** 11.17 / 11.19 /
+  11.16 tok/s at 32 / 300 / 600 tokens on Bonsai-2-27B, against the
+  PrismML fork's 11.46 / 11.50. Before this release it sloped -- 11.1
+  at 32 tokens and 10.95 at 300 -- and the slope was exactly a host
+  attention whose work grows with `seq_len`.
+- The decode attention runs its heads in parallel. They share nothing,
+  and the loop was serial on a six-core machine.
+- `ferrox-metal/src/scratch_pool.rs` reuses shared-storage buffers
+  across launches.
+
+### Fixed
+
+- **The TEMPLATE decides the tool-call grammar, not the served name.**
+  A checkpoint served under `--alias bonsai-2-27b` is a Qwen3.5 file
+  whose template prints `<tool_call><function=…><parameter=…>`, and
+  `ToolCallFormat::infer` reads the NAME, finds no "qwen" in it and
+  falls through to the Llama 3 fallback, which reads none of those
+  calls. Measured against the running server before the fix:
+  `finish_reason: stop`, `tool_calls: null`, and the whole call
+  delivered as raw markup in `content`. **Tool calling was broken over
+  the OpenAI API for that model**, which is what a coding agent
+  pointed at it uses. `probe_implied_tool_format` renders the template
+  with a tool in hand at load and reads the grammar out of what it
+  prints; `PromptTemplate::tool_call_format` prefers that over the
+  name.
+- **The PTQ1_0 bandwidth probe reported roughly a third of the truth**,
+  measuring wall time around a whole command buffer. It subtracts its
+  own launch cost now -- which reversed a conclusion that had already
+  been committed, and put the matvec back to four rows a threadgroup.
+
+### Documentation
+
+- `docs/plans/gdn-resident-state.md` records the bug that would have
+  shipped: the device attention was first encoded on a CONCURRENT
+  encoder while its tail expects a serial one, and the model generated
+  fluent nonsense while `ferrox parity` stayed MATCH -- parity reads
+  the FIRST token, which is prefill, and that path is decode. Nothing
+  in the suite covers a decode step against a reference. A greedy
+  100-token generation compared against the same build with the device
+  path off is what proves the fix, and the plan says that comparison
+  should be a test.
 
 ## [0.24.0] - 2026-09-19
 

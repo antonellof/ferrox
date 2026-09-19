@@ -166,18 +166,26 @@ is faster.
   launches and Q5_0 prefill as N matvecs while the kernel registry
   recorded a GEMM hit), and `ferrox bench` refused every hybrid model
   because its cache probe read KV rows on a recurrent layer. Speed on
-  the M2 Pro, back to back on a quiet box: pp128 32.7 / tg32 7.7 tok/s
-  against the fork's 66.8 / 11.5, up from 2.9 / 2.4 at first light. The last 9% of decode came
-  from putting the ROTATION on the device
-  (`ferrox-metal/src/hadamard.rs`) so a folded FFN could take the
-  fused `gate -> SwiGLU -> down` launch, which halves a layer's
-  submissions; the same prologue LOST 6% on prefill and the module
-  records that, because `transform_rows` is already parallel across
-  cores and the kernel only serialises into the GEMM's own buffer.
-  What remains is structural and measured: ~120 command buffers a
-  token at 0.166 ms of submission latency each beyond their GPU time,
-  where the fork encodes one graph, plus the delta-net recurrence on
-  the CPU.
+  the M2 Pro, back to back on a quiet box: pp128 43.1 / tg32 11.17
+  against the fork's 66.8 / 11.46, up from 2.9 / 2.4 at first light,
+  and decode is FLAT with context (11.17 / 11.19 / 11.16 at 32 / 300 /
+  600 tokens, the fork 11.46 / 11.50). The whole of that came from the
+  SUBMISSION COUNT, 192 command buffers a token down to 20: a
+  recurrent layer runs end to end in one of them and consecutive ones
+  wait once; the attention layer's tail rides in the next group's
+  buffer and its projections in the previous one's; and the attention
+  itself runs on the device against the sequence's own KV mirror
+  (`KvCache::metal_attn`, which is a MIRROR -- the host `k`/`v` stay
+  the authority, so truncation, the prefix cache and slot files are
+  untouched, and the mirror is trusted only while its `seq_len` equals
+  the cache's rows). Two earlier levers are recorded where their code
+  is because they did NOT work: the device-side rotation bought 9% of
+  decode and cost 6% of prefill, where `transform_rows` is already
+  parallel across cores; and a spin-then-block wait on the command
+  buffer, aimed at the 0.166 ms of wake-up, measured 3.7 tok/s against
+  7.1. What remains is not plumbing: a token's GPU time is 88.8 ms
+  against the fork's whole token of 86.7-87.3, so the last ~3% is
+  inside the PTQ1_0 matvec.
 - **Llama 4: Scout and Maverick** (`llama4`), audited against libllama
   on 2026-09-14 (`tests/llama4_graphs.rs`, KL 1.1e-12 on the 16- and
   128-expert shapes, and the last of 8200 positions across the chunk
