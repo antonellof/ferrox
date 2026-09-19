@@ -15,6 +15,8 @@
 mod attn_block;
 #[cfg(feature = "cuda")]
 mod cuda_prefill;
+#[cfg(feature = "metal")]
+mod device_attention;
 mod entry;
 mod ffn_block;
 #[cfg(feature = "metal")]
@@ -3098,8 +3100,20 @@ impl Decoder {
                 #[cfg(feature = "metal")]
                 let mut deferred: Option<Vec<f32>> = None;
                 #[cfg(feature = "metal")]
+                let mut ready: Option<attn_block::AttnReady> = None;
+                #[cfg(feature = "metal")]
+                let residual_in = hidden.clone();
+                #[cfg(feature = "metal")]
                 let tail = if self.fused_attention_tail_eligible(l, layer) {
-                    attn_block::AttnTail::Defer(&mut deferred)
+                    attn_block::AttnTail::Defer {
+                        branch: &mut deferred,
+                        // The attention itself goes to the device when
+                        // this layer's shape allows it; otherwise only
+                        // the tail is fused and the host attends.
+                        ready: self
+                            .device_attention_shape_ok(l, layer)
+                            .then_some(&mut ready),
+                    }
                 } else {
                     attn_block::AttnTail::apply()
                 };
@@ -3126,6 +3140,72 @@ impl Decoder {
                     tail,
                     precomputed,
                 );
+                // The attention layer's inputs came back instead of its
+                // output: run the whole layer on the device, at the head
+                // of the next recurrent run when there is one.
+                #[cfg(feature = "metal")]
+                if let Some(r) = ready {
+                    let gate = r.gate.as_deref();
+                    if let Some(end) = self.device_attention_layer_then_run(
+                        l,
+                        layer,
+                        &r.q,
+                        &r.k,
+                        &r.v,
+                        gate,
+                        &mut hidden,
+                        kv_caches,
+                        &mut pending_qkv,
+                    ) {
+                        fused_through = end;
+                        continue;
+                    }
+                    let cache = &mut kv_caches[l];
+                    if let Some(out) = self.device_attention_layer(
+                        l,
+                        layer,
+                        cache,
+                        &r.q,
+                        &r.k,
+                        &r.v,
+                        gate,
+                        &residual_in,
+                    ) {
+                        cache
+                            .push(&r.k, &r.v)
+                            .expect("unbounded/planned KvCache growth is infallible");
+                        hidden = out;
+                        continue;
+                    }
+                    // Both device shapes refused after the layer had
+                    // already been prepared, so finish it on the host
+                    // from the very same inputs.
+                    let mut attn_out = self.push_and_attend_row(
+                        KvStep::Decode(&mut kv_caches[l]),
+                        l,
+                        layer,
+                        &r.k,
+                        &r.v,
+                        &r.q,
+                    );
+                    if let Some(g) = gate {
+                        crate::attn_gate::apply_interleaved_gate(&mut attn_out, g);
+                    }
+                    let projected = self.project_attn_rows(layer, &attn_out, 1);
+                    residual_add(&mut hidden, &projected, self.config.residual_scale);
+                    self.ffn_block_row(
+                        l,
+                        layer,
+                        &mut hidden,
+                        oai,
+                        residency
+                            .as_ref()
+                            .map(|p| p.layer_plan(self.physical_index(l))),
+                        inputs,
+                        skip_rows.as_deref().map(|rows| SkipStream { rows }),
+                    );
+                    continue;
+                }
                 #[cfg(feature = "metal")]
                 if let Some(branch) = deferred {
                     // The tail feeds the recurrent layers after it, so

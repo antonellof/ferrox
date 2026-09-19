@@ -32,6 +32,7 @@
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
 
+use crate::attn::MetalKvBuffers;
 use crate::gdn::{buffer_no_copy, encode_delta_step_at, encode_gated_norm, DeltaShape};
 use crate::gdn_head::{encode_conv_silu, encode_gates, encode_l2_norm_heads, HeadShape};
 use crate::gpu::{encode_matvec, resident_weight_buffer, shared_metal, MatvecLaunch, MetalError};
@@ -985,6 +986,65 @@ impl GdnRun {
         Ok(())
     }
 
+    /// A whole ATTENTION layer at the head of this run: the KV append,
+    /// the attention, the gate, `wo`, the residual, the FFN norm, the
+    /// FFN and the second residual, committed but NOT waited for.
+    ///
+    /// With this, a hybrid's four-layer group -- one attention layer
+    /// and three recurrent -- is ONE wait, and nothing in it returns to
+    /// the host.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::layer`]: the states this borrows must stay the
+    /// caller's until [`Self::finish`] returns.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn attn_layer(
+        &mut self,
+        kv: &mut MetalKvBuffers,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        gate: Option<&[f32]>,
+        n_heads: usize,
+        softcap: Option<f32>,
+        out_proj: &MatvecLaunch<'_>,
+        fold_branch: Option<&FoldPlan<'_>>,
+        ffn: &LayerFfn<'_>,
+    ) -> Result<(), MetalError> {
+        let shared = shared_metal()?;
+        let cmd_buf = shared
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandFailed)?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?;
+        let hidden_buf = self.hidden.buf(0);
+        encode_attn_layer(
+            &encoder,
+            kv,
+            q,
+            k,
+            v,
+            gate,
+            n_heads,
+            softcap,
+            out_proj,
+            fold_branch,
+            ffn,
+            // The stream is already in the run's buffer.
+            &[],
+            Some(hidden_buf),
+            &mut self.keep,
+        )?;
+        encoder.endEncoding();
+        cmd_buf.commit();
+        self.last = Some(cmd_buf);
+        self.submissions += 1;
+        Ok(())
+    }
+
     /// Waits for every layer committed so far and returns the residual
     /// stream.
     pub fn finish(self) -> Result<Vec<f32>, MetalError> {
@@ -1166,5 +1226,218 @@ pub fn launch_attn_tail(
     // kernels this call has waited for.
     unsafe {
         Ok(std::slice::from_raw_parts(result.contents().as_ptr() as *const f32, hidden).to_vec())
+    }
+}
+
+/// Everything an ATTENTION layer does after its projections, in ONE
+/// command buffer: this token's K/V appended to the device KV, the
+/// attention over it, the sigmoid gate, `wo`, the residual add, the FFN
+/// norm, the FFN and the second residual add.
+///
+/// # Why
+///
+/// With the projections riding in the previous run
+/// ([`GdnRun::attn_head`]) and the tail in the next
+/// ([`GdnRun::attn_tail`]), the only thing an attention layer still
+/// came back to the host for was the attention itself, because the KV
+/// lived there. It does not have to: `kv` is the sequence's own device
+/// mirror, appended one row a token and re-uploaded whenever the host
+/// cache says it has drifted.
+///
+/// That removes the last host step in a decode token AND the last
+/// growing one: the reference's decode is flat from 32 to 300 tokens
+/// and this engine's was not, because attention on the host grows with
+/// the context while a kernel over resident KV does not.
+///
+/// `gate` is the half of a double-width `wq` the caller split off; it
+/// is `None` for a layer that does not gate.
+#[allow(clippy::too_many_arguments)]
+fn encode_attn_layer(
+    encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    kv: &mut MetalKvBuffers,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    gate: Option<&[f32]>,
+    n_heads: usize,
+    softcap: Option<f32>,
+    out_proj: &MatvecLaunch<'_>,
+    fold_branch: Option<&FoldPlan<'_>>,
+    ffn: &LayerFfn<'_>,
+    residual: &[f32],
+    h_ext: Option<&ProtocolObject<dyn MTLBuffer>>,
+    keep: &mut Vec<ScratchSet>,
+) -> Result<(), MetalError> {
+    // `wo`'s row count IS the hidden width; `residual` is empty when
+    // the run already holds the stream in `h_ext`.
+    let hidden = out_proj.rows;
+    let per_token = kv.elems_per_token();
+    let branch_cols = out_proj.row_bytes / out_proj.block_bytes * out_proj.block_elems;
+    if (h_ext.is_none() && residual.len() != hidden)
+        || k.len() != per_token
+        || v.len() != per_token
+        || q.len() != n_heads * kv.head_dim
+        || branch_cols != n_heads * kv.head_dim
+        || gate.is_some_and(|g| g.len() != q.len())
+        || kv.seq_len >= kv.capacity()
+    {
+        return Err(MetalError::CommandFailed);
+    }
+    let shared = shared_metal()?;
+    let device = &shared.device;
+    let scratch = crate::scratch_pool::Scratch::take(
+        device,
+        &[q.len(), per_token, per_token, q.len().max(1), hidden],
+    )
+    .ok_or(MetalError::BufferAllocFailed)?;
+    let q_buf = scratch.write(0, q).ok_or(MetalError::CommandFailed)?;
+    let k_buf = scratch.write(1, k).ok_or(MetalError::CommandFailed)?;
+    let v_buf = scratch.write(2, v).ok_or(MetalError::CommandFailed)?;
+    let gate_buf = match gate {
+        None => None,
+        Some(g) => Some(scratch.write(3, g).ok_or(MetalError::CommandFailed)?),
+    };
+    // The attention output, which is also `wo`'s input.
+    let attn_buf = scratch.buf(4);
+    let tail = crate::scratch_pool::Scratch::take(
+        device,
+        &[
+            hidden,
+            hidden,
+            ffn.gate.rows,
+            ffn.up.rows,
+            ffn.gate.rows,
+            hidden,
+        ],
+    )
+    .ok_or(MetalError::BufferAllocFailed)?;
+    let proj = crate::scratch_pool::Scratch::take(device, &[hidden])
+        .ok_or(MetalError::BufferAllocFailed)?;
+    let out_w = resident_weight_buffer(device, out_proj.weights)?;
+    let signs = match fold_branch.and_then(|p| p.signs) {
+        None => None,
+        Some(sg) => {
+            // SAFETY: a `&[f32]` viewed as its own bytes, read only.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(sg.as_ptr() as *const u8, std::mem::size_of_val(sg))
+            };
+            Some(resident_weight_buffer(device, bytes)?)
+        }
+    };
+
+    let mut mrs = crate::mem_ranges::MemRanges::new();
+    // Append this token, then attend over everything including it.
+    let at = (kv.seq_len * per_token) as u32;
+    crate::attn::encode_kv_store_append(encoder, device, k_buf, v_buf, kv, at, per_token as u32)?;
+    let seq_len = kv.seq_len + 1;
+    crate::attn::encode_gqa_with_kv(
+        encoder,
+        &mut mrs,
+        device,
+        q_buf,
+        kv,
+        attn_buf,
+        n_heads as u32,
+        kv.n_kv_heads as u32,
+        kv.head_dim as u32,
+        seq_len as u32,
+        0,
+        softcap,
+    )?;
+    if let Some(g) = gate_buf {
+        crate::elem::encode_sigmoid_mul(encoder, device, attn_buf, g, q.len() as u32)?;
+    }
+    // `wo` reads the gated attention output directly: the fold rewrites
+    // that buffer in place and nothing reads it afterwards, so there is
+    // nothing to copy.
+    let branch_buf = attn_buf;
+    encode_attn_tail(
+        encoder,
+        device,
+        out_proj,
+        &out_w,
+        fold_branch,
+        signs.as_ref().map(|b| &*b.buffer),
+        ffn,
+        branch_buf,
+        branch_cols,
+        proj.buf(0),
+        &tail,
+        residual,
+        h_ext,
+        hidden,
+    )?;
+    kv.seq_len = seq_len;
+    keep.push(ScratchSet {
+        main: scratch,
+        head: Some(proj),
+        ffn: Some(tail),
+    });
+    Ok(())
+}
+
+/// The whole attention layer in a command buffer of its own.
+///
+/// [`GdnRun::attn_layer`] puts the same encoding at the head of a run
+/// instead, where it shares the run's single wait; this is the shape
+/// for a layer with no recurrent layers behind it.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_attn_layer(
+    kv: &mut MetalKvBuffers,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    gate: Option<&[f32]>,
+    n_heads: usize,
+    softcap: Option<f32>,
+    out_proj: &MatvecLaunch<'_>,
+    fold_branch: Option<&FoldPlan<'_>>,
+    ffn: &LayerFfn<'_>,
+    residual: &[f32],
+) -> Result<Vec<f32>, MetalError> {
+    let hidden = residual.len();
+    let shared = shared_metal()?;
+    let cmd_buf = shared
+        .queue
+        .commandBuffer()
+        .ok_or(MetalError::CommandFailed)?;
+    // SERIAL, not concurrent: `encode_attn_tail` was written for an
+    // encoder that orders its own dispatches, and on a concurrent one
+    // its fold, matvecs, norm and adds run unordered. The first version
+    // of this launch used a concurrent encoder and generated fluent
+    // nonsense while `ferrox parity` stayed MATCH -- parity reads the
+    // FIRST token, which is prefill, and this path is decode.
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    let mut keep = Vec::new();
+    encode_attn_layer(
+        &encoder,
+        kv,
+        q,
+        k,
+        v,
+        gate,
+        n_heads,
+        softcap,
+        out_proj,
+        fold_branch,
+        ffn,
+        residual,
+        None,
+        &mut keep,
+    )?;
+    encoder.endEncoding();
+    let clock = crate::timing::SubmitClock::start();
+    crate::timing::commit_wait_note(&cmd_buf, "attn-layer", 32, clock);
+    let out = keep
+        .last()
+        .and_then(|s| s.ffn.as_ref())
+        .ok_or(MetalError::CommandFailed)?
+        .buf(0);
+    // SAFETY: shared storage of exactly `hidden` floats, written by
+    // kernels this call has waited for.
+    unsafe {
+        Ok(std::slice::from_raw_parts(out.contents().as_ptr() as *const f32, hidden).to_vec())
     }
 }

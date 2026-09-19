@@ -77,7 +77,30 @@ pub(crate) enum AttnTail<'a> {
     /// buffer -- so the variant is gated and `Apply` carries the
     /// lifetime for both.
     #[cfg(feature = "metal")]
-    Defer(&'a mut Option<Vec<f32>>),
+    Defer {
+        /// The attention output BEFORE `wo`, when only the tail is
+        /// fused.
+        branch: &'a mut Option<Vec<f32>>,
+        /// Where to leave Q/K/V and the gate when the caller means to
+        /// run the ATTENTION on the device as well
+        /// (`crate::decoder::device_attention`). `None` asks for the
+        /// branch instead, attended on the host.
+        ///
+        /// Nothing is pushed to the KV cache on this path: the caller
+        /// pushes, because only it knows whether the device launch
+        /// took the row.
+        ready: Option<&'a mut Option<AttnReady>>,
+    },
+}
+
+/// One attention layer's inputs, after the projections, the biases, the
+/// QK norms and RoPE -- exactly what the attention itself reads.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+pub(crate) struct AttnReady {
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub gate: Option<Vec<f32>>,
 }
 
 impl AttnTail<'_> {
@@ -171,7 +194,9 @@ impl Decoder {
         normed: &[f32],
         pos: usize,
         mut kv: KvStep<'_>,
-        #[cfg_attr(not(feature = "metal"), allow(unused_variables))] tail: AttnTail<'_>,
+        #[cfg_attr(not(feature = "metal"), allow(unused_variables, unused_mut))] mut tail: AttnTail<
+            '_,
+        >,
         precomputed: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>,
     ) -> Option<Vec<f32>> {
         let head_dim = self.config.head_dim;
@@ -224,10 +249,38 @@ impl Decoder {
         // falcon-h1.cpp:156-160: the parallel Mamba-2 block on the same
         // normed row, summed into the attention branch.
         let ssm = self.parallel_ssm_rows(layer_idx, layer, normed, 1, kv.recurrent_slot());
+        // The whole layer on the device, when the sequence's KV mirror
+        // can carry it: attention, gate, `wo`, residual, norm, FFN,
+        // residual, in one submission
+        // (`crate::decoder::device_attention`). Tried BEFORE the host
+        // push, so the mirror and the cache are at the same length and
+        // nothing has to be re-uploaded; the push below then brings the
+        // authority level with it.
+        // The caller means to attend on the device: hand it the inputs
+        // and let it decide how -- at the head of a run, on its own, or
+        // not at all. Nothing is pushed here, because only the caller
+        // knows which of those happened.
+        #[cfg(feature = "metal")]
+        if let AttnTail::Defer {
+            ready: Some(slot), ..
+        } = &mut tail
+        {
+            debug_assert!(
+                ssm.is_none(),
+                "a parallel SSM branch cannot defer its attention"
+            );
+            **slot = Some(AttnReady {
+                q,
+                k,
+                v,
+                gate: q_gate,
+            });
+            return None;
+        }
         let mut attn_out = self.push_and_attend_row(kv, layer_idx, layer, &k, &v, &q);
         let branch = self.attn_branch_rows(layer, normed, &mut attn_out, 1, q_gate.as_deref());
         #[cfg(feature = "metal")]
-        if let AttnTail::Defer(slot) = tail {
+        if let AttnTail::Defer { branch: slot, .. } = tail {
             // `wo` and everything after it is the caller's, because it
             // is going to encode them into one command buffer with the
             // FFN (`crate::decoder::fused_attention`). A layer with a
