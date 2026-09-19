@@ -29,6 +29,7 @@
 //! submission this rides in already existed. The third has not, and is
 //! why the host body stays as the fallback and the caller measures.
 
+use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
 
 use crate::gdn::{buffer_no_copy, encode_delta_step_at, encode_gated_norm, DeltaShape};
@@ -160,21 +161,22 @@ impl BranchWeights<'_> {
     }
 }
 
-/// One token through the whole branch, in one submission.
+/// One layer encoded into a caller's command buffer, with its scratch
+/// handed back so the caller can hold it until that buffer completes.
 ///
-/// BOTH states are page-aligned host allocations wrapped in place and
-/// never copied: the delta state (`ssm_ptr`) and the convolution window
-/// (`conv_ptr`). `qkv` is `attn_qkv`'s output for this token and `z` is
-/// `attn_gate`'s.
+/// The ONE encoder: [`launch_gdn_branch`] wraps it in a command buffer
+/// of its own and waits, and [`GdnRun`] gives a whole run of layers one
+/// command buffer each and waits ONCE at the end. A second copy of this
+/// sequence is the thing this repo keeps paying for.
 ///
 /// # Safety
 ///
-/// Each pointer must address that many readable-writable, page-aligned
-/// bytes which outlive the call and which the caller holds exclusively
-/// across it. The GPU writes those bytes rather than a copy of them,
-/// and this call waits for it.
+/// As [`launch_gdn_branch`]: the two state pointers must address that
+/// many readable-writable, page-aligned bytes, held exclusively by the
+/// caller until the command buffer this encodes into has completed.
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn launch_gdn_branch(
+unsafe fn encode_layer(
+    encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     w: &BranchWeights<'_>,
     ssm_ptr: *mut f32,
     ssm_bytes: usize,
@@ -186,7 +188,8 @@ pub unsafe fn launch_gdn_branch(
     beta_in: Option<&[f32]>,
     alpha_in: Option<&[f32]>,
     residual: Option<&[f32]>,
-) -> Result<Vec<f32>, MetalError> {
+    h_ext: Option<&ProtocolObject<dyn MTLBuffer>>,
+) -> Result<(EncodedLayer, ScratchSet), MetalError> {
     let h = w.head;
     let (key_dim, value_dim, conv_dim) = (h.key_dim(), h.value_dim(), h.conv_dim());
     if !w.is_supported()
@@ -201,20 +204,23 @@ pub unsafe fn launch_gdn_branch(
         || qkv.is_some() != z.is_some()
         || qkv.is_some() != beta_in.is_some()
         || qkv.is_some() != alpha_in.is_some()
-        // The residual is needed by the FFN, and by the head as the
-        // vector it norms.
-        || (w.ffn.is_some() || w.head_in.is_some()) != residual.is_some()
-        // The residual travels exactly when the FFN does, so a caller
-        // cannot ask for the fused layer and forget what to add the
-        // branch to.
-        || residual.is_some_and(|r| r.len() != w.out_proj.rows)
+        // The residual stream is needed by the FFN, and by the head as
+        // the vector it norms. It comes from ONE of two places -- the
+        // host (`residual`) or a buffer the caller already holds
+        // (`h_ext`, which is how a RUN passes it from layer to layer)
+        // -- so a caller cannot ask for a fused layer and forget what
+        // to add the branch to, and the length is this call's business
+        // only when the bytes travel.
+        || ((w.ffn.is_some() || w.head_in.is_some())
+            && residual.is_none()
+            && h_ext.is_none())
+        || (h_ext.is_none() && residual.is_some_and(|r| r.len() != w.out_proj.rows))
     {
         return Err(MetalError::CommandFailed);
     }
 
     let shared = shared_metal()?;
     let device = &shared.device;
-    let queue = &shared.queue;
 
     // SAFETY: the caller's contract, forwarded.
     let ssm_buf = unsafe { buffer_no_copy(device, ssm_ptr, ssm_bytes) }
@@ -320,19 +326,18 @@ pub unsafe fn launch_gdn_branch(
         }
     };
 
-    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
-    let encoder = cmd_buf
-        .computeCommandEncoder()
-        .ok_or(MetalError::CommandFailed)?;
     // The layer's HEAD, when the caller owns it: the norm and the four
     // projections, which is the second of a recurrent layer's three
     // submissions.
     if let (Some(hd), Some(sc), Some(res)) = (&w.head_in, &head_scratch, residual) {
-        let x_buf = sc.write(0, res).ok_or(MetalError::CommandFailed)?;
+        let x_buf = match h_ext {
+            Some(b) => b,
+            None => sc.write(0, res).ok_or(MetalError::CommandFailed)?,
+        };
         let normed = sc.buf(1);
         let norm_w = crate::gpu::resident_f32_buffer(device, hd.norm)?;
         crate::norm::encode_rms_norm(
-            &encoder,
+            encoder,
             device,
             x_buf,
             &norm_w.buffer,
@@ -345,8 +350,8 @@ pub unsafe fn launch_gdn_branch(
         // and the fold below rewrites that buffer in place.
         let beta_w = resident_weight_buffer(device, hd.beta.weights)?;
         let alpha_w = resident_weight_buffer(device, hd.alpha.weights)?;
-        encode_matvec(&encoder, device, hd.beta, &beta_w, normed, beta_in_buf)?;
-        encode_matvec(&encoder, device, hd.alpha, &alpha_w, normed, alpha_in_buf)?;
+        encode_matvec(encoder, device, hd.beta, &beta_w, normed, beta_in_buf)?;
+        encode_matvec(encoder, device, hd.alpha, &alpha_w, normed, alpha_in_buf)?;
         if let Some(plan) = hd.fold_x {
             plan.check(hidden)?;
             let signs = match plan.signs {
@@ -363,7 +368,7 @@ pub unsafe fn launch_gdn_branch(
                 }
             };
             crate::hadamard::encode_fold(
-                &encoder,
+                encoder,
                 device,
                 normed,
                 hidden,
@@ -373,11 +378,11 @@ pub unsafe fn launch_gdn_branch(
         }
         let qkv_w = resident_weight_buffer(device, hd.qkv.weights)?;
         let z_w = resident_weight_buffer(device, hd.z.weights)?;
-        encode_matvec(&encoder, device, hd.qkv, &qkv_w, normed, qkv_buf)?;
-        encode_matvec(&encoder, device, hd.z, &z_w, normed, z_buf)?;
+        encode_matvec(encoder, device, hd.qkv, &qkv_w, normed, qkv_buf)?;
+        encode_matvec(encoder, device, hd.z, &z_w, normed, z_buf)?;
     }
     encode_gates(
-        &encoder,
+        encoder,
         device,
         h.n_v_heads,
         beta_in_buf,
@@ -388,7 +393,7 @@ pub unsafe fn launch_gdn_branch(
         g_buf,
     )?;
     encode_conv_silu(
-        &encoder,
+        encoder,
         device,
         h,
         &conv_buf,
@@ -398,7 +403,7 @@ pub unsafe fn launch_gdn_branch(
     )?;
     // Q and K only: V is the convolution's output as it stands.
     encode_l2_norm_heads(
-        &encoder,
+        encoder,
         device,
         conv_out,
         0,
@@ -407,7 +412,7 @@ pub unsafe fn launch_gdn_branch(
         w.eps,
     )?;
     encode_l2_norm_heads(
-        &encoder,
+        encoder,
         device,
         conv_out,
         key_dim,
@@ -416,7 +421,7 @@ pub unsafe fn launch_gdn_branch(
         w.eps,
     )?;
     encode_delta_step_at(
-        &encoder,
+        encoder,
         device,
         w.shape,
         &ssm_buf,
@@ -428,7 +433,7 @@ pub unsafe fn launch_gdn_branch(
         (o_buf, 0),
     )?;
     encode_gated_norm(
-        &encoder,
+        encoder,
         device,
         h.n_v_heads,
         h.head_dim,
@@ -441,7 +446,7 @@ pub unsafe fn launch_gdn_branch(
     if let Some(plan) = w.fold_y {
         plan.check(value_dim)?;
         crate::hadamard::encode_fold(
-            &encoder,
+            encoder,
             device,
             y_buf,
             value_dim,
@@ -449,14 +454,24 @@ pub unsafe fn launch_gdn_branch(
             signs_buf.as_ref().map(|b| &*b.buffer),
         )?;
     }
-    encode_matvec(&encoder, device, w.out_proj, &weights_buf, y_buf, out_buf)?;
+    encode_matvec(encoder, device, w.out_proj, &weights_buf, y_buf, out_buf)?;
 
     // The rest of the layer, when the caller owns it: the whole point
     // of the file, because none of this needs the host and each piece
     // of it used to cost a submission.
-    let result_buf = match (&w.ffn, &ffn_scratch, residual) {
+    // The value of this match is the encoding; which buffer holds the
+    // result is reported through `EncodedLayer` instead, because a run
+    // of layers keeps that buffer and does not read it here.
+    let _ = match (&w.ffn, &ffn_scratch, residual) {
         (Some(f), Some(sc), Some(res)) => {
-            let h_buf = sc.write(0, res).ok_or(MetalError::CommandFailed)?;
+            // The layer's residual stream: the caller's buffer when
+            // there is one (a RUN of layers shares it and it never
+            // comes back to the host between them), else this layer's
+            // own, filled from the host.
+            let h_buf = match h_ext {
+                Some(b) => b,
+                None => sc.write(0, res).ok_or(MetalError::CommandFailed)?,
+            };
             let (normed, gate_buf) = (sc.buf(1), sc.buf(2));
             let (up_buf, act_buf, ffn_out) = (sc.buf(3), sc.buf(4), sc.buf(5));
             let ffn_signs = |plan: Option<&FoldPlan<'_>>| match plan.and_then(|p| p.signs) {
@@ -479,9 +494,9 @@ pub unsafe fn launch_gdn_branch(
             let up_w = resident_weight_buffer(device, f.up.weights)?;
             let down_w = resident_weight_buffer(device, f.down.weights)?;
 
-            crate::elem::encode_vec_add(&encoder, device, h_buf, out_buf, hidden as u32)?;
+            crate::elem::encode_vec_add(encoder, device, h_buf, out_buf, hidden as u32)?;
             crate::norm::encode_rms_norm(
-                &encoder,
+                encoder,
                 device,
                 h_buf,
                 &norm_w.buffer,
@@ -492,7 +507,7 @@ pub unsafe fn launch_gdn_branch(
             if let Some(plan) = f.fold_x {
                 plan.check(hidden)?;
                 crate::hadamard::encode_fold(
-                    &encoder,
+                    encoder,
                     device,
                     normed,
                     hidden,
@@ -500,10 +515,10 @@ pub unsafe fn launch_gdn_branch(
                     x_signs.as_ref().map(|b| &*b.buffer),
                 )?;
             }
-            encode_matvec(&encoder, device, f.gate, &gate_w, normed, gate_buf)?;
-            encode_matvec(&encoder, device, f.up, &up_w, normed, up_buf)?;
+            encode_matvec(encoder, device, f.gate, &gate_w, normed, gate_buf)?;
+            encode_matvec(encoder, device, f.up, &up_w, normed, up_buf)?;
             crate::elem::encode_silu_mul(
-                &encoder,
+                encoder,
                 device,
                 gate_buf,
                 up_buf,
@@ -513,7 +528,7 @@ pub unsafe fn launch_gdn_branch(
             if let Some(plan) = f.fold_act {
                 plan.check(f.gate.rows)?;
                 crate::hadamard::encode_fold(
-                    &encoder,
+                    encoder,
                     device,
                     act_buf,
                     f.gate.rows,
@@ -521,12 +536,116 @@ pub unsafe fn launch_gdn_branch(
                     act_signs.as_ref().map(|b| &*b.buffer),
                 )?;
             }
-            encode_matvec(&encoder, device, f.down, &down_w, act_buf, ffn_out)?;
-            crate::elem::encode_vec_add(&encoder, device, h_buf, ffn_out, hidden as u32)?;
+            encode_matvec(encoder, device, f.down, &down_w, act_buf, ffn_out)?;
+            crate::elem::encode_vec_add(encoder, device, h_buf, ffn_out, hidden as u32)?;
             h_buf
         }
         _ => out_buf,
     };
+    Ok((
+        EncodedLayer {
+            result: match (&w.ffn, h_ext.is_some()) {
+                // A full layer's output IS the residual stream, and a
+                // RUN passes that buffer in: then there is nothing here
+                // to read and the run reads it once at the end.
+                (Some(_), true) => ResultBuf::Caller,
+                (Some(_), false) => ResultBuf::Ffn,
+                (None, _) => ResultBuf::OutProj,
+            },
+            rows: if w.ffn.is_some() {
+                hidden
+            } else {
+                w.out_proj.rows
+            },
+        },
+        ScratchSet {
+            main: scratch,
+            head: head_scratch,
+            ffn: ffn_scratch,
+        },
+    ))
+}
+
+/// What [`encode_layer`] wrote, and where.
+struct EncodedLayer {
+    result: ResultBuf,
+    rows: usize,
+}
+
+/// Which buffer holds the layer's output.
+enum ResultBuf {
+    /// The residual stream the caller supplied; nothing to read here.
+    Caller,
+    /// This layer's own residual buffer, a full layer with no caller
+    /// stream.
+    Ffn,
+    /// `ssm_out`'s output: a branch without an FFN.
+    OutProj,
+}
+
+/// The pooled buffers one encoded layer is still using. Held by the
+/// caller until the command buffer completes, and returned to the pool
+/// when dropped -- which is what makes the pool safe with a command
+/// buffer that has not been waited for yet.
+struct ScratchSet {
+    main: crate::scratch_pool::Scratch,
+    #[allow(dead_code)]
+    head: Option<crate::scratch_pool::Scratch>,
+    ffn: Option<crate::scratch_pool::Scratch>,
+}
+
+impl ScratchSet {
+    /// The buffer an encoded layer's output is in, or `None` when it is
+    /// the caller's own stream.
+    fn result<'b>(&'b self, which: &ResultBuf) -> Option<&'b ProtocolObject<dyn MTLBuffer>> {
+        match which {
+            ResultBuf::Caller => None,
+            ResultBuf::Ffn => self.ffn.as_ref().map(|s| s.buf(0)),
+            ResultBuf::OutProj => Some(self.main.buf(5)),
+        }
+    }
+}
+
+/// One token through the whole branch, in one submission.
+///
+/// BOTH states are page-aligned host allocations wrapped in place and
+/// never copied. `qkv` / `z` / `beta_in` / `alpha_in` arrive from the
+/// host exactly when `head_in` is `None`.
+///
+/// # Safety
+///
+/// Each pointer must address that many readable-writable, page-aligned
+/// bytes which outlive the call and which the caller holds exclusively
+/// across it. The GPU writes those bytes rather than a copy of them,
+/// and this call waits for it.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_gdn_branch(
+    w: &BranchWeights<'_>,
+    ssm_ptr: *mut f32,
+    ssm_bytes: usize,
+    conv_ptr: *mut f32,
+    conv_bytes: usize,
+    conv_len: usize,
+    qkv: Option<&[f32]>,
+    z: Option<&[f32]>,
+    beta_in: Option<&[f32]>,
+    alpha_in: Option<&[f32]>,
+    residual: Option<&[f32]>,
+    h_ext: Option<&ProtocolObject<dyn MTLBuffer>>,
+) -> Result<Vec<f32>, MetalError> {
+    let shared = shared_metal()?;
+    let queue = &shared.queue;
+    let cmd_buf = queue.commandBuffer().ok_or(MetalError::CommandFailed)?;
+    let encoder = cmd_buf
+        .computeCommandEncoder()
+        .ok_or(MetalError::CommandFailed)?;
+    // SAFETY: the caller's contract, forwarded unchanged.
+    let (done, keep) = unsafe {
+        encode_layer(
+            &encoder, w, ssm_ptr, ssm_bytes, conv_ptr, conv_bytes, conv_len, qkv, z, beta_in,
+            alpha_in, residual, h_ext,
+        )
+    }?;
     encoder.endEncoding();
     let clock = crate::timing::SubmitClock::start();
     let label = match (w.head_in.is_some(), w.ffn.is_some()) {
@@ -536,13 +655,147 @@ pub unsafe fn launch_gdn_branch(
     };
     crate::timing::commit_wait_note(&cmd_buf, label, 32, clock);
 
-    // SAFETY: shared storage of exactly `out_proj.rows` floats, written
-    // by kernels this call has waited for. The convolution window needs
-    // no read-back: the kernel wrote the caller's own bytes.
+    let result_buf = keep.result(&done.result).ok_or(MetalError::CommandFailed)?;
+    // SAFETY: shared storage of exactly this many floats, written by
+    // kernels this call has waited for. The convolution window needs no
+    // read-back: the kernel wrote the caller's own bytes.
     unsafe {
         Ok(
-            std::slice::from_raw_parts(result_buf.contents().as_ptr() as *const f32, hidden)
+            std::slice::from_raw_parts(result_buf.contents().as_ptr() as *const f32, done.rows)
                 .to_vec(),
         )
+    }
+}
+
+/// A RUN of consecutive full recurrent layers that shares one residual
+/// buffer and waits ONCE.
+///
+/// # Why
+///
+/// With a layer down to a single command buffer, the ledger says the
+/// token is GPU time plus the OS wake-up from `waitUntilCompleted`,
+/// about 0.17 ms per submission and nothing else. Nothing requires the
+/// host to wait per layer: consecutive recurrent layers pass their
+/// residual stream to each other and the host does not look at it, so
+/// the buffers can be committed back to back and waited for once. The
+/// GPU runs them in order because one queue is ordered.
+///
+/// What that costs is care with the pool: a command buffer that has not
+/// been waited for is still going to READ its scratch, so every layer's
+/// scratch is held here until [`Self::finish`] returns. Dropping it
+/// earlier would hand a live buffer to the next layer.
+pub struct GdnRun {
+    hidden: crate::scratch_pool::Scratch,
+    keep: Vec<ScratchSet>,
+    last: Option<objc2::rc::Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    rows: usize,
+    submissions: usize,
+}
+
+impl GdnRun {
+    /// Starts a run with `hidden` as the residual stream.
+    pub fn start(hidden: &[f32]) -> Result<Self, MetalError> {
+        let shared = shared_metal()?;
+        let scratch = crate::scratch_pool::Scratch::take(&shared.device, &[hidden.len()])
+            .ok_or(MetalError::BufferAllocFailed)?;
+        scratch.write(0, hidden).ok_or(MetalError::CommandFailed)?;
+        Ok(Self {
+            hidden: scratch,
+            keep: Vec::new(),
+            last: None,
+            rows: hidden.len(),
+            submissions: 0,
+        })
+    }
+
+    /// One more layer, committed but NOT waited for.
+    ///
+    /// # Safety
+    ///
+    /// As [`launch_gdn_branch`], and for longer: the two state pointers
+    /// must stay valid and exclusively the caller's until
+    /// [`Self::finish`] returns, because the GPU has not necessarily
+    /// touched them yet when this returns.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn layer(
+        &mut self,
+        w: &BranchWeights<'_>,
+        ssm_ptr: *mut f32,
+        ssm_bytes: usize,
+        conv_ptr: *mut f32,
+        conv_bytes: usize,
+        conv_len: usize,
+    ) -> Result<(), MetalError> {
+        // A run only carries layers that are whole: the residual stream
+        // is what one hands the next, and a branch without an FFN does
+        // not produce one.
+        if w.ffn.is_none() || w.head_in.is_none() {
+            return Err(MetalError::CommandFailed);
+        }
+        let shared = shared_metal()?;
+        let cmd_buf = shared
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandFailed)?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandFailed)?;
+        // SAFETY: the caller's contract, forwarded; the scratch this
+        // returns is held in `self.keep` until `finish`.
+        let (_, keep) = unsafe {
+            encode_layer(
+                &encoder,
+                w,
+                ssm_ptr,
+                ssm_bytes,
+                conv_ptr,
+                conv_bytes,
+                conv_len,
+                None,
+                None,
+                None,
+                None,
+                // The residual is already in the run's own buffer, so
+                // nothing travels from the host: `h_ext` is where both
+                // the head and the FFN read and write it.
+                Some(&[]),
+                Some(self.hidden.buf(0)),
+            )
+        }?;
+        encoder.endEncoding();
+        cmd_buf.commit();
+        self.keep.push(keep);
+        self.last = Some(cmd_buf);
+        self.submissions += 1;
+        Ok(())
+    }
+
+    /// Waits for every layer committed so far and returns the residual
+    /// stream.
+    pub fn finish(self) -> Result<Vec<f32>, MetalError> {
+        let Some(last) = &self.last else {
+            // SAFETY: shared storage of exactly `rows` floats, written
+            // by `start` and by nothing since.
+            return Ok(unsafe {
+                std::slice::from_raw_parts(
+                    self.hidden.buf(0).contents().as_ptr() as *const f32,
+                    self.rows,
+                )
+                .to_vec()
+            });
+        };
+        // One queue is ordered, so waiting for the LAST buffer waits
+        // for every buffer before it.
+        let clock = crate::timing::SubmitClock::start();
+        crate::timing::note_wait(last, "gdn-run", self.submissions, 32, clock);
+        // SAFETY: shared storage of exactly `rows` floats, written by
+        // kernels this call has now waited for.
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                self.hidden.buf(0).contents().as_ptr() as *const f32,
+                self.rows,
+            )
+            .to_vec()
+        })
     }
 }

@@ -2648,7 +2648,32 @@ impl Decoder {
         // reaches them (`metal_can_serve_model`).
         let skip_rows = self.config.skip_stream.then(|| hidden.clone());
         if run_cpu_layers {
-            for (l, cache) in kv_caches.iter_mut().enumerate() {
+            // Indexed rather than iterated, because a RUN of consecutive
+            // recurrent layers is submitted together
+            // (`ferrox_metal::gdn_branch::GdnRun`) and needs several
+            // caches at once. `fused_through` is how many layers that
+            // consumed; every `continue` below is a `for`, so it cannot
+            // spin.
+            // `fused_through` is only ever written under `metal`; the
+            // binding is unconditional so the loop reads the same either
+            // way.
+            #[allow(unused_mut, unused_assignments)]
+            let mut fused_through = 0usize;
+            #[allow(clippy::needless_range_loop)]
+            for l in 0..kv_caches.len() {
+                if l < fused_through {
+                    continue;
+                }
+                // Consecutive layers the fused launch serves whole pass
+                // their residual stream to each other on the device and
+                // wait ONCE, which is the submission count the decode
+                // gap is made of (`docs/plans/gdn-resident-state.md`).
+                #[cfg(feature = "metal")]
+                if let Some(end) = self.fused_recurrent_run(l, &mut hidden, kv_caches) {
+                    fused_through = end;
+                    continue;
+                }
+                let cache = &mut kv_caches[l];
                 let layer = self.layer_for(l);
                 // --- attention block ---
                 #[cfg(feature = "metal")]

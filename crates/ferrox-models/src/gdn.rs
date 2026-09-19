@@ -517,6 +517,114 @@ impl Gdn {
     /// (`qwen3next.cpp:422-436`) is host arithmetic this has no kernel
     /// for. Each one falls through rather than being approximated.
     #[cfg(feature = "metal")]
+    /// Builds this layer's [`ferrox_metal::gdn_branch::BranchWeights`]
+    /// and hands it to `f`.
+    ///
+    /// A closure rather than a return value because the weights borrow
+    /// launches and fold plans that are locals here, and ONE
+    /// construction site because a second would be a second place that
+    /// has to remember the head map, the fold widths and which
+    /// `beta_alpha` spelling has a kernel.
+    #[cfg(feature = "metal")]
+    fn with_branch_weights<R>(
+        &self,
+        rms_eps: f32,
+        head: Option<&crate::fused_layer::LayerHeadParts<'_>>,
+        ffn: Option<&crate::fused_layer::LayerFfnParts<'_>>,
+        f: impl FnOnce(&ferrox_metal::gdn_branch::BranchWeights<'_>) -> R,
+    ) -> Option<R> {
+        if !ferrox_core::weight_matrix::metal_dense_enabled() {
+            return None;
+        }
+        if matches!(self.beta_alpha, BetaAlpha::Fused { .. }) {
+            return None;
+        }
+        let h = self.h;
+        let (base, fold) = self.out_proj.launch_parts();
+        let out_proj = crate::metal_launch::matvec(base)?;
+        let fold_y = match fold {
+            None => None,
+            Some(fd) => Some(fd.metal_plan(h.value_dim())?),
+        };
+        let ffn_launches = match ffn {
+            None => None,
+            Some(parts) => Some(parts.launches()?),
+        };
+        let head_launches = match head {
+            None => None,
+            Some(parts) => Some(parts.launches()?),
+        };
+        let w = ferrox_metal::gdn_branch::BranchWeights {
+            shape: ferrox_metal::gdn::DeltaShape {
+                n_k_heads: h.n_k_heads,
+                n_v_heads: h.n_v_heads,
+                head_dim: h.head_dim,
+                map: match h.map {
+                    HeadMap::Tiled => ferrox_metal::gdn::HeadMapKind::Tiled,
+                    HeadMap::Grouped => ferrox_metal::gdn::HeadMapKind::Grouped,
+                },
+            },
+            head: ferrox_metal::gdn_head::HeadShape {
+                n_k_heads: h.n_k_heads,
+                n_v_heads: h.n_v_heads,
+                head_dim: h.head_dim,
+                d_conv: h.d_conv,
+            },
+            conv1d: &self.conv1d,
+            dt_bias: &self.dt_bias,
+            a: &self.a,
+            ssm_norm: &self.norm,
+            eps: rms_eps,
+            out_proj: &out_proj,
+            fold_y: fold_y.as_ref(),
+            ffn: ffn_launches.as_ref().map(|l| l.as_metal()),
+            head_in: head_launches.as_ref().map(|l| l.as_metal()),
+        };
+        if !w.is_supported() {
+            return None;
+        }
+        Some(f(&w))
+    }
+
+    /// This layer appended to a RUN of layers sharing one residual
+    /// buffer and one wait.
+    ///
+    /// # Safety
+    ///
+    /// The state this borrows must stay valid and exclusively the
+    /// caller's until the run finishes, because the GPU has not
+    /// necessarily read it when this returns.
+    #[cfg(feature = "metal")]
+    pub unsafe fn run_layer(
+        &self,
+        run: &mut ferrox_metal::gdn_branch::GdnRun,
+        attn_norm: &[f32],
+        rms_eps: f32,
+        ffn: &crate::fused_layer::LayerFfnParts<'_>,
+        state: &mut RecurrentState,
+    ) -> Option<()> {
+        let BetaAlpha::Split { beta, alpha } = &self.beta_alpha else {
+            return None;
+        };
+        let head = crate::fused_layer::LayerHeadParts::for_block(
+            attn_norm,
+            rms_eps,
+            &self.qkv,
+            &self.z_proj,
+            beta,
+            alpha,
+        )?;
+        let conv_len = state.conv.len();
+        let (ssm_bytes, ssm_ptr) = (state.ssm.alloc_bytes(), state.ssm.as_ptr());
+        let (conv_bytes, conv_ptr) = (state.conv.alloc_bytes(), state.conv.as_ptr());
+        self.with_branch_weights(rms_eps, Some(&head), Some(ffn), |w| {
+            // SAFETY: the caller's contract, forwarded.
+            unsafe { run.layer(w, ssm_ptr, ssm_bytes, conv_ptr, conv_bytes, conv_len) }
+        })?
+        .ok()
+    }
+
+    #[cfg(feature = "metal")]
     #[allow(clippy::type_complexity)]
     fn device_branch_full(
         &self,
@@ -611,6 +719,10 @@ impl Gdn {
                 // The residual is what the head norms and what the FFN
                 // adds to, so it travels when either does.
                 rest.map(|(_, residual)| residual),
+                // A single layer keeps its residual stream to itself;
+                // `ferrox_metal::gdn_branch::GdnRun` is what passes one
+                // from layer to layer without the host seeing it.
+                None,
             )
         }
         .ok()

@@ -290,6 +290,47 @@ weights the order is unobservable, and Bonsai's are folded. That is the
 second time in this file's history that a sabotage passing meant the
 TEST was wrong rather than the code right.
 
+## A RUN of layers, one wait
+
+Nothing required the host to wait per layer. Consecutive recurrent
+layers hand each other a residual stream the host never looks at, and
+one Metal queue is ordered, so `ferrox_metal::gdn_branch::GdnRun`
+commits them back to back against ONE device buffer and waits for the
+last. Qwen3.5 puts a full-attention layer every fourth, so the runs are
+three layers long and three waits become one.
+
+What it costs is care with the pool: a command buffer that has not been
+waited for is still going to read its scratch, so every layer's scratch
+is held by the run until `finish` returns.
+
+Bonsai `tg32`, the reference's own shape, interleaved on one box:
+
+| | tok/s | waits/token |
+|---|---|---|
+| session start | 9.49 | 101 |
+| whole layer fused | 9.49 | 101 |
+| + runs of three | **10.12** | **69** |
+| PrismML fork (`llama-bench`) | 11.45 - 11.54 | (one graph) |
+
+And the DIAGNOSIS has moved with it. The ledger now reads GPU 88.8 ms
+against a 98.8 ms token, so submission overhead is about 10 ms of it
+and the reference's WHOLE token is 86.7 ms. Our GPU work is no longer
+faster than the reference's token; it IS the gap. Every remaining
+submission could vanish and this engine would sit at 88.8 ms, or 11.3
+tok/s, which is the first time that number has been below the
+reference's.
+
+So the plan's whole premise -- "the gap is the number of submissions"
+-- was right for three rounds and is now spent. What is left is kernel
+throughput: 88.8 ms for a 5.95 GB weight read is 67 GB/s of a 200 GB/s
+part, and a recurrent layer is 1.31 ms of it. Inside that layer are
+some twelve small dispatches (two gates, the convolution, two l2 norms,
+the delta step, the gated norm, two folds, two adds, two norms) whose
+per-dispatch cost measures at about 8 microseconds, or 0.1 ms a layer
+and 5 ms a token; the rest is the PTQ1_0 matvecs, which
+`gemm_throughput_probe` and the six measured non-results below say are
+close to what this kernel shape gives.
+
 ## What is left, and it is one thing
 
 The token is now GPU 82.7 ms, latency 16.7 ms, host about 13 ms. The
