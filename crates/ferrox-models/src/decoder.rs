@@ -18,6 +18,8 @@ mod cuda_prefill;
 mod entry;
 mod ffn_block;
 #[cfg(feature = "metal")]
+mod fused_attention;
+#[cfg(feature = "metal")]
 mod fused_recurrent;
 #[cfg(any(feature = "metal", feature = "cuda"))]
 mod fused_view;
@@ -3080,9 +3082,37 @@ impl Decoder {
                         .expect("unbounded/planned KvCache growth is infallible");
                     continue;
                 }
-                if let Some(projected) =
-                    self.attn_block(l, layer, &normed, pos, KvStep::Decode(&mut *cache))
-                {
+                // An ATTENTION layer whose tail the fused launch serves
+                // hands `wo` over to it, so `wo`, the residual add, the
+                // FFN norm and the FFN are ONE command buffer instead
+                // of two (`crate::decoder::fused_attention`). The
+                // attention itself still runs on the host: the KV lives
+                // there.
+                #[cfg(feature = "metal")]
+                let mut deferred: Option<Vec<f32>> = None;
+                #[cfg(feature = "metal")]
+                let tail = if self.fused_attention_tail_eligible(l, layer) {
+                    attn_block::AttnTail::Defer(&mut deferred)
+                } else {
+                    attn_block::AttnTail::apply()
+                };
+                #[cfg(not(feature = "metal"))]
+                let tail = attn_block::AttnTail::apply();
+                let projected =
+                    self.attn_block_tail(l, layer, &normed, pos, KvStep::Decode(&mut *cache), tail);
+                #[cfg(feature = "metal")]
+                if let Some(branch) = deferred {
+                    if let Some(out) = self.fused_attention_tail(l, layer, &branch, &hidden) {
+                        hidden = out;
+                        continue;
+                    }
+                    // The launch refused after the predicate said yes,
+                    // which only a device error does: finish the layer
+                    // on the host from the branch it handed back.
+                    let p = self.project_attn_rows(layer, &branch, 1);
+                    residual_add(&mut hidden, &p, self.config.residual_scale);
+                }
+                if let Some(projected) = projected {
                     residual_add(&mut hidden, &projected, self.config.residual_scale);
                 }
                 self.ffn_block_row(

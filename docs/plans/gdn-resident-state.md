@@ -331,6 +331,33 @@ and 5 ms a token; the rest is the PTQ1_0 matvecs, which
 `gemm_throughput_probe` and the six measured non-results below say are
 close to what this kernel shape gives.
 
+## The attention layers' tail, fused
+
+The sixteen attention layers cost three submissions each while the
+forty-eight recurrent ones cost one, and two of those three are `wo`
+and the FFN with nothing but a vector add and a norm between them. They
+are one now (`ferrox_metal::gdn_branch::launch_attn_tail`,
+`crate::decoder::fused_attention`), which is 51 waits a token instead
+of 69: **10.29 to 10.59 tok/s**, interleaved on one build, parity
+MATCH. The attention itself still runs on the host, because the KV
+lives there.
+
+Two things made it cheap. `encode_ffn_tail` was extracted from the
+recurrent layer's encoder first, so the two layer kinds cannot drift
+about what a layer tail is; and `attn_block` gained an `AttnTail`
+parameter rather than a second copy of itself, so the deferring path
+gets the QKV projections, the biases, the two QK norms, RoPE, the
+scale, the temperature, the KV push, the attend and the gates
+identically -- a second copy of that body is how this file lost eight
+model features.
+
+It also cost a bug worth recording: `fused_attention_tail_eligible`
+asked `fused_attention_refusals(..).is_none()` where the function
+returns `Some(())` to mean "nothing refuses". The predicate was
+inverted, every layer declined, and the ledger showed no `attn-tail`
+label at all -- which is the only reason it was caught, because the
+fallback is correct and the model ran fine.
+
 ## The limit, which is not where this plan assumed
 
 Our GPU time for a decode token is **88.8 ms**. The reference's WHOLE
@@ -352,8 +379,8 @@ left of it precisely so nobody spends a fifth round finding that out.
 
 | | waits | latency | token | tok/s |
 |---|---|---|---|---|
-| today | 69 | 11.7 ms | 100.5 ms | 9.95 - 10.17 |
-| the attention TAIL fused (`wo` + residual + norm + FFN) | 53 | 9.0 ms | 97.8 ms | 10.22 |
+| before the tail was fused | 69 | 11.7 ms | 100.5 ms | 10.29 |
+| **the attention TAIL fused (`wo` + residual + norm + FFN), today** | **51** | **8.7 ms** | **97.5 ms** | **10.59** |
 | the attention LAYER fused | 37 | 6.3 ms | 95.1 ms | 10.52 |
 | the whole token as ONE run | 2 | 0.3 ms | 89.1 ms | 11.22 |
 | **the floor, at today's kernels** | 0 | 0 | **88.8 ms** | **11.26** |
