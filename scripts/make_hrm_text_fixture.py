@@ -20,11 +20,18 @@ once (`src/models/hrm-text.cpp`):
     one is the final norm.
 
 Two fixtures. The default is `lps = 2, h = 2, l = 1`: eight slots over
-four blocks, passes LOW HIGH LOW HIGH. `--deep` is `l = 2`: twelve
-slots, passes LOW LOW HIGH LOW LOW HIGH, which is the case where the
-LOW stack runs TWICE IN A ROW against two different cache slots -- a
-schedule that aliased the wrong way would still alternate correctly in
-the first file and not in the second.
+four blocks, passes LOW HIGH LOW HIGH. `--deep` is `h = 1, l = 2`: six
+slots, passes LOW LOW HIGH, which is the case where the LOW stack runs
+TWICE IN A ROW against two different cache slots -- a schedule that
+aliased the wrong way would still alternate correctly in the first
+file and not in the second.
+
+`--deep` is THREE stacks and not six on purpose. Every stack ends with
+a weightless RMS, and a renormalised residual amplifies the ~1e-7 that
+two f32 reduction orders differ by: six stacks measured 1.6e-4 on
+arm64 and 1.1e-3 on x86_64 CI, three measure 3.5e-5, and a fixture
+whose tolerance has to be widened until it passes on every machine is
+evidence of the machine rather than of the schedule.
 
 Everything else it carries was already served: weightless RMS norms at
 every layer slot (`:107,144,162`, `NormOp::RmsNoParams`), a per-element
@@ -71,7 +78,8 @@ DEEP_L_CYCLES = 2
 
 def main(out_path: str, deep: bool = False) -> None:
     l_cycles = DEEP_L_CYCLES if deep else L_CYCLES
-    n_slot = LPS * H_CYCLES * (l_cycles + 1)
+    h_cycles = 1 if deep else H_CYCLES
+    n_slot = LPS * h_cycles * (l_cycles + 1)
     n_block = 2 * LPS
     rng = np.random.default_rng(0x8121)
 
@@ -95,7 +103,7 @@ def main(out_path: str, deep: bool = False) -> None:
     w.add_rope_dimension_count(HEAD_DIM)
     w.add_embedding_scale(EMBEDDING_SCALE)
     w.add_uint32(f"{ARCH}.hrm.layers_per_stack", LPS)
-    w.add_uint32(f"{ARCH}.hrm.h_cycles", H_CYCLES)
+    w.add_uint32(f"{ARCH}.hrm.h_cycles", h_cycles)
     w.add_uint32(f"{ARCH}.hrm.l_cycles", l_cycles)
     w.add_file_type(gguf.LlamaFileType.ALL_F32)
 

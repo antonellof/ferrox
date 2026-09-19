@@ -80,9 +80,12 @@ are the ones worth reading twice.
   here". Two fixtures, because the alternating schedule (LOW HIGH LOW
   HIGH) never reaches the case where the LOW stack runs twice in a
   row: the first matches EXACTLY and the deep one at 1.6e-4, which
-  three measured depths show is six weightless renormalisations
-  amplifying f32 reduction order and not a structural difference
-  (`tests/hrm_text_graphs.rs`).
+  three measured depths show is weightless renormalisations amplifying
+  f32 reduction order and not a structural difference: two stacks are
+  exact, three measure 3.5e-5 and six 1.6e-4 on arm64, and the
+  six-stack file measured 1.1e-3 on x86_64 CI -- which is why the deep
+  fixture is the THREE-stack schedule, the shallowest one that runs
+  the LOW stack twice in a row (`tests/hrm_text_graphs.rs`).
 
 - **`muse-glimmer` runs**, the fourth row closed against the moved pin
   and two norm facts nothing else upstream has.

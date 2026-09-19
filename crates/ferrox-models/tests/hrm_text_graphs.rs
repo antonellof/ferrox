@@ -51,13 +51,18 @@ use ferrox_models::norm::NormOp;
 const HRM: &str = "hrm_text";
 const HRM_DEEP: &str = "hrm_text_deep";
 
-/// The deep schedule runs six stacks, and six weightless RMS norms
-/// over twelve layers amplify the ~1e-7 that ferrox and ggml differ by
-/// per reduction. MEASURED rather than assumed: the SAME weights under
-/// the alternating schedule (four stacks, eight layers) match at the
-/// suite default of 3e-5 exactly, three stacks land at 3.5e-5 and six
-/// at 1.6e-4, so the error is depth and not a structural difference.
-/// Every sabotage below moves the logits by more than 1.
+/// The deep schedule's line, and where it comes from.
+///
+/// Every stack ends with a WEIGHTLESS RMS, so a renormalised residual
+/// amplifies the ~1e-7 that two f32 reduction orders differ by, and the
+/// amplification grows with the number of stacks. Measured across
+/// three depths on arm64: two stacks exact at the suite default (3e-5),
+/// three at 3.5e-5, six at 1.6e-4 -- and the six-stack file measured
+/// 1.1e-3 on x86_64 CI, which is the same effect with another SIMD
+/// width. So the deep fixture is THREE stacks, the shallowest schedule
+/// that runs the LOW stack twice in a row, and the line is 5e-4: an
+/// order over the arm64 number, comfortably over the x86 one at this
+/// depth, and three orders under every sabotage below.
 const HRM_DEEP_TOL: f32 = 5e-4;
 
 /// llama.cpp's logits for `hrm_text_tiny.gguf` over [`GRAPH_PROMPT`].
@@ -114,54 +119,54 @@ const HRM_GOLDEN: [f32; 48] = [
 
 /// The same weights with TWO low passes per cycle.
 const HRM_DEEP_GOLDEN: [f32; 48] = [
-    -1.7315321,
-    1.3455698,
-    0.5333432,
-    -2.4015927,
-    2.0042908,
-    0.6849818,
-    0.84940934,
-    1.4212723,
-    -0.2938357,
-    0.99640936,
-    0.78271693,
-    -0.25756648,
-    0.46557346,
-    1.841322,
-    -0.23009472,
-    -0.88842714,
-    -0.7803574,
-    0.23483726,
-    1.3887397,
-    -0.23898005,
-    0.3767509,
-    0.028825477,
-    -2.2967558,
-    -1.0761021,
-    3.1547508,
-    0.98069245,
-    0.4690307,
-    -1.7409105,
-    2.9399304,
-    0.07342398,
-    1.1268061,
-    -0.281987,
-    1.1018726,
-    0.5206571,
-    -0.8513704,
-    -3.0395393,
-    -0.2054615,
-    0.43257284,
-    0.5906327,
-    -1.4180499,
-    1.4115309,
-    -0.40540177,
-    1.7289664,
-    0.8499189,
-    -1.0128067,
-    1.964002,
-    -1.4922485,
-    1.3887901,
+    0.90758383,
+    0.22953302,
+    -2.9290957,
+    -0.91447467,
+    0.3418988,
+    -1.0681655,
+    0.06694257,
+    -1.3104312,
+    -0.27177373,
+    2.2454808,
+    1.4815192,
+    -0.39861965,
+    -0.95136833,
+    -0.24828023,
+    -0.76831377,
+    2.8056233,
+    0.29154465,
+    -0.73113346,
+    -0.9889295,
+    -0.19202757,
+    -0.10745835,
+    -2.554587,
+    1.3898308,
+    -2.4129229,
+    -0.11541099,
+    -0.4458959,
+    -2.7572427,
+    -1.4002583,
+    2.796239,
+    -1.2634301,
+    0.12001756,
+    -1.1158018,
+    0.40241373,
+    0.3288846,
+    -1.8391914,
+    -0.8395929,
+    0.12101996,
+    0.7995589,
+    2.2497063,
+    1.5525922,
+    -0.7898507,
+    1.5446601,
+    -0.9307585,
+    -3.3308845,
+    -0.55149263,
+    1.7406132,
+    0.480614,
+    1.1693362,
 ];
 
 #[test]
@@ -219,8 +224,8 @@ fn twelve_slots_alias_four_blocks_in_the_order_hrm_text_cpp_runs_them() {
     // The deep file is the other order: two LOW passes, then a HIGH.
     let deep = load_graph_fixture(HRM_DEEP);
     assert_eq!(deep.layers.len(), 4);
-    assert_eq!(deep.config.n_layers, 12);
-    let deep_physical: Vec<usize> = (0..12)
+    assert_eq!(deep.config.n_layers, 6);
+    let deep_physical: Vec<usize> = (0..6)
         .map(|l| {
             deep.layers
                 .iter()
@@ -228,7 +233,7 @@ fn twelve_slots_alias_four_blocks_in_the_order_hrm_text_cpp_runs_them() {
                 .expect("every slot aliases one of the blocks")
         })
         .collect();
-    assert_eq!(deep_physical, [0, 1, 0, 1, 2, 3, 0, 1, 0, 1, 2, 3]);
+    assert_eq!(deep_physical, [0, 1, 0, 1, 2, 3], "LOW LOW HIGH");
     // Every slot has its own cache: the KV is per SLOT even though the
     // weights are per block.
     assert_eq!(d.config.new_kv_caches().len(), 8);

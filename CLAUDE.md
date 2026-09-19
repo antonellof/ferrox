@@ -105,9 +105,13 @@ schedule are one value the four host bodies ask, and `crate::hrm` is
 the two-stream state, one type with two methods rather than four
 copies of "hold two vectors". Two fixtures: the alternating schedule
 matches EXACTLY and the deep one (two LOW passes in a row, the case
-the alternating order never reaches) lands at 1.6e-4, which is six
-weightless renormalisations amplifying the 1e-7 ferrox and ggml differ
-by per reduction -- measured by running three depths, not assumed.
+the alternating order never reaches) at a measured line. Every stack
+ends with a weightless RMS, so a renormalised residual amplifies the
+1e-7 two f32 reduction orders differ by: two stacks exact, three
+3.5e-5, six 1.6e-4 on arm64 and 1.1e-3 on x86_64 CI. The deep fixture
+is the THREE-stack schedule for that reason -- a tolerance widened
+until it passes everywhere is evidence of the machine, not of the
+model.
 
 So **five** triaged refusals are left, and they say which of three
 things is missing: **0 are a fixture away, 0 are one match arm away**,
